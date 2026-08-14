@@ -12,6 +12,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::db::Db;
+use crate::obsidian;
 use crate::provider::ToolSpec;
 
 pub const MAX_LIST_ITEMS: usize = 500;
@@ -30,6 +32,18 @@ pub trait Tool {
 
 pub struct ToolCtx {
     pub workspace: PathBuf,
+    pub vault: Option<PathBuf>,
+    pub db_path: PathBuf,
+}
+
+impl ToolCtx {
+    pub fn new(workspace: PathBuf) -> Self {
+        Self {
+            workspace,
+            vault: None,
+            db_path: PathBuf::from("."),
+        }
+    }
 }
 
 pub struct ToolRegistry {
@@ -46,6 +60,7 @@ impl ToolRegistry {
                 Box::new(EditFile),
                 Box::new(WriteFile),
                 Box::new(Bash),
+                Box::new(ObsidianSearch),
             ],
         }
     }
@@ -131,6 +146,30 @@ pub fn resolve_in_workspace(workspace: &Path, user_path: &str) -> Result<PathBuf
     }
 }
 
+pub fn resolve_tool_path(ctx: &ToolCtx, user_path: &str) -> Result<PathBuf> {
+    let resolved = resolve_in_workspace(&ctx.workspace, user_path)?;
+    reject_vault(&resolved, ctx.vault.as_deref())?;
+    Ok(resolved)
+}
+
+fn reject_vault(path: &Path, vault: Option<&Path>) -> Result<()> {
+    let Some(vault) = vault else {
+        return Ok(());
+    };
+    if !vault.exists() {
+        return Ok(());
+    }
+    let Ok(v) = vault.canonicalize() else {
+        return Ok(());
+    };
+    if path.starts_with(&v) {
+        return Err(anyhow!(
+            "Obsidian Vault는 파일 도구로 열 수 없습니다. obsidian_search 를 사용하세요"
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
@@ -169,7 +208,7 @@ pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<Stri
         "write_file" => {
             let path = str_field(input, "path")?;
             let content = str_field(input, "content")?;
-            let resolved = resolve_in_workspace(&ctx.workspace, path)?;
+            let resolved = resolve_tool_path(ctx, path)?;
             let old = if resolved.exists() {
                 fs::read_to_string(&resolved).unwrap_or_default()
             } else {
@@ -185,7 +224,7 @@ pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<Stri
             let path = str_field(input, "path")?;
             let old_str = str_field(input, "old_str")?;
             let new_str = str_field(input, "new_str")?;
-            let resolved = resolve_in_workspace(&ctx.workspace, path)?;
+            let resolved = resolve_tool_path(ctx, path)?;
             let body = fs::read_to_string(&resolved)
                 .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", resolved.display()))?;
             let count = body.matches(old_str).count();
@@ -225,6 +264,7 @@ struct Grep;
 struct EditFile;
 struct WriteFile;
 struct Bash;
+struct ObsidianSearch;
 
 impl Tool for ReadFile {
     fn name(&self) -> &'static str {
@@ -249,7 +289,7 @@ impl Tool for ReadFile {
     }
     fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
         let path = str_field(&input, "path")?;
-        let resolved = resolve_in_workspace(&ctx.workspace, path)?;
+        let resolved = resolve_tool_path(ctx, path)?;
         if !resolved.is_file() {
             return Err(anyhow!("파일이 아닙니다: {}", resolved.display()));
         }
@@ -294,7 +334,7 @@ impl Tool for ListDir {
     }
     fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let resolved = resolve_in_workspace(&ctx.workspace, path)?;
+        let resolved = resolve_tool_path(ctx, path)?;
         if !resolved.is_dir() {
             return Err(anyhow!("폴더가 아닙니다: {}", resolved.display()));
         }
@@ -343,7 +383,7 @@ impl Tool for Grep {
         let pattern = str_field(&input, "pattern")?;
         let re = Regex::new(pattern).map_err(|e| anyhow!("정규식이 올바르지 않습니다: {e}"))?;
         let start = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let root = resolve_in_workspace(&ctx.workspace, start)?;
+        let root = resolve_tool_path(ctx, start)?;
         let glob_re = match input.get("glob").and_then(|v| v.as_str()) {
             Some(g) if !g.is_empty() => Some(glob_to_regex(g)?),
             _ => None,
@@ -423,7 +463,7 @@ impl Tool for EditFile {
         let path = str_field(&input, "path")?;
         let old_str = str_field(&input, "old_str")?;
         let new_str = str_field(&input, "new_str")?;
-        let resolved = resolve_in_workspace(&ctx.workspace, path)?;
+        let resolved = resolve_tool_path(ctx, path)?;
         let body = fs::read_to_string(&resolved)
             .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", resolved.display()))?;
         let count = body.matches(old_str).count();
@@ -461,7 +501,7 @@ impl Tool for WriteFile {
     fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
         let path = str_field(&input, "path")?;
         let content = str_field(&input, "content")?;
-        let resolved = resolve_in_workspace(&ctx.workspace, path)?;
+        let resolved = resolve_tool_path(ctx, path)?;
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -498,6 +538,39 @@ impl Tool for Bash {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(run_bash(command, workspace))
         })
+    }
+}
+
+impl Tool for ObsidianSearch {
+    fn name(&self) -> &'static str {
+        "obsidian_search"
+    }
+    fn description(&self) -> &'static str {
+        "Obsidian Vault 노트를 FTS5로 검색합니다. 제목·경로·발췌를 반환합니다."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "검색어"},
+                "limit": {"type": "integer", "description": "결과 개수. 기본 5"}
+            },
+            "required": ["query"]
+        })
+    }
+    fn needs_approval(&self, _input: &Value) -> bool {
+        false
+    }
+    fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
+        let query = str_field(&input, "query")?;
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 20) as usize;
+        let db = Db::open(&ctx.db_path)?;
+        let hits = db.search_notes(query, limit)?;
+        Ok(obsidian::format_tool_results(&hits))
     }
 }
 
@@ -657,9 +730,7 @@ mod tests {
     fn write_preview_stays_inside_workspace() {
         let dir = std::env::temp_dir().join("agent-harness-write-preview");
         fs::create_dir_all(&dir).unwrap();
-        let ctx = ToolCtx {
-            workspace: dir.clone(),
-        };
+        let ctx = ToolCtx::new(dir.clone());
         let preview = approval_preview(
             "write_file",
             &json!({"path": "hello.txt", "content": "안녕"}),

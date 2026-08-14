@@ -108,7 +108,6 @@ pub struct ConfigFile {
     pub memory: MemoryConfig,
     #[allow(dead_code)]
     pub inspector: InspectorConfig,
-    #[allow(dead_code)]
     pub obsidian: ObsidianConfig,
     #[allow(dead_code)]
     pub telegram: TelegramConfig,
@@ -182,7 +181,6 @@ pub struct InspectorConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct ObsidianConfig {
     pub vault_path: String,
     pub db_path: String,

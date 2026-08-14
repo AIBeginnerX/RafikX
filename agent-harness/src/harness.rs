@@ -604,9 +604,9 @@ async fn run_verify(
         println!("검증 생략: bash 도구가 없습니다.");
         return Ok(outcome);
     };
-    let ctx = ToolCtx {
-        workspace: cfg.workspace.clone(),
-    };
+    let mut ctx = ToolCtx::new(cfg.workspace.clone());
+    ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
+    ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
 
     for round in 0..3 {
         println!("[검증] {cmd}");

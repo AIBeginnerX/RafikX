@@ -3,6 +3,7 @@ mod applog;
 mod config;
 mod db;
 mod harness;
+mod obsidian;
 mod provider;
 mod tools;
 
@@ -39,7 +40,7 @@ enum Commands {
     Ask {
         /// 지시문
         prompt: String,
-        /// Vault 컨텍스트 강제 (Phase 4에서 본문 주입, 지금은 분류만 medium)
+        /// Vault 검색 결과를 컨텍스트로 주입
         #[arg(long)]
         obsidian: bool,
     },
@@ -48,6 +49,14 @@ enum Commands {
         /// 작업 지시
         prompt: String,
     },
+    /// Vault 노트를 FTS5에 인덱싱
+    Index,
+    /// Vault 노트 검색
+    Search {
+        query: String,
+    },
+    /// Vault 파일 변경을 감시하며 재인덱싱
+    Watch,
     /// 설정·키·워크스페이스·프로바이더를 점검합니다
     Doctor,
 }
@@ -59,6 +68,9 @@ async fn main() -> ExitCode {
         Commands::Doctor => cmd_doctor(&cli).await,
         Commands::Ask { prompt, obsidian } => cmd_ask(&cli, prompt, *obsidian).await,
         Commands::Agent { prompt } => cmd_ask(&cli, prompt, false).await,
+        Commands::Index => cmd_index(&cli),
+        Commands::Search { query } => cmd_search(&cli, query),
+        Commands::Watch => cmd_watch(&cli).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -110,12 +122,36 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
 
     let db_path = Db::db_path()?;
     match Db::open(&db_path) {
-        Ok(_) => println!("[OK] DB: {}", db_path.display()),
+        Ok(db) => {
+            println!("[OK] DB: {}", db_path.display());
+            match db.has_fts5() {
+                Ok(true) => println!("[OK] FTS5: 사용 가능"),
+                Ok(false) => {
+                    println!("[실패] FTS5: rusqlite bundled 에 FTS5가 없습니다");
+                    ok = false;
+                }
+                Err(e) => {
+                    println!("[실패] FTS5 확인: {e}");
+                    ok = false;
+                }
+            }
+        }
         Err(e) => {
             println!("[실패] DB: {e}");
             ok = false;
         }
     }
+
+    let vault = config::expand_tilde(&cfg.file.obsidian.vault_path);
+    if vault.exists() {
+        println!("[OK] Vault: {}", vault.display());
+    } else {
+        println!("[주의] Vault: {} (폴더가 아직 없습니다. index 시 생성됩니다)", vault.display());
+    }
+    println!(
+        "[OK] tokenizer: {}",
+        cfg.file.obsidian.tokenizer
+    );
 
     println!();
     println!("프로바이더 ping");
@@ -157,6 +193,24 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
     )?;
     print_binding(&binding);
 
+    let mut task = prompt.to_string();
+    if obsidian {
+        match crate::obsidian::ask_context(&cfg, prompt) {
+            Ok(ctx) => {
+                if ctx.sources.is_empty() {
+                    println!("[Obsidian] 검색 결과 없음 (index 를 먼저 실행하세요)");
+                } else {
+                    println!("[Obsidian] 출처:");
+                    for s in &ctx.sources {
+                        println!("  - {s}");
+                    }
+                }
+                task = format!("{}\n\n(질문)\n{prompt}", ctx.block);
+            }
+            Err(e) => eprintln!("Obsidian 컨텍스트를 넣지 못했습니다: {e}"),
+        }
+    }
+
     let db = Db::open(&Db::db_path()?)?;
     let run_id = db.start_run(
         mode,
@@ -177,7 +231,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
     match run_pipeline(
         &cfg,
         &binding,
-        prompt,
+        &task,
         cli.yes,
         cli.provider.as_deref(),
     )
@@ -201,5 +255,25 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
             Err(e)
         }
     }
+}
+
+fn cmd_index(cli: &Cli) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    let stats = obsidian::index_vault(&cfg)?;
+    println!(
+        "인덱싱 완료: 추가/갱신 {}개, 변경 없음 {}개, 삭제 {}개",
+        stats.updated, stats.skipped, stats.deleted
+    );
+    Ok(())
+}
+
+fn cmd_search(cli: &Cli, query: &str) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    obsidian::search_print(&cfg, query)
+}
+
+async fn cmd_watch(cli: &Cli) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    obsidian::watch_vault(&cfg).await
 }
 

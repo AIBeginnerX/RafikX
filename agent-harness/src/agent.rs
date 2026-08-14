@@ -66,9 +66,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         eprintln!("경고: --yes 는 모든 도구를 승인 없이 실행합니다.");
     }
 
-    let ctx = ToolCtx {
-        workspace: cfg.workspace.clone(),
-    };
+    let mut ctx = ToolCtx::new(cfg.workspace.clone());
+    ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
+    ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
     let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
     let mut allow_all = yes;
     let mut iterations = 0u32;
