@@ -98,13 +98,12 @@ allow_agent = false
 approval_timeout_secs = 300
 "#;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ConfigFile {
     pub general: GeneralConfig,
     pub providers: HashMap<String, ProviderConfig>,
     pub harness: HarnessConfig,
     pub subagents: HashMap<String, SubAgentConfig>,
-    #[allow(dead_code)]
     pub memory: MemoryConfig,
     #[allow(dead_code)]
     pub inspector: InspectorConfig,
@@ -113,7 +112,7 @@ pub struct ConfigFile {
     pub telegram: TelegramConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GeneralConfig {
     pub default_provider: String,
     pub workspace: String,
@@ -124,7 +123,7 @@ pub struct GeneralConfig {
     pub classifier: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
     pub kind: String,
     #[serde(default)]
@@ -138,7 +137,7 @@ pub struct ProviderConfig {
     pub supports_tools: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HarnessConfig {
     pub simple: String,
     pub medium: String,
@@ -147,7 +146,7 @@ pub struct HarnessConfig {
     pub fallback: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SubAgentConfig {
     pub provider: String,
     pub model_role: String,
@@ -164,15 +163,14 @@ pub struct SubAgentConfig {
     pub system_extra: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     pub enabled: bool,
     pub max_lessons: u32,
     pub inject_limit_chars: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct InspectorConfig {
     pub subagent: String,
@@ -180,7 +178,7 @@ pub struct InspectorConfig {
     pub notify_telegram: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ObsidianConfig {
     pub vault_path: String,
     pub db_path: String,
@@ -188,7 +186,7 @@ pub struct ObsidianConfig {
     pub tokenizer: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct TelegramConfig {
     pub enabled: bool,
@@ -198,7 +196,7 @@ pub struct TelegramConfig {
     pub approval_timeout_secs: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub path: PathBuf,
     #[allow(dead_code)]

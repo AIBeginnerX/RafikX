@@ -1,3 +1,3 @@
-완료: Phase 4 — Obsidian 엔진(index/search/watch, FTS5, obsidian_search, ask --obsidian 컨텍스트·백링크).
-다음: Phase 5 (chat + lessons). GitHub 푸시는 로그인 계정(lovensk0-a11y)으로 private 저장소 생성 승인 후 재시도. AIBeginnerX 로 올리려면 해당 계정으로 gh auth login 필요.
-이슈: API 키/Ollama 없어 ask --obsidian 의 실제 LLM 호출은 미검증. GitHub 원격(origin) 없음.
+완료: Phase 5 — chat REPL(/save /quit /resume /list)·sessions 저장·교훈(lessons) 주입·비동기 리플렉션·list/add/rm/clear.
+다음: Phase 6 (Inspector). API 키 없으면 리플렉션·chat 실제 LLM 호출은 스킵됨. 수동 lessons add 는 키 없이 동작.
+이슈: GitHub origin 없음. rustyline 미사용(SPEC: 승인 후, stdin 기본).

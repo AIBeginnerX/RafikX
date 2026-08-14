@@ -1,8 +1,10 @@
 mod agent;
 mod applog;
+mod chat;
 mod config;
 mod db;
 mod harness;
+mod lessons;
 mod obsidian;
 mod provider;
 mod tools;
@@ -57,8 +59,32 @@ enum Commands {
     },
     /// Vault 파일 변경을 감시하며 재인덱싱
     Watch,
+    /// 대화 REPL
+    Chat {
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        resume: Option<String>,
+    },
+    /// 교훈 관리
+    Lessons {
+        #[command(subcommand)]
+        action: LessonsCmd,
+    },
     /// 설정·키·워크스페이스·프로바이더를 점검합니다
     Doctor,
+}
+
+#[derive(Subcommand)]
+enum LessonsCmd {
+    /// 저장된 교훈 목록
+    List,
+    /// 교훈을 직접 추가
+    Add { text: String },
+    /// id로 삭제
+    Rm { id: i64 },
+    /// 모두 삭제
+    Clear,
 }
 
 #[tokio::main]
@@ -71,6 +97,10 @@ async fn main() -> ExitCode {
         Commands::Index => cmd_index(&cli),
         Commands::Search { query } => cmd_search(&cli, query),
         Commands::Watch => cmd_watch(&cli).await,
+        Commands::Chat { list, resume } => {
+            cmd_chat_entry(&cli, *list, resume.clone()).await
+        }
+        Commands::Lessons { action } => cmd_lessons(&cli, action),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -234,6 +264,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         &task,
         cli.yes,
         cli.provider.as_deref(),
+        None,
     )
     .await
     {
@@ -248,10 +279,17 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
                 outcome.input_tokens,
                 outcome.output_tokens
             );
+            lessons::maybe_spawn(&cfg, prompt, &outcome);
             Ok(())
         }
         Err(e) => {
             let _ = db.finish_run(&run_id, "fail", 0, 0, 0, Some(&e.to_string()));
+            let fail = agent::AgentOutcome {
+                status: "fail".into(),
+                error: Some(e.to_string()),
+                ..Default::default()
+            };
+            lessons::maybe_spawn(&cfg, prompt, &fail);
             Err(e)
         }
     }
@@ -275,5 +313,29 @@ fn cmd_search(cli: &Cli, query: &str) -> Result<()> {
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let cfg = Config::load(cli.config.as_deref())?;
     obsidian::watch_vault(&cfg).await
+}
+
+fn cmd_lessons(cli: &Cli, action: &LessonsCmd) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    match action {
+        LessonsCmd::List => lessons::cmd_list(&cfg),
+        LessonsCmd::Add { text } => lessons::cmd_add(&cfg, text),
+        LessonsCmd::Rm { id } => lessons::cmd_rm(*id),
+        LessonsCmd::Clear => lessons::cmd_clear(),
+    }
+}
+
+async fn cmd_chat_entry(cli: &Cli, list: bool, resume: Option<String>) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    chat::cmd_chat(
+        cfg,
+        cli.yes,
+        cli.provider.clone(),
+        cli.model.clone(),
+        cli.class.clone(),
+        list,
+        resume,
+    )
+    .await
 }
 

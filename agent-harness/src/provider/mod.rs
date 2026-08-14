@@ -5,8 +5,10 @@ pub use anthropic::AnthropicProvider;
 pub use openai_compat::OpenAiCompatProvider;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub enum Role {
     System,
@@ -14,7 +16,8 @@ pub enum Role {
     Assistant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum ContentBlock {
     Text {
@@ -32,7 +35,7 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,

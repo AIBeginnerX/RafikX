@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 
 use crate::agent::{self, AgentOutcome, AgentRun};
 use crate::config::{Config, ProviderConfig};
+use crate::db::Db;
 use crate::provider::{
     AnthropicProvider, ChatRequest, ChatResponse, ContentBlock, DynProvider, Message,
     OpenAiCompatProvider, is_retryable,
@@ -466,14 +467,19 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
     }
 }
 
-pub fn system_prompt(cfg: &Config, extra: &str) -> String {
-    format!(
+pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
+    let mut s = format!(
         "You are agent-harness, a personal CLI assistant.\n\
          Workspace: {}\n\
          If the user writes in Korean, reply in Korean.\n\
          {extra}",
         cfg.workspace.display()
-    )
+    );
+    if !lessons.trim().is_empty() {
+        s.push('\n');
+        s.push_str(lessons.trim_end());
+    }
+    s
 }
 
 pub async fn run_pipeline(
@@ -482,6 +488,7 @@ pub async fn run_pipeline(
     task: &str,
     yes: bool,
     cli_provider: Option<&str>,
+    resume: Option<Vec<Message>>,
 ) -> Result<AgentOutcome> {
     let role = cfg
         .file
@@ -490,7 +497,24 @@ pub async fn run_pipeline(
         .map(|s| s.model_role.as_str())
         .unwrap_or("main");
     let order = fallback_order(cfg, &binding.provider_name, cli_provider);
-    let system = system_prompt(cfg, &binding.system_extra);
+    let lessons_block = if cfg.file.memory.enabled {
+        Db::open(&Db::db_path()?)
+            .ok()
+            .map(|db| {
+                crate::lessons::inject_block(
+                    &db,
+                    task,
+                    cfg.file.memory.inject_limit_chars as usize,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if !lessons_block.is_empty() {
+        crate::applog::info(&format!("lessons inject:\n{lessons_block}"));
+    }
+    let system = system_prompt(cfg, &binding.system_extra, &lessons_block);
 
     if binding.plan_first {
         let req = ChatRequest {
@@ -516,10 +540,11 @@ pub async fn run_pipeline(
 
     let use_tools = !binding.tools.is_empty();
     if !use_tools {
+        let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
         let req = ChatRequest {
             model: binding.model.clone(),
             system,
-            messages: vec![Message::user_text(task)],
+            messages: messages.clone(),
             tools: vec![],
             max_tokens: cfg.file.general.max_tokens,
             stream: true,
@@ -534,14 +559,21 @@ pub async fn run_pipeline(
             "[tokens] in={} out={} stop={:?}",
             resp.input_tokens, resp.output_tokens, resp.stop_reason
         );
+        messages.push(Message {
+            role: crate::provider::Role::Assistant,
+            content: resp.content.clone(),
+        });
         return Ok(AgentOutcome {
             status: "ok".into(),
             iterations: 1,
             input_tokens: resp.input_tokens,
             output_tokens: resp.output_tokens,
             error: None,
-            messages: vec![],
+            messages,
             changed_files: vec![],
+            tool_errors: vec![],
+            deny_reasons: vec![],
+            verify_fail: None,
         });
     }
 
@@ -571,7 +603,7 @@ pub async fn run_pipeline(
         max_iterations: binding.max_iterations,
         system: system.clone(),
         registry,
-        resume: None,
+        resume,
     })
     .await?;
 
@@ -648,9 +680,11 @@ async fn run_verify(
                     println!("{err}");
                     outcome.status = "fail".into();
                     outcome.error = Some(err.chars().take(500).collect());
+                    outcome.verify_fail = Some(err.chars().take(500).collect());
                     return Ok(outcome);
                 }
                 println!("검증 실패, 오류를 되먹여 재시도합니다 ({}/2)", round + 1);
+                let cause: String = err.chars().take(500).collect();
                 let mut msgs = outcome.messages.clone();
                 if msgs.is_empty() {
                     msgs.push(Message::user_text(task));
@@ -658,7 +692,7 @@ async fn run_verify(
                 msgs.push(Message::user_text(format!(
                     "검증 명령이 실패했습니다. 오류를 고치세요.\n{err}"
                 )));
-                outcome = agent::run_agent(AgentRun {
+                let mut next = agent::run_agent(AgentRun {
                     cfg,
                     client,
                     model: &binding.model,
@@ -670,6 +704,10 @@ async fn run_verify(
                     resume: Some(msgs),
                 })
                 .await?;
+                if next.verify_fail.is_none() {
+                    next.verify_fail = Some(cause);
+                }
+                outcome = next;
             }
         }
     }

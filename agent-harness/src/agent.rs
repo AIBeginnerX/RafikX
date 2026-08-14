@@ -23,6 +23,26 @@ pub struct AgentOutcome {
     pub error: Option<String>,
     pub messages: Vec<Message>,
     pub changed_files: Vec<String>,
+    pub tool_errors: Vec<String>,
+    pub deny_reasons: Vec<String>,
+    pub verify_fail: Option<String>,
+}
+
+impl Default for AgentOutcome {
+    fn default() -> Self {
+        Self {
+            status: "ok".into(),
+            iterations: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            error: None,
+            messages: Vec::new(),
+            changed_files: Vec::new(),
+            tool_errors: Vec::new(),
+            deny_reasons: Vec::new(),
+            verify_fail: None,
+        }
+    }
 }
 
 pub struct AgentRun<'a> {
@@ -77,6 +97,8 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let mut denied_any = false;
     let mut call_counts: HashMap<String, u32> = HashMap::new();
     let mut changed_files: Vec<String> = Vec::new();
+    let mut tool_errors: Vec<String> = Vec::new();
+    let mut deny_reasons: Vec<String> = Vec::new();
     let max_iter = max_iterations.min(HARD_CAP);
     let max_chars = cfg.file.general.max_context_chars;
 
@@ -91,6 +113,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 error: Some("반복 상한".into()),
                 messages,
                 changed_files,
+                tool_errors,
+                deny_reasons,
+                verify_fail: None,
             });
         }
         iterations += 1;
@@ -127,6 +152,10 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             .collect();
 
         if resp.stop_reason != StopReason::ToolUse && tool_uses.is_empty() {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: resp.content.clone(),
+            });
             return Ok(AgentOutcome {
                 status: if denied_any { "denied".into() } else { "ok".into() },
                 iterations,
@@ -135,10 +164,17 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 error: None,
                 messages,
                 changed_files,
+                tool_errors,
+                deny_reasons,
+                verify_fail: None,
             });
         }
 
         if tool_uses.is_empty() {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: resp.content.clone(),
+            });
             return Ok(AgentOutcome {
                 status: "ok".into(),
                 iterations,
@@ -147,6 +183,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 error: None,
                 messages,
                 changed_files,
+                tool_errors,
+                deny_reasons,
+                verify_fail: None,
             });
         }
 
@@ -170,14 +209,19 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                     error: Some("동일 도구 3회 반복".into()),
                     messages,
                     changed_files,
+                    tool_errors,
+                    deny_reasons,
+                    verify_fail: None,
                 });
             }
 
             println!("[도구] {name}");
             let Some(tool) = registry.get(&name) else {
+                let msg = format!("알 수 없는 도구: {name}");
+                tool_errors.push(msg.clone());
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id,
-                    content: format!("알 수 없는 도구: {name}"),
+                    content: msg,
                     is_error: true,
                 });
                 continue;
@@ -192,9 +236,20 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                             Approval::Always => allow_all = true,
                             Approval::No => {
                                 denied_any = true;
+                                let reason = read_deny_reason()?;
+                                let msg = if reason.is_empty() {
+                                    "사용자가 도구 실행을 거부했습니다.".to_string()
+                                } else {
+                                    format!("사용자가 도구 실행을 거부했습니다. 사유: {reason}")
+                                };
+                                deny_reasons.push(if reason.is_empty() {
+                                    "거부".into()
+                                } else {
+                                    reason
+                                });
                                 results.push(ContentBlock::ToolResult {
                                     tool_use_id: id,
-                                    content: "사용자가 도구 실행을 거부했습니다.".into(),
+                                    content: msg,
                                     is_error: true,
                                 });
                                 continue;
@@ -207,6 +262,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                             content: e.to_string(),
                             is_error: true,
                         });
+                        tool_errors.push(e.to_string());
                         continue;
                     }
                 }
@@ -231,6 +287,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 Err(e) => {
                     applog::error(&format!("tool {name}: {e}"));
                     println!("도구 오류: {e}");
+                    tool_errors.push(format!("{name}: {e}"));
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id,
                         content: e.to_string(),
@@ -261,6 +318,52 @@ fn warn_if_not_git(workspace: &Path) {
     if !workspace.join(".git").exists() {
         eprintln!("경고: 이 폴더는 git 저장소가 아닙니다. git init 을 권장합니다.");
     }
+}
+
+fn read_deny_reason() -> Result<String> {
+    print!("사유(선택, Enter로 생략): ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
+    let mut keep: Vec<Message> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let has_use = messages[i]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let has_result = messages[i]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        if messages[i].role == Role::Assistant && has_use {
+            if i + 1 < messages.len()
+                && messages[i + 1].role == Role::User
+                && messages[i + 1]
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            {
+                keep.push(messages[i].clone());
+                keep.push(messages[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if messages[i].role == Role::User && has_result && !messages[i].content.iter().any(|b| matches!(b, ContentBlock::Text { .. })) {
+            i += 1;
+            continue;
+        }
+        keep.push(messages[i].clone());
+        i += 1;
+    }
+    *messages = keep;
 }
 
 fn read_approval() -> Result<Approval> {
@@ -333,4 +436,53 @@ pub fn record_finish(
         outcome.output_tokens as i64,
         outcome.error.as_deref(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn drops_unpaired_tool_use() {
+        let mut msgs = vec![
+            Message::user_text("hi"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "1".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "a.rs"}),
+                }],
+            },
+        ];
+        sanitize_tool_pairs(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::User));
+    }
+
+    #[test]
+    fn keeps_paired_tool_use() {
+        let mut msgs = vec![
+            Message::user_text("hi"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "1".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "a.rs"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        sanitize_tool_pairs(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+    }
 }
