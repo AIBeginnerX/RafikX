@@ -1,0 +1,271 @@
+use anyhow::{Context, Result, anyhow};
+use futures_util::StreamExt;
+use serde_json::{Value, json};
+
+use super::{
+    ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason, map_stop_reason,
+};
+
+const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+pub struct AnthropicProvider {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+impl AnthropicProvider {
+    pub fn new(api_key: String) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("HTTP 클라이언트를 만들 수 없습니다")?;
+        Ok(Self { client, api_key })
+    }
+
+    #[allow(dead_code)]
+    pub async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        let body = build_body(req);
+        let resp = self
+            .client
+            .post(MESSAGES_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Anthropic API 요청에 실패했습니다")?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text));
+        }
+        parse_message_json(&text)
+    }
+
+    pub async fn chat_stream<F>(&self, req: &ChatRequest, mut on_text: F) -> Result<ChatResponse>
+    where
+        F: FnMut(&str),
+    {
+        let body = build_body(req);
+        let resp = self
+            .client
+            .post(MESSAGES_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Anthropic API 요청에 실패했습니다")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(api_error(status.as_u16(), &text));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut full_text = String::new();
+        let mut input_tokens = 0u32;
+        let mut output_tokens = 0u32;
+        let mut stop_reason = StopReason::Other;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("응답 스트림을 읽는 중 오류")?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            loop {
+                let sep = buf.find("\n\n").or_else(|| buf.find("\r\n\r\n"));
+                let Some(pos) = sep else { break };
+                let sep_len = if buf[pos..].starts_with("\r\n\r\n") { 4 } else { 2 };
+                let event = buf[..pos].to_string();
+                buf = buf[pos + sep_len..].to_string();
+                if let Some(data) = sse_data(&event) {
+                    if data.trim() == "[DONE]" {
+                        continue;
+                    }
+                    let v: Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match v.get("type").and_then(|t| t.as_str()) {
+                        Some("message_start") => {
+                            input_tokens = v
+                                .pointer("/message/usage/input_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0) as u32;
+                        }
+                        Some("content_block_delta") => {
+                            if v.pointer("/delta/type").and_then(|x| x.as_str()) == Some("text_delta") {
+                                if let Some(piece) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
+                                    if !piece.is_empty() {
+                                        on_text(piece);
+                                        full_text.push_str(piece);
+                                    }
+                                }
+                            }
+                        }
+                        Some("message_delta") => {
+                            stop_reason = map_stop_reason(
+                                v.pointer("/delta/stop_reason").and_then(|x| x.as_str()),
+                            );
+                            if let Some(n) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
+                                output_tokens = n as u32;
+                            }
+                        }
+                        Some("message_stop") => {
+                            return Ok(ChatResponse {
+                                content: vec![ContentBlock::Text { text: full_text }],
+                                stop_reason,
+                                input_tokens,
+                                output_tokens,
+                            });
+                        }
+                        Some("error") => {
+                            let msg = v
+                                .pointer("/error/message")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("스트림 오류");
+                            return Err(anyhow!("Anthropic API 오류: {}", redact_secrets(msg)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(ChatResponse {
+            content: vec![ContentBlock::Text { text: full_text }],
+            stop_reason,
+            input_tokens,
+            output_tokens,
+        })
+    }
+}
+
+fn build_body(req: &ChatRequest) -> Value {
+    let mut body = json!({
+        "model": req.model,
+        "max_tokens": req.max_tokens,
+        "system": req.system,
+        "messages": to_api_messages(&req.messages),
+        "stream": req.stream,
+    });
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tools);
+    }
+    body
+}
+
+fn to_api_messages(msgs: &[Message]) -> Vec<Value> {
+    msgs.iter()
+        .filter_map(|m| {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => return None,
+            };
+            let content: Vec<Value> = m
+                .content
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::Text { text } => json!({"type": "text", "text": text}),
+                    ContentBlock::ToolUse { id, name, input } => {
+                        json!({"type": "tool_use", "id": id, "name": name, "input": input})
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                        "is_error": is_error,
+                    }),
+                })
+                .collect();
+            Some(json!({"role": role, "content": content}))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn parse_message_json(text: &str) -> Result<ChatResponse> {
+    let v: Value = serde_json::from_str(text).context("Anthropic 응답 JSON을 해석할 수 없습니다")?;
+    let mut blocks = Vec::new();
+    if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+        for item in arr {
+            if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    blocks.push(ContentBlock::Text { text: t.to_string() });
+                }
+            }
+        }
+    }
+    Ok(ChatResponse {
+        content: blocks,
+        stop_reason: map_stop_reason(v.get("stop_reason").and_then(|s| s.as_str())),
+        input_tokens: v
+            .pointer("/usage/input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        output_tokens: v
+            .pointer("/usage/output_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+    })
+}
+
+fn sse_data(event: &str) -> Option<&str> {
+    let mut data_lines = Vec::new();
+    for line in event.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim_start());
+        }
+    }
+    if data_lines.is_empty() {
+        None
+    } else {
+        // 여러 data: 줄을 합치되, 실제로는 한 줄 JSON.
+        Some(data_lines[0])
+    }
+}
+
+fn api_error(status: u16, body: &str) -> anyhow::Error {
+    let safe = redact_secrets(body);
+    let snippet: String = safe.chars().take(400).collect();
+    if status == 401 {
+        anyhow!("Anthropic API 인증 실패 (HTTP 401). API 키를 확인하세요.")
+    } else {
+        anyhow!("Anthropic API 오류 HTTP {status}: {snippet}")
+    }
+}
+
+fn redact_secrets(s: &str) -> String {
+    let mut out = s.to_string();
+    let prefix = "sk-ant-";
+    while let Some(i) = out.find(prefix) {
+        let rest = &out[i + prefix.len()..];
+        let n = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        out.replace_range(i..i + prefix.len() + n, "[redacted]");
+    }
+    out
+}

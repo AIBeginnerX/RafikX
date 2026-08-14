@@ -1,0 +1,26 @@
+[package]
+name = "agent-harness"
+version = "0.1.0"
+edition = "2024"
+description = "초경량 개인용 AI 코딩 에이전트 CLI"
+
+[features]
+default = []
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "6.0.0"
+futures-util = "0.3.34"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util", "sync", "signal"] }
+toml = "1.1.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
