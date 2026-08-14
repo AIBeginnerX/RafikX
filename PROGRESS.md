@@ -1,3 +1,3 @@
-완료: Phase 1 — 뼈대·config 자동생성·로그·Anthropic SSE·ask/doctor. 릴리즈 바이너리 약 2.3MB. API 키·텔레그램은 의도적으로 미등록.
-다음: Phase 2 (에이전트 루프 + 도구 + 승인). ask 스트리밍 검증은 키 등록 후.
-이슈: reqwest 0.13에서 명세의 rustls-tls 피처명이 rustls로 변경됨(openssl 미사용). 워크스페이스 ~/dev/playground 폴더는 아직 없음.
+완료: Phase 2 — 도구 6종(read/list/grep/edit/write/bash) + 경로 jail + 승인[y/n/a] + Agent Loop + runs DB. 단위테스트 3건 통과. API 키 없어 실제 agent 대화는 미검증.
+다음: Phase 3 (분류기·서브에이전트 프로파일·OpenAI 호환 프로바이더). 키 등록 후 agent 실전 검증 권장.
+이슈: git remote가 없어 push 불가. 원격 저장소 URL이 필요함. 워크스페이스 ~/dev/playground 는 agent 첫 실행 시 자동 생성됨.

@@ -23,7 +23,6 @@ impl AnthropicProvider {
         Ok(Self { client, api_key })
     }
 
-    #[allow(dead_code)]
     pub async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
         let body = build_body(req);
         let resp = self
@@ -204,7 +203,6 @@ fn to_api_messages(msgs: &[Message]) -> Vec<Value> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn parse_message_json(text: &str) -> Result<ChatResponse> {
     let v: Value = serde_json::from_str(text).context("Anthropic 응답 JSON을 해석할 수 없습니다")?;
     let mut blocks = Vec::new();
@@ -214,6 +212,19 @@ fn parse_message_json(text: &str) -> Result<ChatResponse> {
                 if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
                     blocks.push(ContentBlock::Text { text: t.to_string() });
                 }
+            } else if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                let id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input = item.get("input").cloned().unwrap_or_else(|| json!({}));
+                blocks.push(ContentBlock::ToolUse { id, name, input });
             }
         }
     }
