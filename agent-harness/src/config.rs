@@ -102,9 +102,7 @@ approval_timeout_secs = 300
 pub struct ConfigFile {
     pub general: GeneralConfig,
     pub providers: HashMap<String, ProviderConfig>,
-    #[allow(dead_code)]
     pub harness: HarnessConfig,
-    #[allow(dead_code)]
     pub subagents: HashMap<String, SubAgentConfig>,
     #[allow(dead_code)]
     pub memory: MemoryConfig,
@@ -121,11 +119,9 @@ pub struct GeneralConfig {
     pub default_provider: String,
     pub workspace: String,
     pub max_tokens: u32,
-    #[allow(dead_code)]
     pub max_context_chars: u32,
     #[allow(dead_code)]
     pub approval: String,
-    #[allow(dead_code)]
     pub classifier: String,
 }
 
@@ -136,18 +132,14 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     pub model: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub small_model: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub base_url: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub supports_tools: bool,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct HarnessConfig {
     pub simple: String,
     pub medium: String,
@@ -157,7 +149,6 @@ pub struct HarnessConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SubAgentConfig {
     pub provider: String,
     pub model_role: String,

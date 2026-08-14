@@ -1,6 +1,10 @@
 pub mod anthropic;
+pub mod openai_compat;
 
 pub use anthropic::AnthropicProvider;
+pub use openai_compat::OpenAiCompatProvider;
+
+use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -84,4 +88,39 @@ pub fn map_stop_reason(raw: Option<&str>) -> StopReason {
         Some("max_tokens") => StopReason::MaxTokens,
         _ => StopReason::Other,
     }
+}
+
+pub enum DynProvider {
+    Anthropic(AnthropicProvider),
+    OpenAi(OpenAiCompatProvider),
+}
+
+impl DynProvider {
+    pub async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        match self {
+            DynProvider::Anthropic(p) => p.chat(req).await,
+            DynProvider::OpenAi(p) => p.chat(req).await,
+        }
+    }
+
+    pub async fn chat_stream<F>(&self, req: &ChatRequest, on_text: F) -> Result<ChatResponse>
+    where
+        F: FnMut(&str),
+    {
+        match self {
+            DynProvider::Anthropic(p) => p.chat_stream(req, on_text).await,
+            DynProvider::OpenAi(p) => p.chat_stream(req, on_text).await,
+        }
+    }
+}
+
+pub fn is_retryable(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_lowercase();
+    s.contains("http 429")
+        || s.contains("http 500")
+        || s.contains("http 502")
+        || s.contains("http 503")
+        || s.contains("http 504")
+        || s.contains("timeout")
+        || s.contains("timed out")
 }

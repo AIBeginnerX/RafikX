@@ -61,6 +61,8 @@ impl Db {
         &self,
         mode: &str,
         task: &str,
+        class: Option<&str>,
+        subagent: Option<&str>,
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<String> {
@@ -68,8 +70,8 @@ impl Db {
         let started = now_secs();
         let task: String = task.chars().take(500).collect();
         self.conn.execute(
-            "INSERT INTO runs (id, started_at, mode, task, provider, model, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ok')",
-            rusqlite::params![id, started, mode, task, provider, model],
+            "INSERT INTO runs (id, started_at, mode, class, subagent, task, provider, model, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ok')",
+            rusqlite::params![id, started, mode, class, subagent, task, provider, model],
         )?;
         Ok(id)
     }

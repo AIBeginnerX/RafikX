@@ -50,6 +50,20 @@ impl ToolRegistry {
         }
     }
 
+    pub fn with_names(names: &[String]) -> Self {
+        if names.iter().any(|n| n == "*") {
+            return Self::all();
+        }
+        let all = Self::all();
+        Self {
+            tools: all
+                .tools
+                .into_iter()
+                .filter(|t| names.iter().any(|n| n == t.name()))
+                .collect(),
+        }
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
             .iter()

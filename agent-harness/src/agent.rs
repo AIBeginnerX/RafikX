@@ -8,7 +8,7 @@ use crate::applog;
 use crate::config::Config;
 use crate::db::Db;
 use crate::provider::{
-    AnthropicProvider, ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason,
+    ChatRequest, ChatResponse, ContentBlock, DynProvider, Message, Role, StopReason,
 };
 use crate::tools::{self, ToolCtx, ToolRegistry};
 
@@ -21,6 +21,20 @@ pub struct AgentOutcome {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub error: Option<String>,
+    pub messages: Vec<Message>,
+    pub changed_files: Vec<String>,
+}
+
+pub struct AgentRun<'a> {
+    pub cfg: &'a Config,
+    pub client: &'a DynProvider,
+    pub model: &'a str,
+    pub task: &'a str,
+    pub yes: bool,
+    pub max_iterations: u32,
+    pub system: String,
+    pub registry: ToolRegistry,
+    pub resume: Option<Vec<Message>>,
 }
 
 enum Approval {
@@ -29,13 +43,19 @@ enum Approval {
     Always,
 }
 
-pub async fn run_agent(
-    cfg: &Config,
-    client: &AnthropicProvider,
-    model: &str,
-    task: &str,
-    yes: bool,
-) -> Result<AgentOutcome> {
+pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
+    let AgentRun {
+        cfg,
+        client,
+        model,
+        task,
+        yes,
+        max_iterations,
+        system,
+        registry,
+        resume,
+    } = run;
+
     if !cfg.workspace.exists() {
         std::fs::create_dir_all(&cfg.workspace)?;
         eprintln!("워크스페이스 폴더를 만들었습니다: {}", cfg.workspace.display());
@@ -46,28 +66,19 @@ pub async fn run_agent(
         eprintln!("경고: --yes 는 모든 도구를 승인 없이 실행합니다.");
     }
 
-    let registry = ToolRegistry::all();
     let ctx = ToolCtx {
         workspace: cfg.workspace.clone(),
     };
-    let mut messages = vec![Message::user_text(task)];
+    let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
     let mut allow_all = yes;
     let mut iterations = 0u32;
     let mut input_tokens = 0u32;
     let mut output_tokens = 0u32;
     let mut denied_any = false;
     let mut call_counts: HashMap<String, u32> = HashMap::new();
-    let max_iter = AGENT_MAX_ITER.min(HARD_CAP);
+    let mut changed_files: Vec<String> = Vec::new();
+    let max_iter = max_iterations.min(HARD_CAP);
     let max_chars = cfg.file.general.max_context_chars;
-
-    let system = format!(
-        "You are a careful senior developer working in a local workspace.\n\
-         Always read a file before editing it. Prefer the smallest possible change.\n\
-         Workspace: {}\n\
-         If the user writes in Korean, reply in Korean.\n\
-         신중한 시니어 개발자다. 수정 전 반드시 원문을 읽고, 최소 diff로 고친다.",
-        cfg.workspace.display()
-    );
 
     loop {
         if iterations >= max_iter {
@@ -78,6 +89,8 @@ pub async fn run_agent(
                 input_tokens,
                 output_tokens,
                 error: Some("반복 상한".into()),
+                messages,
+                changed_files,
             });
         }
         iterations += 1;
@@ -120,6 +133,8 @@ pub async fn run_agent(
                 input_tokens,
                 output_tokens,
                 error: None,
+                messages,
+                changed_files,
             });
         }
 
@@ -130,6 +145,8 @@ pub async fn run_agent(
                 input_tokens,
                 output_tokens,
                 error: None,
+                messages,
+                changed_files,
             });
         }
 
@@ -151,6 +168,8 @@ pub async fn run_agent(
                     input_tokens,
                     output_tokens,
                     error: Some("동일 도구 3회 반복".into()),
+                    messages,
+                    changed_files,
                 });
             }
 
@@ -195,9 +214,14 @@ pub async fn run_agent(
                 eprintln!("[자동승인] {name}");
             }
 
-            match tool.run(input, &ctx) {
+            match tool.run(input.clone(), &ctx) {
                 Ok(out) => {
                     println!("{out}");
+                    if name == "write_file" || name == "edit_file" {
+                        if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                            changed_files.push(p.to_string());
+                        }
+                    }
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id,
                         content: out,
