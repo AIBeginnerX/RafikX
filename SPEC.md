@@ -1,4 +1,4 @@
-🛠 agent-harness v3.0 — AI 구현 지시서 (SPEC.md)
+🛠 RafikX v3.0 — AI 구현 지시서 (SPEC.md)
 목적: Rust 기반 초경량 개인용 AI 코딩 에이전트 CLI (Claude Code류) v3 핵심: ① 작업 난이도별 자동 하네스(서브에이전트) 시스템 ② 자기학습 메모리(같은 실수 반복 방지) ③ Inspector 자가 점검 에이전트(오류 로그 분석 → 개선 리포트) ④ 모바일 원격 접속 필수화(텔레그램) 사용법: 이 파일을 프로젝트 루트에 SPEC.md로 저장 → AI(Claude Code / Cursor)에게 "SPEC.md의 Phase N을 구현해라"라고 지시
 
 0. 사람(운영자)이 지켜야 할 운영 규칙 — 먼저 읽기
@@ -57,13 +57,15 @@ v2 → v3 (이번 개정):
 3. 아키텍처 (v3)
 ┌────────────────────── Interfaces ──────────────────────┐
 
-│  CLI: ask / agent / chat / index / search / watch /    │
+│  CLI: (TTY 기본 TUI) ask / agent / chat / index /     │
 
-│       lessons / inspect / report / doctor / telegram   │
+│       search / watch / lessons / inspect / report /    │
+
+│       doctor / settings / ranks / telegram             │
 
 │  📱 Telegram(필수): /ask /obsidian /status /report      │
 
-│       + 원격 승인 버튼(✅/❌)          [선택: tui]        │
+│       + 원격 승인 버튼(✅/❌)          [tui 기본]        │
 
 └──────────────────────────┬─────────────────────────────┘
 
@@ -121,7 +123,7 @@ v2 → v3 (이번 개정):
 
 └────────────────┘                      └────────────────────┘
 
-     공용 저장소: ~/.agent-harness/
+     공용 저장소: ~/.rafikx/
 
      config.toml + data.db(WAL: 인덱스·세션·runs·lessons·reports)
 
@@ -146,10 +148,10 @@ v2 → v3 (이번 개정):
 | diff 표시 | similar | edit/write 승인 시 diff 출력 |
 | 마크다운 | pulldown-cmark | Phase 4 |
 | 파일 감시 | notify, notify-debouncer-mini | Phase 4 |
-| REPL 입력 | rustyline | Phase 5, 선택 |
+| REPL 입력 | rustyline | Phase 5, 선택 (미사용: TUI 입력은 crossterm) |
 | async trait | async-trait | 선택 — enum 디스패치 시 불필요 |
 | [feature: telegram — 기본 포함] | teloxide | Phase 7. default = ["telegram"]. 초경량 코어만 원하면 --no-default-features 빌드 |
-| [feature: tui — 선택] | ratatui, crossterm | 부록 |
+| [feature: tui — 기본 포함] | ratatui, crossterm | TTY에서 `rafikx` 무인자 대화 화면. Windows cmd/WT 포함 |
 
 금지: LangChain류, 벡터 DB, 임베딩, ORM/sqlx, native-tls, 정밀 토크나이저, uuid/rand(ID는 타임스탬프+시퀀스로), cron 크레이트(스케줄은 tokio interval).
 
@@ -157,35 +159,44 @@ v2 → v3 (이번 개정):
 
 5. 인터페이스 계약 ❄️ FROZEN
 이 장은 모든 Phase에서 수정 금지. 변경 필요 시 AI는 구현을 멈추고 사유를 보고한다.
+(2026-08-21 제품 승인: TTY에서 인자 없는 `rafikx` 가 대화 TUI를 연다. 비TTY는 사용법을 출력한다.)
 5.1 CLI 명령 표면
-agent-harness ask "지시"              # 통합 진입점: 분류기 → 서브에이전트 자동 실행
+rafikx                         # TTY: 대화 TUI. 파이프/비TTY: 사용법
 
-agent-harness ask --class dev "지시"  # 분류 강제 (simple|medium|advanced|dev)
+rafikx ask "지시"              # 통합 진입점: 분류기 → 서브에이전트 자동 실행
 
-agent-harness ask --obsidian "질문"   # Vault 컨텍스트 강제 주입
+rafikx ask --class dev "지시"  # 분류 강제 (simple|medium|advanced|dev)
 
-agent-harness agent "작업 지시"       # = ask --class dev 별칭 (개발 하네스 강제)
+rafikx ask --obsidian "질문"   # Vault 컨텍스트 강제 주입
 
-agent-harness chat                    # 대화 REPL (하네스 규칙 동일 적용)
+rafikx agent "작업 지시"       # = ask --class dev 별칭 (개발 하네스 강제)
 
-agent-harness index / search "키워드" / watch     # Obsidian
+rafikx chat                    # 대화 TUI (하네스 규칙 동일). --list 세션 목록, --resume <id>
 
-agent-harness lessons list            # 교훈 관리
+rafikx index / search "키워드" / watch     # Obsidian
 
-agent-harness lessons add "교훈 문장"
+rafikx lessons list            # 교훈 관리
 
-agent-harness lessons rm <id> | clear
+rafikx lessons add "교훈 문장"
 
-agent-harness inspect [--last N] [--apply]   # 즉시 점검 (--apply: 제안 교훈 일괄 승인 저장)
+rafikx lessons rm <id> | clear
 
-agent-harness report last             # 마지막 점검 리포트 다시 보기
+rafikx inspect [--last N] [--apply]   # 즉시 점검 (--apply: 제안 교훈 일괄 승인 저장)
 
-agent-harness doctor                  # 자가진단 (키·경로·FTS5·프로바이더·프로파일 바인딩)
+rafikx report last             # 마지막 점검 리포트 다시 보기
 
-agent-harness telegram [--with-watch] # 📱 원격 데몬: 봇 + Inspector 스케줄 (+옵션 watch)
+rafikx doctor                  # 자가진단 (키·경로·FTS5·프로바이더·프로파일 바인딩)
+
+rafikx login                   # 서비스 연결 (OpenCode Zen/Go, Anthropic, …)
+
+rafikx telegram [--with-watch] # 📱 원격 데몬: 봇 + Inspector 스케줄 (+옵션 watch)
 
 공통 옵션: --provider <이름> --model <ID> --class <분류> --yes --config <경로>
-5.2 config.toml (전체 예시 — 최초 실행 시 ~/.agent-harness/config.toml 자동 생성)
+
+OpenCode Zen: base `https://opencode.ai/zen/v1`, Bearer, 환경변수 `OPENCODE_API_KEY` (별칭 `OPENCODE_ZEN_API_KEY`). 기본 모델 `glm-5.1` (chat/completions). 키는 opencode.ai/auth.
+OpenCode Go: base `https://opencode.ai/zen/go/v1`, Bearer, `OPENCODE_GO_API_KEY` 또는 `OPENCODE_API_KEY`. 기본 모델 `kimi-k2.7-code`.
+
+5.2 config.toml (전체 예시 — 최초 실행 시 ~/.rafikx/config.toml 자동 생성)
 [general]
 
 default_provider = "anthropic"
@@ -324,7 +335,7 @@ notify_telegram = true             # 리포트 요약을 텔레그램으로 푸�
 
 vault_path = "~/Documents/TestVault"   # 개발 중엔 반드시 '사본' Vault
 
-db_path = "~/.agent-harness/data.db"
+db_path = "~/.rafikx/data.db"
 
 context_limit_chars = 12000
 
@@ -510,7 +521,7 @@ user:   [작업 요약 500자] + [오류/사유 500자]
 5.7 Inspector 계약 — 자가 디버깅·점검·개선 에이전트
 정체: 파일쓰기·bash 도구가 강제로 제거된(읽기 전용) 서브에이전트. [inspector].subagent로 어떤 프로파일을 쓸지 지정하며, 다른 프로파일을 등록해 교체·확장 가능(예: [subagents.myguard] 추가 → inspect --subagent myguard).
 
-데이터 소스: ① runs 최근 N건(기본 200) ② lessons 전체 통계 ③ ~/.agent-harness/logs/agent.log 끝부분(에러 라인) ④ doctor 결과.
+데이터 소스: ① runs 최근 N건(기본 200) ② lessons 전체 통계 ③ ~/.rafikx/logs/agent.log 끝부분(에러 라인) ④ doctor 결과.
 
 파이프라인:
 
@@ -530,7 +541,7 @@ user:   [작업 요약 500자] + [오류/사유 500자]
 
     사용자 액션 아이템 }
 
-→ 저장: reports 테이블 + ~/.agent-harness/reports/YYYYMMDD-HHMM.md
+→ 저장: reports 테이블 + ~/.rafikx/reports/YYYYMMDD-HHMM.md
 
 → 전달: 터미널 출력 + (notify_telegram=true && 데몬 가동 중) 텔레그램 요약 푸시
 
@@ -539,7 +550,7 @@ user:   [작업 요약 500자] + [오류/사유 500자]
 실행 방식: 수동 inspect / 데몬(telegram 명령) 내 auto_interval_hours 간격 자동 실행.
 
 안전 불변식(하드코딩): Inspector는 어떤 경우에도 ① 파일을 쓰지 않고 ② 명령을 실행하지 않으며 ③ config·코드를 수정하지 않는다. 오직 리포트와 제안만 만든다. 반영은 항상 사용자 승인(--apply 또는 수동 수정)을 거친다.
-5.8 DB 스키마 (SQLite 단일 파일 ~/.agent-harness/data.db)
+5.8 DB 스키마 (SQLite 단일 파일 ~/.rafikx/data.db)
 연결 시 필수 PRAGMA (데몬+CLI 동시 사용 대비):
 
 PRAGMA journal_mode = WAL;
@@ -667,7 +678,7 @@ bash 제한: 승인 필수 + 타임아웃 60초 + 차단목록 — sudo, rm -rf 
 
 [목표]
 
-SPEC.md에 따라 초경량 Rust CLI 에이전트 `agent-harness`를 Phase 순서대로 구현한다.
+SPEC.md에 따라 초경량 Rust CLI 에이전트 RafikX(`rafikx`)를 Phase 순서대로 구현한다.
 
 v3의 핵심은 ① 작업 분류 하네스(서브에이전트 프로파일) ② 자기학습 메모리(lessons)
 
@@ -714,31 +725,31 @@ Obsidian 테스트용 사본 Vault 생성 (원본 훼손 방지 — 개발 중 �
 검증: rustc --version / echo $ANTHROPIC_API_KEY | head -c 12 / echo $TELEGRAM_BOT_TOKEN | head -c 10 모두 정상 출력.
 
 🟢 Phase 1 — 뼈대 + 설정 + 첫 대화 (난이도 ★ / AI 세션 1회)
-목표: agent-harness ask "안녕" 이 Claude 응답을 스트리밍 출력.
+목표: rafikx ask "안녕" 이 Claude 응답을 스트리밍 출력.
 
-cargo new agent-harness && cd agent-harness (git 초기화 확인)
+cargo new agent-harness && cd agent-harness (git 초기화 확인; 소스 폴더는 agent-harness, 패키지/바이너리 이름은 rafikx)
 Cargo.toml: 릴리즈 프로필 + 최소 크레이트(tokio, reqwest, futures-util, clap, serde, serde_json, toml, dirs, anyhow) + [features] default=[](telegram feature는 Phase 7에서 추가)
 src/config.rs: 5.2 로드/기본 생성, api_key_env 해석, ~ 확장
-로그 초기화: ~/.agent-harness/logs/agent.log에 std::fs append로 1줄 JSON 기록 유틸(레벨·시각·메시지) — 크레이트 추가 없이
+로그 초기화: ~/.rafikx/logs/agent.log에 std::fs append로 1줄 JSON 기록 유틸(레벨·시각·메시지) — 크레이트 추가 없이
 src/provider/anthropic.rs: 비스트리밍 먼저 → 성공 후 SSE 스트리밍
 src/main.rs: clap 서브커맨드 ask, doctor
 doctor v1: 설정 경로 / 키 존재(마지막 4자) / workspace 존재
 
-검증: cargo run -- doctor 전 항목 OK → cargo run -- ask "안녕하세요. 한 문장으로" 스트리밍 응답 → cargo build --release && ls -lh target/release/agent-harness 크기 기록.
+검증: rafikx doctor 전 항목 OK → rafikx ask "안녕하세요. 한 문장으로" 스트리밍 응답 → cargo build --release && ls -lh target/release/rafikx 크기 기록.
 
 자주 터지는 문제: linker 'cc' not found→xcode-select / openssl 에러→rustls-tls 확인 / 401→새 터미널에서 키 재확인 / 스트리밍 안 끝남→Anthropic은 event: message_stop으로 종료(OpenAI data: [DONE]과 다름).
 
 🔴 Phase 2 — 에이전트 루프 + 도구 + 승인 (난이도 ★★★ / 핵심. AI 세션 2~3회 분할)
-목표: agent-harness agent "hello.txt 만들고 '안녕' 써줘" → 승인 → 파일 생성. 여기까지가 '미니 Claude Code' MVP.
+목표: rafikx agent "hello.txt 만들고 '안녕' 써줘" → 승인 → 파일 생성. 여기까지가 '미니 Claude Code' MVP.
 
 2a: Tool trait + ToolCtx + 경로 jail / read_file·list_dir / tools 전달·tool_use 파싱(비스트리밍) / Agent Loop(5.5 공통 규칙 전부) / runs 기록 v1(id·시각·mode·task·status) 2b: edit_file(old_str 유일성 + similar diff)·write_file / 승인 게이트 [y/n/a] + --yes(경고) 2c: bash(tokio::process·타임아웃·차단목록·20KB 절단) / grep / git 저장소 경고
 
 검증:
 
-cargo run -- agent "이 폴더 파일 목록 보고 Cargo.toml 요약해줘" → 읽기 도구 자동 실행
-cargo run -- agent "hello.txt 만들고 '안녕하세요' 써줘" → diff → y → cat hello.txt
+rafikx agent "이 폴더 파일 목록 보고 Cargo.toml 요약해줘" → 읽기 도구 자동 실행
+rafikx agent "hello.txt 만들고 '안녕하세요' 써줘" → diff → y → cat hello.txt
 edit_file 승인 흐름 / /etc/hosts 읽기 지시 → jail 거부 / sudo 지시 → 차단 / n 거부 시 무변경
-sqlite3 ~/.agent-harness/data.db "select mode,status from runs" → 기록 확인
+sqlite3 ~/.rafikx/data.db "select mode,status from runs" → 기록 확인
 
 문제 예방: 400 최다 원인 = tool_result 규격 위반(5.5) / input_schema required 누락 → 빈 인자 / 무한루프 → 상한 동작 테스트 / agent 모드는 비스트리밍 유지.
 
@@ -756,9 +767,9 @@ runs 확장(class·subagent·provider·model·iterations·tokens) / doctor 확�
 
 검증:
 
-cargo run -- ask "안녕" → [하네스] simple → quick / cargo run -- ask "이 저장소 구조 분석해서 개선 전략 보고서 써줘" → advanced
-cargo run -- ask "buggy.py 만들어서 일부러 문법 오류 넣고, 고친 뒤 검증까지 해줘" → dev 분류 → 계획 → 실행 → py_compile 검증 → 재시도 성공
-cargo run -- ask --class simple "..." 강제 동작
+rafikx ask "안녕" → [하네스] simple → quick / rafikx ask "이 저장소 구조 분석해서 개선 전략 보고서 써줘" → advanced
+rafikx ask "buggy.py 만들어서 일부러 문법 오류 넣고, 고친 뒤 검증까지 해줘" → dev 분류 → 계획 → 실행 → py_compile 검증 → 재시도 성공
+rafikx ask --class simple "..." 강제 동작
 config에서 anthropic을 잠시 지우고 local(도구 미지원)만 남김 → dev 지시 → 정중 거부 메시지 → 원복
 키 이름 잠시 변경 → 폴백 프로바이더 응답 → 원복 / doctor 바인딩 표 확인
 
@@ -803,13 +814,13 @@ lessons list/add/rm/clear + 정리 규칙(max_lessons)
 통계 모듈(모델 호출 전 코드로 계산): 성공률·분류별 건수·도구별 실패율·프로바이더별 429/timeout·평균 반복·총 토큰·최다 오류 Top5
 수집기: runs 최근 N + lessons 통계 + agent.log tail(에러 라인) + doctor 결과
 분석 호출: [inspector].subagent 프로파일 사용하되 도구 목록 강제 제거(읽기 전용 불변식)
-리포트 생성(5.7 형식) → reports 테이블 + ~/.agent-harness/reports/…md 저장 → 터미널 출력
+리포트 생성(5.7 형식) → reports 테이블 + ~/.rafikx/reports/…md 저장 → 터미널 출력
 inspect --last N / inspect --apply(제안 교훈 일괄 lessons 저장) / report last
 --subagent <이름> 옵션으로 점검 에이전트 교체 가능(확장 포인트)
 
 검증:
 
-Phase 1~5를 쓰며 쌓인 runs로 cargo run -- inspect → 리포트 생성·저장·출력
+Phase 1~5를 쓰며 쌓인 runs로 rafikx inspect → 리포트 생성·저장·출력
 리포트에 실제 실패 패턴(예: edit_file old_str 불일치 다발)이 잡히는지
 inspect --apply → lessons list에 제안 교훈 추가 / report last 재출력
 Inspector가 파일을 쓰거나 명령을 실행하는 경로가 코드상 존재하지 않는지 확인(도구 강제 제거 로직 리뷰)
@@ -837,11 +848,11 @@ auto_interval_hours=0.02(약 1분, 테스트용)로 잠시 설정 → 자동 리
 함정: 같은 봇 두 곳 동시 폴링 → 409 충돌(데몬 1개만) / 봇 토큰 로그 노출 금지 / teloxide로 바이너리 커지는 건 정상(코어 빌드와 분리 측정) / 원격 응답 지연 시 "작업 시작…" 선전송 후 결과 전송.
 
 ⚪ Phase 8 — 최적화·마무리 (난이도 ★ / AI 세션 1회)
-크기·cold start·RSS 측정(/usr/bin/time -l target/release/agent-harness ask "hi") → 2장 표와 비교, PROGRESS.md 기록 — 기본 빌드/코어 빌드 각각
+크기·cold start·RSS 측정(/usr/bin/time -l target/release/rafikx ask "hi") → 2장 표와 비교, PROGRESS.md 기록 — 기본 빌드/코어 빌드 각각
 cargo tree 의존성 감사 / (선택) cargo bloat --release
 cargo install --path . → 전역 실행 확인
 README.md(비개발자 기준 재현 가능하게: 설치→config→텔레그램 연결→일상 사용 흐름)
-(선택) TUI feature / 크로스 빌드는 실제 필요 시에만
+(선택) 크로스 빌드는 실제 필요 시에만. TUI는 기본 feature.
 
 9. 공통 함정 목록 (모든 Phase에서 참조)
 크레이트는 추가 시점 최신 안정판 고정, 이유 없는 업그레이드 금지, Cargo.lock 커밋.

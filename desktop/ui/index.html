@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RafikX</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Sans+KR:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #03060e;
+      --panel: rgba(8, 12, 24, 0.86);
+      --line: rgba(232, 213, 163, 0.14);
+      --gold: #e8d5a3;
+      --violet: #6b5cff;
+      --cyan: #5ee7ff;
+      --text: #e8e6de;
+      --muted: #8b93a7;
+      --danger: #ff7b7b;
+      --ok: #7dffc3;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: "IBM Plex Sans KR", sans-serif; }
+    body {
+      background:
+        radial-gradient(1200px 600px at 10% -10%, rgba(107, 92, 255, 0.18), transparent 55%),
+        radial-gradient(900px 500px at 90% 0%, rgba(94, 231, 255, 0.08), transparent 50%),
+        var(--bg);
+    }
+    #app { display: grid; grid-template-columns: 248px 1fr 300px; height: 100%; }
+    aside, .graph {
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+      padding: 16px 14px;
+      overflow: auto;
+    }
+    .graph { border-right: 0; border-left: 1px solid var(--line); }
+    .brand { font-family: "Instrument Serif", serif; font-size: 28px; color: var(--gold); letter-spacing: 0.04em; }
+    .brand span { color: var(--cyan); font-size: 13px; margin-left: 8px; font-family: "IBM Plex Sans KR", sans-serif; }
+    .meta { color: var(--muted); font-size: 12px; margin: 8px 0 16px; line-height: 1.45; }
+    h3 { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--gold); margin: 18px 0 8px; }
+    .pill {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+      margin-bottom: 6px; cursor: pointer; font-size: 13px; background: transparent; color: inherit; width: 100%; text-align: left;
+    }
+    .pill:hover, .pill.active { border-color: var(--violet); background: rgba(107, 92, 255, 0.12); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+    .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .dot.off { background: #4a5163; }
+    button.ghost, .btn {
+      background: transparent; color: var(--gold); border: 1px solid var(--line);
+      border-radius: 8px; padding: 8px 10px; cursor: pointer; font: inherit; font-size: 12px;
+    }
+    .btn.primary { background: linear-gradient(135deg, var(--violet), #3a2db0); color: white; border: 0; }
+    .btn.cyan { border-color: var(--cyan); color: var(--cyan); }
+    main { display: flex; flex-direction: column; min-width: 0; }
+    #transcript { flex: 1; overflow: auto; padding: 22px 28px 12px; }
+    .msg { max-width: 760px; margin: 0 auto 16px; }
+    .msg .who { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+    .msg.user .who { color: var(--gold); }
+    .msg.assistant .who { color: var(--cyan); }
+    .msg.system .who { color: var(--violet); }
+    .msg .body { white-space: pre-wrap; line-height: 1.55; font-size: 14.5px; }
+    .msg.warn .body { color: var(--danger); }
+    .composer {
+      border-top: 1px solid var(--line); padding: 12px 20px 16px; background: rgba(3, 6, 14, 0.7);
+    }
+    .composer-inner { max-width: 760px; margin: 0 auto; }
+    textarea {
+      width: 100%; min-height: 72px; resize: vertical; background: #070b16; color: var(--text);
+      border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: inherit; outline: none;
+    }
+    textarea:focus { border-color: var(--violet); }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+    select, input[type="text"], input[type="password"] {
+      background: #070b16; color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+      padding: 7px 9px; font: inherit; font-size: 12px;
+    }
+    .status { font-size: 12px; color: var(--muted); margin-left: auto; }
+    .node { font-family: "IBM Plex Mono", monospace; font-size: 11px; border-left: 2px solid var(--violet); padding: 6px 8px; margin-bottom: 6px; }
+    .node .k { color: var(--cyan); }
+    .modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; place-items: center; z-index: 20;
+    }
+    .modal.show { display: grid; }
+    .card {
+      width: min(560px, 92vw); background: #0a1020; border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px;
+    }
+    .card h2 { font-family: "Instrument Serif", serif; color: var(--gold); margin: 0 0 12px; font-weight: 400; }
+    .settings-list { max-height: 50vh; overflow: auto; }
+    pre.search { white-space: pre-wrap; font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside>
+      <div class="brand">RafikX<span id="ver"></span></div>
+      <div class="meta" id="boot-meta">불러오는 중…</div>
+      <button class="btn primary" style="width:100%" onclick="newChat()">새 대화</button>
+      <h3>세션</h3>
+      <div id="sessions"></div>
+      <h3>연결</h3>
+      <div id="providers"></div>
+      <button class="btn" style="width:100%;margin-top:8px" onclick="openSettings()">설정 · Connect</button>
+      <h3>Obsidian</h3>
+      <div class="meta" id="obs-status">—</div>
+      <div class="row">
+        <button class="ghost" onclick="indexVault()">인덱스</button>
+        <button class="ghost" id="watch-btn" onclick="toggleWatch()">감시</button>
+      </div>
+      <input id="obs-q" type="text" placeholder="노트 검색" style="width:100%;margin-top:8px" onkeydown="if(event.key==='Enter') searchVault()" />
+      <pre class="search" id="obs-hits"></pre>
+    </aside>
+    <main>
+      <div id="transcript"></div>
+      <div class="composer">
+        <div class="composer-inner">
+          <textarea id="prompt" placeholder="지시하거나 /help  ·  Ctrl+Enter 전송"></textarea>
+          <div class="row">
+            <label><input type="checkbox" id="obsidian" /> Obsidian</label>
+            <select id="class">
+              <option value="">분류 자동</option>
+              <option value="simple">simple</option>
+              <option value="medium">medium</option>
+              <option value="advanced">advanced</option>
+              <option value="dev">dev</option>
+            </select>
+            <select id="provider"></select>
+            <button class="btn primary" onclick="send()">보내기</button>
+            <span class="status" id="status">준비</span>
+          </div>
+        </div>
+      </div>
+    </main>
+    <div class="graph">
+      <h3>Harness graph</h3>
+      <div class="meta" id="graph-id">아직 실행 없음</div>
+      <div id="graph"></div>
+    </div>
+  </div>
+
+  <div class="modal" id="settings">
+    <div class="card">
+      <h2>Connect</h2>
+      <p class="meta">키는 ~/.rafikx/secrets.toml 에만 저장됩니다. 채팅에 붙이지 마세요.</p>
+      <div class="settings-list" id="settings-providers"></div>
+      <h3>워크스페이스</h3>
+      <div class="row">
+        <input id="ws-path" type="text" style="flex:1" />
+        <button class="ghost" onclick="pickWs()">찾기</button>
+        <button class="ghost" onclick="saveWs()">저장</button>
+      </div>
+      <h3>Obsidian vault</h3>
+      <div class="row">
+        <input id="vault-path" type="text" style="flex:1" />
+        <button class="ghost" onclick="pickVault()">찾기</button>
+        <button class="ghost" onclick="saveVault()">저장</button>
+        <label><input type="checkbox" id="vault-on" /> 사용</label>
+      </div>
+      <h3>커스텀 OpenAI 호환</h3>
+      <div class="row">
+        <input id="c-name" placeholder="id" />
+        <input id="c-url" placeholder="https://…/v1" style="flex:1" />
+        <input id="c-model" placeholder="model" />
+        <button class="ghost" onclick="addCustom()">추가</button>
+      </div>
+      <div class="row" style="margin-top:16px">
+        <button class="btn" onclick="closeSettings()">닫기</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="approval">
+    <div class="card">
+      <h2>도구 승인</h2>
+      <pre class="search" id="approval-preview"></pre>
+      <div class="row">
+        <button class="btn primary" onclick="resolve('yes')">이번만</button>
+        <button class="btn cyan" onclick="resolve('always')">이번 실행 모두</button>
+        <button class="btn" onclick="resolve('no')">거부</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const invoke = (...a) => window.__TAURI__.core.invoke(...a);
+    const listen = (...a) => window.__TAURI__.event.listen(...a);
+
+    let sid = null;
+    let bootInfo = null;
+    let watching = false;
+    let approvalId = null;
+    let streamEl = null;
+
+    function el(html) { const d = document.createElement("div"); d.innerHTML = html; return d.firstElementChild; }
+    function esc(s) { return String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+    function addMsg(role, text, extra) {
+      const box = document.getElementById("transcript");
+      const m = document.createElement("div");
+      m.className = "msg " + role + (extra ? " " + extra : "");
+      m.innerHTML = `<div class="who">${esc(role)}</div><div class="body"></div>`;
+      m.querySelector(".body").textContent = text;
+      box.appendChild(m);
+      box.scrollTop = box.scrollHeight;
+      return m.querySelector(".body");
+    }
+
+    function renderGraph(runId, nodes) {
+      document.getElementById("graph-id").textContent = runId ? "run " + runId : "아직 실행 없음";
+      const g = document.getElementById("graph");
+      g.innerHTML = (nodes || []).map(n =>
+        `<div class="node"><span class="k">${esc(n.kind)}</span>  ${esc(n.label)}${n.detail ? "<div>"+esc(n.detail)+"</div>" : ""}</div>`
+      ).join("");
+    }
+
+    async function refreshBoot() {
+      bootInfo = await invoke("boot");
+      document.getElementById("ver").textContent = "v" + bootInfo.version;
+      document.getElementById("boot-meta").innerHTML =
+        `워크스페이스<br>${esc(bootInfo.workspace)}<br>하네스 ${esc(bootInfo.harness)} · ${esc(bootInfo.default_provider)}`;
+      const obs = bootInfo.obsidian;
+      document.getElementById("obs-status").textContent =
+        (obs.enabled ? "켜짐" : "꺼짐") + " · " + (obs.vault_exists ? obs.vault_path : "vault 없음");
+      document.getElementById("obsidian").checked = obs.enabled;
+      document.getElementById("ws-path").value = bootInfo.workspace;
+      document.getElementById("vault-path").value = obs.vault_path;
+      document.getElementById("vault-on").checked = obs.enabled;
+      const sel = document.getElementById("provider");
+      sel.innerHTML = bootInfo.providers.map(p =>
+        `<option value="${esc(p.id)}" ${p.is_default ? "selected" : ""}>${esc(p.label)}${p.connected ? "" : " · 미연결"}</option>`
+      ).join("");
+      const list = document.getElementById("providers");
+      list.innerHTML = bootInfo.providers.map(p =>
+        `<button class="pill" onclick="openSettings('${esc(p.id)}')"><span><span class="dot ${p.connected ? "on" : "off"}"></span>${esc(p.label)}</span><span>${esc(p.model)}</span></button>`
+      ).join("");
+      renderSettings();
+    }
+
+    function renderSettings() {
+      if (!bootInfo) return;
+      document.getElementById("settings-providers").innerHTML = bootInfo.providers.map(p => `
+        <div class="pill" style="display:block;cursor:default">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <strong>${esc(p.label)}</strong>
+            <span class="dot ${p.connected ? "on" : "off"}"></span>
+          </div>
+          <div class="meta">${esc(p.env_hint)}${p.auth_url ? " · " + esc(p.auth_url) : ""}</div>
+          <div class="row">
+            <input type="password" placeholder="API 키 붙여넣기" data-key="${esc(p.id)}" />
+            <button class="ghost" onclick="saveKey('${esc(p.id)}', this)">저장</button>
+            <button class="ghost" onclick="invoke('set_default_provider',{name:'${esc(p.id)}'}).then(refreshBoot)">기본</button>
+            ${p.connected ? `<button class="ghost" onclick="invoke('disconnect_provider',{name:'${esc(p.id)}'}).then(refreshBoot)">해제</button>` : ""}
+          </div>
+        </div>`).join("");
+    }
+
+    async function refreshSessions() {
+      const rows = await invoke("list_sessions");
+      document.getElementById("sessions").innerHTML = rows.map(s =>
+        `<button class="pill ${s.id === sid ? "active" : ""}" onclick="openSession('${esc(s.id)}')">${esc(s.title)}</button>`
+      ).join("") || `<div class="meta">저장된 세션 없음</div>`;
+    }
+
+    async function newChat() {
+      const provider = document.getElementById("provider").value || null;
+      const sess = await invoke("new_session", { provider, model: null, class: null, resume: null });
+      sid = sess.id;
+      document.getElementById("transcript").innerHTML = "";
+      addMsg("system", "새 대화. 같은 하네스가 CLI와 같이 돌아갑니다.");
+      await refreshSessions();
+    }
+
+    async function openSession(id) {
+      const provider = document.getElementById("provider").value || null;
+      const sess = await invoke("new_session", { provider, model: null, class: null, resume: id });
+      sid = sess.id;
+      document.getElementById("transcript").innerHTML = "";
+      sess.messages.forEach(m => addMsg(m.role, m.text));
+      document.getElementById("obsidian").checked = sess.obsidian_on;
+      await refreshSessions();
+    }
+
+    async function send() {
+      if (!sid) await newChat();
+      const ta = document.getElementById("prompt");
+      const prompt = ta.value.trim();
+      if (!prompt) return;
+      ta.value = "";
+      addMsg("user", prompt);
+      streamEl = addMsg("assistant", "");
+      document.getElementById("status").textContent = "실행 중…";
+      try {
+        const r = await invoke("send", {
+          sid,
+          prompt,
+          obsidian: document.getElementById("obsidian").checked,
+          class: document.getElementById("class").value || null
+        });
+        if (r.kind === "slash") {
+          streamEl.parentElement.remove();
+          addMsg("system", r.notes);
+          if (r.quit) await newChat();
+        } else if (r.turn) {
+          if (!streamEl.textContent.trim() && r.messages.length) {
+            const last = [...r.messages].reverse().find(m => m.role === "assistant");
+            if (last) streamEl.textContent = last.text;
+          }
+          document.getElementById("status").textContent =
+            r.turn.label + " · " + r.turn.status + " · in " + r.turn.tokens_in + " / out " + r.turn.tokens_out;
+          renderGraph(r.turn.run_id, r.turn.graph);
+        }
+        if (r.session_id) sid = r.session_id;
+        await refreshSessions();
+      } catch (e) {
+        addMsg("system", String(e), "warn");
+        document.getElementById("status").textContent = "오류";
+      }
+      streamEl = null;
+    }
+
+    async function saveKey(id, btn) {
+      const input = btn.parentElement.querySelector("input[type=password]");
+      await invoke("save_key", { provider: id, key: input.value });
+      input.value = "";
+      await refreshBoot();
+    }
+
+    async function openSettings() { document.getElementById("settings").classList.add("show"); }
+    function closeSettings() { document.getElementById("settings").classList.remove("show"); }
+
+    async function pickWs() {
+      const p = await invoke("pick_folder");
+      if (p) document.getElementById("ws-path").value = p;
+    }
+    async function saveWs() {
+      await invoke("set_workspace", { path: document.getElementById("ws-path").value });
+      await refreshBoot();
+    }
+    async function pickVault() {
+      const p = await invoke("pick_folder");
+      if (p) document.getElementById("vault-path").value = p;
+    }
+    async function saveVault() {
+      await invoke("set_obsidian_vault", { path: document.getElementById("vault-path").value });
+      await invoke("set_obsidian_enabled", { on: document.getElementById("vault-on").checked });
+      await refreshBoot();
+    }
+    async function addCustom() {
+      await invoke("add_custom_provider", {
+        name: document.getElementById("c-name").value,
+        base_url: document.getElementById("c-url").value,
+        model: document.getElementById("c-model").value
+      });
+      await refreshBoot();
+    }
+    async function indexVault() {
+      const s = await invoke("index_obsidian");
+      document.getElementById("obs-hits").textContent = s;
+      await refreshBoot();
+    }
+    async function searchVault() {
+      const q = document.getElementById("obs-q").value;
+      document.getElementById("obs-hits").textContent = await invoke("search_obsidian", { query: q });
+    }
+    async function toggleWatch() {
+      if (watching) { await invoke("stop_watch"); watching = false; document.getElementById("watch-btn").textContent = "감시"; }
+      else { const m = await invoke("start_watch"); watching = true; document.getElementById("watch-btn").textContent = "감시 중"; document.getElementById("obs-hits").textContent = m; }
+    }
+    async function resolve(choice) {
+      if (!approvalId) return;
+      await invoke("resolve_approval", { id: approvalId, choice });
+      approvalId = null;
+      document.getElementById("approval").classList.remove("show");
+    }
+
+    document.getElementById("prompt").addEventListener("keydown", e => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+    });
+
+    async function start() {
+      await listen("live", ev => {
+        const { kind, text } = ev.payload;
+        if (kind === "chunk" || kind === "assistant") {
+          if (!streamEl) streamEl = addMsg("assistant", "");
+          streamEl.textContent += text;
+          document.getElementById("transcript").scrollTop = 9e9;
+        } else if (kind === "warn") addMsg("system", text, "warn");
+        else if (kind === "system" || kind === "status") {
+          document.getElementById("status").textContent = text;
+          if (kind === "system") addMsg("system", text);
+        }
+      });
+      await listen("approval", ev => {
+        approvalId = ev.payload.id;
+        document.getElementById("approval-preview").textContent = ev.payload.preview;
+        document.getElementById("approval").classList.add("show");
+      });
+      await listen("obsidian", ev => {
+        document.getElementById("obs-hits").textContent = ev.payload.text;
+        if (ev.payload.kind === "watch") { watching = false; document.getElementById("watch-btn").textContent = "감시"; }
+      });
+      await refreshBoot();
+      await newChat();
+      await refreshSessions();
+      try {
+        const latest = await invoke("graph_latest");
+        if (latest) renderGraph(latest[0], latest[1]);
+      } catch (_) {}
+    }
+    start().catch(e => addMsg("system", String(e), "warn"));
+  </script>
+</body>
+</html>

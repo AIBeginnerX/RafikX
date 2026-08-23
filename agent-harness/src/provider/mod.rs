@@ -4,7 +4,7 @@ pub mod openai_compat;
 pub use anthropic::AnthropicProvider;
 pub use openai_compat::OpenAiCompatProvider;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +60,13 @@ pub struct ChatRequest {
     pub stream: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LimitHint {
+    pub retry_after_secs: Option<u64>,
+    pub remaining: Option<u32>,
+    pub reset_at: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     #[allow(dead_code)]
@@ -67,6 +74,7 @@ pub struct ChatResponse {
     pub stop_reason: StopReason,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub limit: LimitHint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,11 +127,62 @@ impl DynProvider {
 
 pub fn is_retryable(err: &anyhow::Error) -> bool {
     let s = format!("{err:#}").to_lowercase();
-    s.contains("http 429")
+    is_rate_limited(err)
         || s.contains("http 500")
         || s.contains("http 502")
         || s.contains("http 503")
         || s.contains("http 504")
         || s.contains("timeout")
         || s.contains("timed out")
+}
+
+pub fn is_rate_limited(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_lowercase();
+    s.contains("http 429")
+        || s.contains("rate_limited")
+        || s.contains("rate limit")
+        || s.contains("too many requests")
+        || s.contains("overloaded")
+}
+
+pub fn limit_hint(headers: &reqwest::header::HeaderMap) -> LimitHint {
+    let mut h = LimitHint::default();
+    if let Some(v) = header_u64(headers, "retry-after") {
+        h.retry_after_secs = Some(v);
+    }
+    if let Some(v) = header_u32(headers, "anthropic-ratelimit-requests-remaining")
+        .or_else(|| header_u32(headers, "x-ratelimit-remaining-requests"))
+        .or_else(|| header_u32(headers, "x-ratelimit-remaining"))
+    {
+        h.remaining = Some(v);
+    }
+    if let Some(v) = header_u64(headers, "anthropic-ratelimit-requests-reset")
+        .or_else(|| header_u64(headers, "x-ratelimit-reset-requests"))
+        .or_else(|| header_u64(headers, "x-ratelimit-reset"))
+    {
+        if v > 1_000_000_000 {
+            h.reset_at = Some(v as i64);
+        } else {
+            h.retry_after_secs = h.retry_after_secs.or(Some(v));
+            h.reset_at = Some(crate::usage::now_secs() + v as i64);
+        }
+    }
+    h
+}
+
+fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn header_u32(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u32> {
+    header_u64(headers, name).map(|n| n as u32)
+}
+
+pub fn rate_limit_error(status: u16, body: &str, hint: &LimitHint) -> anyhow::Error {
+    let snippet: String = body.chars().take(200).collect();
+    let wait = hint.retry_after_secs.unwrap_or(45);
+    anyhow!("HTTP {status} rate_limited retry_after={wait} {snippet}")
 }

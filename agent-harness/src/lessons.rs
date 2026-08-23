@@ -85,7 +85,7 @@ pub fn cmd_list(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_add(cfg: &Config, text: &str) -> Result<()> {
+pub fn add_text(cfg: &Config, text: &str) -> Result<String> {
     let lesson = text.trim();
     if lesson.is_empty() {
         anyhow::bail!("교훈 문장이 비어 있습니다");
@@ -93,10 +93,18 @@ pub fn cmd_add(cfg: &Config, text: &str) -> Result<()> {
     let db = Db::open(&Db::db_path()?)?;
     let keywords = keywords_from_text(lesson);
     let max = cfg.file.memory.max_lessons;
-    match db.add_lesson("manual", &keywords, lesson, max)? {
-        db::LessonWrite::Inserted { id } => println!("교훈을 저장했습니다 (id={id})"),
-        db::LessonWrite::Bumped { id } => println!("비슷한 교훈이 있어 가중치만 올렸습니다 (id={id})"),
-    }
+    let msg = match db.add_lesson("manual", &keywords, lesson, max)? {
+        db::LessonWrite::Inserted { id } => format!("교훈을 저장했습니다 (id={id})"),
+        db::LessonWrite::Bumped { id } => {
+            format!("비슷한 교훈이 있어 가중치만 올렸습니다 (id={id})")
+        }
+    };
+    println!("{msg}");
+    Ok(msg)
+}
+
+pub fn cmd_add(cfg: &Config, text: &str) -> Result<()> {
+    add_text(cfg, text)?;
     Ok(())
 }
 

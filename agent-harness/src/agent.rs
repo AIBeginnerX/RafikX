@@ -1,15 +1,17 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::applog;
 use crate::config::Config;
 use crate::db::Db;
-use crate::provider::{
-    ChatRequest, ChatResponse, ContentBlock, DynProvider, Message, Role, StopReason,
-};
+use crate::provider::{ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason};
 use crate::tools::{self, ToolCtx, ToolRegistry};
 
 pub const HARD_CAP: u32 = 50;
@@ -47,7 +49,7 @@ impl Default for AgentOutcome {
 
 pub struct AgentRun<'a> {
     pub cfg: &'a Config,
-    pub client: &'a DynProvider,
+    pub provider_name: &'a str,
     pub model: &'a str,
     pub task: &'a str,
     pub yes: bool,
@@ -55,7 +57,26 @@ pub struct AgentRun<'a> {
     pub system: String,
     pub registry: ToolRegistry,
     pub resume: Option<Vec<Message>>,
+    pub remote: Option<RemoteApproval>,
+    pub local_ask: Option<LocalAsk>,
+    pub context_window: u32,
 }
+
+#[derive(Clone)]
+pub struct RemoteApproval {
+    pub timeout: Duration,
+    pub ask: Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalChoice {
+    Yes,
+    No,
+    Always,
+}
+
+pub type LocalAsk =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ApprovalChoice> + Send>> + Send + Sync>;
 
 enum Approval {
     Yes,
@@ -66,7 +87,7 @@ enum Approval {
 pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let AgentRun {
         cfg,
-        client,
+        provider_name,
         model,
         task,
         yes,
@@ -74,16 +95,25 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         system,
         registry,
         resume,
+        remote,
+        local_ask,
+        context_window,
     } = run;
+
+    // 원격(텔레그램)에서는 yolo/--yes 를 코드 수준에서 금지
+    let yes = effective_yes(yes, &remote);
 
     if !cfg.workspace.exists() {
         std::fs::create_dir_all(&cfg.workspace)?;
-        eprintln!("워크스페이스 폴더를 만들었습니다: {}", cfg.workspace.display());
+        crate::ui::live_line(&format!(
+            "워크스페이스 폴더를 만들었습니다: {}",
+            cfg.workspace.display()
+        ));
     }
     warn_if_not_git(&cfg.workspace);
 
     if yes {
-        eprintln!("경고: --yes 는 모든 도구를 승인 없이 실행합니다.");
+        crate::ui::live_warn("경고: --yes 는 모든 도구를 승인 없이 실행합니다.");
     }
 
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
@@ -100,11 +130,10 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let mut tool_errors: Vec<String> = Vec::new();
     let mut deny_reasons: Vec<String> = Vec::new();
     let max_iter = max_iterations.min(HARD_CAP);
-    let max_chars = cfg.file.general.max_context_chars;
 
     loop {
         if iterations >= max_iter {
-            println!("상한 도달, 여기까지 결과");
+            crate::ui::live_line("상한 도달, 여기까지 결과");
             return Ok(AgentOutcome {
                 status: "limit".into(),
                 iterations,
@@ -119,7 +148,21 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             });
         }
         iterations += 1;
-        trim_history(&mut messages, max_chars);
+        let specs = registry.specs();
+        messages = crate::packer::pack_messages(
+            &messages,
+            &system,
+            &specs,
+            context_window,
+            cfg.file.general.max_tokens,
+            cfg.file.general.max_context_chars,
+        );
+        crate::graph::node(
+            "pre_step",
+            &format!("iter {iterations}"),
+            &format!("msgs={} window={context_window}", messages.len()),
+            Some("bind"),
+        );
 
         let req = ChatRequest {
             model: model.to_string(),
@@ -130,13 +173,19 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             stream: false,
         };
 
-        let resp = client.chat(&req).await?;
+        let resp = crate::harness::chat_accounts(cfg, provider_name, req).await?;
+        crate::graph::node(
+            "request",
+            model,
+            &format!("in={} out={}", resp.input_tokens, resp.output_tokens),
+            Some("pre_step"),
+        );
         input_tokens += resp.input_tokens;
         output_tokens += resp.output_tokens;
-        println!(
+        crate::ui::live_status(&format!(
             "[tokens] in={} out={} (누적 in={} out={})",
             resp.input_tokens, resp.output_tokens, input_tokens, output_tokens
-        );
+        ));
 
         print_text_blocks(&resp);
 
@@ -200,7 +249,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             let count = call_counts.entry(key).or_insert(0);
             *count += 1;
             if *count >= 3 {
-                println!("동일 도구·입력이 3회 반복되어 중단합니다.");
+                crate::ui::live_line("동일 도구·입력이 3회 반복되어 중단합니다.");
                 return Ok(AgentOutcome {
                     status: "limit".into(),
                     iterations,
@@ -215,7 +264,8 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 });
             }
 
-            println!("[도구] {name}");
+            crate::ui::live_line(&format!("[도구] {name}"));
+            crate::graph::node("tool_pre", &name, "", Some("request"));
             let Some(tool) = registry.get(&name) else {
                 let msg = format!("알 수 없는 도구: {name}");
                 tool_errors.push(msg.clone());
@@ -230,13 +280,17 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             if tool.needs_approval(&input) && !allow_all {
                 match tools::approval_preview(tool.name(), &input, &ctx) {
                     Ok(preview) => {
-                        println!("{preview}");
-                        match read_approval()? {
+                        crate::ui::live_line(&preview);
+                        match decide_approval(&remote, &local_ask, preview).await? {
                             Approval::Yes => {}
                             Approval::Always => allow_all = true,
                             Approval::No => {
                                 denied_any = true;
-                                let reason = read_deny_reason()?;
+                                let reason = if remote.is_some() || local_ask.is_some() {
+                                    String::new()
+                                } else {
+                                    read_deny_reason()?
+                                };
                                 let msg = if reason.is_empty() {
                                     "사용자가 도구 실행을 거부했습니다.".to_string()
                                 } else {
@@ -267,12 +321,13 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                     }
                 }
             } else if tool.needs_approval(&input) && allow_all {
-                eprintln!("[자동승인] {name}");
+                crate::ui::live_warn(&format!("[자동승인] {name}"));
             }
 
             match tool.run(input.clone(), &ctx) {
                 Ok(out) => {
-                    println!("{out}");
+                    crate::graph::node("tool_post", &name, "ok", Some("tool_pre"));
+                    crate::ui::live_line(&out);
                     if name == "write_file" || name == "edit_file" {
                         if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
                             changed_files.push(p.to_string());
@@ -285,8 +340,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                     });
                 }
                 Err(e) => {
+                    crate::graph::node("tool_post", &name, "error", Some("tool_pre"));
                     applog::error(&format!("tool {name}: {e}"));
-                    println!("도구 오류: {e}");
+                    crate::ui::live_line(&format!("도구 오류: {e}"));
                     tool_errors.push(format!("{name}: {e}"));
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id,
@@ -308,7 +364,7 @@ fn print_text_blocks(resp: &ChatResponse) {
     for b in &resp.content {
         if let ContentBlock::Text { text } = b {
             if !text.trim().is_empty() {
-                println!("{text}");
+                crate::ui::live_assistant(text);
             }
         }
     }
@@ -316,7 +372,7 @@ fn print_text_blocks(resp: &ChatResponse) {
 
 fn warn_if_not_git(workspace: &Path) {
     if !workspace.join(".git").exists() {
-        eprintln!("경고: 이 폴더는 git 저장소가 아닙니다. git init 을 권장합니다.");
+        crate::ui::live_warn("경고: 이 폴더는 git 저장소가 아닙니다. git init 을 권장합니다.");
     }
 }
 
@@ -381,46 +437,48 @@ fn read_approval() -> Result<Approval> {
     }
 }
 
-fn message_chars(m: &Message) -> usize {
-    m.content
-        .iter()
-        .map(|b| match b {
-            ContentBlock::Text { text } => text.len(),
-            ContentBlock::ToolUse { id, name, input } => {
-                id.len() + name.len() + input.to_string().len()
-            }
-            ContentBlock::ToolResult { content, .. } => content.len(),
-        })
-        .sum()
+async fn decide_approval(
+    remote: &Option<RemoteApproval>,
+    local_ask: &Option<LocalAsk>,
+    preview: String,
+) -> Result<Approval> {
+    if let Some(ask) = local_ask {
+        return Ok(match ask(preview).await {
+            ApprovalChoice::Yes => Approval::Yes,
+            ApprovalChoice::No => Approval::No,
+            ApprovalChoice::Always => Approval::Always,
+        });
+    }
+    let Some(r) = remote else {
+        return read_approval();
+    };
+    let ask = r.ask.clone();
+    match tokio::time::timeout(r.timeout, (ask)(preview)).await {
+        Ok(true) => Ok(Approval::Yes),
+        _ => Ok(Approval::No),
+    }
 }
 
-fn trim_history(messages: &mut Vec<Message>, max_chars: u32) {
-    let max = max_chars as usize;
-    let mut total: usize = messages.iter().map(message_chars).sum();
-    while total > max && messages.len() > 1 {
-        let has_tool_use = messages[0]
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-        let remove = if has_tool_use
-            && messages.len() > 1
-            && messages[1]
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        {
-            2
-        } else {
-            1
-        };
-        for _ in 0..remove {
-            if messages.len() <= 1 {
-                break;
+pub fn effective_yes(yes: bool, remote: &Option<RemoteApproval>) -> bool {
+    if remote.is_some() { false } else { yes }
+}
+
+#[allow(dead_code)]
+pub fn assistant_text(messages: &[Message]) -> String {
+    let mut parts = Vec::new();
+    for m in messages {
+        if m.role != Role::Assistant {
+            continue;
+        }
+        for b in &m.content {
+            if let ContentBlock::Text { text } = b {
+                if !text.trim().is_empty() {
+                    parts.push(text.as_str());
+                }
             }
-            let m = messages.remove(0);
-            total = total.saturating_sub(message_chars(&m));
         }
     }
+    parts.join("\n")
 }
 
 pub fn record_finish(
@@ -484,5 +542,17 @@ mod tests {
         ];
         sanitize_tool_pairs(&mut msgs);
         assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn remote_forces_yes_off() {
+        let remote = Some(RemoteApproval {
+            timeout: Duration::from_secs(1),
+            ask: Arc::new(|_| Box::pin(async { true })),
+        });
+        assert!(!effective_yes(true, &remote));
+        assert!(!effective_yes(false, &remote));
+        assert!(effective_yes(true, &None));
+        assert!(!effective_yes(false, &None));
     }
 }

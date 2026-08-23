@@ -3,7 +3,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use super::{
-    ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason, map_stop_reason,
+    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, limit_hint,
+    map_stop_reason, rate_limit_error,
 };
 
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -11,37 +12,63 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    token: String,
+    oauth: bool,
 }
 
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Result<Self> {
+        Self::create(api_key, false)
+    }
+
+    pub fn with_oauth(token: String) -> Result<Self> {
+        Self::create(token, true)
+    }
+
+    fn create(token: String, oauth: bool) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .context("HTTP 클라이언트를 만들 수 없습니다")?;
-        Ok(Self { client, api_key })
+        Ok(Self {
+            client,
+            token,
+            oauth,
+        })
+    }
+
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.oauth {
+            req.header("Authorization", format!("Bearer {}", self.token))
+                .header("anthropic-beta", "oauth-2025-04-20")
+        } else {
+            req.header("x-api-key", &self.token)
+        }
     }
 
     pub async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
         let body = build_body(req);
         let resp = self
-            .client
-            .post(MESSAGES_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
+            .apply_auth(
+                self.client
+                    .post(MESSAGES_URL)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .header("content-type", "application/json"),
+            )
             .json(&body)
             .send()
             .await
             .context("Anthropic API 요청에 실패했습니다")?;
 
         let status = resp.status();
+        let hint = limit_hint(resp.headers());
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(api_error(status.as_u16(), &text));
+            return Err(api_error(status.as_u16(), &text, &hint));
         }
-        parse_message_json(&text)
+        let mut parsed = parse_message_json(&text)?;
+        parsed.limit = hint;
+        Ok(parsed)
     }
 
     pub async fn chat_stream<F>(&self, req: &ChatRequest, mut on_text: F) -> Result<ChatResponse>
@@ -50,20 +77,22 @@ impl AnthropicProvider {
     {
         let body = build_body(req);
         let resp = self
-            .client
-            .post(MESSAGES_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
+            .apply_auth(
+                self.client
+                    .post(MESSAGES_URL)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .header("content-type", "application/json"),
+            )
             .json(&body)
             .send()
             .await
             .context("Anthropic API 요청에 실패했습니다")?;
 
         let status = resp.status();
+        let hint = limit_hint(resp.headers());
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(api_error(status.as_u16(), &text));
+            return Err(api_error(status.as_u16(), &text, &hint));
         }
 
         let mut stream = resp.bytes_stream();
@@ -121,6 +150,7 @@ impl AnthropicProvider {
                                 stop_reason,
                                 input_tokens,
                                 output_tokens,
+                                limit: hint.clone(),
                             });
                         }
                         Some("error") => {
@@ -141,6 +171,7 @@ impl AnthropicProvider {
             stop_reason,
             input_tokens,
             output_tokens,
+            limit: hint,
         })
     }
 }
@@ -239,6 +270,7 @@ fn parse_message_json(text: &str) -> Result<ChatResponse> {
             .pointer("/usage/output_tokens")
             .and_then(|x| x.as_u64())
             .unwrap_or(0) as u32,
+        limit: LimitHint::default(),
     })
 }
 
@@ -258,8 +290,11 @@ fn sse_data(event: &str) -> Option<&str> {
     }
 }
 
-fn api_error(status: u16, body: &str) -> anyhow::Error {
+fn api_error(status: u16, body: &str, hint: &LimitHint) -> anyhow::Error {
     let safe = redact_secrets(body);
+    if status == 429 {
+        return rate_limit_error(status, &safe, hint);
+    }
     let snippet: String = safe.chars().take(400).collect();
     if status == 401 {
         anyhow!("Anthropic API 인증 실패 (HTTP 401). API 키를 확인하세요.")

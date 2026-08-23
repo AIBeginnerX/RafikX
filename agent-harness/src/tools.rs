@@ -716,9 +716,9 @@ mod tests {
 
     #[test]
     fn jail_rejects_path_outside_workspace() {
-        let dir = std::env::temp_dir().join("agent-harness-jail-test");
+        let dir = std::env::temp_dir().join("rafikx-jail-test");
         fs::create_dir_all(&dir).unwrap();
-        let outside = std::env::temp_dir().join("agent-harness-jail-outside.txt");
+        let outside = std::env::temp_dir().join("rafikx-jail-outside.txt");
         fs::write(&outside, "x").unwrap();
         let err = resolve_in_workspace(&dir, outside.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("jail"));
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn write_preview_stays_inside_workspace() {
-        let dir = std::env::temp_dir().join("agent-harness-write-preview");
+        let dir = std::env::temp_dir().join("rafikx-write-preview");
         fs::create_dir_all(&dir).unwrap();
         let ctx = ToolCtx::new(dir.clone());
         let preview = approval_preview(

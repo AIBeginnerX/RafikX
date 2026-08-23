@@ -1,0 +1,16 @@
+name: 제안
+description: 기능이나 문서 개선
+labels: [enhancement]
+body:
+  - type: textarea
+    id: why
+    attributes:
+      label: 왜 필요한가요
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 어떻게 보이면 좋나요
+    validations:
+      required: true

@@ -8,7 +8,7 @@ use crate::config::{Config, ProviderConfig};
 use crate::db::Db;
 use crate::provider::{
     AnthropicProvider, ChatRequest, ChatResponse, ContentBlock, DynProvider, Message,
-    OpenAiCompatProvider, is_retryable,
+    OpenAiCompatProvider, is_rate_limited, is_retryable,
 };
 use crate::tools::{self, ToolCtx, ToolRegistry};
 
@@ -41,6 +41,7 @@ impl TaskClass {
     }
 }
 
+#[derive(Clone)]
 pub struct Binding {
     pub class: TaskClass,
     pub profile_name: String,
@@ -53,6 +54,8 @@ pub struct Binding {
     pub verify: bool,
     pub verify_command: String,
     pub system_extra: String,
+    pub context_window: u32,
+    pub verify_model: Option<String>,
 }
 
 pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
@@ -98,6 +101,8 @@ fn looks_like_dev(text: &str) -> bool {
             "고쳐",
             "버그",
             "디버그",
+            "디버깅",
+            "검증",
             "컴파일",
             "빌드",
             "리팩터",
@@ -127,6 +132,7 @@ fn looks_like_advanced(text: &str) -> bool {
             "보고서",
             "계획 수립",
             "검토",
+            "구성",
         ],
     )
 }
@@ -172,46 +178,49 @@ pub fn bind(
         .get(&profile_name)
         .ok_or_else(|| anyhow!("서브에이전트 '{profile_name}' 이(가) config에 없습니다"))?;
 
-    let mut provider_name = provider_override
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| sub.provider.clone());
     let needs_tools = !sub.tools.is_empty();
-    let p = cfg.provider(&provider_name)?;
+    let selection = cfg.file.harness.selection.trim().to_ascii_lowercase();
+    let manual = selection == "manual";
 
-    if needs_tools && !p.supports_tools {
-        let mut rebound = None;
-        for name in &cfg.file.harness.fallback {
-            if let Ok(fp) = cfg.provider(name) {
-                if fp.supports_tools {
-                    rebound = Some(name.clone());
-                    break;
-                }
-            }
+    let (provider_name, model, verify_model) = if let (Some(p), Some(m)) =
+        (provider_override, model_override)
+    {
+        (p.to_string(), m.to_string(), None)
+    } else if let Some(m) = model_override {
+        let p = provider_override
+            .map(|s| s.to_string())
+            .or_else(|| provider_for_model(cfg, m))
+            .unwrap_or_else(|| sub.provider.clone());
+        (p, m.to_string(), None)
+    } else if let Some(p) = provider_override {
+        ensure_connected(cfg, p)?;
+        let pc = cfg.provider(p)?;
+        if needs_tools && !pc.supports_tools {
+            anyhow::bail!("'{p}' 는 도구를 지원하지 않습니다. 다른 연결을 고르세요.");
         }
-        match rebound {
-            Some(name) => {
-                eprintln!(
-                    "경고: '{provider_name}' 는 도구를 지원하지 않아 '{name}' 로 바꿉니다."
-                );
-                provider_name = name;
-            }
-            None => {
-                if matches!(class, TaskClass::Dev | TaskClass::Advanced) {
-                    anyhow::bail!(
-                        "도구를 지원하는 모델이 등록되어 있지 않습니다. config에 supports_tools=true 프로바이더를 추가하세요."
-                    );
-                }
-            }
-        }
-    }
-
-    let p = cfg.provider(&provider_name)?;
-    let model = if let Some(m) = model_override {
-        m.to_string()
+        let model = pick_for_provider(cfg, p, class, &sub.model_role, needs_tools)
+            .unwrap_or_else(|| model_for_role(pc, &sub.model_role));
+        (p.to_string(), model, None)
+    } else if manual {
+        pick_manual(cfg, class, sub, needs_tools)?
     } else {
-        model_for_role(p, &sub.model_role)
+        pick_auto(cfg, class, sub, needs_tools)?
     };
 
+    let p = cfg.provider(&provider_name)?;
+    if !crate::auth::is_usable(cfg, &provider_name) && crate::auth::auth_mode(&provider_name, p) != "none"
+    {
+        if crate::auth::is_connected(cfg, &provider_name) && !crate::auth::is_enabled(cfg, &provider_name) {
+            anyhow::bail!(
+                "'{provider_name}' 는 사용 중지입니다. rafikx settings 에서 다시 켜세요."
+            );
+        }
+        anyhow::bail!(
+            "'{provider_name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요."
+        );
+    }
+
+    let window = crate::packer::context_window_for(&provider_name, &model, Some(p));
     Ok(Binding {
         class,
         profile_name,
@@ -231,7 +240,222 @@ pub fn bind(
         verify: sub.verify,
         verify_command: sub.verify_command.clone(),
         system_extra: sub.system_extra.clone(),
+        context_window: window,
+        verify_model,
     })
+}
+
+fn ensure_connected(cfg: &Config, name: &str) -> Result<()> {
+    if crate::auth::is_usable(cfg, name) {
+        Ok(())
+    } else if crate::auth::is_connected(cfg, name) {
+        Err(anyhow!(
+            "'{name}' 는 사용 중지입니다. rafikx settings 에서 다시 켜세요."
+        ))
+    } else {
+        Err(anyhow!(
+            "'{name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요."
+        ))
+    }
+}
+
+fn provider_for_model(cfg: &Config, model: &str) -> Option<String> {
+    crate::auth::registered_models(cfg)
+        .into_iter()
+        .find(|r| r.id == model)
+        .map(|r| r.provider)
+}
+
+fn parse_manual_spec(spec: &str) -> (Option<String>, String) {
+    let t = spec.trim();
+    if let Some((p, m)) = t.split_once(':') {
+        if !p.is_empty() && !m.is_empty() && !p.contains('/') {
+            return (Some(p.to_string()), m.to_string());
+        }
+    }
+    (None, t.to_string())
+}
+
+fn resolve_spec(
+    cfg: &Config,
+    spec: &str,
+    needs_tools: bool,
+) -> Result<(String, String)> {
+    let (p, m) = parse_manual_spec(spec);
+    if let Some(p) = p {
+        ensure_connected(cfg, &p)?;
+        let pc = cfg.provider(&p)?;
+        if needs_tools && !pc.supports_tools {
+            anyhow::bail!("'{p}' 는 도구를 지원하지 않습니다.");
+        }
+        return Ok((p, m));
+    }
+    if let Some(r) = crate::auth::registered_models(cfg)
+        .into_iter()
+        .find(|r| r.id == m)
+    {
+        return Ok((r.provider, r.id));
+    }
+    Err(anyhow!(
+        "수동 모델 '{spec}' 을(를) 등록된 연결에서 찾지 못했습니다. rafikx settings 에서 다시 고르세요."
+    ))
+}
+
+fn pick_manual(
+    cfg: &Config,
+    class: TaskClass,
+    sub: &crate::config::SubAgentConfig,
+    needs_tools: bool,
+) -> Result<(String, String, Option<String>)> {
+    let h = &cfg.file.harness;
+    let spec = match class {
+        TaskClass::Advanced => h.manual_design.as_deref().filter(|s| !s.is_empty()),
+        TaskClass::Dev => h.manual_debug.as_deref().filter(|s| !s.is_empty()),
+        _ => None,
+    }
+    .or(h.manual_model.as_deref().filter(|s| !s.is_empty()));
+    let verify_spec = h.manual_verify.as_deref().filter(|s| !s.is_empty());
+    let verify_model = if let Some(vs) = verify_spec {
+        resolve_spec(cfg, vs, needs_tools).ok().map(|(_, m)| m)
+    } else {
+        None
+    };
+    if let Some(spec) = spec {
+        let (p, m) = resolve_spec(cfg, spec, needs_tools)?;
+        return Ok((p, m, verify_model));
+    }
+    pick_auto(cfg, class, sub, needs_tools).map(|(p, m, _)| (p, m, verify_model))
+}
+
+/// 연결된(등록된) 모델만. 미연결 프로바이더는 절대 고르지 않는다.
+pub fn pick_auto(
+    cfg: &Config,
+    class: TaskClass,
+    sub: &crate::config::SubAgentConfig,
+    needs_tools: bool,
+) -> Result<(String, String, Option<String>)> {
+    let table = crate::ranks::load();
+    let all = crate::auth::registered_models(cfg);
+    if all.is_empty() {
+        anyhow::bail!(
+            "연결된 서비스가 없습니다. rafikx settings 또는 rafikx doctor 에서 번호로 연결하세요."
+        );
+    }
+    let mut regs: Vec<crate::auth::RegisteredModel> = all
+        .into_iter()
+        .filter(|r| {
+            if !needs_tools {
+                return true;
+            }
+            cfg.provider(&r.provider)
+                .map(|p| p.supports_tools)
+                .unwrap_or(false)
+        })
+        .collect();
+    if regs.is_empty() {
+        anyhow::bail!(
+            "이 작업에 필요한 도구를 지원하는 연결이 없습니다. rafikx settings 에서 Anthropic 등을 연결하세요."
+        );
+    }
+
+    let prefer_strong = matches!(class, TaskClass::Advanced | TaskClass::Dev);
+    let prefer_cheap = matches!(class, TaskClass::Simple | TaskClass::Medium);
+
+    if prefer_cheap {
+        if let Some(hit) = pick_cheap(&regs, &table, &sub.provider) {
+            return Ok((hit.provider, hit.id, None));
+        }
+    }
+
+    if prefer_strong {
+        if let Some(hit) = pick_strongest(&regs, &table) {
+            return Ok((hit.provider, hit.id.clone(), Some(hit.id)));
+        }
+    }
+
+    // 순위 모르면 프로파일 기본 (그 프로바이더가 연결된 경우만)
+    if crate::auth::is_usable(cfg, &sub.provider) {
+        if let Ok(p) = cfg.provider(&sub.provider) {
+            if !needs_tools || p.supports_tools {
+                let model = model_for_role(p, &sub.model_role);
+                return Ok((sub.provider.clone(), model, None));
+            }
+        }
+    }
+    let first = regs.remove(0);
+    Ok((first.provider, first.id, None))
+}
+
+fn pick_cheap(
+    regs: &[crate::auth::RegisteredModel],
+    table: &crate::ranks::RankTable,
+    preferred_provider: &str,
+) -> Option<crate::auth::RegisteredModel> {
+    let mut cheap: Vec<&crate::auth::RegisteredModel> = regs
+        .iter()
+        .filter(|r| r.small || crate::ranks::is_cheap_id(&r.id))
+        .collect();
+    if cheap.is_empty() {
+        // 등록분이 전부 플래그십이면 그대로 써도 됨 — 그 중 가장 낮은 점수(저렴 쪽) 선호
+        let mut all = regs.to_vec();
+        all.sort_by_key(|r| crate::ranks::score_of(table, &r.id).unwrap_or(999));
+        return all.first().cloned();
+    }
+    cheap.sort_by_key(|r| {
+        let pref = if r.provider == preferred_provider { 0 } else { 1 };
+        (pref, crate::ranks::score_of(table, &r.id).unwrap_or(50))
+    });
+    cheap.first().cloned().cloned()
+}
+
+fn pick_strongest(
+    regs: &[crate::auth::RegisteredModel],
+    table: &crate::ranks::RankTable,
+) -> Option<crate::auth::RegisteredModel> {
+    let mut ranked: Vec<(i32, bool, &crate::auth::RegisteredModel)> = regs
+        .iter()
+        .filter_map(|r| {
+            let e = crate::ranks::match_entry(table, &r.id)?;
+            Some((e.score, crate::ranks::Tier::parse(&e.tier) == crate::ranks::Tier::Top5, r))
+        })
+        .collect();
+    if !ranked.is_empty() {
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        // top5 가 등록되어 있으면 그걸, 없으면 등록분 중 최고점
+        if let Some(hit) = ranked.iter().find(|(_, top, _)| *top) {
+            return Some((*hit.2).clone());
+        }
+        return Some(ranked[0].2.clone());
+    }
+    None
+}
+
+fn pick_for_provider(
+    cfg: &Config,
+    name: &str,
+    class: TaskClass,
+    role: &str,
+    _needs_tools: bool,
+) -> Option<String> {
+    let Ok(p) = cfg.provider(name) else {
+        return None;
+    };
+    if p.model_auto || cfg.file.harness.selection.trim().eq_ignore_ascii_case("auto") {
+        let regs: Vec<_> = crate::auth::registered_models(cfg)
+            .into_iter()
+            .filter(|r| r.provider == name)
+            .collect();
+        let table = crate::ranks::load();
+        if matches!(class, TaskClass::Simple | TaskClass::Medium) {
+            if let Some(h) = pick_cheap(&regs, &table, name) {
+                return Some(h.id);
+            }
+        }
+        if let Some(h) = pick_strongest(&regs, &table) {
+            return Some(h.id);
+        }
+    }
+    Some(model_for_role(p, role))
 }
 
 fn model_for_role(p: &ProviderConfig, role: &str) -> String {
@@ -243,40 +467,157 @@ fn model_for_role(p: &ProviderConfig, role: &str) -> String {
 }
 
 pub fn build_provider(cfg: &Config, name: &str) -> Result<DynProvider> {
+    let accs = crate::accounts::for_provider(name);
+    let id = crate::usage::select_account(&accs).unwrap_or_else(|| name.to_string());
+    build_provider_account(cfg, name, &id)
+}
+
+pub fn build_provider_account(cfg: &Config, name: &str, account_id: &str) -> Result<DynProvider> {
     let p = cfg.provider(name)?;
+    let cred = crate::auth::resolve_account_credential(cfg, name, account_id)?;
     match p.kind.as_str() {
         "anthropic" => {
-            let key = cfg.api_key(name)?.ok_or_else(|| {
-                anyhow!("환경변수 {} 가 없습니다", p.api_key_env)
+            let c = cred.ok_or_else(|| {
+                anyhow!(
+                    "'{name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요"
+                )
             })?;
-            Ok(DynProvider::Anthropic(AnthropicProvider::new(key)?))
+            if c.oauth {
+                Ok(DynProvider::Anthropic(AnthropicProvider::with_oauth(c.token)?))
+            } else {
+                Ok(DynProvider::Anthropic(AnthropicProvider::new(c.token)?))
+            }
         }
         "openai_compat" => {
+            if name == "openai" {
+                if let Some(c) = &cred {
+                    if c.oauth {
+                        return Ok(DynProvider::OpenAi(OpenAiCompatProvider::with_codex_oauth(
+                            c.token.clone(),
+                            c.account_id.clone(),
+                        )?));
+                    }
+                }
+            }
             let base = p
                 .base_url
                 .clone()
                 .ok_or_else(|| anyhow!("프로바이더 '{name}' 에 base_url 이 없습니다"))?;
-            let key = cfg.api_key(name)?;
+            let key = cred.map(|c| c.token);
+            if crate::auth::auth_mode(name, p) != "none" && key.is_none() {
+                return Err(anyhow!(
+                    "'{name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요"
+                ));
+            }
             Ok(DynProvider::OpenAi(OpenAiCompatProvider::new(base, key)?))
         }
         other => Err(anyhow!("알 수 없는 프로바이더 kind: {other}")),
     }
 }
 
+fn account_ids_for(name: &str) -> Vec<String> {
+    let accs = crate::accounts::for_provider(name);
+    if accs.is_empty() {
+        vec![name.to_string()]
+    } else {
+        crate::usage::order_ids(&accs)
+    }
+}
+
+async fn try_accounts<F, Fut>(
+    cfg: &Config,
+    name: &str,
+    mut call: F,
+) -> Result<ChatResponse>
+where
+    F: FnMut(DynProvider) -> Fut,
+    Fut: std::future::Future<Output = Result<ChatResponse>>,
+{
+    let ids = account_ids_for(name);
+    let mut last_err = None;
+    for (i, id) in ids.iter().enumerate() {
+        let wait = crate::usage::seconds_left(id);
+        if wait > 0 && wait <= 20 {
+            crate::ui::note(&format!("계정 대기 {wait}초 후 재시도…"));
+            tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+        } else if wait > 20 && i + 1 < ids.len() {
+            crate::ui::note(&format!(
+                "{} 리밋 {}분 → 다른 계정",
+                crate::accounts::get(id)
+                    .map(|a| a.label)
+                    .unwrap_or_else(|| id.clone()),
+                (wait + 59) / 60
+            ));
+            continue;
+        }
+        let Ok(client) = build_provider_account(cfg, name, id) else {
+            continue;
+        };
+        match call(client).await {
+            Ok(resp) => {
+                crate::usage::record_success(id, &resp);
+                crate::usage::apply_hint(id, &resp.limit);
+                return Ok(resp);
+            }
+            Err(e) if is_rate_limited(&e) => {
+                let secs = crate::usage::parse_retry_after(&format!("{e:#}"));
+                crate::usage::mark_limited(id, secs);
+                crate::ui::warn(&format!(
+                    "리밋 → 다음 계정으로 전환 ({})",
+                    crate::accounts::get(id)
+                        .map(|a| a.label)
+                        .unwrap_or_else(|| id.clone())
+                ));
+                last_err = Some(e);
+            }
+            Err(e) if is_retryable(&e) => {
+                last_err = Some(e);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("'{name}' 사용 가능한 계정이 없습니다")))
+}
+
 pub fn fallback_order(cfg: &Config, primary: &str, cli_provider: Option<&str>) -> Vec<String> {
     let mut order = Vec::new();
     if let Some(p) = cli_provider {
-        order.push(p.to_string());
+        if crate::auth::is_usable(cfg, p) {
+            order.push(p.to_string());
+        }
     }
-    if !order.iter().any(|x| x == primary) {
+    if crate::auth::is_usable(cfg, primary) && !order.iter().any(|x| x == primary) {
         order.push(primary.to_string());
     }
     for f in &cfg.file.harness.fallback {
-        if !order.iter().any(|x| x == f) {
+        if crate::auth::is_usable(cfg, f) && !order.iter().any(|x| x == f) {
             order.push(f.clone());
         }
     }
     order
+}
+
+fn model_for_fallback(
+    cfg: &Config,
+    name: &str,
+    model_role: &str,
+    original_model: &str,
+    primary: Option<&str>,
+) -> Option<String> {
+    if !crate::auth::is_usable(cfg, name) {
+        return None;
+    }
+    let Ok(p) = cfg.provider(name) else {
+        return None;
+    };
+    if Some(name) == primary && !original_model.is_empty() {
+        Some(original_model.to_string())
+    } else {
+        Some(model_for_role(p, model_role))
+    }
 }
 
 pub async fn chat_with_fallback(
@@ -285,27 +626,22 @@ pub async fn chat_with_fallback(
     model_role: &str,
     mut req: ChatRequest,
 ) -> Result<(String, ChatResponse)> {
+    let original_model = req.model.clone();
+    let primary = order.first().map(|s| s.as_str());
     let mut last_err = None;
     for name in order {
-        let Ok(p) = cfg.provider(name) else { continue };
-        req.model = model_for_role(p, model_role);
-        let Ok(client) = build_provider(cfg, name) else {
+        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary) else {
             continue;
         };
-        let mut delay = 1u64;
-        for attempt in 0..3 {
-            match client.chat(&req).await {
-                Ok(resp) => return Ok((name.clone(), resp)),
-                Err(e) if is_retryable(&e) && attempt < 2 => {
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    delay *= 2;
-                    last_err = Some(e);
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    break;
-                }
-            }
+        req.model = model;
+        match try_accounts(cfg, name, |client| {
+            let req = req.clone();
+            async move { client.chat(&req).await }
+        })
+        .await
+        {
+            Ok(resp) => return Ok((name.clone(), resp)),
+            Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
@@ -321,20 +657,34 @@ pub async fn stream_with_fallback<F>(
 where
     F: FnMut(&str),
 {
+    let original_model = req.model.clone();
+    let primary = order.first().map(|s| s.as_str());
     let mut last_err = None;
     for name in order {
-        let Ok(p) = cfg.provider(name) else { continue };
-        req.model = model_for_role(p, model_role);
-        let Ok(client) = build_provider(cfg, name) else {
+        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary) else {
             continue;
         };
-        let mut delay = 1u64;
-        for attempt in 0..3 {
+        req.model = model;
+        let ids = account_ids_for(name);
+        for (i, id) in ids.iter().enumerate() {
+            let wait = crate::usage::seconds_left(id);
+            if wait > 20 && i + 1 < ids.len() {
+                continue;
+            }
+            if wait > 0 && wait <= 20 {
+                tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+            }
+            let Ok(client) = build_provider_account(cfg, name, id) else {
+                continue;
+            };
             match client.chat_stream(&req, &mut on_text).await {
-                Ok(resp) => return Ok((name.clone(), resp)),
-                Err(e) if is_retryable(&e) && attempt < 2 => {
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    delay *= 2;
+                Ok(resp) => {
+                    crate::usage::record_success(id, &resp);
+                    return Ok((name.clone(), resp));
+                }
+                Err(e) if is_rate_limited(&e) => {
+                    crate::usage::mark_limited(id, crate::usage::parse_retry_after(&format!("{e:#}")));
+                    crate::ui::warn("리밋 → 다음 계정으로 전환");
                     last_err = Some(e);
                 }
                 Err(e) => {
@@ -345,6 +695,18 @@ where
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
+}
+
+pub async fn chat_accounts(
+    cfg: &Config,
+    provider: &str,
+    req: ChatRequest,
+) -> Result<ChatResponse> {
+    try_accounts(cfg, provider, |client| {
+        let req = req.clone();
+        async move { client.chat(&req).await }
+    })
+    .await
 }
 
 pub async fn classify(
@@ -390,12 +752,12 @@ async fn classify_llm(cfg: &Config, text: &str) -> Result<TaskClass> {
 }
 
 pub fn print_binding(b: &Binding) {
-    println!(
-        "[하네스] {} → {} ({})",
+    crate::ui::note(&format!(
+        "하네스  {} → {}  ·  {}",
         b.class.as_str(),
         b.profile_name,
-        b.model
-    );
+        crate::ui::bold(&b.model)
+    ));
 }
 
 pub fn print_binding_table(cfg: &Config) {
@@ -431,31 +793,45 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
     let Ok(client) = client else {
         return format!("{name}: HTTP 클라이언트 실패");
     };
+    let cred = crate::auth::resolve_credential(cfg, name).ok().flatten();
     match p.kind.as_str() {
         "anthropic" => {
-            let Ok(Some(key)) = cfg.api_key(name) else {
-                return format!("{name}: 키 없음 (ping 생략)");
+            let Some(c) = cred else {
+                return format!("{name}: 미연결 (ping 생략)");
             };
-            match client
-                .get("https://api.anthropic.com/v1/models")
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01")
-                .send()
-                .await
-            {
+            let req = crate::auth::apply_anthropic_cred(
+                client
+                    .get("https://api.anthropic.com/v1/models")
+                    .header("anthropic-version", "2023-06-01"),
+                &c,
+            );
+            match req.send().await {
                 Ok(r) if r.status().is_success() => format!("{name}: ping OK"),
                 Ok(r) => format!("{name}: ping HTTP {}", r.status().as_u16()),
                 Err(e) => format!("{name}: ping 실패 ({e})"),
             }
         }
         "openai_compat" => {
-            let Some(base) = &p.base_url else {
-                return format!("{name}: base_url 없음");
+            let oauth_openai = name == "openai" && cred.as_ref().is_some_and(|c| c.oauth);
+            let url = if oauth_openai {
+                "https://chatgpt.com/backend-api/codex/models".to_string()
+            } else {
+                let Some(base) = &p.base_url else {
+                    return format!("{name}: base_url 없음");
+                };
+                format!("{}/models", base.trim_end_matches('/'))
             };
-            let url = format!("{}/models", base.trim_end_matches('/'));
             let mut req = client.get(url);
-            if let Ok(Some(key)) = cfg.api_key(name) {
-                req = req.header("Authorization", format!("Bearer {key}"));
+            if let Some(c) = &cred {
+                req = req.header("Authorization", format!("Bearer {}", c.token));
+                if oauth_openai {
+                    req = req
+                        .header("originator", "codex_cli_rs")
+                        .header("User-Agent", "codex_cli_rs");
+                    if !c.account_id.is_empty() {
+                        req = req.header("chatgpt-account-id", &c.account_id);
+                    }
+                }
             }
             match req.send().await {
                 Ok(r) if r.status().is_success() => format!("{name}: ping OK"),
@@ -469,7 +845,7 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
 
 pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
     let mut s = format!(
-        "You are agent-harness, a personal CLI assistant.\n\
+        "You are RafikX, a personal CLI assistant.\n\
          Workspace: {}\n\
          If the user writes in Korean, reply in Korean.\n\
          {extra}",
@@ -489,6 +865,8 @@ pub async fn run_pipeline(
     yes: bool,
     cli_provider: Option<&str>,
     resume: Option<Vec<Message>>,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
 ) -> Result<AgentOutcome> {
     let role = cfg
         .file
@@ -513,6 +891,9 @@ pub async fn run_pipeline(
     };
     if !lessons_block.is_empty() {
         crate::applog::info(&format!("lessons inject:\n{lessons_block}"));
+        crate::graph::node("pre_step", "lessons", "injected", Some("bind"));
+    } else {
+        crate::graph::node("pre_step", "lessons", "none", Some("bind"));
     }
     let system = system_prompt(cfg, &binding.system_extra, &lessons_block);
 
@@ -527,20 +908,29 @@ pub async fn run_pipeline(
         };
         match chat_with_fallback(cfg, &order, role, req).await {
             Ok((_n, resp)) => {
-                println!("[계획]");
+                crate::graph::node("plan", "plan_first", "", Some("pre_step"));
+                crate::ui::live_line("[계획]");
                 for b in &resp.content {
                     if let ContentBlock::Text { text } = b {
-                        println!("{text}");
+                        crate::ui::live_line(text);
                     }
                 }
             }
-            Err(e) => eprintln!("계획 단계 실패(계속 진행): {e}"),
+            Err(e) => crate::ui::live_warn(&format!("계획 단계 실패(계속 진행): {e}")),
         }
     }
 
     let use_tools = !binding.tools.is_empty();
     if !use_tools {
         let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
+        messages = crate::packer::pack_messages(
+            &messages,
+            &system,
+            &[],
+            binding.context_window,
+            cfg.file.general.max_tokens,
+            cfg.file.general.max_context_chars,
+        );
         let req = ChatRequest {
             model: binding.model.clone(),
             system,
@@ -550,15 +940,20 @@ pub async fn run_pipeline(
             stream: true,
         };
         let (_name, resp) = stream_with_fallback(cfg, &order, role, req, |piece| {
-            print!("{piece}");
-            let _ = io::stdout().flush();
+            crate::ui::live_chunk(piece);
         })
         .await?;
-        println!();
-        println!(
+        crate::graph::node(
+            "request",
+            &binding.model,
+            &format!("in={} out={}", resp.input_tokens, resp.output_tokens),
+            Some("pre_step"),
+        );
+        crate::ui::live_chunk("\n");
+        crate::ui::live_status(&format!(
             "[tokens] in={} out={} stop={:?}",
             resp.input_tokens, resp.output_tokens, resp.stop_reason
-        );
+        ));
         messages.push(Message {
             role: crate::provider::Role::Assistant,
             content: resp.content.clone(),
@@ -579,24 +974,16 @@ pub async fn run_pipeline(
 
     if !cfg.workspace.exists() {
         std::fs::create_dir_all(&cfg.workspace)?;
-        eprintln!("워크스페이스 폴더를 만들었습니다: {}", cfg.workspace.display());
+        crate::ui::live_line(&format!(
+            "워크스페이스 폴더를 만들었습니다: {}",
+            cfg.workspace.display()
+        ));
     }
-
-    let client = build_provider(cfg, &binding.provider_name).or_else(|_| {
-        let mut last = anyhow!("프로바이더를 만들 수 없습니다");
-        for name in &order {
-            match build_provider(cfg, name) {
-                Ok(c) => return Ok(c),
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
-    })?;
 
     let registry = ToolRegistry::with_names(&binding.tools);
     let mut outcome = agent::run_agent(AgentRun {
         cfg,
-        client: &client,
+        provider_name: &binding.provider_name,
         model: &binding.model,
         task,
         yes,
@@ -604,11 +991,16 @@ pub async fn run_pipeline(
         system: system.clone(),
         registry,
         resume,
+        remote: remote.clone(),
+        local_ask: local_ask.clone(),
+        context_window: binding.context_window,
     })
     .await?;
 
     if binding.verify {
-        outcome = run_verify(cfg, binding, &client, task, yes, system, outcome).await?;
+        crate::graph::node("verify", "start", "", Some("request"));
+        outcome = run_verify(cfg, binding, task, yes, system, outcome, remote, local_ask).await?;
+        crate::graph::node("verify", &outcome.status, "", Some("verify"));
     }
     Ok(outcome)
 }
@@ -616,58 +1008,73 @@ pub async fn run_pipeline(
 async fn run_verify(
     cfg: &Config,
     binding: &Binding,
-    client: &DynProvider,
     task: &str,
     yes: bool,
     system: String,
     mut outcome: AgentOutcome,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
 ) -> Result<AgentOutcome> {
     let mut cmd = binding.verify_command.clone();
     if cmd.trim().is_empty() {
         cmd = auto_verify_command(cfg, &outcome.changed_files);
     }
     if cmd.is_empty() {
-        println!("검증 생략: 자동 감지할 빌드가 없습니다.");
+        crate::ui::live_line("검증 생략: 자동 감지할 빌드가 없습니다.");
         return Ok(outcome);
     }
 
     let bash = ToolRegistry::all();
     let Some(tool) = bash.get("bash") else {
-        println!("검증 생략: bash 도구가 없습니다.");
+        crate::ui::live_line("검증 생략: bash 도구가 없습니다.");
         return Ok(outcome);
     };
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
     ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
     ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
 
+    let yes = agent::effective_yes(yes, &remote);
     for round in 0..3 {
-        println!("[검증] {cmd}");
+        crate::ui::live_line(&format!("[검증] {cmd}"));
         let input = serde_json::json!({"command": cmd});
         if tool.needs_approval(&input) && !yes {
             match tools::approval_preview("bash", &input, &ctx) {
                 Ok(p) => {
-                    println!("{p}");
-                    print!("[y] 이번만  / [n] 거부  / [a] 이번 실행 모두 허용 : ");
-                    let _ = io::stdout().flush();
-                    let mut line = String::new();
-                    io::stdin().read_line(&mut line)?;
-                    let t = line.trim().to_lowercase();
-                    if t == "n" || t == "no" {
-                        println!("검증이 거부되었습니다.");
+                    crate::ui::live_line(&p);
+                    let denied = if let Some(ask) = &local_ask {
+                        !matches!(
+                            ask(p.clone()).await,
+                            crate::agent::ApprovalChoice::Yes | crate::agent::ApprovalChoice::Always
+                        )
+                    } else if let Some(r) = &remote {
+                        let ask = r.ask.clone();
+                        !tokio::time::timeout(r.timeout, (ask)(p.clone()))
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        print!("[y] 이번만  / [n] 거부  / [a] 이번 실행 모두 허용 : ");
+                        let _ = io::stdout().flush();
+                        let mut line = String::new();
+                        io::stdin().read_line(&mut line)?;
+                        let t = line.trim().to_lowercase();
+                        t == "n" || t == "no"
+                    };
+                    if denied {
+                        crate::ui::live_line("검증이 거부되었습니다.");
                         outcome.status = "denied".into();
                         return Ok(outcome);
                     }
                 }
                 Err(e) => {
-                    println!("검증 명령을 실행할 수 없습니다: {e}");
+                    crate::ui::live_line(&format!("검증 명령을 실행할 수 없습니다: {e}"));
                     return Ok(outcome);
                 }
             }
         }
         match tool.run(serde_json::json!({"command": cmd}), &ctx) {
             Ok(out) if !out.contains("[exit") => {
-                println!("검증 성공");
-                println!("{out}");
+                crate::ui::live_line("검증 성공");
+                crate::ui::live_line(&out);
                 return Ok(outcome);
             }
             other => {
@@ -676,14 +1083,17 @@ async fn run_verify(
                     Err(e) => e.to_string(),
                 };
                 if round >= 2 {
-                    println!("검증이 2회 재시도 후에도 실패했습니다.");
-                    println!("{err}");
+                    crate::ui::live_line("검증이 2회 재시도 후에도 실패했습니다.");
+                    crate::ui::live_line(&err);
                     outcome.status = "fail".into();
                     outcome.error = Some(err.chars().take(500).collect());
                     outcome.verify_fail = Some(err.chars().take(500).collect());
                     return Ok(outcome);
                 }
-                println!("검증 실패, 오류를 되먹여 재시도합니다 ({}/2)", round + 1);
+                crate::ui::live_line(&format!(
+                    "검증 실패, 오류를 되먹여 재시도합니다 ({}/2)",
+                    round + 1
+                ));
                 let cause: String = err.chars().take(500).collect();
                 let mut msgs = outcome.messages.clone();
                 if msgs.is_empty() {
@@ -694,14 +1104,17 @@ async fn run_verify(
                 )));
                 let mut next = agent::run_agent(AgentRun {
                     cfg,
-                    client,
-                    model: &binding.model,
+                    provider_name: &binding.provider_name,
+                    model: binding.verify_model.as_deref().unwrap_or(&binding.model),
                     task,
                     yes,
                     max_iterations: binding.max_iterations,
                     system: system.clone(),
                     registry: ToolRegistry::with_names(&binding.tools),
                     resume: Some(msgs),
+                    remote: remote.clone(),
+                    local_ask: local_ask.clone(),
+                    context_window: binding.context_window,
                 })
                 .await?;
                 if next.verify_fail.is_none() {
@@ -768,5 +1181,60 @@ mod tests {
     #[test]
     fn classifies_medium_from_obsidian_flag() {
         assert_eq!(classify_rules("안녕", true), TaskClass::Medium);
+    }
+
+    #[test]
+    fn maps_design_verify_debug_to_existing_classes() {
+        assert_eq!(
+            classify_rules("시스템 구성안을 설계해줘", false),
+            TaskClass::Advanced
+        );
+        assert_eq!(classify_rules("이 코드 검증해줘", false), TaskClass::Dev);
+        assert_eq!(classify_rules("디버깅 좀 도와줘", false), TaskClass::Dev);
+    }
+
+    #[test]
+    fn auto_pick_falls_back_to_registered_only() {
+        let table = crate::ranks::bundled();
+        let regs = vec![
+            crate::auth::RegisteredModel {
+                provider: "grok".into(),
+                id: "grok-3".into(),
+                small: false,
+            },
+            crate::auth::RegisteredModel {
+                provider: "anthropic".into(),
+                id: "claude-haiku-4-5".into(),
+                small: true,
+            },
+        ];
+        let hit = pick_strongest(&regs, &table).expect("ranked");
+        assert!(!hit.id.contains("opus-5"));
+        assert!(!hit.id.contains("gpt-5.6"));
+        assert_eq!(hit.id, "claude-haiku-4-5");
+
+        let only_grok = vec![crate::auth::RegisteredModel {
+            provider: "grok".into(),
+            id: "grok-3".into(),
+            small: false,
+        }];
+        let hit = pick_strongest(&only_grok, &table).expect("grok");
+        assert_eq!(hit.provider, "grok");
+        assert_eq!(hit.id, "grok-3");
+
+        let flagships = vec![
+            crate::auth::RegisteredModel {
+                provider: "anthropic".into(),
+                id: "claude-opus-5".into(),
+                small: false,
+            },
+            crate::auth::RegisteredModel {
+                provider: "openai".into(),
+                id: "gpt-5.6".into(),
+                small: false,
+            },
+        ];
+        let cheap = pick_cheap(&flagships, &table, "anthropic").expect("ok flagship");
+        assert!(cheap.id.contains("opus") || cheap.id.contains("gpt-5.6"));
     }
 }

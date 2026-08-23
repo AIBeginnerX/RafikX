@@ -1,0 +1,143 @@
+# RafikX
+
+터미널과 텔레그램에서 쓰는 **개인용 AI 코딩 에이전트**입니다.
+
+할 일을 말하면 난이도를 나누고, 연결해 둔 모델과 계정 중에서 실행합니다. 같은 모델에 계정을 여러 개 두면 리밋이 난 쪽을 쉬게 하고 다른 계정으로 넘어갑니다.
+
+```text
+rafikx
+rafikx ask "이 폴더 README를 짧게 요약해줘"
+```
+
+Windows · macOS · Linux. 명령 이름은 `rafikx` 입니다.
+
+[설치](docs/INSTALL.md) · [보안](SECURITY.md) · [기여](CONTRIBUTING.md) · [운영 흐름](RAFIKX_WORKFLOW.html)
+
+---
+
+## 한 줄 설치
+
+**macOS / Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.sh | bash
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.ps1 | iex
+```
+
+설치 후:
+
+```bash
+rafikx --version
+rafikx
+```
+
+Rust가 없으면 스크립트가 rustup을 넣습니다. 첫 설치는 컴파일이라 몇 분 걸릴 수 있습니다.  
+저장소가 아직 공개 전이면 [docs/INSTALL.md](docs/INSTALL.md) 의 **로컬 설치**를 쓰세요.
+
+---
+
+## 환경
+
+| | |
+| --- | --- |
+| OS | Windows 10+, macOS 12+, Linux |
+| Rust | 1.85+ (에디션 2024). 한 줄 설치가 처리 |
+| Git | 한 줄 설치에 필요 |
+| 선택 | AI 계정(로그인 또는 키), 텔레그램 봇, [Ollama](https://ollama.com) |
+
+macOS는 Xcode Command Line Tools (`xcode-select --install`)가 필요합니다.  
+Windows는 rustup이 C++ 빌드 도구를 요청할 수 있습니다.
+
+설정 폴더: `~/.rafikx` (Windows는 `%USERPROFILE%\.rafikx`).
+
+---
+
+## 5분 사용
+
+1. `rafikx` — 터미널에서 대화 화면이 열립니다. 처음이면 Zen / Go / Claude 등 하나를 고르고 키를 붙이거나 로그인합니다.
+2. 같은 서비스를 한 번 더 고르면 **계정을 추가**할 수 있습니다 (`rafikx login` 또는 `rafikx settings`).
+3. 한 줄로만 질문하려면 `rafikx ask "안녕"`.
+4. 파일을 고치려면 대화에서 말하거나 `rafikx agent "hello.txt 만들어줘"`.
+5. 폰에서 쓰려면 설정에서 봇 토큰을 넣고 `rafikx telegram`.
+
+| 하고 싶은 일 | 명령 |
+| --- | --- |
+| 대화 화면 | `rafikx` 또는 `rafikx chat` |
+| 연결 | `rafikx login` |
+| 설정 | `rafikx settings` |
+| 상태 점검 | `rafikx doctor` |
+| 한 줄 질문 | `rafikx ask "…"` |
+| 코딩 | `rafikx agent "…"` |
+| 텔레그램 | `rafikx telegram` |
+| 노트 인덱스 | `rafikx index` |
+
+**키와 봇 토큰을 README·이슈·채팅에 붙이지 마세요.**
+
+---
+
+## 하는 일
+
+- **이름 또는 번호**로 프로바이더·모델을 고릅니다. 대화에서는 `/model` `/provider` `/connect`.
+- **자동 하네스**: 설계·검증·디버깅은 등록한 모델 중 추론 순위가 높은 것을 씁니다. 수동으로 바꿀 수 있습니다.
+- **계정 전환**: 리밋이 먼저 끝난 계정을 쓰고, 429면 다음 계정으로 갑니다. 하단에서 사용량을 봅니다.
+- **안전**: 워크스페이스 밖 파일 차단, 위험한 bash 차단, 텔레그램 허용 목록 밖은 무응답, 원격 `--yes` 금지.
+- **기억**: 교훈 주입, Obsidian 검색. Inspector는 코드를 자동으로 고치지 않습니다.
+
+상세 흐름: [RAFIKX_WORKFLOW.html](RAFIKX_WORKFLOW.html) (브라우저에서 열기).
+
+---
+
+## 개발
+
+```bash
+git clone https://github.com/AIBeginnerX/rafikx.git
+cd rafikx
+cargo test --manifest-path agent-harness/Cargo.toml
+cargo install --path agent-harness --force
+```
+
+소스 크레이트 폴더는 `agent-harness/` 입니다. 제품 이름은 RafikX 입니다.
+
+라이선스: [MIT](LICENSE).
+
+---
+
+## 데스크탑 앱
+
+CLI와 **같은 하네스**를 쓰는 가벼운 창입니다 (Tauri 2, Electron 아님). 채팅, 연결/설정, 세션, Obsidian, 실행 그래프.
+
+자세한 설치·빌드: [docs/INSTALL.md](docs/INSTALL.md#데스크탑-앱).
+
+**Windows (이 저장소에서)**
+
+```powershell
+powershell -File scripts/build-desktop.ps1
+```
+
+끝나면 `desktop/src-tauri/target/release/bundle/nsis/` 아래 `RafikX_*_x64-setup.exe` 가 생깁니다.
+
+**macOS**
+
+```bash
+chmod +x scripts/build-desktop.sh
+./scripts/build-desktop.sh dmg
+```
+
+**Linux**
+
+```bash
+./scripts/build-desktop.sh appimage,deb,rpm
+```
+
+Linux는 WebKitGTK 개발 패키지가 필요합니다 (`libwebkit2gtk-4.1-dev` 등). 개발 실행:
+
+```bash
+cargo tauri dev --config desktop/src-tauri/tauri.conf.json
+# 또는
+cd desktop/src-tauri && cargo tauri dev
+```

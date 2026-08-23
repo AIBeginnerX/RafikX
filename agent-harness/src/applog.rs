@@ -3,13 +3,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 pub fn log_file_path() -> Result<PathBuf> {
-    let dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("홈 폴더를 찾을 수 없습니다"))?
-        .join(".agent-harness")
-        .join("logs");
+    let dir = crate::config::Config::data_dir()?.join("logs");
     fs::create_dir_all(&dir)?;
     Ok(dir.join("agent.log"))
 }

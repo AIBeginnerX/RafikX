@@ -1,2 +1,22 @@
 .~lock.*
 *.docx.bak
+.DS_Store
+Thumbs.db
+*.swp
+
+# Rust
+target/
+**/*.pdb
+
+# Secrets — never commit
+.env
+.env.*
+secrets.toml
+auth.json
+usage.json
+accounts.json
+
+# Local scratch
+*.log
+.rafikx-src/
+desktop/dist/

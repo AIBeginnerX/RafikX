@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "RafikX desktop window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default"
+  ]
+}

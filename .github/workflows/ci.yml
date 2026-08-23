@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: test (default / telegram)
+        run: cargo test --manifest-path agent-harness/Cargo.toml --locked
+      - name: test (core, no telegram)
+        run: cargo test --manifest-path agent-harness/Cargo.toml --locked --no-default-features
+      - name: check help
+        run: cargo run --manifest-path agent-harness/Cargo.toml --locked -- --version
+      - name: check desktop (Windows)
+        if: runner.os == 'Windows'
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml

@@ -1,3 +1,3 @@
-완료: Phase 5 — chat REPL(/save /quit /resume /list)·sessions 저장·교훈(lessons) 주입·비동기 리플렉션·list/add/rm/clear.
-다음: Phase 6 (Inspector). API 키 없으면 리플렉션·chat 실제 LLM 호출은 스킵됨. 수동 lessons add 는 키 없이 동작.
-이슈: GitHub origin 없음. rustyline 미사용(SPEC: 승인 후, stdin 기본).
+완료: Anthropic 5개 쌓임 원인 분석·고아 계정 자동 정리·중복 OAuth 차단·연결 마법사 중복 방지. 실제 데이터는 anthropic::3+openai 2개만 남김.
+다음: 새 rafikx.exe(8/20 빌드) 사용. Anthropic 다시 쓰려면 설정에서 enabled 켜기.
+이슈: 예전 rafikx.exe(8/16)는 정리 기능 없음. target\release\rafikx.exe 를 쓰세요.

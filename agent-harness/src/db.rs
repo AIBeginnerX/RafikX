@@ -62,6 +62,23 @@ impl Db {
               lesson TEXT NOT NULL,
               weight INTEGER NOT NULL DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS reports (
+              id TEXT PRIMARY KEY,
+              created_at INTEGER NOT NULL,
+              summary TEXT NOT NULL,
+              body_path TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS graph_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL,
+              seq INTEGER NOT NULL,
+              kind TEXT NOT NULL,
+              label TEXT NOT NULL,
+              detail TEXT NOT NULL DEFAULT '',
+              parent TEXT,
+              created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_graph_run ON graph_events(run_id, seq);
             "#,
         )?;
         let db = Self { conn };
@@ -385,6 +402,57 @@ impl Db {
         Ok(out)
     }
 
+    pub fn latest_run_id(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn push_graph_event(
+        &self,
+        run_id: &str,
+        kind: &str,
+        label: &str,
+        detail: &str,
+        parent: Option<&str>,
+    ) -> Result<()> {
+        let seq: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM graph_events WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO graph_events (run_id, seq, kind, label, detail, parent, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![run_id, seq, kind, label, detail, parent, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    pub fn graph_events(&self, run_id: &str) -> Result<Vec<GraphEventRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, kind, label, detail, parent FROM graph_events WHERE run_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(GraphEventRow {
+                seq: r.get(0)?,
+                kind: r.get(1)?,
+                label: r.get(2)?,
+                detail: r.get(3)?,
+                parent: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn add_lesson(
         &self,
         trigger: &str,
@@ -538,6 +606,73 @@ impl Db {
         out.sort_by(|a, b| b.weight.cmp(&a.weight).then(b.last_hit.cmp(&a.last_hit)));
         Ok(out)
     }
+
+    pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, started_at, mode, class, subagent, provider, model, task, iterations, input_tokens, output_tokens, status, error \
+             FROM runs ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok(RunRow {
+                id: r.get(0)?,
+                started_at: r.get(1)?,
+                mode: r.get(2)?,
+                class: r.get(3)?,
+                subagent: r.get(4)?,
+                provider: r.get(5)?,
+                model: r.get(6)?,
+                task: r.get(7)?,
+                iterations: r.get(8)?,
+                input_tokens: r.get(9)?,
+                output_tokens: r.get(10)?,
+                status: r.get(11)?,
+                error: r.get(12)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    #[allow(dead_code)]
+    pub fn tokens_since(&self, since: i64) -> Result<(i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM runs WHERE started_at >= ?1",
+                [since],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn save_report(&self, id: &str, summary: &str, body_path: &str) -> Result<()> {
+        let now = now_secs();
+        self.conn.execute(
+            "INSERT INTO reports (id, created_at, summary, body_path) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, now, summary, body_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_report(&self) -> Result<Option<ReportRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, created_at, summary, body_path FROM reports ORDER BY created_at DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok(ReportRow {
+                        id: r.get(0)?,
+                        created_at: r.get(1)?,
+                        summary: r.get(2)?,
+                        body_path: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +684,47 @@ pub struct SessionRow {
     pub updated_at: i64,
     pub title: Option<String>,
     pub messages_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphEventRow {
+    pub seq: i64,
+    pub kind: String,
+    pub label: String,
+    pub detail: String,
+    pub parent: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunRow {
+    #[allow(dead_code)]
+    pub id: String,
+    #[allow(dead_code)]
+    pub started_at: i64,
+    #[allow(dead_code)]
+    pub mode: String,
+    pub class: Option<String>,
+    #[allow(dead_code)]
+    pub subagent: Option<String>,
+    pub provider: Option<String>,
+    #[allow(dead_code)]
+    pub model: Option<String>,
+    #[allow(dead_code)]
+    pub task: String,
+    pub iterations: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReportRow {
+    pub id: String,
+    #[allow(dead_code)]
+    pub created_at: i64,
+    pub summary: String,
+    pub body_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -627,7 +803,7 @@ mod tests {
     #[test]
     fn lesson_add_and_inject() {
         let dir = std::env::temp_dir().join(format!(
-            "agent-harness-lesson-{}",
+            "rafikx-lesson-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

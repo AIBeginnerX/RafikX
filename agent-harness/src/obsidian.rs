@@ -62,23 +62,29 @@ pub fn index_vault(cfg: &Config) -> Result<IndexStats> {
 }
 
 pub fn search_print(cfg: &Config, query: &str) -> Result<()> {
+    let text = search_text(cfg, query)?;
+    println!("{text}");
+    Ok(())
+}
+
+pub fn search_text(cfg: &Config, query: &str) -> Result<String> {
     let db = open_notes_db(cfg)?;
     db.ensure_notes_fts(&cfg.file.obsidian.tokenizer)?;
     let hits = db.search_notes(query, 10)?;
     if hits.is_empty() {
-        println!("검색 결과 없음");
-        return Ok(());
+        return Ok("검색 결과 없음".into());
     }
+    let mut out = String::new();
     for (i, h) in hits.iter().enumerate() {
-        println!("{}. {}  ({})", i + 1, h.title, h.path);
+        out.push_str(&format!("{}. {}  ({})\n", i + 1, h.title, h.path));
         if !h.tags.is_empty() {
-            println!("   tags: {}", h.tags);
+            out.push_str(&format!("   tags: {}\n", h.tags));
         }
         if !h.excerpt.trim().is_empty() {
-            println!("   {}", h.excerpt.replace('\n', " "));
+            out.push_str(&format!("   {}\n", h.excerpt.replace('\n', " ")));
         }
     }
-    Ok(())
+    Ok(out.trim_end().to_string())
 }
 
 pub fn format_tool_results(hits: &[NoteHit]) -> String {
@@ -103,7 +109,7 @@ pub fn ask_context(cfg: &Config, query: &str) -> Result<AskContext> {
     let hits = db.search_notes(query, 5)?;
     if hits.is_empty() {
         return Ok(AskContext {
-            block: "[Obsidian 컨텍스트]\n인덱스가 비어 있거나 일치하는 노트가 없습니다. 먼저 `agent-harness index` 를 실행하세요.".into(),
+            block: "[Obsidian 컨텍스트]\n인덱스가 비어 있거나 일치하는 노트가 없습니다. 먼저 `rafikx index` 를 실행하세요.".into(),
             sources: Vec::new(),
         });
     }
@@ -149,6 +155,51 @@ pub fn ask_context(cfg: &Config, query: &str) -> Result<AskContext> {
 }
 
 pub async fn watch_vault(cfg: &Config) -> Result<()> {
+    watch_vault_loop(cfg, true).await
+}
+
+/// Same watcher as the CLI, but stop when `cancel` becomes true (desktop).
+pub async fn watch_vault_until(cfg: &Config, mut cancel: tokio::sync::watch::Receiver<bool>) -> Result<String> {
+    let vault = vault_dir(cfg)?;
+    let path = vault.display().to_string();
+    let db = open_notes_db(cfg)?;
+    db.ensure_notes_fts(&cfg.file.obsidian.tokenizer)?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DebounceEventResult>();
+    let mut debouncer = new_debouncer(Duration::from_secs(1), move |res: DebounceEventResult| {
+        let _ = tx.send(res);
+    })
+    .map_err(|e| anyhow!("파일 감시를 시작하지 못했습니다: {e}"))?;
+    debouncer
+        .watcher()
+        .watch(&vault, RecursiveMode::Recursive)
+        .map_err(|e| anyhow!("Vault를 감시할 수 없습니다: {e}"))?;
+
+    loop {
+        tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    break;
+                }
+            }
+            Some(res) = rx.recv() => {
+                match res {
+                    Ok(events) => {
+                        for ev in events {
+                            if let Err(e) = handle_watch_event(&db, &vault, &ev.path) {
+                                crate::ui::live_warn(&format!("감시 처리 오류 ({}): {e}", ev.path.display()));
+                            }
+                        }
+                    }
+                    Err(e) => crate::ui::live_warn(&format!("감시 오류: {e:?}")),
+                }
+            }
+        }
+    }
+    Ok(path)
+}
+
+async fn watch_vault_loop(cfg: &Config, stop_on_ctrl_c: bool) -> Result<()> {
     let vault = vault_dir(cfg)?;
     let db = open_notes_db(cfg)?;
     db.ensure_notes_fts(&cfg.file.obsidian.tokenizer)?;
@@ -166,7 +217,7 @@ pub async fn watch_vault(cfg: &Config) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = tokio::signal::ctrl_c(), if stop_on_ctrl_c => {
                 println!("감시를 종료합니다.");
                 break;
             }
