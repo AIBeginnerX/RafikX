@@ -68,6 +68,8 @@ enum Commands {
         /// 작업 지시
         prompt: String,
     },
+    /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
+    Update,
     /// Vault 노트를 FTS5에 인덱싱
     Index,
     /// Vault 노트 검색
@@ -237,6 +239,7 @@ async fn main() -> ExitCode {
         Some(Commands::Chat { list, resume }) => {
             cmd_chat_entry(&cli, *list, resume.clone()).await
         }
+        Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
         Some(Commands::Inspect {
             last,
@@ -927,7 +930,14 @@ async fn cmd_chat_entry(cli: &Cli, list: bool, resume: Option<String>) -> Result
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // U 키로 업그레이드가 요청됐으면 에이전트를 나와서 단독으로 진행한다.
+                if rafikx::update::take_update_request() {
+                    println!();
+                    return rafikx::update::run_update_flow();
+                }
+                return Ok(());
+            }
             Err(err) => {
                 eprintln!("화면을 열지 못했습니다 ({err:#}). 줄 단위 대화로 전환합니다.");
             }

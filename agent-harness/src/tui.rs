@@ -199,13 +199,9 @@ pub async fn run(
 
     // 새 릴리스 확인 — 네트워크 조회가 시작을 막지 않도록 백그라운드로 돌린다.
     let (upd_tx, mut upd_rx) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
-        let checked = tokio::time::timeout(
-            Duration::from_secs(10),
-            crate::update::latest_release(),
-        )
-        .await;
-        if let Ok(Ok(rel)) = checked {
+    // 동기 조회(git/gh)라 별도 스레드에서 — 시작을 막지 않는다.
+    std::thread::spawn(move || {
+        if let Ok(rel) = crate::update::latest_release() {
             let current = env!("CARGO_PKG_VERSION");
             if let Some(notice) = crate::update::upgrade_notice(&rel, current) {
                 let _ = upd_tx.send(notice);
@@ -1002,69 +998,16 @@ fn history_next(app: &mut App) {
     app.cursor = app.input.len();
 }
 
-/// U 키로 릴리스 업그레이드를 진행한다 (~/.rafikx-src pull + cargo install).
+/// U 키 — 업그레이드 요청을 남기고 에이전트를 종료하면 main 이 `rafikx update` 흐름을 실행한다.
 fn start_upgrade(app: &mut App) {
     if app.upgrading {
         return;
     }
     app.upgrading = true;
-    let tag = app.upgrade.clone().unwrap_or_default();
-    app.status = format!("v{tag} 업그레이드 중… (완료까지 몇 분)");
-    crate::ui::live_line("업그레이드를 시작합니다. 진행 상황은 아래에 표시됩니다.");
-    tokio::spawn(async move {
-        let result = run_upgrade().await;
-        match result {
-            Ok(_) => crate::ui::live_line(&format!("[upgrade-ok] v{tag}")),
-            Err(e) => {
-                crate::ui::live_warn(&format!("업그레이드 실패: {e:#}"));
-                crate::ui::live_line(&format!(
-                    "수동 명령어: {}",
-                    crate::update::upgrade_command()
-                ));
-            }
-        }
-        crate::ui::live_line("[upgrade-done]");
-    });
-}
-
-async fn run_upgrade() -> Result<()> {
-    use tokio::process::Command;
-    let script = r#"
-set -e
-SRC="$HOME/.rafikx-src"
-if [ -d "$SRC/.git" ]; then
-  git -C "$SRC" fetch --depth 1 origin master
-  git -C "$SRC" checkout -q master
-  git -C "$SRC" reset -q --hard origin/master
-else
-  echo "NO_SRC"
-  exit 2
-fi
-cargo install --path "$SRC/agent-harness" --locked --force
-"#;
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .await?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let tail: String = String::from_utf8_lossy(&out.stderr)
-            .lines()
-            .rev()
-            .take(5)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("
-");
-        if String::from_utf8_lossy(&out.stdout).contains("NO_SRC") {
-            anyhow::bail!("표준 설치 경로(~/.rafikx-src)가 없습니다. 아래 명령어로 직접 설치하세요");
-        }
-        anyhow::bail!("{}", tail)
-    }
+    crate::update::request_update();
+    app.quit = true;
+    app.status = "종료 후 업데이트를 실행합니다…".into();
+    push(app, EntryKind::System, "에이전트를 종료하고 업데이트를 실행합니다. 곧 화면이 전환됩니다.");
 }
 
 fn open_model_picker(app: &mut App) {

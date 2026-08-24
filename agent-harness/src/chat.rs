@@ -156,14 +156,9 @@ pub fn open_session(
         // 별도 스레드에서 확인 (TUI의 async 런타임을 막지 않는다)
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            if let Ok(rt) = rt {
-                let _ = tx.send(rt.block_on(crate::update::latest_release()));
-            }
+            let _ = tx.send(crate::update::latest_release());
         });
-        let checked = rx.recv_timeout(std::time::Duration::from_secs(4)).ok();
+        let checked = rx.recv_timeout(std::time::Duration::from_secs(6)).ok();
         if let Some(Ok(rel)) = checked {
             if let Some(notice) = crate::update::upgrade_notice(&rel, env!("CARGO_PKG_VERSION")) {
                 for line in notice.lines() {

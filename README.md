@@ -76,6 +76,15 @@ Windows는 rustup이 C++ 빌드 도구를 요청할 수 있습니다.
 
 설정 폴더: `~/.rafikx` (Windows는 `%USERPROFILE%\.rafikx`).
 
+### 업데이트 확인 · 업그레이드
+
+```bash
+rafikx update
+```
+
+실행하면 GitHub 의 최신 태그·릴리스를 확인해 핵심 변경사항을 보여주고, 확인(Y)하면 소스를 받아 재설치합니다.
+대화 화면에서도 새 버전이 감지되면 요약과 함께 안내가 뜨고, **U 키**를 누르면 에이전트를 종료한 뒤 `rafikx update` 흐름으로 이어집니다.
+
 ### 자동 로그인 가져오기 (OAuth)
 
 Claude Code · Codex CLI · Gemini CLI 중 하나라도 로컬에 로그인돼 있으면,

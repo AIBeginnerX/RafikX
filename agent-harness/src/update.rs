@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 pub const REPO_API: &str = "https://api.github.com/repos/AIBeginnerX/RafikX/releases/latest";
-pub const REPO_TAGS_API: &str = "https://api.github.com/repos/AIBeginnerX/RafikX/tags";
+const GIT_URL: &str = "https://github.com/AIBeginnerX/RafikX.git";
 
 #[derive(Debug, Clone)]
 pub struct Release {
@@ -24,61 +24,71 @@ struct GhRelease {
     html_url: String,
 }
 
-async fn get_json(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
-    let resp = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| anyhow!("조회 실패: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("HTTP {}", resp.status()));
+/// 최신 릴리스를 조회한다 (동기).
+/// 비공개 저장소 대응: 먼저 gh CLI 로 releases/latest 를 시도하고,
+/// 없으면 git 자격증명으로 `git ls-remote --tags` 에서 최신 semver 태그를 고른다.
+pub fn latest_release() -> Result<Release> {
+    use std::process::Command;
+    if let Ok(out) = Command::new("gh").args(["api", REPO_API]).output() {
+        if out.status.success() {
+            if let Ok(gh) = serde_json::from_slice::<GhRelease>(&out.stdout) {
+                return Ok(Release {
+                    tag: gh.tag_name,
+                    name: gh.name.unwrap_or_default(),
+                    notes: gh.body.unwrap_or_default(),
+                    url: gh.html_url,
+                });
+            }
+        }
     }
-    Ok(resp)
+    let out = Command::new("git")
+        .args(["ls-remote", "--tags", GIT_URL])
+        .output()
+        .map_err(|e| anyhow!("git ls-remote 실패: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "태그 조회 실패: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let best = text
+        .lines()
+        .filter_map(|l| l.rsplit('/').next())
+        .filter_map(|t| {
+            t.parse::<SemverKey>()
+                .ok()
+                .map(|k| (t.to_string(), k))
+        })
+        .max_by(|a, b| a.1.cmp(&b.1));
+    let Some((tag, _)) = best else {
+        return Err(anyhow!("태그가 없습니다"));
+    };
+    Ok(Release {
+        tag,
+        name: String::new(),
+        notes:
+            "공개 릴리스 노트가 없습니다. 전체 변경사항은 https://github.com/AIBeginnerX/RafikX/blob/master/README.md".into(),
+        url: "https://github.com/AIBeginnerX/RafikX/releases".into(),
+    })
 }
 
-/// 최신 릴리스를 조회한다. 공개 릴리스가 없으면 최신 태그로 폴백한다(변경사항 요약은 없음).
-pub async fn latest_release() -> Result<Release> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .user_agent("RafikX/+update-check")
-        .build()?;
-    match get_json(&client, REPO_API).await {
-        Ok(resp) => {
-            let gh: GhRelease = resp
-                .json()
-                .await
-                .map_err(|e| anyhow!("릴리스 해석 실패: {e}"))?;
-            Ok(Release {
-                tag: gh.tag_name,
-                name: gh.name.unwrap_or_default(),
-                notes: gh.body.unwrap_or_default(),
-                url: gh.html_url,
-            })
-        }
-        Err(_) => {
-            // 폴백: 태그 목록의 첫 항목 (GitHub 는 최신순으로 돌려준다)
-            #[derive(Deserialize)]
-            struct Tag {
-                name: String,
-            }
-            let resp = get_json(&client, REPO_TAGS_API).await?;
-            let tags: Vec<Tag> = resp
-                .json()
-                .await
-                .map_err(|e| anyhow!("태그 해석 실패: {e}"))?;
-            tags.first()
-                .map(|t| Release {
-                    tag: t.name.clone(),
-                    name: String::new(),
-                    notes: format!(
-                        "공개 릴리스 노트가 없습니다. 변경사항은 https://github.com/AIBeginnerX/RafikX/compare/{}...{} 에서 볼 수 있습니다.",
-                        t.name, "HEAD"
-                    ),
-                    url: format!("https://github.com/AIBeginnerX/RafikX/releases/tag/{}", t.name),
-                })
-                .ok_or_else(|| anyhow!("태그가 없습니다"))
-        }
+/// vX.Y.Z 태그 정렬용 키.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SemverKey(Vec<u64>);
+
+impl std::str::FromStr for SemverKey {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let nums: Vec<u64> = s
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .split('.')
+            .take(3)
+            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u64>())
+            .collect::<Result<_, _>>()?;
+        Ok(SemverKey(nums))
     }
 }
 
@@ -123,6 +133,16 @@ pub fn summarize_notes(notes: &str, max_lines: usize) -> Vec<String> {
 
 /// 표준 설치 경로(~/.rafikx-src)에서 최신 소스를 받아 설치하는 명령.
 static LAST_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// TUI 에서 U 키로 요청하면 기록하고, 에이전트 종료 후 main 이 소비한다.
+static UPDATE_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn request_update() {
+    UPDATE_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn take_update_request() -> bool {
+    UPDATE_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
 
 /// TUI 가 U 키 동작에 쓰도록 감지된 최신 태그를 저장해 둔다.
 pub fn last_seen_tag() -> Option<String> {
@@ -153,9 +173,70 @@ pub fn upgrade_notice(release: &Release, current: &str) -> Option<String> {
     if !release.url.is_empty() {
         out.push(release.url.clone());
     }
-    out.push(format!("명령어: {}", upgrade_command()));
-    out.push("지금 업그레이드하려면 U 키를 누르세요.".into());
+    out.push("명령어: rafikx update".into());
+    out.push("지금 업그레이드하려면 U 키를 누르세요 (에이전트가 종료되며 업데이트가 실행됩니다).".into());
     Some(out.join("\n"))
+}
+
+/// rafikx update 서브커맨드 본체 — 에이전트 밖에서 단독 실행된다.
+/// GitHub 확인 → 요약 출력 → ~/.rafikx-src 갱신 후 cargo install (진행 출력 그대로 스트리밍).
+pub fn run_update_flow() -> anyhow::Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("현재 버전 v{current} — GitHub 확인 중…");
+    let rel = latest_release()?;
+    if !is_newer(&rel.tag, current) {
+        println!("최신 버전입니다 (v{current} == {}).", rel.tag);
+        return Ok(());
+    }
+    println!("새 버전 {} 이 있습니다.", rel.tag);
+    for line in summarize_notes(&rel.notes, 8) {
+        println!("· {line}");
+    }
+    println!();
+    print!("v{current} → {} 업그레이드를 진행할까요? [Y/n] ", rel.tag);
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    let mut ans = String::new();
+    std::io::stdin().read_line(&mut ans)?;
+    let ans = ans.trim().to_lowercase();
+    if !ans.is_empty() && ans != "y" && ans != "yes" {
+        println!("취소했습니다. 나중에 `rafikx update` 로 다시 진행하세요.");
+        return Ok(());
+    }
+    perform_install()
+}
+
+fn perform_install() -> anyhow::Result<()> {
+    use std::process::Command;
+    let script = r#"
+set -e
+SRC="$HOME/.rafikx-src"
+if [ -d "$SRC/.git" ]; then
+  git -C "$SRC" fetch --depth 1 origin master
+  git -C "$SRC" checkout -q master
+  git -C "$SRC" reset -q --hard origin/master
+else
+  echo "NO_SRC"
+  exit 2
+fi
+cargo install --path "$SRC/agent-harness" --locked --force
+"#;
+    // 상속된 stdio — cargo·git 진행 출력이 터미널에 그대로 흐른다.
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .status()?;
+    if !status.success() {
+        if let Some(2) = status.code() {
+            anyhow::bail!(
+                "표준 설치 경로(~/.rafikx-src)가 없습니다. 수동 설치: git clone https://github.com/AIBeginnerX/RafikX.git ~/.rafikx-src && cargo install --path ~/.rafikx-src/agent-harness --locked --force"
+            );
+        }
+        anyhow::bail!("업그레이드 실패 (exit {})", status.code().unwrap_or(-1));
+    }
+    println!();
+    println!("업그레이드 완료 — `rafikx` 를 다시 실행하세요.");
+    Ok(())
 }
 
 #[cfg(test)]
