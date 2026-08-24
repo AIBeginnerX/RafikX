@@ -232,6 +232,18 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
 
         if e.kind == EntryKind::Assistant {
             for seg in markdown_segs(&text) {
+                // 코드블록은 oh-my-pi 스타일 syntax highlighting 으로 그린다.
+                if seg.kind == MdKind::CodeBlock {
+                    push_code_rows(
+                        &mut lines,
+                        &seg.text,
+                        seg.lang.as_deref(),
+                        th,
+                        &tag_pad,
+                        &mut first,
+                    );
+                    continue;
+                }
                 let st = match seg.kind {
                     MdKind::Heading => Style::default()
                         .fg(th.accent)
@@ -417,6 +429,95 @@ fn append_alert_spans(spans: &mut Vec<Span<'static>>, text: &str, th: &Pal) {
     if rest_start < text.len() {
         spans.push(Span::styled(text[rest_start..].to_string(), err_style));
     }
+}
+
+/// 코드블록을 syntax highlighting 한 뒤 트랜스크립트 행으로 붙인다.
+fn push_code_rows(
+    lines: &mut Vec<Line<'static>>,
+    code: &str,
+    lang: Option<&str>,
+    th: &Pal,
+    tag_pad: &str,
+    first: &mut bool,
+) {
+    for row_spans in highlight_code(code, lang, th) {
+        let mut all: Vec<Span> = Vec::with_capacity(row_spans.len() + 1);
+        if *first {
+            all.push(Span::styled(
+                format!(" {tag_pad}|"),
+                Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+            ));
+            *first = false;
+        } else {
+            all.push(Span::styled("        |", Style::default().fg(th.mute)));
+        }
+        all.extend(row_spans);
+        lines.push(Line::from(all));
+    }
+}
+
+/// syntect 로 토큰별 착색한 코드 행 — 패널 배경 위에 oh-my-pi 처럼 색이 입혀진다.
+fn highlight_code(code: &str, lang: Option<&str>, th: &Pal) -> Vec<Vec<Span<'static>>> {
+    use std::sync::OnceLock;
+    use syntect::easy::HighlightLines;
+    use syntect::highlighting::ThemeSet;
+    use syntect::parsing::SyntaxSet;
+
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    static THEMES: OnceLock<ThemeSet> = OnceLock::new();
+    let ss = SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_nonewlines);
+    let ts = THEMES.get_or_init(syntect::highlighting::ThemeSet::load_defaults);
+    let theme = ts
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| ts.themes.values().next());
+    let Some(theme) = theme else {
+        return vec![vec![Span::styled(
+            code.to_string(),
+            Style::default().fg(th.code).bg(th.panel),
+        )]];
+    };
+    let syntax = lang
+        .and_then(|l| ss.find_syntax_by_token(l))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut hl = HighlightLines::new(syntax, theme);
+
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    for row in code.split('\n') {
+        let ranges = match hl.highlight_line(row, ss) {
+            Ok(r) => r,
+            Err(_) => {
+                return vec![vec![Span::styled(
+                    code.to_string(),
+                    Style::default().fg(th.code).bg(th.panel),
+                )]];
+            }
+        };
+        let mut spans: Vec<Span> = Vec::with_capacity(ranges.len() + 1);
+        for (style, chunk) in ranges {
+            if chunk.is_empty() {
+                continue;
+            }
+            spans.push(Span::styled(
+                chunk.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(
+                        style.foreground.r,
+                        style.foreground.g,
+                        style.foreground.b,
+                    ))
+                    .bg(th.panel),
+            ));
+        }
+        if spans.is_empty() {
+            spans.push(Span::styled(" ".to_string(), Style::default().bg(th.panel)));
+        }
+        out.push(spans);
+    }
+    if out.is_empty() {
+        out.push(vec![Span::styled(" ".to_string(), Style::default().bg(th.panel))]);
+    }
+    out
 }
 
 /// 모델의 사고 블록(<think>…</think>)을 화면에서 숨긴다. 미완결 블록도 숨김.

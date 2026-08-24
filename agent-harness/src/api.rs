@@ -483,11 +483,11 @@ pub async fn remote_models(provider: &str) -> Result<Vec<String>> {
     auth::list_remote_models(&cfg, provider).await
 }
 
-/// 하네스 엔진 저장 (rafikx | deepseek).
+/// 하네스 엔진 저장 (rafikx | deepseek | dk | pi).
 pub fn set_engine(name: &str) -> Result<String> {
     let e = name.trim().to_ascii_lowercase();
-    if !matches!(e.as_str(), "rafikx" | "deepseek") {
-        anyhow::bail!("엔진은 rafikx|deepseek 중 하나여야 합니다");
+    if !crate::chat::is_valid_engine(&e) {
+        anyhow::bail!("엔진은 rafikx|deepseek|dk|pi 중 하나여야 합니다");
     }
     let cfg = Config::load(None)?;
     crate::config::write_toml_key(
@@ -496,14 +496,13 @@ pub fn set_engine(name: &str) -> Result<String> {
         "engine",
         &crate::config::toml_string(&e),
     )?;
-    Ok(format!(
-        "하네스 엔진: {e}{}",
-        if e == "deepseek" {
-            " — 모든 도구 작업을 단계별(todo) 실행합니다"
-        } else {
-            " — 기본 파이프라인"
-        }
-    ))
+    let note = match e.as_str() {
+        "dk" => " — DeepSeek DSH 호환 모드(단계별 실행)",
+        "pi" => " — oh-my-pi 스타일 모드",
+        "deepseek" => " — 모든 도구 작업을 단계별(todo) 실행합니다",
+        _ => " — 기본 파이프라인",
+    };
+    Ok(format!("하네스 엔진: {e}{note}"))
 }
 
 /// 하네스 선정 모드 저장 (auto | manual).

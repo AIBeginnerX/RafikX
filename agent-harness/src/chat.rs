@@ -1174,6 +1174,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn engine_slash_end_to_end() {
+        let cfg_path = Config::load(None).expect("config");
+        let mut s = Session {
+            cfg: cfg_path,
+            yes: true,
+            provider: None,
+            model: None,
+            class: None,
+            mode: "build".into(),
+            session_id: None,
+            messages: vec![],
+            obsidian_on: false,
+            attachments: vec![],
+            dirty: false,
+            sticky: None,
+        };
+
+        // pi 엔진 — 정상 저장되어야 한다.
+        let out = handle_slash(&mut s, "/engine pi", false).expect("ok");
+        assert!(matches!(out, Slash::Continue(_)));
+        assert_eq!(s.cfg.file.general.engine, "pi");
+
+        // dk 엔진 — 정상 저장되어야 한다.
+        let out = handle_slash(&mut s, "/engine dk", false).expect("ok");
+        assert!(matches!(out, Slash::Continue(_)));
+        assert_eq!(s.cfg.file.general.engine, "dk");
+
+        // 미지원 값 — 거부 안내를 반환한다.
+        let out = handle_slash(&mut s, "/engine nope", false).expect("ok");
+        match out {
+            Slash::Continue(notes) => {
+                assert!(notes.iter().any(|n| n.contains("rafikx|deepseek|dk|pi")));
+            }
+            _ => panic!("expected Continue"),
+        }
+
+        // rafikx 로 원복해 테스트 흔적을 정리한다.
+        let _ = handle_slash(&mut s, "/engine rafikx", false);
+        assert_eq!(s.cfg.file.general.engine, "rafikx");
+    }
+
+    #[test]
     fn engine_slash_accepts_dk_and_pi_only() {
         assert!(is_valid_engine("rafikx"));
         assert!(is_valid_engine("deepseek"));

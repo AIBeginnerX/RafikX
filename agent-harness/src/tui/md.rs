@@ -62,13 +62,32 @@ pub enum MdKind {
 pub struct MdSeg {
     pub kind: MdKind,
     pub text: String,
+    /// 코드블록 언어 태그(```rust 등) — syntax highlighting 에 사용.
+    pub lang: Option<String>,
+}
+
+impl MdSeg {
+    fn plain(kind: MdKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+            lang: None,
+        }
+    }
+
+    fn with_lang(kind: MdKind, text: impl Into<String>, lang: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+            lang: Some(lang.into()),
+        }
+    }
 }
 
 /// Lightweight markdown split for TUI styling. Not a full parser.
 pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
     let lines: Vec<&str> = input.lines().collect();
     let mut out: Vec<MdSeg> = Vec::new();
-    let mut in_fence = false;
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i];
@@ -83,33 +102,26 @@ pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
                     i += 1;
                 }
                 i += 1; // 닫는 fence 소비
-                out.push(MdSeg {
-                    kind: MdKind::Chart,
-                    text: render_chart(&body),
-                });
+                out.push(MdSeg::plain(MdKind::Chart, render_chart(&body)));
                 continue;
             }
-            in_fence = !in_fence;
-            out.push(MdSeg {
-                kind: MdKind::CodeBlock,
-                text: line.to_string(),
-            });
+            // 일반 코드블록 — fence 전체를 하나의 세그먼트로 묶어 하이라이팅한다.
             i += 1;
-            continue;
-        }
-        if in_fence {
-            out.push(MdSeg {
-                kind: MdKind::CodeBlock,
-                text: line.to_string(),
+            let mut body: Vec<&str> = Vec::new();
+            while i < lines.len() && !lines[i].starts_with("```") {
+                body.push(lines[i]);
+                i += 1;
+            }
+            i += 1; // 닫는 fence 소비 (없으면 EOF)
+            out.push(if lang.is_empty() {
+                MdSeg::plain(MdKind::CodeBlock, body.join("\n"))
+            } else {
+                MdSeg::with_lang(MdKind::CodeBlock, body.join("\n"), lang)
             });
-            i += 1;
             continue;
         }
         if line.starts_with('#') {
-            out.push(MdSeg {
-                kind: MdKind::Heading,
-                text: line.to_string(),
-            });
+            out.push(MdSeg::plain(MdKind::Heading, line));
             i += 1;
             continue;
         }
@@ -121,20 +133,14 @@ pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
                 rows.push(split_row(lines[i]));
                 i += 1;
             }
-            out.push(MdSeg {
-                kind: MdKind::Table,
-                text: render_grid(&rows),
-            });
+            out.push(MdSeg::plain(MdKind::Table, render_grid(&rows)));
             continue;
         }
         push_inline(line, &mut out);
         i += 1;
     }
     if out.is_empty() {
-        out.push(MdSeg {
-            kind: MdKind::Text,
-            text: String::new(),
-        });
+        out.push(MdSeg::plain(MdKind::Text, ""));
     }
     upgrade_fenced_tables(&mut out);
     out
@@ -192,43 +198,27 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
-/// 모델이 표를 ``` 블록 안에 통째로 담는 경우가 흔하다 — 본문이 전부 표 행이면
-/// 코드블록을 정렬 그리드로 승격시킨다.
+/// 코드블록 안에 통째로 담긴 표(모델이 흔히 그렇게 출력함)도 그리드로 승격시킨다.
 fn upgrade_fenced_tables(out: &mut Vec<MdSeg>) {
-    let mut i = 0usize;
-    while i < out.len() {
-        if !out[i].text.starts_with("```") || out[i].kind != MdKind::CodeBlock {
-            i += 1;
+    for i in 0..out.len() {
+        if out[i].kind != MdKind::CodeBlock {
             continue;
         }
-        let mut j = i + 1;
-        let mut body: Vec<String> = Vec::new();
-        let mut closed = false;
-        while j < out.len() {
-            if out[j].kind == MdKind::CodeBlock && out[j].text.starts_with("```") {
-                closed = true;
-                break;
-            }
-            body.push(out[j].text.clone());
-            j += 1;
+        let body_lines: Vec<&str> = out[i].text.split('\n').collect();
+        if body_lines.len() < 2 || !body_lines.iter().all(|l| is_table_line(l)) {
+            continue;
         }
-        let all_rows = !body.is_empty() && body.iter().all(|l| is_table_line(l));
-        if closed && all_rows && body.len() >= 2 {
-            let mut rows: Vec<Vec<String>> = body.iter().map(|l| split_row(l)).collect();
-            // 두 번째 줄이 |---|---| 구분자면 버린다.
-            if rows.len() > 1
-                && rows[1].iter().all(|c| c.is_empty() || c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
-            {
-                let head = rows[0].clone();
-                let rest = rows.split_off(2);
-                rows = rest;
-                rows.insert(0, head);
-            }
-            let grid = render_grid(&rows);
-            out.splice(i..=j, std::iter::once(MdSeg { kind: MdKind::Table, text: grid }));
-        } else {
-            i = j.max(i + 1);
+        let mut rows: Vec<Vec<String>> = body_lines.iter().map(|l| split_row(l)).collect();
+        // 두 번째 줄이 |---|---| 구분자면 버린다.
+        if rows.len() > 1
+            && rows[1]
+                .iter()
+                .all(|c| c.is_empty() || c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+        {
+            rows.remove(1);
         }
+        let grid = render_grid(&rows);
+        out[i] = MdSeg::plain(MdKind::Table, grid);
     }
 }
 
@@ -306,10 +296,7 @@ fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
     let mut buf = String::new();
     let flush = |kind: MdKind, buf: &mut String, out: &mut Vec<MdSeg>| {
         if !buf.is_empty() {
-            out.push(MdSeg {
-                kind,
-                text: std::mem::take(buf),
-            });
+            out.push(MdSeg::plain(kind, std::mem::take(buf)));
         }
     };
     while i < chars.len() {
@@ -326,7 +313,7 @@ fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
             } else {
                 MdKind::Text
             };
-            out.push(MdSeg { kind, text: tok });
+            out.push(MdSeg::plain(kind, tok));
             continue;
         }
         if chars[i] == '`' {
@@ -340,10 +327,7 @@ fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
             if i < chars.len() {
                 i += 1;
             }
-            out.push(MdSeg {
-                kind: MdKind::Code,
-                text: code,
-            });
+            out.push(MdSeg::plain(MdKind::Code, code));
             continue;
         }
         if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
@@ -357,10 +341,7 @@ fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
             if i + 1 < chars.len() {
                 i += 2;
             }
-            out.push(MdSeg {
-                kind: MdKind::Emphasis,
-                text: em,
-            });
+            out.push(MdSeg::plain(MdKind::Emphasis, em));
             continue;
         }
         buf.push(chars[i]);
