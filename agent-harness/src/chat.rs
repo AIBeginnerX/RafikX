@@ -261,6 +261,11 @@ pub enum Slash {
     Compact,
 }
 
+/// /engine 에서 선택 가능한 엔진인지 판정한다.
+pub fn is_valid_engine(e: &str) -> bool {
+    matches!(e, "rafikx" | "deepseek" | "dk" | "pi")
+}
+
 pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Result<Slash> {
     let db = Db::open(&Db::db_path()?)?;
     let mut parts = line.splitn(2, char::is_whitespace);
@@ -301,7 +306,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 Ok(Slash::Continue(vec![format!(
                     "현재 하네스 엔진: {cur}   ·   변경: /engine {ENGINES}"
                 )]))
-            } else if matches!(e.as_str(), "rafikx" | "deepseek" | "dk" | "pi") {
+            } else if is_valid_engine(&e) {
                 let label = match e.as_str() {
                     "dk" => "dk-harness (DeepSeek DSH 호환 모드)".into(),
                     "pi" => "pi-harness (oh-my-pi 스타일)".into(),
@@ -1167,6 +1172,18 @@ fn list_sessions(db: &Db) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_slash_accepts_dk_and_pi_only() {
+        assert!(is_valid_engine("rafikx"));
+        assert!(is_valid_engine("deepseek"));
+        assert!(is_valid_engine("dk"));
+        assert!(is_valid_engine("pi"));
+        // 오타·미지원 값은 거부해야 한다.
+        assert!(!is_valid_engine("dkharness"));
+        assert!(!is_valid_engine(""));
+        assert!(!is_valid_engine("gpt"));
+    }
 
     #[test]
     fn mentions_expand_only_existing_files() {

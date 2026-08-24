@@ -64,7 +64,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let pal_h = if slash_hits.is_empty() {
         0u16
     } else {
-        (slash_hits.len().min(5) + 1) as u16
+        (slash_hits.len().min(9) + 1) as u16
     };
 
     let chunks = Layout::default()
@@ -633,7 +633,7 @@ fn draw_slash_palette(
 ) {
     let total = hits.len();
     let mut header = format!(" 명령 {total}개");
-    if total > 5 {
+    if total > 9 {
         header.push_str(" · 접두어를 더 입력하면 좁혀집니다");
     }
     let mut lines = Vec::new();
@@ -641,7 +641,7 @@ fn draw_slash_palette(
         header,
         Style::default().fg(th.mute),
     )));
-    for (name, desc) in hits.iter().take(5) {
+    for (name, desc) in hits.iter().take(9) {
         lines.push(Line::from(vec![
             Span::styled(format!(" {name}"), Style::default().fg(th.accent)),
             Span::styled(format!("  {desc}"), Style::default().fg(th.mute)),
