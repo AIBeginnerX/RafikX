@@ -285,6 +285,9 @@ pub struct GeneralConfig {
     /// 첫 실행 마법사를 이미 지났으면 true. 옛 설정에는 없음 → false.
     #[serde(default)]
     pub setup_done: bool,
+    /// 하네스 엔진: rafikx (기본) | deepseek (dsh 영향 단계별 실행 강화). 옛 설정엔 없음 → rafikx.
+    #[serde(default)]
+    pub engine: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

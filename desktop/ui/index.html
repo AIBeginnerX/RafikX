@@ -346,6 +346,16 @@
               <button class="ghost" id="btn-catalog-refresh" title="연결된 서비스의 원격 모델 목록을 다시 불러와 선택지를 갱신합니다">모델 목록 새로고침</button>
               <span class="hint" id="ranks-status"></span>
             </div>
+            <h4>하네스 엔진</h4>
+            <div class="seg" id="engine-seg">
+              <label><input type="radio" name="engine" value="rafikx" /> ◆ rafikx harness (기본)</label>
+              <label><input type="radio" name="engine" value="deepseek" /> ◈ deepseek harness (단계별 실행 강화)</label>
+            </div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn primary" id="btn-engine-save">엔진 저장</button>
+              <span class="hint" id="engine-now"></span>
+            </div>
+            <p class="hint">deepseek harness 는 DeepSeek Harness(dsh)의 단계별 실행 방식을 본뜬 엔진입니다. 모든 도구 작업을 todo 단계로 쪼개 실행하고 각 단계 상태와 검증 결과를 보고합니다.</p>
             <h4>분류별 모델 — 「(자동)」이면 순위 기반 자동 선정</h4>
             <div id="class-rows"></div>
             <p class="hint">순위 근거: Artificial Analysis 지능·코딩 지수 + LMArena 계열 Elo 교차 검증 (2곳 이상 점수가 모일 때만 상위 티어 재판정). 프롬프트 캐시가 켜져 있어 같은 하네스 반복 호출의 입력 토큰 비용이 절감됩니다.</p>
@@ -540,6 +550,13 @@
       } catch (e) { addMsg("system", String(e), "warn"); }
     }
 
+    function updateEngineNow() {
+      const picked = document.querySelector('input[name="engine"]:checked');
+      const el = document.getElementById("engine-now");
+      if (picked && el) el.textContent = `현재: ${picked.value === "deepseek" ? "deepseek harness" : "rafikx harness"}`;
+    }
+    document.querySelectorAll('input[name="engine"]').forEach(r => r.addEventListener("change", updateEngineNow));
+
     // ---- 관리자 팝업 ------------------------------------------------------
     function switchTab(name) {
       document.querySelectorAll("#admin-nav button.nav").forEach(b =>
@@ -580,6 +597,10 @@
       const chip = document.getElementById("model-chip");
       chip.innerHTML = `<span>◆ 기본 모델</span><b>${esc(bootInfo.default_model)}</b>`;
       document.getElementById("ranks-status").textContent = bootInfo.ranks_status || "";
+      const eng = ["rafikx","deepseek"].includes(bootInfo.engine) ? bootInfo.engine : "rafikx";
+      const engRadio = document.querySelector(`input[name="engine"][value="${eng}"]`);
+      if (engRadio) engRadio.checked = true;
+      updateEngineNow();
       renderHarness();
       renderHarnessTab();
       renderProviders();
@@ -835,6 +856,15 @@
         try {
           await invoke("set_harness_selection", { mode });
           addMsg("system", `하네스 모드: ${mode === "manual" ? "수동(선택 모델 우선)" : "자동(업무별 최적 — 기본)"}`);
+        } catch (e) { addMsg("system", String(e), "warn"); }
+      });
+      on("btn-engine-save", "click", async () => {
+        const picked = document.querySelector('input[name="engine"]:checked');
+        if (!picked) return;
+        try {
+          const msg = await invoke("set_engine", { name: picked.value });
+          addMsg("system", msg);
+          await refreshBoot();
         } catch (e) { addMsg("system", String(e), "warn"); }
       });
       on("btn-catalog-refresh", "click", async () => {

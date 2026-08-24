@@ -53,12 +53,21 @@ pub fn draw(f: &mut Frame, app: &App) {
         area,
     );
 
+    // 입력이 "/" 로 시작하면 하단에 명령 팔레트를 깐다 (최대 5개 + 총 개수).
+    let slash_hits = slash_matches(app);
+    let pal_h = if slash_hits.is_empty() {
+        0u16
+    } else {
+        (slash_hits.len().min(5) + 1) as u16
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
             Constraint::Length(input_height(app, area.width)),
+            Constraint::Length(pal_h),
             Constraint::Length(2),
         ])
         .split(area);
@@ -66,7 +75,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_header(f, app, chunks[0], &th);
     draw_transcript(f, app, chunks[1], &th);
     draw_input(f, app, chunks[2], &th);
-    draw_footer(f, app, chunks[3], &th);
+    if pal_h > 0 {
+        draw_slash_palette(f, chunks[3], &slash_hits, &th);
+    }
+    draw_footer(f, app, chunks[4], &th);
 
     if app.help {
         draw_overlay(f, area, "키", super::md::KEY_HELP, &th);
@@ -338,23 +350,108 @@ fn cursor_xy(text: &str, cursor: usize, width: u16) -> (u16, u16) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
-    let hint = if app.busy {
-        "실행 중"
+    let mut line_spans: Vec<Span> = Vec::new();
+    if app.busy {
+        // 디지털 그라데이션 진행바 (파랑 계열, 시간 기반 애니메이션)
+        line_spans.extend(digital_bar(22));
+        line_spans.push(Span::raw(" "));
+        let phase = crate::spinner::current_label().unwrap_or_else(|| "실행 중".into());
+        line_spans.push(Span::styled(phase, Style::default().fg(th.code)));
+        if !app.tokens.is_empty() {
+            line_spans.push(Span::raw("  "));
+            line_spans.push(Span::styled(app.tokens.clone(), Style::default().fg(th.mute)));
+        }
     } else {
-        "? 키   /connect 키등록   /mode plan|build   /help   Ctrl+C 종료"
-    };
-    let line = Line::from(vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(&app.status, Style::default().fg(th.code)),
-        Span::raw("  "),
-        Span::styled(&app.tokens, Style::default().fg(th.mute)),
-        Span::raw("  "),
-        Span::styled(hint, Style::default().fg(th.secondary)),
-    ]);
+        let hint = "? 키   /connect 키등록   /mode plan|build   /help   Ctrl+C 종료";
+        line_spans.push(Span::styled(" ", Style::default()));
+        line_spans.push(Span::styled(&app.status, Style::default().fg(th.code)));
+        line_spans.push(Span::raw("  "));
+        line_spans.push(Span::styled(&app.tokens, Style::default().fg(th.mute)));
+        line_spans.push(Span::raw("  "));
+        line_spans.push(Span::styled(hint, Style::default().fg(th.secondary)));
+    }
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(th.bg)),
+        Paragraph::new(Line::from(line_spans)).style(Style::default().bg(th.bg)),
         area,
     );
+}
+
+/// 파란 계열 그라데이션의 슬라이딩 디지털 바. 프레임은 시간에서 유도(재그리기마다 움직인다).
+fn digital_bar(width: usize) -> Vec<Span<'static>> {
+    const SHADES: [(u8, u8, u8); 6] = [
+        (30, 52, 148),
+        (46, 82, 200),
+        (66, 118, 240),
+        (96, 156, 255),
+        (140, 196, 255),
+        (186, 226, 255),
+    ];
+    const RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as usize)
+        .unwrap_or(0);
+    let offset = now / 110;
+    let width = width.max(8);
+    let mut out = vec![Span::styled(
+        "[",
+        Style::default().fg(Color::Rgb(70, 100, 200)),
+    )];
+    for i in 0..width {
+        // 이동하는 디지털 파형 (0..15 삼각파)
+        let h = (i + offset) % 16;
+        let tri = if h < 8 { h } else { 15 - h };
+        let ch = RAMP[(tri * RAMP.len() / 8).min(RAMP.len() - 1)];
+        let shade = SHADES[i * SHADES.len() / width];
+        out.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(shade.0, shade.1, shade.2))));
+    }
+    out.push(Span::styled(
+        "]",
+        Style::default().fg(Color::Rgb(70, 100, 200)),
+    ));
+    out
+}
+
+/// 입력이 "/명령 접두어" 형태일 때 일치하는 명령 목록 (공백이 들어가면 숨긴다).
+fn slash_matches(app: &App) -> Vec<&'static (&'static str, &'static str)> {
+    let t = app.input.trim_start();
+    if !t.starts_with('/') || t.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let tok = &t[1..];
+    crate::chat::SLASH_COMMANDS
+        .iter()
+        .filter(|(name, _)| name[1..].starts_with(tok))
+        .collect()
+}
+
+fn draw_slash_palette(
+    f: &mut Frame,
+    area: Rect,
+    hits: &[&'static (&'static str, &'static str)],
+    th: &Pal,
+) {
+    let total = hits.len();
+    let mut header = format!(" 명령 {total}개");
+    if total > 5 {
+        header.push_str(" · 접두어를 더 입력하면 좁혀집니다");
+    }
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(th.mute),
+    )));
+    for (name, desc) in hits.iter().take(5) {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {name}"), Style::default().fg(th.accent)),
+            Span::styled(format!("  {desc}"), Style::default().fg(th.mute)),
+        ]));
+    }
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(th.secondary))
+        .style(Style::default().bg(th.bg));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_picker(f: &mut Frame, area: Rect, picker: &super::Picker, th: &Pal) {

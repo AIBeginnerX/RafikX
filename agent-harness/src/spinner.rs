@@ -37,6 +37,11 @@ pub fn set_label(msg: &str) {
     }
 }
 
+/// 현재 라벨 — TUI 진행바가 단계 상태를 표시할 때 읽는다.
+pub fn current_label() -> Option<String> {
+    label_slot().lock().ok().and_then(|g| g.clone())
+}
+
 /// 스피너 구동 중 들어온 시스템 메시지 버퍼 — 종료 때 한 번에 출력해 유실 없다.
 fn notes_slot() -> &'static Mutex<Vec<String>> {
     static SLOT: OnceLock<Mutex<Vec<String>>> = OnceLock::new();

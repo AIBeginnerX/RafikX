@@ -1019,6 +1019,41 @@ pub async fn run_pipeline(
     }
     let system = system_prompt(cfg, &binding.system_extra, &lessons_block);
 
+    // 난이도 기반 단계별 실행 (dsh ctx.goals 영향 수용):
+    // 단순 업무는 즉답, medium 이상은 todo 스테이징. deepseek 엔진은 모든 도구 작업에 적용.
+    let engine_deep = cfg.file.general.engine.eq_ignore_ascii_case("deepseek");
+    let staged = !binding.tools.is_empty()
+        && (engine_deep || binding.class != crate::harness::TaskClass::Simple);
+    let mut system = system;
+    if staged {
+        crate::ui::live_line(&format!(
+            "[하네스] {} 난이도{} — 단계별 실행(todo) 활성",
+            binding.class.as_str(),
+            if engine_deep {
+                " · deepseek 엔진"
+            } else {
+                ""
+            }
+        ));
+        crate::graph::node(
+            "pre_step",
+            "staging",
+            if engine_deep { "deepseek" } else { "auto" },
+            Some("bind"),
+        );
+        let mut directive = String::from(
+            "\n\n[실행 방식 — 단계별 처리]\n\
+             이 작업은 여러 단계가 필요하다. 다른 도구를 쓰기 전에 먼저 todo_write 로 2~6개의 실행 단계를 등록하고, \
+             한 단계를 마칠 때마다 todo_write 로 상태를 갱신하라. \
+             모든 단계가 끝나면 단계별 핵심 결과를 짧게 요약해 답을 마친다.",
+        );
+        if engine_deep {
+            directive.push_str(" 각 단계 시작 시 `[N/총M] 단계명` 형식의 한 줄 상태를 출력한다. \
+                검증 가능한 작업(빌드·테스트·파일 수정)은 마지막에 검증 방법과 결과를 함께 남긴다.");
+        }
+        system.push_str(&directive);
+    }
+
     if binding.plan_first {
         let req = ChatRequest {
             model: binding.model.clone(),

@@ -328,6 +328,11 @@ async fn remote_models(provider: String) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
+fn set_engine(name: String) -> Result<String, String> {
+    api::set_engine(&name).map_err(err)
+}
+
+#[tauri::command]
 fn set_harness_selection(mode: String) -> Result<String, String> {
     api::set_harness_selection(&mode).map_err(err)
 }
@@ -428,6 +433,7 @@ fn main() {
             catalog_models,
             remote_models,
             set_harness_selection,
+            set_engine,
             set_harness_model,
             detect_workspace,
             pick_folder,

@@ -120,6 +120,10 @@ Windows는 rustup이 C++ 빌드 도구를 요청할 수 있습니다.
   - `apply_patch` 는 여러 파일의 추가/수정/삭제를 codex 스타일 패치 한 번으로 적용합니다.
   - `bash` 는 `timeout_secs`(5~600초), `grep` 은 `context`(앞뒤 문맥 줄) 파라미터를 지원합니다.
 - **plan / build 모드**: `/mode plan` 은 읽기 전용으로 계획만 세우고, `/mode build` 로 실행합니다.
+- **하네스 엔진 선택**: `/engine rafikx|deepseek` — 기본은 **rafikx harness**. **deepseek harness** 는 DeepSeek Harness(dsh)의 단계별 실행 방식을 본뜬 것으로, 모든 도구 작업을 todo 단계로 쪼개 실행하고 단계 상태와 검증 결과를 보고합니다. 데스크탑은 관리자 › 하네스 탭에서 고릅니다.
+- **난이도 기반 단계 실행**: 단순 업무는 즉답하고, medium 이상은 자동으로 todo 단계(2~6개)를 등록해 순서대로 처리합니다.
+- **TUI 진행바**: 실행 중 파란 그라데이션 디지털 바가 현재 단계(모델 호출 · 도구 실행 · 반복 횟수)를 실시간 표시합니다.
+- **명령 팔레트**: 입력창에 `/` 를 치면 하단에 일치하는 명령 최대 5개와 총 개수가 나타납니다.
 - **세션 명령**: `/sessions` `/resume <id>` `/compact`(대화 요약 압축) `/undo` `/tools` `/todo`.
 - **파일 첨부**: `@src/main.rs` 멘션 또는 `/file <경로>` 로 다음 질문에 파일을 붙입니다.
 - **테마**: `/theme rafikx|opal|synth` — config `[ui] theme` 에 저장됩니다.

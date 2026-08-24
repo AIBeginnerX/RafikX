@@ -30,6 +30,33 @@ pub struct Session {
     pub dirty: bool,
 }
 
+/// 슬래시 명령 테이블 — TUI 하단 팔레트와 도움말이 함께 쓴다.
+pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "명령 보기"),
+    ("/connect", "서비스 연결·키 등록"),
+    ("/login", "연결 마법사"),
+    ("/provider", "기본 연결 변경"),
+    ("/model", "모델 선택"),
+    ("/engine", "하네스 엔진 rafikx|deepseek"),
+    ("/mode", "plan(읽기전용)/build 전환"),
+    ("/class", "분류 고정 simple|medium|advanced|dev"),
+    ("/agent", "코딩 실행"),
+    ("/file", "파일 첨부 (@경로 멘션 가능)"),
+    ("/sessions", "세션 목록"),
+    ("/resume", "세션 이어하기"),
+    ("/find", "지난 세션 검색"),
+    ("/compact", "대화 요약 압축"),
+    ("/undo", "마지막 질문 되돌리기"),
+    ("/tools", "도구 목록"),
+    ("/todo", "작업 목록 보기"),
+    ("/status", "연결·사용량 요약"),
+    ("/theme", "테마 변경"),
+    ("/obsidian", "볼트 사용 on|off"),
+    ("/save", "세션 저장"),
+    ("/clear", "대화 지우기"),
+    ("/quit", "종료"),
+];
+
 impl Session {
     pub fn is_plan_mode(&self) -> bool {
         self.mode.eq_ignore_ascii_case("plan")
@@ -206,6 +233,29 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             session.messages.clear();
             session.dirty = true;
             Ok(Slash::Continue(vec!["대화 맥락을 지웠습니다.".into()]))
+        }
+        "/engine" => {
+            let e = rest.trim().to_ascii_lowercase();
+            if e.is_empty() {
+                let cur = if session.cfg.file.general.engine.eq_ignore_ascii_case("deepseek") {
+                    "deepseek"
+                } else {
+                    "rafikx"
+                };
+                Ok(Slash::Continue(vec![format!(
+                    "현재 하네스 엔진: {cur}   ·   변경: /engine rafikx|deepseek"
+                )]))
+            } else if matches!(e.as_str(), "rafikx" | "deepseek") {
+                session.cfg.file.general.engine = e.clone();
+                match crate::api::set_engine(&e) {
+                    Ok(msg) => Ok(Slash::Continue(vec![msg])),
+                    Err(err) => Ok(Slash::Continue(vec![format!("저장 실패: {err}")])),
+                }
+            } else {
+                Ok(Slash::Continue(vec![
+                    "/engine rafikx|deepseek 중에서 고르세요.".into()
+                ]))
+            }
         }
         "/mode" => {
             let m = rest.to_ascii_lowercase();
