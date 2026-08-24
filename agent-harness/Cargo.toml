@@ -1,8 +1,8 @@
 [package]
 name = "rafikx"
-version = "0.1.0"
+version = "0.3.4"
 edition = "2024"
-description = "RafikX — personal AI coding agent for the terminal and Telegram"
+description = "RafikX ??personal AI coding agent for the terminal and Telegram"
 license = "MIT"
 repository = "https://github.com/AIBeginnerX/rafikx"
 homepage = "https://github.com/AIBeginnerX/rafikx"

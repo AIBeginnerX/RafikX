@@ -14,6 +14,13 @@ use crate::obsidian;
 use crate::provider::{ContentBlock, Role};
 
 #[derive(Debug, Clone, Serialize)]
+pub struct HarnessManual {
+    pub class: String,
+    /// 수동 지정값 ("" = 자동)
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BootInfo {
     pub version: String,
     pub config_path: String,
@@ -21,8 +28,28 @@ pub struct BootInfo {
     pub workspace: String,
     pub default_provider: String,
     pub harness: String,
+    /// auto | manual
+    pub harness_mode: String,
+    /// 분류별 수동 지정 현황
+    pub harness_manual: Vec<HarnessManual>,
+    /// 순위표 기준일·교차검증 표기
+    pub ranks_status: String,
+    /// 사이드바 하네스 요약 (분류 → 프로파일 → 모델)
+    pub harness_rows: Vec<HarnessRow>,
+    /// 컴포저 칩용 기본 모델 표기
+    pub default_model: String,
+    /// 데스크탑 배경 모드: light | dark | auto
+    pub appearance: String,
     pub obsidian: ObsidianInfo,
     pub providers: Vec<ProviderInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HarnessRow {
+    pub class: String,
+    pub profile: String,
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,10 +113,14 @@ pub struct SlashResult {
     pub notes: String,
     pub quit: bool,
     pub agent_task: Option<String>,
+    /// true 면 호출자가 compact_session 을 실행해야 한다.
+    pub compact: bool,
 }
 
 pub fn boot() -> Result<BootInfo> {
     crate::ui::init();
+    // 주 1회 모델 순위 갱신은 백그라운드로 — 부트를 막지 않는다.
+    crate::ranks::spawn_weekly_refresh();
     let cfg = Config::load(None)?;
     Ok(boot_with(&cfg))
 }
@@ -97,7 +128,57 @@ pub fn boot() -> Result<BootInfo> {
 pub fn boot_with(cfg: &Config) -> BootInfo {
     let vault = crate::config::expand_tilde(&cfg.file.obsidian.vault_path);
     let names = auth::menu_provider_names(cfg);
-    let providers = names.iter().map(|n| provider_info(cfg, n)).collect();
+    let providers: Vec<ProviderInfo> = names.iter().map(|n| provider_info(cfg, n)).collect();
+    let harness_rows = [
+        crate::harness::TaskClass::Simple,
+        crate::harness::TaskClass::Medium,
+        crate::harness::TaskClass::Advanced,
+        crate::harness::TaskClass::Dev,
+    ]
+    .iter()
+    .map(|c| match crate::harness::bind(cfg, *c, None, None) {
+        Ok(b) => HarnessRow {
+            class: b.class.as_str().into(),
+            profile: b.profile_name.clone(),
+            provider: b.provider_name.clone(),
+            model: b.model.clone(),
+        },
+        Err(_) => HarnessRow {
+            class: c.as_str().into(),
+            profile: crate::harness::profile_name_for(cfg, *c).to_string(),
+            provider: String::new(),
+            model: "(미연결)".into(),
+        },
+    })
+    .collect();
+    let default_model = providers
+        .iter()
+        .find(|p| p.is_default && p.connected)
+        .or_else(|| providers.iter().find(|p| p.connected))
+        .map(|p| format!("{} · {}", p.label, p.model))
+        .unwrap_or_else(|| "연결 없음".into());
+    let harness_manual = [
+        crate::harness::TaskClass::Simple,
+        crate::harness::TaskClass::Medium,
+        crate::harness::TaskClass::Advanced,
+        crate::harness::TaskClass::Dev,
+    ]
+    .iter()
+    .map(|c| {
+        let h = &cfg.file.harness;
+        let value = match c {
+            crate::harness::TaskClass::Simple => h.manual_simple.clone(),
+            crate::harness::TaskClass::Medium => h.manual_medium.clone(),
+            crate::harness::TaskClass::Advanced => h.manual_design.clone(),
+            crate::harness::TaskClass::Dev => h.manual_debug.clone(),
+        }
+        .unwrap_or_default();
+        HarnessManual {
+            class: c.as_str().into(),
+            value,
+        }
+    })
+    .collect();
     BootInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         config_path: cfg.path.display().to_string(),
@@ -109,6 +190,16 @@ pub fn boot_with(cfg: &Config) -> BootInfo {
         } else {
             "자동".into()
         },
+        harness_mode: if cfg.file.harness.selection.eq_ignore_ascii_case("manual") {
+            "manual".into()
+        } else {
+            "auto".into()
+        },
+        harness_manual,
+        ranks_status: crate::ranks::status_line(),
+        appearance: cfg.file.ui.appearance.clone(),
+        harness_rows,
+        default_model,
         obsidian: ObsidianInfo {
             enabled: cfg.file.obsidian.enabled,
             vault_path: vault.display().to_string(),
@@ -241,18 +332,36 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             notes: notes.join("\n"),
             quit: false,
             agent_task: None,
+            compact: false,
         }),
         Slash::Quit => Ok(SlashResult {
             notes: "세션을 닫습니다.".into(),
             quit: true,
             agent_task: None,
+            compact: false,
         }),
         Slash::Agent(task) => Ok(SlashResult {
             notes: String::new(),
             quit: false,
             agent_task: Some(task),
+            compact: false,
+        }),
+        Slash::Compact => Ok(SlashResult {
+            notes: String::new(),
+            quit: false,
+            agent_task: None,
+            compact: true,
         }),
     }
+}
+
+/// /compact 공용 실행 — 세션 메시지를 요약 하나로 압축한다.
+pub async fn compact_session(session: &mut Session) -> Result<String> {
+    let len = chat::compact_session(session).await?;
+    if session.dirty {
+        let _ = chat::save_if_dirty(session);
+    }
+    Ok(format!("대화를 {len}자 요약으로 압축했습니다."))
 }
 
 pub fn save_key(provider: &str, key: &str) -> Result<String> {
@@ -311,6 +420,18 @@ pub fn set_obsidian_enabled(on: bool) -> Result<()> {
     )
 }
 
+/// 데스크탑 배경 모드 저장 (light | dark | auto). 잘못된 값은 auto 로 정규화.
+pub fn set_appearance(mode: &str) -> Result<String> {
+    let m = match mode.trim().to_ascii_lowercase().as_str() {
+        "light" => "light",
+        "dark" => "dark",
+        _ => "auto",
+    };
+    let cfg = Config::load(None)?;
+    crate::config::write_toml_key(&cfg.path, "[ui]", "appearance", &crate::config::toml_string(m))?;
+    Ok(m.to_string())
+}
+
 pub fn index_obsidian() -> Result<String> {
     let cfg = Config::load(None)?;
     let s = obsidian::index_vault(&cfg)?;
@@ -336,6 +457,31 @@ pub fn graph_for(run_id: &str) -> Result<Vec<graph::GraphNode>> {
 pub fn catalog_models(provider: &str) -> Result<Vec<String>> {
     let cfg = Config::load(None)?;
     Ok(auth::catalog_models(&cfg, provider))
+}
+
+/// 연결된 프로바이더의 원격 모델 목록 (키 등록 후 실제 사용 가능한 모델 검색).
+pub async fn remote_models(provider: &str) -> Result<Vec<String>> {
+    let cfg = Config::load(None)?;
+    auth::list_remote_models(&cfg, provider).await
+}
+
+/// 하네스 선정 모드 저장 (auto | manual).
+pub fn set_harness_selection(mode: &str) -> Result<String> {
+    let cfg = Config::load(None)?;
+    crate::harness::set_selection_mode(&cfg, mode)?;
+    Ok(if mode.eq_ignore_ascii_case("manual") {
+        "manual".into()
+    } else {
+        "auto".into()
+    })
+}
+
+/// 분류별 수동 모델 지정. 빈 값이면 자동으로 되돌린다.
+pub fn set_harness_model(class: &str, spec: &str) -> Result<String> {
+    let cfg = Config::load(None)?;
+    let tc = crate::harness::TaskClass::parse(class)
+        .ok_or_else(|| anyhow::anyhow!("분류는 simple|medium|advanced|dev 중 하나여야 합니다"))?;
+    crate::harness::set_manual_model(&cfg, tc, spec)
 }
 
 pub fn detect_workspace() -> String {

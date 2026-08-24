@@ -6,17 +6,50 @@ use ratatui::Frame;
 
 use super::md::{markdown_segs, MdKind};
 use super::{App, EntryKind};
+use crate::palette::{self, Theme};
 
-pub const GOLD: Color = Color::Rgb(232, 213, 163);
-pub const VIOLET: Color = Color::Rgb(107, 92, 255);
-pub const CYAN: Color = Color::Rgb(94, 231, 255);
-pub const BG: Color = Color::Rgb(3, 6, 14);
-pub const MUTE: Color = Color::Rgb(92, 97, 120);
+/// ratatui 색으로 변환한 팔레트.
+pub struct Pal {
+    pub bg: Color,
+    pub accent: Color,
+    pub secondary: Color,
+    pub code: Color,
+    pub text: Color,
+    pub body: Color,
+    pub mute: Color,
+    pub warn: Color,
+}
+
+fn rgb(c: (u8, u8, u8)) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
+}
+
+pub fn theme_of(app: &App) -> Pal {
+    let t: &Theme = {
+        let name = app.session.cfg.file.ui.theme.as_str();
+        if name.is_empty() {
+            &palette::RAFIKX
+        } else {
+            palette::by_name(name)
+        }
+    };
+    Pal {
+        bg: rgb(t.bg),
+        accent: rgb(t.accent),
+        secondary: rgb(t.secondary),
+        code: rgb(t.code),
+        text: rgb(t.text),
+        body: rgb(t.body),
+        mute: rgb(t.mute),
+        warn: rgb(t.warn),
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
+    let th = theme_of(app);
     let area = f.area();
     f.render_widget(
-        Block::default().style(Style::default().bg(BG).fg(GOLD)),
+        Block::default().style(Style::default().bg(th.bg).fg(th.accent)),
         area,
     );
 
@@ -30,16 +63,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    draw_header(f, app, chunks[0]);
-    draw_transcript(f, app, chunks[1]);
-    draw_input(f, app, chunks[2]);
-    draw_footer(f, app, chunks[3]);
+    draw_header(f, app, chunks[0], &th);
+    draw_transcript(f, app, chunks[1], &th);
+    draw_input(f, app, chunks[2], &th);
+    draw_footer(f, app, chunks[3], &th);
 
     if app.help {
-        draw_overlay(f, area, "키", super::md::KEY_HELP);
+        draw_overlay(f, area, "키", super::md::KEY_HELP, &th);
     }
     if let Some(p) = &app.picker {
-        draw_picker(f, area, p);
+        draw_picker(f, area, p, &th);
     }
     if let Some(t) = &app.text {
         let field = draw_field_overlay(
@@ -48,13 +81,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             &t.title,
             "",
             &t.hint,
-            if t.buf.is_empty() {
-                ""
-            } else {
-                &t.buf
-            },
+            if t.buf.is_empty() { "" } else { &t.buf },
             t.buf.is_empty(),
             false,
+            &th,
         );
         if let Some(inner) = field {
             place_cursor(f, inner, &t.buf, t.buf.len());
@@ -86,63 +116,93 @@ pub fn draw(f: &mut Frame, app: &App) {
             &shown,
             s.buf.is_empty(),
             true,
+            &th,
         );
         if let Some(inner) = field {
             place_cursor(f, inner, &shown, shown.len());
         }
     }
     if let Some(c) = &app.confirm {
-        draw_overlay(f, area, &c.title, &c.body);
+        draw_overlay(f, area, &c.title, &c.body, &th);
     }
     if let Some(p) = &app.approval {
         let body = format!(
             "{}\n\n[y] 이번만   [n] 거부   [a] 이번 실행 모두",
             p.preview
         );
-        draw_overlay(f, area, "도구 승인", &body);
+        draw_overlay(f, area, "도구 승인", &body, &th);
     }
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let title = Line::from(vec![
+fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
+    let version = env!("CARGO_PKG_VERSION");
+    let mode_badge = if app.session.is_plan_mode() {
+        Span::styled(
+            " PLAN ",
+            Style::default()
+                .fg(th.bg)
+                .bg(th.secondary)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            " BUILD ",
+            Style::default()
+                .fg(th.bg)
+                .bg(th.code)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let spans = vec![
         Span::styled(
             " RAFIKX ",
             Style::default()
-                .fg(BG)
-                .bg(GOLD)
+                .fg(th.bg)
+                .bg(th.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  v0.1.0  ", Style::default().fg(MUTE)),
-        Span::styled(&app.binding, Style::default().fg(CYAN)),
+        Span::styled(format!("  v{version}  "), Style::default().fg(th.mute)),
+        mode_badge,
+        Span::raw(" "),
+        Span::styled(&app.binding, Style::default().fg(th.code)),
         Span::raw("  "),
-        Span::styled(&app.cwd, Style::default().fg(VIOLET)),
-    ]);
+        Span::styled(&app.cwd, Style::default().fg(th.secondary)),
+    ];
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(VIOLET))
-        .style(Style::default().bg(BG));
-    f.render_widget(Paragraph::new(title).block(block), area);
+        .border_style(Style::default().fg(th.secondary))
+        .style(Style::default().bg(th.bg));
+    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
-fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
-    let inner_w = area.width.saturating_sub(2) as usize;
+fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let mut lines: Vec<Line> = Vec::new();
     for e in &app.transcript {
         let (tag, style) = match e.kind {
-            EntryKind::User => ("you", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-            EntryKind::Assistant => ("rafikx", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-            EntryKind::System => ("sys", Style::default().fg(MUTE)),
-            EntryKind::Tool => ("tool", Style::default().fg(VIOLET)),
-            EntryKind::Warn => ("!", Style::default().fg(Color::Yellow)),
+            EntryKind::User => (
+                "you",
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+            EntryKind::Assistant => (
+                "rafikx",
+                Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+            ),
+            EntryKind::System => ("sys", Style::default().fg(th.mute)),
+            EntryKind::Tool => ("tool", Style::default().fg(th.secondary)),
+            EntryKind::Warn => ("!", Style::default().fg(th.warn)),
         };
         lines.push(Line::from(Span::styled(format!(" {tag}"), style)));
         if e.kind == EntryKind::Assistant {
             for seg in markdown_segs(&e.text) {
                 let st = match seg.kind {
-                    MdKind::Heading => Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-                    MdKind::Emphasis => Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-                    MdKind::Code | MdKind::CodeBlock => Style::default().fg(CYAN),
-                    MdKind::Text => Style::default().fg(Color::White),
+                    MdKind::Heading => Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD),
+                    MdKind::Emphasis => Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD),
+                    MdKind::Code | MdKind::CodeBlock => Style::default().fg(th.code),
+                    MdKind::Text => Style::default().fg(th.text),
                 };
                 for piece in seg.text.split('\n') {
                     lines.push(Line::from(Span::styled(format!("  {piece}"), st)));
@@ -153,9 +213,9 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(Span::styled(
                     format!("  {row}"),
                     Style::default().fg(if e.kind == EntryKind::Warn {
-                        Color::Yellow
+                        th.warn
                     } else {
-                        Color::Gray
+                        th.body
                     }),
                 )));
             }
@@ -165,7 +225,7 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "  할 일을 말하면 실행합니다.  ?  키 도움말",
-            Style::default().fg(MUTE),
+            Style::default().fg(th.mute),
         )));
     }
 
@@ -177,11 +237,10 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     } else {
         app.scroll.min(max_scroll)
     };
-    let _ = inner_w;
 
     let block = Block::default()
         .borders(Borders::NONE)
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(th.bg));
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -197,7 +256,7 @@ fn input_height(app: &App, width: u16) -> u16 {
     (rows as u16 + 2).clamp(3, 8)
 }
 
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+fn draw_input(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let title = if app.busy {
         " 실행 중 "
     } else {
@@ -205,14 +264,18 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.busy { MUTE } else { GOLD }))
-        .title(Span::styled(title, Style::default().fg(GOLD)))
-        .style(Style::default().bg(BG));
+        .border_style(Style::default().fg(if app.busy {
+            th.mute
+        } else {
+            th.accent
+        }))
+        .title(Span::styled(title, Style::default().fg(th.accent)))
+        .style(Style::default().bg(th.bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let para = Paragraph::new(app.input.as_str())
-        .style(Style::default().fg(GOLD))
+        .style(Style::default().fg(th.accent))
         .wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 
@@ -259,27 +322,27 @@ fn cursor_xy(text: &str, cursor: usize, width: u16) -> (u16, u16) {
     (x, y)
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let hint = if app.busy {
         "실행 중"
     } else {
-        "? 키   /connect 키등록   /help   Ctrl+C 종료"
+        "? 키   /connect 키등록   /mode plan|build   /help   Ctrl+C 종료"
     };
     let line = Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled(&app.status, Style::default().fg(CYAN)),
+        Span::styled(&app.status, Style::default().fg(th.code)),
         Span::raw("  "),
-        Span::styled(&app.tokens, Style::default().fg(MUTE)),
+        Span::styled(&app.tokens, Style::default().fg(th.mute)),
         Span::raw("  "),
-        Span::styled(hint, Style::default().fg(VIOLET)),
+        Span::styled(hint, Style::default().fg(th.secondary)),
     ]);
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(BG)),
+        Paragraph::new(line).style(Style::default().bg(th.bg)),
         area,
     );
 }
 
-fn draw_picker(f: &mut Frame, area: Rect, picker: &super::Picker) {
+fn draw_picker(f: &mut Frame, area: Rect, picker: &super::Picker, th: &Pal) {
     let vis = 14usize;
     let start = picker.selected.saturating_sub(vis / 2);
     let end = (start + vis).min(picker.items.len());
@@ -299,9 +362,10 @@ fn draw_picker(f: &mut Frame, area: Rect, picker: &super::Picker) {
     lines.push(extra.into());
     let body = lines.join("\n");
     let count = (end - start).min(16) as u16;
-    draw_overlay_sized(f, area, &picker.title, &body, 80, count.saturating_add(6));
+    draw_overlay_sized(f, area, &picker.title, &body, 80, count.saturating_add(6), th);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_field_overlay(
     f: &mut Frame,
     area: Rect,
@@ -311,6 +375,7 @@ fn draw_field_overlay(
     field: &str,
     empty: bool,
     _masked: bool,
+    th: &Pal,
 ) -> Option<Rect> {
     let w = area.width.saturating_sub(8).min(76).max(36);
     let h = 14u16.min(area.height.saturating_sub(4)).max(10);
@@ -327,10 +392,12 @@ fn draw_field_overlay(
         .borders(Borders::ALL)
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(th.accent)
+                .add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(CYAN))
-        .style(Style::default().bg(BG).fg(GOLD));
+        .border_style(Style::default().fg(th.code))
+        .style(Style::default().bg(th.bg).fg(th.accent));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -346,7 +413,7 @@ fn draw_field_overlay(
     let mut head = Vec::new();
     for row in header.lines() {
         if !row.is_empty() {
-            head.push(Line::from(Span::styled(row, Style::default().fg(CYAN))));
+            head.push(Line::from(Span::styled(row, Style::default().fg(th.code))));
         }
     }
     if head.is_empty() {
@@ -360,20 +427,25 @@ fn draw_field_overlay(
         "여기에 입력 · Ctrl+V"
     };
     let shown = if empty {
-        Span::styled(placeholder, Style::default().fg(MUTE))
+        Span::styled(placeholder, Style::default().fg(th.mute))
     } else {
-        Span::styled(field, Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
+        Span::styled(
+            field,
+            Style::default()
+                .fg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        )
     };
     let field_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(GOLD))
-        .title(Span::styled(" 입력 ", Style::default().fg(GOLD)));
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(" 입력 ", Style::default().fg(th.accent)));
     let field_inner = field_block.inner(chunks[1]);
     f.render_widget(field_block, chunks[1]);
     f.render_widget(Paragraph::new(Line::from(shown)), field_inner);
 
     f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(VIOLET))),
+        Paragraph::new(Span::styled(hint, Style::default().fg(th.secondary))),
         chunks[2],
     );
     Some(field_inner)
@@ -389,11 +461,19 @@ fn place_cursor(f: &mut Frame, inner: Rect, text: &str, cursor: usize) {
     }
 }
 
-fn draw_overlay(f: &mut Frame, area: Rect, title: &str, body: &str) {
-    draw_overlay_sized(f, area, title, body, 72, 22);
+fn draw_overlay(f: &mut Frame, area: Rect, title: &str, body: &str, th: &Pal) {
+    draw_overlay_sized(f, area, title, body, 72, 22, th);
 }
 
-fn draw_overlay_sized(f: &mut Frame, area: Rect, title: &str, body: &str, max_w: u16, max_h: u16) {
+fn draw_overlay_sized(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: &str,
+    max_w: u16,
+    max_h: u16,
+    th: &Pal,
+) {
     let w = area.width.saturating_sub(8).min(max_w).max(24);
     let h = area.height.saturating_sub(4).min(max_h).max(8);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -409,15 +489,17 @@ fn draw_overlay_sized(f: &mut Frame, area: Rect, title: &str, body: &str, max_w:
         .borders(Borders::ALL)
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(th.accent)
+                .add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(GOLD))
-        .style(Style::default().bg(BG).fg(GOLD));
+        .border_style(Style::default().fg(th.accent))
+        .style(Style::default().bg(th.bg).fg(th.accent));
     f.render_widget(
         Paragraph::new(body)
             .block(block)
             .wrap(Wrap { trim: false })
-            .style(Style::default().fg(GOLD)),
+            .style(Style::default().fg(th.accent)),
         rect,
     );
 }

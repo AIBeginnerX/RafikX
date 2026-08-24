@@ -56,7 +56,10 @@ pub fn banner(subtitle: &str) {
     println!(
         "{} {} {}",
         gold("│"),
-        pad_visible(&format!("{}  {}", gold("RAFIKX"), dim("v0.1.0")), WIDTH - 2),
+        pad_visible(
+            &format!("{}  {}", gold("RAFIKX"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            WIDTH - 2,
+        ),
         gold("│")
     );
     if !subtitle.is_empty() {
@@ -195,6 +198,7 @@ pub fn live_chunk(s: &str) {
     if s.is_empty() {
         return;
     }
+    crate::spinner::mark_answer_started();
     if !emit(Live::Chunk(s.to_string())) {
         print!("{s}");
         let _ = io::stdout().flush();
@@ -205,24 +209,41 @@ pub fn live_assistant(s: &str) {
     if s.is_empty() {
         return;
     }
+    crate::spinner::mark_answer_started();
     if !emit(Live::Assistant(s.to_string())) {
         println!("{s}");
     }
 }
 
 pub fn live_line(s: &str) {
+    // 스피너 구동 중에는 줄을 버퍼링해 진행바를 깨뜨리지 않고, 종료 때 출력한다.
+    if crate::spinner::is_running() {
+        crate::spinner::push_note(s);
+        crate::spinner::set_label(s);
+        return;
+    }
     if !emit(Live::System(s.to_string())) {
         println!("{s}");
     }
 }
 
 pub fn live_status(s: &str) {
+    if crate::spinner::is_running() {
+        crate::spinner::set_label(s);
+        return;
+    }
     if !emit(Live::Status(s.to_string())) {
         note(s);
     }
 }
 
 pub fn live_warn(s: &str) {
+    if crate::spinner::is_running() {
+        let note = format!("⚠ {s}");
+        crate::spinner::push_note(&note);
+        crate::spinner::set_label(s);
+        return;
+    }
     if !emit(Live::Warn(s.to_string())) {
         warn(s);
     }

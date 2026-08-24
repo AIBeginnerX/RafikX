@@ -402,6 +402,47 @@ impl Db {
         Ok(out)
     }
 
+    /// 오늘(로컬 자정 이후) 실행 통계 — rafikx status /chat /status 용.
+    pub fn usage_today(&self) -> Result<(i64, i64, i64)> {
+        let now = now_secs() as i64;
+        // KST/로컬 자정 근사: UTC 기준 당일 00:00 (운영 참고용 정확도로 충분)
+        let midnight = now - (now % 86_400);
+        let (count, tin, tout): (i64, i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) \
+             FROM runs WHERE started_at >= ?1",
+            [midnight],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok((count, tin, tout))
+    }
+
+    /// 세션 내용(제목·메시지) 통검색 — omo 의 session_search 에서 착안한 경량 구현.
+    /// 개인 규모의 세션 수에서는 LIKE 로 충분하고 FTS 마이그레이션이 필요 없다.
+    pub fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SessionRow>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let pat = format!("%{}%", query.replace('%', "").replace('_', ""));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, updated_at, title, messages_json FROM sessions \
+             WHERE title LIKE ?1 OR messages_json LIKE ?1 ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pat, limit as i64], |r| {
+            Ok(SessionRow {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                updated_at: r.get(2)?,
+                title: r.get(3)?,
+                messages_json: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn latest_run_id(&self) -> Result<Option<String>> {
         self.conn
             .query_row(

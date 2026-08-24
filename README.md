@@ -39,6 +39,27 @@ rafikx
 Rust가 없으면 스크립트가 rustup을 넣습니다. 첫 설치는 컴파일이라 몇 분 걸릴 수 있습니다.  
 저장소가 아직 공개 전이면 [docs/INSTALL.md](docs/INSTALL.md) 의 **로컬 설치**를 쓰세요.
 
+### 사설 저장소에서 다른 PC에 설치 (private 동안)
+
+원라이너는 공개 저장소 전용입니다. private 동안에는 git 인증 후 클론으로 설치하세요.
+
+```powershell
+# Windows
+git clone https://github.com/AIBeginnerX/RafikX.git
+cd RafikX
+cargo install --path agent-harness --force          # 터미널 (rafikx)
+powershell -ExecutionPolicy Bypass -File scripts/build-desktop.ps1   # 데스크탑(선택)
+```
+
+```bash
+# macOS / Linux
+git clone https://github.com/AIBeginnerX/RafikX.git
+cd RafikX && cargo install --path agent-harness --force
+```
+
+GitHub 인증이 필요하면 `gh auth login` 또는 자격증명 관리자에 PAT를 등록해 두세요.  
+설치 확인: `rafikx --version` · 상태: `rafikx status` · 연결: `rafikx login` 또는 대화 화면 `/connect`.
+
 ---
 
 ## 환경
@@ -75,6 +96,10 @@ Windows는 rustup이 C++ 빌드 도구를 요청할 수 있습니다.
 | 코딩 | `rafikx agent "…"` |
 | 텔레그램 | `rafikx telegram` |
 | 노트 인덱스 | `rafikx index` |
+| 하네스 모드·분류별 모델 | `rafikx harness` (`--mode auto\|manual`, `<분류> <모델>`) |
+| 사용 가능한 원격 모델 | `rafikx models <서비스>` |
+| 지난 세션 검색 | `rafikx find <검색어>` |
+| 화면 테마·배경 | `rafikx theme` / `rafikx workspace <경로>` |
 
 **키와 봇 토큰을 README·이슈·채팅에 붙이지 마세요.**
 
@@ -87,6 +112,15 @@ Windows는 rustup이 C++ 빌드 도구를 요청할 수 있습니다.
 - **계정 전환**: 리밋이 먼저 끝난 계정을 쓰고, 429면 다음 계정으로 갑니다. 하단에서 사용량을 봅니다.
 - **안전**: 워크스페이스 밖 파일 차단, 위험한 bash 차단, 텔레그램 허용 목록 밖은 무응답, 원격 `--yes` 금지.
 - **기억**: 교훈 주입, Obsidian 검색. Inspector는 코드를 자동으로 고치지 않습니다.
+
+### opencode급 도구 · 모드 (v0.2)
+
+- **도구 13종**: read_file · list_dir · grep · glob · webfetch · edit_file · multi_edit · write_file · bash · todo_write · todo_read · obsidian_search · task(서브에이전트 위임).
+- **plan / build 모드**: `/mode plan` 은 읽기 전용으로 계획만 세우고, `/mode build` 로 실행합니다.
+- **세션 명령**: `/sessions` `/resume <id>` `/compact`(대화 요약 압축) `/undo` `/tools` `/todo`.
+- **파일 첨부**: `@src/main.rs` 멘션 또는 `/file <경로>` 로 다음 질문에 파일을 붙입니다.
+- **테마**: `/theme rafikx|opal|synth` — config `[ui] theme` 에 저장됩니다.
+- `task` 도구와 plan 모드도 같은 하네스 분류·모델 자동선택을 그대로 통과합니다.
 
 상세 흐름: [RAFIKX_WORKFLOW.html](RAFIKX_WORKFLOW.html) (브라우저에서 열기).
 

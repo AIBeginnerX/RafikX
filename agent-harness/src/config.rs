@@ -252,6 +252,10 @@ token_env = "TELEGRAM_BOT_TOKEN"
 allowed_user_ids = [123456789]
 allow_agent = false
 approval_timeout_secs = 300
+
+[ui]
+theme = "rafikx"                   # rafikx | opal | synth
+appearance = "auto"                # 데스크탑: light | dark | auto (시간대 자동)
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,6 +268,9 @@ pub struct ConfigFile {
     pub inspector: InspectorConfig,
     pub obsidian: ObsidianConfig,
     pub telegram: TelegramConfig,
+    /// 옛 설정에 없으면 기본값 (테마 rafikx).
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,6 +329,11 @@ pub struct HarnessConfig {
     pub fallback: Vec<String>,
     #[serde(default = "default_selection")]
     pub selection: String,
+    /// 수동 모드에서 각 분류가 쓸 모델 ("provider:model" 또는 모델 ID). 빈 값이면 자동.
+    #[serde(default)]
+    pub manual_simple: Option<String>,
+    #[serde(default)]
+    pub manual_medium: Option<String>,
     #[serde(default)]
     pub manual_design: Option<String>,
     #[serde(default)]
@@ -382,6 +394,32 @@ pub struct TelegramConfig {
     pub allowed_user_ids: Vec<i64>,
     pub allow_agent: bool,
     pub approval_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UiConfig {
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// 데스크탑 화면 배경: light | dark | auto (시간대 자동).
+    #[serde(default = "default_appearance")]
+    pub appearance: String,
+}
+
+fn default_theme() -> String {
+    "rafikx".into()
+}
+
+fn default_appearance() -> String {
+    "auto".into()
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+            appearance: default_appearance(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

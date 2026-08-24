@@ -6,6 +6,7 @@ Thumbs.db
 
 # Rust
 target/
+target-authfix/
 **/*.pdb
 
 # Secrets — never commit
@@ -18,5 +19,7 @@ accounts.json
 
 # Local scratch
 *.log
+*.exe.bak
 .rafikx-src/
+desktop/dist
 desktop/dist/

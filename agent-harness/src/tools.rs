@@ -16,6 +16,9 @@ use crate::db::Db;
 use crate::obsidian;
 use crate::provider::ToolSpec;
 
+use crate::agent::LocalAsk;
+use crate::tools_more::{GlobTool, MultiEdit, TaskTool, TodoRead, TodoWrite, WebFetch};
+
 pub const MAX_LIST_ITEMS: usize = 500;
 pub const MAX_GREP_LINES: usize = 200;
 pub const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -34,6 +37,8 @@ pub struct ToolCtx {
     pub workspace: PathBuf,
     pub vault: Option<PathBuf>,
     pub db_path: PathBuf,
+    /// 서브에이전트(task 도구)가 승인 흐름을 이어받기 위한 채널.
+    pub local_ask: Option<LocalAsk>,
 }
 
 impl ToolCtx {
@@ -42,6 +47,7 @@ impl ToolCtx {
             workspace,
             vault: None,
             db_path: PathBuf::from("."),
+            local_ask: None,
         }
     }
 }
@@ -57,24 +63,66 @@ impl ToolRegistry {
                 Box::new(ReadFile),
                 Box::new(ListDir),
                 Box::new(Grep),
+                Box::new(GlobTool),
+                Box::new(WebFetch),
                 Box::new(EditFile),
+                Box::new(MultiEdit),
                 Box::new(WriteFile),
                 Box::new(Bash),
+                Box::new(TodoWrite),
+                Box::new(TodoRead),
                 Box::new(ObsidianSearch),
+                Box::new(TaskTool),
             ],
         }
     }
 
+    /// 읽기 전용 도구 집합 (plan 모드와 프로파일 확장에 사용).
+    pub const READ_ONLY: &'static [&'static str] = &[
+        "read_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "webfetch",
+        "todo_read",
+        "todo_write",
+        "obsidian_search",
+    ];
+
     pub fn with_names(names: &[String]) -> Self {
         if names.iter().any(|n| n == "*") {
             return Self::all();
+        }
+        let mut expanded: Vec<String> = names.to_vec();
+        // 읽기 도구를 하나라도 쓰는 프로파일엔 나머지 읽기 전용 도구를 자동 포함
+        // (옛 config 가 새 도구 없이도 동일한 읽기 능력을 갖도록).
+        if names
+            .iter()
+            .any(|n| matches!(n.as_str(), "read_file" | "list_dir" | "grep"))
+        {
+            for ro in Self::READ_ONLY {
+                if !expanded.iter().any(|e| e == ro) {
+                    expanded.push((*ro).to_string());
+                }
+            }
         }
         let all = Self::all();
         Self {
             tools: all
                 .tools
                 .into_iter()
-                .filter(|t| names.iter().any(|n| n == t.name()))
+                .filter(|t| expanded.iter().any(|n| n == t.name()))
+                .collect(),
+        }
+    }
+
+    /// 지정한 도구들을 제외한 레지스트리 (task 재귀 방지·plan 모드 등).
+    pub fn without(self, exclude: &[&str]) -> Self {
+        Self {
+            tools: self
+                .tools
+                .into_iter()
+                .filter(|t| !exclude.contains(&t.name()))
                 .collect(),
         }
     }
@@ -236,6 +284,20 @@ pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<Stri
             let updated = body.replacen(old_str, new_str, 1);
             Ok(format!(
                 "[승인] edit_file\npath: {}\n--- diff ---\n{}",
+                resolved.display(),
+                unified_diff(&body, &updated)
+            ))
+        }
+        "multi_edit" => {
+            let path = str_field(input, "path")?;
+            let edits = crate::tools_more::MultiEdit::parse_edits(input)?;
+            let resolved = resolve_tool_path(ctx, path)?;
+            let body = fs::read_to_string(&resolved)
+                .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", resolved.display()))?;
+            let updated = crate::tools_more::MultiEdit::apply(&body, &edits)?;
+            Ok(format!(
+                "[승인] multi_edit ({})\npath: {}\n--- diff ---\n{}",
+                edits.len(),
                 resolved.display(),
                 unified_diff(&body, &updated)
             ))

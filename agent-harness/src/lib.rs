@@ -12,12 +12,16 @@ pub mod harness;
 pub mod inspector;
 pub mod lessons;
 pub mod menu;
+pub mod model_wizard;
 pub mod obsidian;
 pub mod packer;
+pub mod palette;
 pub mod provider;
 pub mod ranks;
 pub mod settings;
+pub mod spinner;
 pub mod tools;
+pub mod tools_more;
 pub mod ui;
 pub mod usage;
 #[cfg(feature = "telegram")]

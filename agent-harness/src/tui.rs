@@ -48,6 +48,7 @@ pub struct App {
     streaming: bool,
     quit: bool,
     quit_after: bool,
+    slash_hint_shown: bool,
 }
 
 pub struct ApprovalPrompt {
@@ -168,6 +169,7 @@ pub async fn run(
         streaming: false,
         quit: false,
         quit_after: false,
+        slash_hint_shown: false,
     };
     if app.transcript.is_empty() {
         app.transcript.push(Entry {
@@ -540,6 +542,21 @@ fn handle_key(
         KeyCode::End => app.cursor = app.input.len(),
         KeyCode::Up => history_prev(app),
         KeyCode::Down => history_next(app),
+        KeyCode::Char('/') if app.input.is_empty() => {
+            // 슬래시 명령 목록 즉시 표시 (한 번)
+            if !app.slash_hint_shown {
+                for line in crate::chat::help_text().lines() {
+                    push(app, EntryKind::System, line.to_string());
+                }
+                push(
+                    app,
+                    EntryKind::System,
+                    "↑ 명령은 입력창에 그대로 치면 됩니다. 다시 보기: /help".to_string(),
+                );
+                app.slash_hint_shown = true;
+            }
+            insert_char(app, '/');
+        }
         KeyCode::Char(c) if !ctrl => insert_char(app, c),
         _ => {}
     }
@@ -602,6 +619,9 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
             Ok(Slash::Agent(task)) => {
                 start_turn(app, task, Some("dev".into()), false, local_ask, done_tx);
             }
+            Ok(Slash::Compact) => {
+                start_compact(app, done_tx);
+            }
             Err(e) => push(app, EntryKind::Warn, format!("{e:#}")),
         }
         return;
@@ -659,6 +679,40 @@ fn finish_turn(app: &mut App, done: TurnDone) {
     }
 }
 
+fn start_compact(
+    app: &mut App,
+    done_tx: &mpsc::UnboundedSender<TurnDone>,
+) {
+    if app.busy {
+        return;
+    }
+    push(app, EntryKind::System, "대화를 요약해 압축하는 중…");
+    app.busy = true;
+    app.status = "압축 중…".into();
+    let mut session = app.session.clone();
+    let done_tx = done_tx.clone();
+    tokio::spawn(async move {
+        let result = match chat::compact_session(&mut session).await {
+            Ok(len) => {
+                push_live_system(format!("압축 완료 ({len}자 요약)."));
+                Ok(chat::TurnInfo {
+                    run_id: String::new(),
+                    label: "compact 완료".into(),
+                    status: "ok".into(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                })
+            }
+            Err(e) => Err(e),
+        };
+        let _ = done_tx.send(TurnDone { result, session });
+    });
+}
+
+fn push_live_system(text: String) {
+    crate::ui::live_line(&text);
+}
+
 fn apply_live(app: &mut App, ev: Live) {
     app.follow = true;
     match ev {
@@ -714,7 +768,8 @@ fn binding_label(session: &Session) -> String {
     let model = session.model.as_deref().unwrap_or("auto");
     let provider = session.provider.as_deref().unwrap_or("auto");
     let class = session.class.as_deref().unwrap_or("auto");
-    format!("{provider} · {model} · {class}")
+    let mode = if session.is_plan_mode() { "plan" } else { "build" };
+    format!("{provider} · {model} · {class} · {mode}")
 }
 
 fn hydrate(messages: &[Message]) -> Vec<Entry> {
@@ -964,7 +1019,24 @@ fn apply_picker(app: &mut App, picker: Picker) {
                 push(app, EntryKind::System, "모델을 하네스 자동으로 돌렸습니다.");
             } else {
                 app.session.model = Some(id.clone());
-                push(app, EntryKind::System, format!("모델: {id}"));
+                // 영속화 — 재시작 후에도 동일 모델 사용
+                if let Some(r) = crate::auth::registered_models(&app.session.cfg)
+                    .into_iter()
+                    .find(|r| r.id == id)
+                {
+                    let _ = crate::accounts_ui::write_provider_model(
+                        &app.session.cfg,
+                        &r.provider,
+                        &r.id,
+                    );
+                    push(
+                        app,
+                        EntryKind::System,
+                        format!("모델: {} (기본 저장)", r.id),
+                    );
+                } else {
+                    push(app, EntryKind::System, format!("모델: {id} (세션 한정)"));
+                }
             }
             app.binding = binding_label(&app.session);
         }
@@ -1052,11 +1124,16 @@ fn begin_connect(app: &mut App, name: &str) {
 
 fn use_provider(app: &mut App, name: &str) {
     app.session.provider = Some(name.to_string());
+    // 영속화 — 기본 연결로 저장
+    let _ = crate::accounts_ui::set_default_provider(&app.session.cfg, name);
     app.binding = binding_label(&app.session);
     push(
         app,
         EntryKind::System,
-        format!("프로바이더: {}", crate::auth::provider_label(name)),
+        format!(
+            "프로바이더: {} (기본 연결로 저장)",
+            crate::auth::provider_label(name)
+        ),
     );
 }
 

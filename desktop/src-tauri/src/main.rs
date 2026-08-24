@@ -44,6 +44,7 @@ struct SessionDto {
     class: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    mode: String,
 }
 
 #[derive(Serialize)]
@@ -82,6 +83,7 @@ fn dto(id: String, session: &Session) -> SessionDto {
         class: session.class.clone(),
         provider: session.provider.clone(),
         model: session.model.clone(),
+        mode: session.mode.clone(),
     }
 }
 
@@ -162,6 +164,7 @@ async fn send(
     prompt: String,
     obsidian: bool,
     class: Option<String>,
+    mode: Option<String>,
 ) -> Result<SendResult, String> {
     let _guard = state.turn.lock().await;
     let inner = (*state).clone();
@@ -173,6 +176,13 @@ async fn send(
             Some(c)
         };
     }
+    if let Some(m) = mode {
+        session.mode = if m.eq_ignore_ascii_case("plan") {
+            "plan".into()
+        } else {
+            "build".into()
+        };
+    }
     session.obsidian_on = obsidian;
 
     let mut prompt = prompt.trim().to_string();
@@ -181,6 +191,19 @@ async fn send(
         if let Some(task) = slash.agent_task {
             prompt = task;
             session.class = Some("dev".into());
+        } else if slash.compact {
+            let notes = api::compact_session(&mut session).await.map_err(err)?;
+            let messages = api::transcript(&session);
+            let session_id = session.session_id.clone();
+            put_session(&inner, sid, session)?;
+            return Ok(SendResult {
+                kind: "compact".into(),
+                notes,
+                quit: false,
+                turn: None,
+                messages,
+                session_id,
+            });
         } else {
             let messages = api::transcript(&session);
             let session_id = session.session_id.clone();
@@ -265,6 +288,11 @@ fn set_workspace(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_appearance(mode: String) -> Result<String, String> {
+    api::set_appearance(&mode).map_err(err)
+}
+
+#[tauri::command]
 fn set_obsidian_vault(path: String) -> Result<(), String> {
     api::set_obsidian_vault(&path).map_err(err)
 }
@@ -292,6 +320,21 @@ fn graph_latest() -> Result<Option<(String, Vec<rafikx::graph::GraphNode>)>, Str
 #[tauri::command]
 fn catalog_models(provider: String) -> Result<Vec<String>, String> {
     api::catalog_models(&provider).map_err(err)
+}
+
+#[tauri::command]
+async fn remote_models(provider: String) -> Result<Vec<String>, String> {
+    api::remote_models(&provider).await.map_err(err)
+}
+
+#[tauri::command]
+fn set_harness_selection(mode: String) -> Result<String, String> {
+    api::set_harness_selection(&mode).map_err(err)
+}
+
+#[tauri::command]
+fn set_harness_model(class: String, spec: String) -> Result<String, String> {
+    api::set_harness_model(&class, &spec).map_err(err)
 }
 
 #[tauri::command]
@@ -376,12 +419,16 @@ fn main() {
             set_provider_model,
             add_custom_provider,
             set_workspace,
+            set_appearance,
             set_obsidian_vault,
             set_obsidian_enabled,
             index_obsidian,
             search_obsidian,
             graph_latest,
             catalog_models,
+            remote_models,
+            set_harness_selection,
+            set_harness_model,
             detect_workspace,
             pick_folder,
             start_watch,

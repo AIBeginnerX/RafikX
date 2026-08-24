@@ -8,7 +8,10 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::harness::{bind, classify, print_binding, run_pipeline};
 use crate::obsidian;
-use crate::provider::{ContentBlock, Message, Role};
+use crate::provider::{ChatRequest, ContentBlock, Message, Role};
+
+/// plan 모드에서 허용되는 읽기 전용 도구만 남긴다.
+const MAX_ATTACH_CHARS: usize = 80_000;
 
 #[derive(Clone)]
 pub struct Session {
@@ -17,10 +20,20 @@ pub struct Session {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub class: Option<String>,
+    /// opencode 의 build/plan 모드. 기본 build.
+    pub mode: String,
     pub session_id: Option<String>,
     pub messages: Vec<Message>,
     pub obsidian_on: bool,
+    /// /file 로 붙인 첨부 (경로, 내용) — 다음 턴의 컨텍스트로 주입된 뒤 비운다.
+    pub attachments: Vec<(String, String)>,
     pub dirty: bool,
+}
+
+impl Session {
+    pub fn is_plan_mode(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("plan")
+    }
 }
 
 pub async fn cmd_chat(
@@ -57,6 +70,12 @@ pub async fn cmd_chat(
         if line.is_empty() {
             continue;
         }
+        // "/" 만 입력하면 사용 가능한 명령 목록을 바로 보여준다.
+        if line == "/" {
+            println!("{}", crate::ui::gold("── 슬래시 명령 ──"));
+            println!("{}", help_text());
+            continue;
+        }
         if line.starts_with('/') {
             match handle_slash(&mut session, line, true)? {
                 Slash::Continue(notes) => {
@@ -67,6 +86,12 @@ pub async fn cmd_chat(
                 Slash::Quit => break,
                 Slash::Agent(task) => {
                     run_turn(&mut session, &task, Some("dev"), false, None).await?;
+                }
+                Slash::Compact => {
+                    match compact_session(&mut session).await {
+                        Ok(s) => println!("대화를 요약해 압축했습니다 ({s}자)."),
+                        Err(e) => println!("압축 실패: {e:#}"),
+                    };
                 }
             }
             continue;
@@ -113,9 +138,11 @@ pub fn open_session(
             provider,
             model,
             class,
+            mode: "build".into(),
             session_id: Some(row.id),
             messages,
             obsidian_on: false,
+            attachments: Vec::new(),
             dirty: false,
         });
     }
@@ -125,9 +152,11 @@ pub fn open_session(
         provider,
         model,
         class,
+        mode: "build".into(),
         session_id: None,
         messages: Vec::new(),
         obsidian_on: false,
+        attachments: Vec::new(),
         dirty: false,
     })
 }
@@ -151,6 +180,8 @@ pub enum Slash {
     Continue(Vec<String>),
     Quit,
     Agent(String),
+    /// /compact — 대화 요약으로 압축 (비동기)
+    Compact,
 }
 
 pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Result<Slash> {
@@ -176,6 +207,229 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             session.dirty = true;
             Ok(Slash::Continue(vec!["대화 맥락을 지웠습니다.".into()]))
         }
+        "/mode" => {
+            let m = rest.to_ascii_lowercase();
+            match m.as_str() {
+                "" => Ok(Slash::Continue(vec![format!(
+                    "현재 모드: {}   (/mode plan|build)",
+                    session.mode
+                )])),
+                "plan" => {
+                    session.mode = "plan".into();
+                    Ok(Slash::Continue(vec![
+                        "plan 모드: 읽기 전용 도구만 사용합니다.".into()
+                    ]))
+                }
+                "build" => {
+                    session.mode = "build".into();
+                    Ok(Slash::Continue(vec![
+                        "build 모드: 전체 도구를 사용합니다.".into()
+                    ]))
+                }
+                other => Ok(Slash::Continue(vec![format!(
+                    "'{other}' 는 모드가 아닙니다. /mode plan|build"
+                )])),
+            }
+        }
+        "/sessions" => {
+            let rows = db.list_sessions(20)?;
+            if rows.is_empty() {
+                return Ok(Slash::Continue(vec!["저장된 세션이 없습니다.".into()]));
+            }
+            let mut notes = vec!["최근 세션:".into()];
+            for (i, r) in rows.iter().enumerate() {
+                notes.push(format!(
+                    "  [{}] {}  {}",
+                    i + 1,
+                    r.id.clone(),
+                    r.title.clone().unwrap_or_else(|| "(제목 없음)".into())
+                ));
+            }
+            notes.push("예: /resume <id>".into());
+            Ok(Slash::Continue(notes))
+        }
+        "/resume" => {
+            if rest.is_empty() {
+                return Ok(Slash::Continue(vec![
+                    "/resume <세션 id>  ·  목록은 /sessions".into(),
+                ]));
+            }
+            let Some(row) = db.load_session(rest)? else {
+                return Ok(Slash::Continue(vec![format!(
+                    "세션 '{rest}' 를 찾지 못했습니다."
+                )]));
+            };
+            let mut messages: Vec<Message> = serde_json::from_str(&row.messages_json)
+                .map_err(|_| anyhow!("세션 메시지를 읽지 못했습니다"))?;
+            agent::sanitize_tool_pairs(&mut messages);
+            session.messages = messages;
+            session.session_id = Some(row.id.clone());
+            session.dirty = false;
+            session.attachments.clear();
+            Ok(Slash::Continue(vec![format!(
+                "세션 재개: {}  ({})",
+                row.id,
+                row.title.clone().unwrap_or_else(|| "(제목 없음)".into())
+            )]))
+        }
+        "/compact" => Ok(Slash::Compact),
+        "/find" => {
+            if rest.is_empty() {
+                return Ok(Slash::Continue(vec![
+                    "/find <검색어> — 지난 세션 내용을 검색합니다.".into(),
+                ]));
+            }
+            let rows = db.search_sessions(rest, 15)?;
+            if rows.is_empty() {
+                return Ok(Slash::Continue(vec![format!(
+                    "'{rest}' 결과가 없습니다."
+                )]));
+            }
+            let mut notes = vec![format!("'{rest}' 검색 결과 {}건:", rows.len())];
+            for r in &rows {
+                notes.push(format!(
+                    "  {}  {}",
+                    r.id.clone(),
+                    r.title.clone().unwrap_or_else(|| "(제목 없음)".into())
+                ));
+            }
+            notes.push("이어하기: /resume <id>".into());
+            Ok(Slash::Continue(notes))
+        }
+        "/undo" => {
+            let mut cut = None;
+            for (i, m) in session.messages.iter().enumerate().rev() {
+                if m.role == Role::User
+                    && m.content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Text { .. }))
+                {
+                    cut = Some(i);
+                    break;
+                }
+            }
+            match cut {
+                Some(i) => {
+                    session.messages.truncate(i);
+                    session.dirty = true;
+                    Ok(Slash::Continue(vec![format!(
+                        "마지막 질문을 되돌렸습니다 ({i}개 유지)."
+                    )]))
+                }
+                None => Ok(Slash::Continue(vec!["되돌릴 질문이 없습니다.".into()])),
+            }
+        }
+        "/tools" => {
+            let mut b = bind(
+                &session.cfg,
+                crate::harness::TaskClass::Dev,
+                session.provider.as_deref(),
+                session.model.as_deref(),
+            )?;
+            if session.is_plan_mode() {
+                b.tools.retain(|t| {
+                    crate::tools::ToolRegistry::READ_ONLY.contains(&t.as_str())
+                });
+            }
+            let reg = crate::tools::ToolRegistry::with_names(&b.tools);
+            let mut names: Vec<String> =
+                reg.specs().iter().map(|s| s.name.clone()).collect();
+            names.sort();
+            let mode = if session.is_plan_mode() { "plan" } else { "build" };
+            Ok(Slash::Continue(vec![format!(
+                "{mode} 모드 도구({}개): {}",
+                names.len(),
+                names.join(", ")
+            )]))
+        }
+        "/todo" => Ok(Slash::Continue(vec![crate::tools_more::render_todos(
+            &crate::tools_more::current_todos(),
+        )])),
+        "/status" => {
+            let cfg = &session.cfg;
+            let db2 = Db::open(&Db::db_path()?)?;
+            let dn = cfg.file.general.default_provider.clone();
+            let (label, model) = match cfg.provider(&dn) {
+                Ok(p) => (crate::auth::provider_label(&dn), p.model.clone()),
+                Err(_) => (dn.clone(), "-".into()),
+            };
+            let mut notes = vec![format!(
+                "기본  {label} / {model}   ·   모드 {}",
+                if session.is_plan_mode() { "plan" } else { "build" }
+            )];
+            for c in [
+                crate::harness::TaskClass::Simple,
+                crate::harness::TaskClass::Medium,
+                crate::harness::TaskClass::Advanced,
+                crate::harness::TaskClass::Dev,
+            ] {
+                if let Ok(b) = crate::harness::bind(cfg, c, None, None) {
+                    notes.push(format!(
+                        "  {:8} → {:8} {}/{}",
+                        b.class.as_str(),
+                        b.profile_name,
+                        b.provider_name,
+                        b.model
+                    ));
+                }
+            }
+            let (runs, tin, tout) = db2.usage_today()?;
+            notes.push(format!("오늘 실행 {runs}회 · 토큰 in {tin} / out {tout}"));
+            Ok(Slash::Continue(notes))
+        },
+        "/theme" => {
+            if rest.is_empty() {
+                let names = crate::palette::names().join(", ");
+                return Ok(Slash::Continue(vec![format!(
+                    "현재 테마: {}   (/theme {names})",
+                    session.cfg.file.ui.theme
+                )]));
+            }
+            if !crate::palette::names().contains(&rest) {
+                return Ok(Slash::Continue(vec![format!(
+                    "'{rest}' 테마가 없습니다. 사용 가능: {}",
+                    crate::palette::names().join(", ")
+                )]));
+            }
+            match crate::config::write_toml_key(
+                &session.cfg.path,
+                "[ui]",
+                "theme",
+                &crate::config::toml_string(rest),
+            )
+            .and_then(|_| session.cfg.reload())
+            {
+                Ok(cfg) => {
+                    session.cfg = cfg;
+                    Ok(Slash::Continue(vec![format!("테마: {rest}")]))
+                }
+                Err(e) => Ok(Slash::Continue(vec![format!("테마 저장 실패: {e:#}")])),
+            }
+        },
+        "/file" => {
+            if rest.is_empty() {
+                return Ok(Slash::Continue(vec![
+                    "/file <경로> — 다음 질문에 파일 내용을 붙여 넣습니다. @경로 멘션도 가능.".into(),
+                ]));
+            }
+            let resolved = crate::tools::resolve_in_workspace(&session.cfg.workspace, rest)
+                .map_err(|e| anyhow!("{e:#}"))?;
+            if !resolved.is_file() {
+                return Ok(Slash::Continue(vec![format!(
+                    "파일이 아닙니다: {}",
+                    resolved.display()
+                )]));
+            }
+            let body = std::fs::read_to_string(&resolved)
+                .map_err(|_| anyhow!("읽을 수 없습니다: {}", resolved.display()))?;
+            let shown: String = body.chars().take(MAX_ATTACH_CHARS).collect();
+            let size = shown.chars().count();
+            session.attachments.push((rest.to_string(), shown));
+            Ok(Slash::Continue(vec![format!(
+                "첨부함: {} ({size}자). 다음 질문부터 함께 전달됩니다.",
+                resolved.display()
+            )]))
+        }
         "/model" => {
             let regs = crate::auth::registered_models(&session.cfg);
             if regs.is_empty() {
@@ -194,12 +448,12 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                     io::stdout().flush()?;
                     let mut line = String::new();
                     io::stdin().read_line(&mut line)?;
-                    notes.push(apply_model_choice(&mut session.model, &regs, line.trim()));
+                    notes.push(apply_model_choice(session, &regs, line.trim()));
                 }
                 Ok(Slash::Continue(notes))
             } else {
                 Ok(Slash::Continue(vec![apply_model_choice(
-                    &mut session.model,
+                    session,
                     &regs,
                     rest,
                 )]))
@@ -223,18 +477,12 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                     io::stdout().flush()?;
                     let mut line = String::new();
                     io::stdin().read_line(&mut line)?;
-                    notes.push(apply_provider_choice(
-                        &mut session.provider,
-                        &names,
-                        line.trim(),
-                    ));
+                    notes.push(apply_provider_choice(session, &names, line.trim()));
                 }
                 Ok(Slash::Continue(notes))
             } else {
                 Ok(Slash::Continue(vec![apply_provider_choice(
-                    &mut session.provider,
-                    &names,
-                    rest,
+                    session, &names, rest,
                 )]))
             }
         }
@@ -275,9 +523,18 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
 }
 
 pub(crate) fn help_text() -> String {
-    "/save  /quit  /clear  /model  /provider  /connect  /class <simple|medium|advanced|dev>\n\
+    "/mode plan|build      계획(읽기 전용)/실행 모드 전환\n\
+     /tools                현재 모드에서 쓸 수 있는 도구\n\
+     /status               연결·하네스·오늘 사용량 요약\n\
+     /todo                 작업 목록 보기\n\
+     /file <경로>          다음 질문에 파일 첨부 (@src/main.rs 멘션도 가능)\n\
+     /sessions · /resume <id>   세션 목록 · 이어하기\n\
+     /find <검색어>         지난 세션 내용 검색\n\
+     /compact              지금까지 대화를 요약해 맥락 압축\n\
+     /undo                 마지막 질문 되돌리기\n\
+     /save  /clear  /quit\n\
+     /model  /provider  /connect  /class <simple|medium|advanced|dev>\n\
      /obsidian on|off  /agent <지시>\n\
-     /connect 에서 키 칸이 열립니다. Ctrl+V 붙여넣기. /connect zen\n\
      Enter 전송 · Ctrl+J 또는 Shift+Enter 줄바꿈 · ? 키 도움말"
         .into()
 }
@@ -322,19 +579,27 @@ fn connect_slash(cfg: &crate::config::Config, rest: &str, read_stdin: bool) -> R
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     match crate::auth::save_pasted_key(&alias, line.trim()) {
-        Ok(_) => Ok(Slash::Continue(vec![format!(
-            "{} 연결됨",
-            crate::auth::provider_label(&alias)
-        )])),
+        Ok(_) => {
+            // 영속화: 이 서비스를 기본 연결로 저장 — 재시작 후에도 동일 설정.
+            let _ = crate::accounts_ui::set_default_provider(cfg, &alias);
+            Ok(Slash::Continue(vec![
+                format!(
+                    "{} 연결됨 · 기본 연결로 저장했습니다 (재시작 후에도 유지)",
+                    crate::auth::provider_label(&alias)
+                ),
+                "모델 변경은 /model 또는 rafikx model".into(),
+            ]))
+        }
         Err(e) => Ok(Slash::Continue(vec![format!("연결 실패: {e:#}")])),
     }
 }
 
 fn apply_model_choice(
-    model: &mut Option<String>,
+    session: &mut Session,
     regs: &[crate::auth::RegisteredModel],
     rest: &str,
 ) -> String {
+    let model = &mut session.model;
     if rest.is_empty() {
         return format!("현재 모델: {}", model.as_deref().unwrap_or("(하네스 자동)"));
     }
@@ -346,15 +611,23 @@ fn apply_model_choice(
         if let Some(i) = nums.first() {
             if let Some(r) = regs.get(i - 1) {
                 *model = Some(r.id.clone());
-                return format!("모델: {} / {}", r.provider, r.id);
+                // 영속화: 프로바이더 기본 모델로도 저장
+                let _ = crate::accounts_ui::write_provider_model(&session.cfg, &r.provider, &r.id);
+                return format!("모델: {} / {} (기본 저장)", r.provider, r.id);
             }
         }
     }
+    // 직접 입력 — 등록 목록에서 역방향 매칭되면 영속화
     *model = Some(rest.to_string());
-    format!("모델: {rest}")
+    if let Some(r) = regs.iter().find(|r| r.id == rest) {
+        let _ = crate::accounts_ui::write_provider_model(&session.cfg, &r.provider, &r.id);
+        return format!("모델: {rest} (기본 저장)");
+    }
+    format!("모델: {rest} (세션 한정)")
 }
 
-fn apply_provider_choice(provider: &mut Option<String>, names: &[String], rest: &str) -> String {
+fn apply_provider_choice(session: &mut Session, names: &[String], rest: &str) -> String {
+    let provider = &mut session.provider;
     if rest.is_empty() {
         return format!(
             "현재 프로바이더: {}",
@@ -369,26 +642,159 @@ fn apply_provider_choice(provider: &mut Option<String>, names: &[String], rest: 
         if let Some(i) = nums.first() {
             if let Some(n) = names.get(i - 1) {
                 *provider = Some(n.clone());
-                return format!("프로바이더: {n}");
+                let _ = crate::accounts_ui::set_default_provider(&session.cfg, n);
+                return format!("프로바이더: {n} (기본 저장)");
             }
         }
     }
     let alias = crate::auth::resolve_provider_alias(rest).unwrap_or_else(|| rest.to_string());
     if names.iter().any(|n| n == &alias) {
         *provider = Some(alias.clone());
-        return format!("프로바이더: {alias}");
+        let _ = crate::accounts_ui::set_default_provider(&session.cfg, &alias);
+        return format!("프로바이더: {alias} (기본 저장)");
     }
     let labels: Vec<String> = names.iter().map(|n| crate::auth::provider_label(n)).collect();
     let hits = crate::menu::match_items(rest, &labels);
     if hits.len() == 1 {
         if let Some(n) = names.get(hits[0] - 1) {
             *provider = Some(n.clone());
-            return format!("프로바이더: {n}");
+            let _ = crate::accounts_ui::set_default_provider(&session.cfg, n);
+            return format!("프로바이더: {n} (기본 저장)");
         }
     }
     *provider = Some(rest.to_string());
     format!("프로바이더: {rest}")
 }
+
+// ---------------------------------------------------------------------------
+// @파일 멘션 확장 — "@src/main.rs" 토큰을 파일 내용 블록으로 바꾼다.
+// ---------------------------------------------------------------------------
+
+pub fn expand_mentions(cfg: &Config, prompt: &str) -> String {
+    let chars: Vec<char> = prompt.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    let mut budget = MAX_ATTACH_CHARS;
+    while i < chars.len() {
+        let ch = chars[i];
+        let at_start = ch == '@'
+            && (i == 0 || chars[i - 1].is_whitespace())
+            && i + 1 < chars.len()
+            && !chars[i + 1].is_whitespace();
+        if !at_start {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < chars.len() && !chars[end].is_whitespace() && end - start < 300 {
+            end += 1;
+        }
+        let token: String = chars[start..end].iter().collect();
+        let resolved = crate::tools::resolve_in_workspace(&cfg.workspace, &token).ok();
+        let is_file = resolved.as_ref().is_some_and(|r| r.is_file());
+        let body = if is_file {
+            resolved
+                .as_ref()
+                .and_then(|r| std::fs::read_to_string(r).ok())
+        } else {
+            None
+        };
+        match (resolved, body) {
+            (Some(_path), Some(body)) => {
+                let taken: String = body.chars().take(budget).collect();
+                budget -= taken.chars().count();
+                out.push_str(&format!(
+                    "[파일: {token}]\n```\n{taken}\n```\n"
+                ));
+                i = end;
+                if budget <= 0 {
+                    break;
+                }
+            }
+            _ => {
+                // 파일이 아니면 원문 그대로 (@이메일 등)
+                out.push('@');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// compact — 대화 요약으로 맥락 압축
+// ---------------------------------------------------------------------------
+
+fn transcript_for_compact(messages: &[Message]) -> String {
+    let mut buf = String::new();
+    'outer: for m in messages {
+        let role = match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+        };
+        for b in &m.content {
+            if let ContentBlock::Text { text } = b {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let snippet: String = text.chars().take(1500).collect();
+                buf.push_str(&format!("{role}: {snippet}\n"));
+                if buf.len() > 60_000 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    buf
+}
+
+pub async fn summarize_messages(cfg: &Config, messages: &[Message]) -> Result<String> {
+    let transcript = transcript_for_compact(messages);
+    if transcript.trim().is_empty() {
+        return Err(anyhow!("요약할 대화가 없습니다"));
+    }
+    let order =
+        crate::harness::fallback_order(cfg, &cfg.file.general.default_provider, None);
+    let req = ChatRequest {
+        model: String::new(),
+        system: "너는 대화 요약가다. 아래 대화를 결정·사실·남은 할 일 중심으로 한국어 15줄 이내로 요약하라.\n\
+                 파일 경로·오류 메시지 등 나중에 필요한 구체 정보는 그대로 보존하라."
+            .into(),
+        messages: vec![Message::user_text(transcript)],
+        tools: vec![],
+        max_tokens: 1024,
+        stream: false,
+    };
+    let (_name, resp) = crate::harness::chat_with_fallback(cfg, &order, "small", req).await?;
+    let text = resp
+        .content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.trim().to_string()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Err(anyhow!("요약이 비어 있습니다"));
+    }
+    Ok(text)
+}
+
+/// 세션 메시지를 요약 하나로 압축한다. /compact 공용 진입점.
+pub async fn compact_session(session: &mut Session) -> Result<usize> {
+    let summary = summarize_messages(&session.cfg, &session.messages).await?;
+    let len = summary.chars().count();
+    session.messages = vec![Message::user_text(format!("[이전 대화 요약]\n{summary}"))];
+    session.dirty = true;
+    Ok(len)
+}
+
+// ---------------------------------------------------------------------------
+// 턴 실행
+// ---------------------------------------------------------------------------
 
 pub async fn run_turn(
     session: &mut Session,
@@ -398,15 +804,34 @@ pub async fn run_turn(
     local_ask: Option<LocalAsk>,
 ) -> Result<TurnInfo> {
     let class = classify(&session.cfg, prompt, obsidian_on, forced_class).await?;
-    let binding = bind(
+    let mut binding = bind(
         &session.cfg,
         class,
         session.provider.as_deref(),
         session.model.as_deref(),
     )?;
+    // opencode 스타일 plan 모드 — 하네스 분류·모델 자동선택은 그대로 두고 도구만 제한.
+    let plan = session.is_plan_mode();
+    if plan {
+        binding.tools.retain(|t| {
+            crate::tools::ToolRegistry::READ_ONLY.contains(&t.as_str())
+        });
+    }
     print_binding(&binding);
+    if plan {
+        crate::ui::live_line("[모드] plan — 읽기 전용");
+    }
 
-    let mut task = prompt.to_string();
+    let mut task = expand_mentions(&session.cfg, prompt);
+    if !session.attachments.is_empty() {
+        let mut pre = String::new();
+        for (p, body) in session.attachments.drain(..) {
+            pre.push_str(&format!("[첨부 파일: {p}]\n```\n{body}\n```\n"));
+        }
+        task = format!("{pre}{task}");
+    }
+    let original_prompt = prompt.to_string();
+
     if obsidian_on {
         if !session.cfg.file.obsidian.enabled {
             crate::ui::live_line("[Obsidian] 꺼져 있습니다. rafikx settings 에서 켜세요.");
@@ -446,7 +871,8 @@ pub async fn run_turn(
         obsidian_on,
     );
     applog::info(&format!(
-        "chat class={} profile={} provider={} model={}",
+        "chat mode={} class={} profile={} provider={} model={}",
+        session.mode,
         binding.class.as_str(),
         binding.profile_name,
         binding.provider_name,
@@ -476,11 +902,12 @@ pub async fn run_turn(
     )
     .await
     {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
             agent::record_finish(&db, &run_id, &outcome)?;
             crate::graph::node("persist", &outcome.status, "", Some("bind"));
             crate::ui::live_status(&format!(
-                "[run] class={} profile={} status={} iter={} tokens in={} out={}",
+                "[run] mode={} class={} profile={} status={} iter={} tokens in={} out={}",
+                session.mode,
                 binding.class.as_str(),
                 binding.profile_name,
                 outcome.status,
@@ -489,6 +916,14 @@ pub async fn run_turn(
                 outcome.output_tokens
             ));
             if !outcome.messages.is_empty() {
+                // plan 모드에서 첫 사용자 메시지는 원문 질문으로 저장 (첨부 블록 제거)
+                if let Some(first) = outcome.messages.first_mut() {
+                    if first.role == Role::User {
+                        first.content = vec![ContentBlock::Text {
+                            text: original_prompt.clone(),
+                        }];
+                    }
+                }
                 session.messages = outcome.messages.clone();
             } else {
                 session.messages.push(Message::user_text(prompt));
@@ -575,4 +1010,66 @@ fn list_sessions(db: &Db) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mentions_expand_only_existing_files() {
+        let dir = std::env::temp_dir().join("rafikx-mention-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("lib.rs"), "fn f() {}\n").unwrap();
+        let cfg_path = Config::load(None).expect("config");
+        // workspace 만 교체한 설정 복제
+        let mut file = cfg_path.file.clone();
+        file.general.workspace = dir.display().to_string();
+        let cfg = Config {
+            path: cfg_path.path.clone(),
+            data_dir: cfg_path.data_dir.clone(),
+            workspace: dir.clone(),
+            file,
+        };
+
+        let out = expand_mentions(&cfg, "@src/lib.rs 요약해줘 me@example.com 은 유지");
+        assert!(out.contains("[파일: src/lib.rs]"));
+        assert!(out.contains("fn f()"));
+        assert!(out.contains("me@example.com"));
+        assert!(!out.starts_with("@"));
+
+        let plain = expand_mentions(&cfg, "@없는파일.txt 그대로");
+        assert_eq!(plain, "@없는파일.txt 그대로");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn undo_cuts_last_user_exchange() {
+        let msgs = vec![
+            Message::user_text("첫"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "응답1".into(),
+                }],
+            },
+            Message::user_text("둘"),
+        ];
+        let mut session_msgs = msgs.clone();
+        let mut cut = None;
+        for (i, m) in session_msgs.iter().enumerate().rev() {
+            if m.role == Role::User
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { .. }))
+            {
+                cut = Some(i);
+                break;
+            }
+        }
+        session_msgs.truncate(cut.unwrap());
+        assert_eq!(session_msgs.len(), 2);
+    }
 }

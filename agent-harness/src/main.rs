@@ -13,9 +13,13 @@ use rafikx::chat;
 use rafikx::config::{self, Config};
 use rafikx::db::Db;
 use rafikx::graph;
-use rafikx::harness::{bind, classify, ping_provider, print_binding, print_binding_table, run_pipeline};
+use rafikx::harness;
+use rafikx::harness::{
+    bind, classify, ping_provider, print_binding, print_binding_table, run_pipeline,
+};
 use rafikx::inspector;
 use rafikx::lessons;
+use rafikx::model_wizard;
 use rafikx::obsidian;
 use rafikx::ranks;
 use rafikx::settings;
@@ -114,6 +118,47 @@ enum Commands {
         #[command(subcommand)]
         action: Option<RanksCmd>,
     },
+    /// 화면 테마 · 배경 모드 (터미널 = 데스크탑 관리자 '화면' 탭과 동일)
+    Theme {
+        /// rafikx | opal | synth (생략 시 현재값 표시)
+        theme: Option<String>,
+        /// light | dark | auto (시간 자동)
+        #[arg(long)]
+        appearance: Option<String>,
+    },
+    /// 작업 폴더(프로젝트) 지정 또는 확인
+    Workspace {
+        /// 새 프로젝트 폴더 (생략 시 현재값)
+        path: Option<String>,
+    },
+    /// 하네스 선정 모드·분류별 모델 지정 (기본 자동, 수동 선택 가능)
+    Harness {
+        /// 분류 simple|medium|advanced|dev — 모델 지정 시 필요
+        class: Option<String>,
+        /// "provider:model" 또는 모델 ID. "" 또는 clear 로 자동 복귀
+        model: Option<String>,
+        /// auto | manual — 선정 모드만 변경
+        #[arg(long)]
+        mode: Option<String>,
+        /// 해당 분류의 수동 지정 해제
+        #[arg(long)]
+        clear: bool,
+    },
+    /// 연결된 서비스에서 사용 가능한 원격 모델 목록
+    Models {
+        provider: String,
+    },
+    /// 지난 세션 내용 검색
+    Find {
+        query: String,
+    },
+    /// 모델 선택·등록·수정 마법사 (OMO 스타일)
+    Model {
+        #[command(subcommand)]
+        action: Option<ModelCmd>,
+    },
+    /// 현재 상태 요약 (연결·하네스·오늘 사용량)
+    Status,
     /// 텔레그램 봇 + Inspector 스케줄
     Telegram {
         /// Obsidian Vault 감시(watch)를 함께 켭니다
@@ -148,9 +193,21 @@ enum RanksCmd {
     Status,
 }
 
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// 연결·모델 현황 표
+    List,
+    /// 기본 연결·모델 변경 (번호 또는 provider:model)
+    Use {
+        arg: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     ui::init();
+    // 주 1회 모델 순위 갱신 — 백그라운드, 실패 무음.
+    rafikx::ranks::spawn_weekly_refresh();
     let cli = Cli::parse();
     let result = match &cli.cmd {
         None => cmd_default(&cli).await,
@@ -158,6 +215,20 @@ async fn main() -> ExitCode {
         Some(Commands::Login) => cmd_login(&cli).await,
         Some(Commands::Settings) => cmd_settings(&cli).await,
         Some(Commands::Ranks { action }) => cmd_ranks(action.as_ref()).await,
+        Some(Commands::Theme { theme, appearance }) => {
+            cmd_theme(&cli, theme.as_deref(), appearance.as_deref())
+        }
+        Some(Commands::Workspace { path }) => cmd_workspace(&cli, path.as_deref()),
+        Some(Commands::Harness {
+            class,
+            model,
+            mode,
+            clear,
+        }) => cmd_harness(&cli, class.as_deref(), model.as_deref(), mode.as_deref(), *clear),
+        Some(Commands::Models { provider }) => cmd_models(&cli, provider).await,
+        Some(Commands::Find { query }) => cmd_find(&cli, query),
+        Some(Commands::Model { action }) => cmd_model(&cli, action.as_ref()).await,
+        Some(Commands::Status) => cmd_status(&cli).await,
         Some(Commands::Ask { prompt, obsidian }) => cmd_ask(&cli, prompt, *obsidian).await,
         Some(Commands::Agent { prompt }) => cmd_ask(&cli, prompt, false).await,
         Some(Commands::Index) => cmd_index(&cli),
@@ -209,6 +280,244 @@ async fn cmd_ranks(action: Option<&RanksCmd>) -> Result<()> {
         Some(RanksCmd::Status) | None => {
             settings::cmd_ranks_status();
             Ok(())
+        }
+    }
+}
+
+fn cmd_theme(cli: &Cli, theme: Option<&str>, appearance: Option<&str>) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    if theme.is_none() && appearance.is_none() {
+        println!("테마    {}   (rafikx | opal | synth)", cfg.file.ui.theme);
+        println!(
+            "배경    {}   (light | dark | auto — auto 는 07~19시 밝게)",
+            cfg.file.ui.appearance
+        );
+        println!("변경 예: rafikx theme opal   ·   rafikx theme --appearance dark");
+        return Ok(());
+    }
+    if let Some(t) = theme {
+        if !rafikx::palette::names().contains(&t) {
+            anyhow::bail!(
+                "'{t}' 테마가 없습니다. 사용 가능: {}",
+                rafikx::palette::names().join(", ")
+            );
+        }
+        config::write_toml_key(&cfg.path, "[ui]", "theme", &config::toml_string(t))?;
+        ui::ok(&format!("테마 저장: {t}"));
+    }
+    if let Some(a) = appearance {
+        let m = match a.trim().to_ascii_lowercase().as_str() {
+            "light" => "light",
+            "dark" => "dark",
+            _ => "auto",
+        };
+        config::write_toml_key(&cfg.path, "[ui]", "appearance", &config::toml_string(m))?;
+        ui::ok(&format!(
+            "배경 모드 저장: {m}{}",
+            if m == "auto" { " (07~19시 밝게)" } else { "" }
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_workspace(cli: &Cli, path: Option<&str>) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    let Some(p) = path else {
+        println!("현재 프로젝트 폴더: {}", cfg.workspace.display());
+        println!("변경 예: rafikx workspace C:\\projects\\my-app");
+        return Ok(());
+    };
+    let expanded = config::expand_tilde(p);
+    if !expanded.exists() {
+        std::fs::create_dir_all(&expanded)?;
+        ui::note(&format!("폴더를 새로 만들었습니다: {}", expanded.display()));
+    }
+    config::write_toml_key(&cfg.path, "[general]", "workspace", &config::toml_string(p))?;
+    let cfg = cfg.reload()?;
+    ui::ok(&format!("프로젝트 폴더 변경: {}", cfg.workspace.display()));
+    Ok(())
+}
+
+fn cmd_harness(
+    cli: &Cli,
+    class: Option<&str>,
+    model: Option<&str>,
+    mode: Option<&str>,
+    clear: bool,
+) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    if let Some(m) = mode {
+        harness::set_selection_mode(&cfg, m)?;
+        let applied = if m.eq_ignore_ascii_case("manual") { "manual" } else { "auto" };
+        ui::ok(&format!("하네스 선정 모드: {applied}"));
+    }
+    if clear || model.is_some() {
+        let Some(c) = class else {
+            anyhow::bail!("분류가 필요합니다. 예: rafikx harness dev gpt-5.6  ·  rafikx harness --clear dev");
+        };
+        let tc = harness::TaskClass::parse(c)
+            .ok_or_else(|| anyhow::anyhow!("분류는 simple|medium|advanced|dev 중 하나여야 합니다"))?;
+        let spec = if clear { "" } else { model.unwrap_or("") };
+        let msg = harness::set_manual_model(&cfg, tc, spec)?;
+        ui::ok(&msg);
+        if !clear && !spec.is_empty() && cfg.file.harness.selection.eq_ignore_ascii_case("auto") {
+            ui::note("현재 선정 모드가 auto 입니다. 수동 지정을 쓰려면: rafikx harness --mode manual");
+        }
+    }
+    // 상태 표시 (변경이 있었으면 다시 읽는다)
+    let cfg = if mode.is_some() || clear || model.is_some() {
+        cfg.reload()?
+    } else {
+        cfg
+    };
+    println!();
+    println!(
+        "선정 모드: {}",
+        if cfg.file.harness.selection.eq_ignore_ascii_case("manual") {
+            "manual (수동 우선, 빈 분류는 자동)"
+        } else {
+            "auto (업무 난이도별 자동 — 기본)"
+        }
+    );
+    for c in [
+        harness::TaskClass::Simple,
+        harness::TaskClass::Medium,
+        harness::TaskClass::Advanced,
+        harness::TaskClass::Dev,
+    ] {
+        let h = &cfg.file.harness;
+        let manual = match c {
+            harness::TaskClass::Simple => h.manual_simple.clone(),
+            harness::TaskClass::Medium => h.manual_medium.clone(),
+            harness::TaskClass::Advanced => h.manual_design.clone(),
+            harness::TaskClass::Dev => h.manual_debug.clone(),
+        }
+        .filter(|s| !s.is_empty());
+        match harness::bind(&cfg, c, None, None) {
+            Ok(b) => println!(
+                "  {:8} → {:8} {}/{}  [{}]",
+                c.as_str(),
+                b.profile_name,
+                b.provider_name,
+                b.model,
+                manual.as_deref().unwrap_or("자동")
+            ),
+            Err(e) => println!("  {:8} → (미연결: {e})", c.as_str()),
+        }
+    }
+    println!();
+    println!("{}", ranks::status_line());
+    Ok(())
+}
+
+async fn cmd_models(cli: &Cli, provider: &str) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    let models = auth::list_remote_models(&cfg, provider).await?;
+    if models.is_empty() {
+        println!("{provider}: 사용 가능한 원격 모델 목록이 비어 있습니다 (키/연결 확인)");
+        return Ok(());
+    }
+    println!("{} 사용 가능 모델 {}개:", auth::provider_label(provider), models.len());
+    for m in &models {
+        println!("  {m}");
+    }
+    println!();
+    println!("하네스에 지정: rafikx harness <분류> <모델ID>");
+    Ok(())
+}
+
+fn cmd_find(cli: &Cli, query: &str) -> Result<()> {
+    let _ = cli;
+    let db = Db::open(&Db::db_path()?)?;
+    let rows = db.search_sessions(query, 20)?;
+    if rows.is_empty() {
+        println!("'{query}' 검색 결과가 없습니다.");
+        return Ok(());
+    }
+    println!("'{query}' 검색 결과 {}건:", rows.len());
+    for r in rows {
+        println!(
+            "  {:<26} {}",
+            r.id,
+            r.title.unwrap_or_else(|| "(제목 없음)".into())
+        );
+    }
+    println!("이어하기: rafikx chat --resume <id>");
+    Ok(())
+}
+
+/// 운영 상태 요약 — OMO doctor 의 "한눈에 현재 구성" 철학.
+async fn cmd_status(cli: &Cli) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    let db = Db::open(&Db::db_path()?)?;
+
+    let default_name = cfg.file.general.default_provider.clone();
+    let (label, model) = match cfg.provider(&default_name) {
+        Ok(p) => (
+            crate::auth::provider_label(&default_name),
+            p.model.clone(),
+        ),
+        Err(_) => (default_name.clone(), "-".into()),
+    };
+    ui::section("연결");
+    println!(
+        "  기본  {label} / {}",
+        ui::bold(&model)
+    );
+    for r in model_wizard::rows(&cfg).iter().filter(|r| r.connected) {
+        if r.id != default_name {
+            println!("  연결  {} / {}", r.label, r.model);
+        }
+    }
+
+    ui::section("하네스");
+    println!(
+        "  선정 모드: {}",
+        if cfg.file.harness.selection.eq_ignore_ascii_case("manual") {
+            "manual"
+        } else {
+            "auto (업무별 자동)"
+        }
+    );
+    for c in [
+        harness::TaskClass::Simple,
+        harness::TaskClass::Medium,
+        harness::TaskClass::Advanced,
+        harness::TaskClass::Dev,
+    ] {
+        if let Ok(b) = harness::bind(&cfg, c, None, None) {
+            println!(
+                "  {:8} → {:8} {}/{}",
+                b.class.as_str(),
+                b.profile_name,
+                b.provider_name,
+                b.model
+            );
+        }
+    }
+
+    ui::section("오늘");
+    let (runs, tin, tout) = db.usage_today()?;
+    println!("  실행 {runs}회 · 토큰 in {tin} / out {tout}");
+    for line in rafikx::usage::footer_lines() {
+        println!("  {line}");
+    }
+
+    ui::section("순위표");
+    println!("  {}", ranks::status_line());
+    Ok(())
+}
+
+async fn cmd_model(cli: &Cli, action: Option<&ModelCmd>) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    match action {
+        Some(ModelCmd::List) => model_wizard::cmd_list(&cfg).await,
+        Some(ModelCmd::Use { arg }) => model_wizard::cmd_use(&cfg, arg).await,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                return model_wizard::cmd_list(&cfg).await;
+            }
+            model_wizard::run_wizard(cfg).await
         }
     }
 }
@@ -274,7 +583,21 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
             "자동"
         }
     ));
+    ui::ok(&format!(
+        "화면  테마={} 배경={}",
+        cfg.file.ui.theme, cfg.file.ui.appearance
+    ));
     ui::ok(&ranks::status_line());
+
+    let reg = rafikx::tools::ToolRegistry::all();
+    let specs = reg.specs();
+    let mut tool_names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    tool_names.sort();
+    ui::ok(&format!(
+        "도구 {}개  {}",
+        tool_names.len(),
+        tool_names.join(", ")
+    ));
 
     ui::section(&format!("서비스  (기본={})", cfg.file.general.default_provider));
     ui::note("키: 환경변수 또는 secrets.toml. Zen=OPENCODE_API_KEY  Go=OPENCODE_GO_API_KEY");
@@ -311,14 +634,17 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
             }
         }
         if auth::is_usable(&cfg, name) {
-            let models = auth::list_remote_models(&cfg, name).await?;
-            if !models.is_empty() {
-                let show: Vec<_> = models.iter().take(5).cloned().collect();
-                ui::note(&format!(
-                    "모델 {}{}",
-                    show.join(", "),
-                    if models.len() > 5 { " …" } else { "" }
-                ));
+            match auth::list_remote_models(&cfg, name).await {
+                Ok(models) if !models.is_empty() => {
+                    let show: Vec<_> = models.iter().take(5).cloned().collect();
+                    ui::note(&format!(
+                        "모델 {}{}",
+                        show.join(", "),
+                        if models.len() > 5 { " …" } else { "" }
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => ui::note(&format!("{name}: 모델 목록 조회 실패 ({e:#})")),
             }
             ui::note(&ping_provider(&cfg, name).await);
         } else if auth::is_connected(&cfg, name) {
@@ -331,6 +657,20 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
     }
 
     print_binding_table(&cfg);
+
+    // OMO doctor 의 모델 해석 검증 수용: 4개 분류가 전부 유효한 모델로 묶이는지.
+    let ok_classes = [harness::TaskClass::Simple, harness::TaskClass::Medium, harness::TaskClass::Advanced, harness::TaskClass::Dev]
+        .iter()
+        .filter(|c| harness::bind(&cfg, **c, None, None).is_ok())
+        .count();
+    if ok_classes == 4 {
+        ui::ok("폴백 체인  4/4 분류 유효");
+    } else {
+        ui::warn(&format!(
+            "폴백 체인  {ok_classes}/4 분류만 유효 — 연결을 추가하거나 rafikx model use 로 기본 연결을 고르세요"
+        ));
+        ok = false;
+    }
 
     println!();
     let tg = &cfg.file.telegram;
@@ -448,6 +788,8 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         binding.model
     ));
 
+    // 진행 표시 — 첫 출력이 나오면 스피너는 스스로 물러난다.
+    let sp = rafikx::spinner::Spinner::start("응답 생성 중…");
     match run_pipeline(
         &cfg,
         &binding,
@@ -461,6 +803,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
     .await
     {
         Ok(outcome) => {
+            sp.finish();
             agent::record_finish(&db, &run_id, &outcome)?;
             graph::node("persist", &outcome.status, "", Some("bind"));
             println!(
@@ -477,6 +820,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
             Ok(())
         }
         Err(e) => {
+            sp.finish();
             let _ = db.finish_run(&run_id, "fail", 0, 0, 0, Some(&e.to_string()));
             graph::node("persist", "fail", &e.to_string(), Some("bind"));
             let fail = agent::AgentOutcome {

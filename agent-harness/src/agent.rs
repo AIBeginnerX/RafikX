@@ -119,6 +119,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
     ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
     ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
+    ctx.local_ask = local_ask.clone();
     let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
     let mut allow_all = yes;
     let mut iterations = 0u32;
@@ -148,6 +149,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             });
         }
         iterations += 1;
+        crate::spinner::set_label(&format!("반복 {iterations}/{max_iter} · 모델 호출"));
         let specs = registry.specs();
         messages = crate::packer::pack_messages(
             &messages,
@@ -173,7 +175,10 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             stream: false,
         };
 
-        let resp = crate::harness::chat_accounts(cfg, provider_name, req).await?;
+        // 프로바이더 폴백: 주 연결 실패(4xx·5xx·리밋) 시 fallback_order 의 다음 연결로.
+        // 주 연결은 원래 모델을 그대로 쓰고, 이후 연결은 role(main) 기준 모델을 쓴다.
+        let order = crate::harness::fallback_order(cfg, provider_name, None);
+        let (_used, resp) = crate::harness::chat_with_fallback(cfg, &order, "main", req).await?;
         crate::graph::node(
             "request",
             model,
@@ -265,6 +270,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             }
 
             crate::ui::live_line(&format!("[도구] {name}"));
+            crate::spinner::set_label(&format!("도구 실행: {name}"));
             crate::graph::node("tool_pre", &name, "", Some("request"));
             let Some(tool) = registry.get(&name) else {
                 let msg = format!("알 수 없는 도구: {name}");
@@ -328,7 +334,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 Ok(out) => {
                     crate::graph::node("tool_post", &name, "ok", Some("tool_pre"));
                     crate::ui::live_line(&out);
-                    if name == "write_file" || name == "edit_file" {
+                    if name == "write_file" || name == "edit_file" || name == "multi_edit" {
                         if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
                             changed_files.push(p.to_string());
                         }

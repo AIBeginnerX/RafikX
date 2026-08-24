@@ -177,15 +177,30 @@ impl AnthropicProvider {
 }
 
 fn build_body(req: &ChatRequest) -> Value {
+    // 프롬프트 캐시: 시스템 프롬프트(기본+교훈+프로파일 지침)는 매 반복 동일하므로
+    // cache_control 을 붙여 입력 토큰 비용을 크게 줄인다. 실패해도 API 가 무시하지 않으므로
+    // 구형 호환 엔드포인트를 위한 설정 스위치는 환경변수로만 끈다.
+    let caching = std::env::var("RAFIKX_NO_PROMPT_CACHE")
+        .map(|v| v.is_empty() || v == "0")
+        .unwrap_or(true);
+    let system: Value = if caching && !req.system.is_empty() {
+        json!([{
+            "type": "text",
+            "text": req.system,
+            "cache_control": {"type": "ephemeral"}
+        }])
+    } else {
+        json!(req.system)
+    };
     let mut body = json!({
         "model": req.model,
         "max_tokens": req.max_tokens,
-        "system": req.system,
+        "system": system,
         "messages": to_api_messages(&req.messages),
         "stream": req.stream,
     });
     if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
             .map(|t| {
@@ -196,6 +211,12 @@ fn build_body(req: &ChatRequest) -> Value {
                 })
             })
             .collect();
+        // 도구 목록도 시스템 다음 캐시 경계 — 마지막 도구에 두 번째 브레이크포인트.
+        if caching {
+            if let Some(last) = tools.last_mut() {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
         body["tools"] = Value::Array(tools);
     }
     body

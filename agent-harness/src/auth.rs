@@ -195,7 +195,19 @@ pub fn resolve_credential(cfg: &Config, name: &str) -> Result<Option<Credential>
         return resolve_account_credential(cfg, name, name);
     }
     let id = crate::usage::select_account(&accs).unwrap_or_else(|| accs[0].id.clone());
-    resolve_account_credential(cfg, name, &id)
+    if let Some(c) = resolve_account_credential(cfg, name, &id)? {
+        return Ok(Some(c));
+    }
+    // 로테이션이 키 없는 계정을 골랐더라도, 키 있는 계정/프로바이더 키로 이어준다.
+    for a in &accs {
+        if a.id == id {
+            continue;
+        }
+        if let Some(c) = resolve_account_credential(cfg, name, &a.id)? {
+            return Ok(Some(c));
+        }
+    }
+    resolve_account_credential(cfg, name, name)
 }
 
 pub fn resolve_account_credential(
@@ -625,15 +637,45 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
             let Some(c) = cred else {
                 return Ok(Vec::new());
             };
-            let mut req = client
-                .get("https://api.anthropic.com/v1/models")
-                .header("anthropic-version", "2023-06-01");
-            req = apply_anthropic_cred(req, &c);
-            let resp = req.send().await?;
-            if !resp.status().is_success() {
-                return Ok(Vec::new());
+            // /v1/models 는 기본 20개 페이징 — has_more 동안 끝까지 수집한다.
+            let mut ids: Vec<String> = Vec::new();
+            let mut next_page: Option<String> = None;
+            for _ in 0..5 {
+                let url = match &next_page {
+                    Some(pg) => format!(
+                        "https://api.anthropic.com/v1/models?limit=1000&page={}",
+                        url_encode(pg)
+                    ),
+                    None => "https://api.anthropic.com/v1/models?limit=1000".to_string(),
+                };
+                let mut req = client
+                    .get(&url)
+                    .header("anthropic-version", "2023-06-01");
+                req = apply_anthropic_cred(req, &c);
+                let resp = req.send().await?;
+                let status = resp.status();
+                if !status.is_success() {
+                    anyhow::bail!("HTTP {status}");
+                }
+                let v = resp.json::<serde_json::Value>().await.unwrap_or_default();
+                if let Ok(mut part) = parse_id_list(&v) {
+                    ids.append(&mut part);
+                }
+                let has_more = v
+                    .get("has_more")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                next_page = v
+                    .get("next_page")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                if !has_more || next_page.is_none() {
+                    break;
+                }
             }
-            parse_id_list(&resp.json::<serde_json::Value>().await.unwrap_or_default())
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
         }
         "openai_compat" => {
             let oauth_openai = name == "openai" && cred.as_ref().is_some_and(|c| c.oauth);
@@ -661,10 +703,32 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
             let Ok(resp) = resp else {
                 return Ok(Vec::new());
             };
-            if !resp.status().is_success() {
-                return Ok(Vec::new());
+            let status = resp.status();
+            if !status.is_success() {
+                if oauth_openai && status.as_u16() == 400 {
+                    // ChatGPT/Codex OAuth 는 /models 엔드포인트가 없다 — 정적 카탈로그 사용.
+                    return Ok(Vec::new());
+                }
+                anyhow::bail!("HTTP {status}");
             }
-            parse_id_list(&resp.json::<serde_json::Value>().await.unwrap_or_default())
+            let v = resp.json::<serde_json::Value>().await.unwrap_or_default();
+            let mut ids = parse_id_list(&v)?;
+            if ids.is_empty() && oauth_openai {
+                // codex 응답은 {"models":[{"slug":…}]} 형태일 수 있다.
+                if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+                    for item in arr {
+                        for k in ["slug", "id", "name"] {
+                            if let Some(s) = item.get(k).and_then(|x| x.as_str()) {
+                                ids.push(s.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
         }
         _ => Ok(Vec::new()),
     }
@@ -1437,10 +1501,15 @@ pub fn is_connected(cfg: &Config, name: &str) -> bool {
     if auth_mode(name, p) == "none" {
         return true;
     }
-    resolve_credential(cfg, name)
-        .ok()
-        .flatten()
-        .is_some()
+    // 여러 계정 중 하나라도 유효한 자격증명이 있으면 "연결됨".
+    // (키 없는 하위 계정이 로테이션에 선택됐다는 이유로 상태가 뒤집히면 안 된다.)
+    let mut ids: Vec<String> = crate::accounts::for_provider(name)
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+    ids.push(name.to_string());
+    ids.iter()
+        .any(|id| matches!(resolve_account_credential(cfg, name, id), Ok(Some(_))))
 }
 
 pub fn has_cloud_credential(cfg: &Config) -> bool {

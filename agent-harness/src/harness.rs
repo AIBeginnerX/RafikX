@@ -65,9 +65,8 @@ pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
     if looks_like_advanced(text) {
         return TaskClass::Advanced;
     }
-    if obsidian {
-        return TaskClass::Medium;
-    }
+    // obsidian 플래그는 컨텍스트 주입 여부일 뿐 — 인사말까지 medium 으로 올리지 않는다.
+    let _ = obsidian;
     let n = text.chars().count();
     if (150..=600).contains(&n) {
         return TaskClass::Medium;
@@ -308,10 +307,12 @@ fn pick_manual(
     needs_tools: bool,
 ) -> Result<(String, String, Option<String>)> {
     let h = &cfg.file.harness;
+    // 분류별 수동 지정 — 비어 있으면 자동으로 폴백 (사용자 요구: 기본 자동, 수동 선택 시 수동).
     let spec = match class {
+        TaskClass::Simple => h.manual_simple.as_deref().filter(|s| !s.is_empty()),
+        TaskClass::Medium => h.manual_medium.as_deref().filter(|s| !s.is_empty()),
         TaskClass::Advanced => h.manual_design.as_deref().filter(|s| !s.is_empty()),
         TaskClass::Dev => h.manual_debug.as_deref().filter(|s| !s.is_empty()),
-        _ => None,
     }
     .or(h.manual_model.as_deref().filter(|s| !s.is_empty()));
     let verify_spec = h.manual_verify.as_deref().filter(|s| !s.is_empty());
@@ -327,20 +328,86 @@ fn pick_manual(
     pick_auto(cfg, class, sub, needs_tools).map(|(p, m, _)| (p, m, verify_model))
 }
 
+/// 분류 → 수동 모델 설정 키. 관리자 UI/CLI 가 이 이름으로 config 에 쓴다.
+pub fn manual_key_for(class: TaskClass) -> &'static str {
+    match class {
+        TaskClass::Simple => "manual_simple",
+        TaskClass::Medium => "manual_medium",
+        TaskClass::Advanced => "manual_design",
+        TaskClass::Dev => "manual_debug",
+    }
+}
+
+/// 하네스 선정 모드 저장 ("auto" | "manual").
+pub fn set_selection_mode(cfg: &Config, mode: &str) -> Result<()> {
+    let m = if mode.eq_ignore_ascii_case("manual") {
+        "manual"
+    } else {
+        "auto"
+    };
+    crate::config::write_toml_key(&cfg.path, "[harness]", "selection", &crate::config::toml_string(m))
+}
+
+/// 분류별 수동 모델 지정. 빈 spec 이면 해당 분류의 수동 지정을 지운다(자동 폴백).
+pub fn set_manual_model(cfg: &Config, class: TaskClass, spec: &str) -> Result<String> {
+    let key = manual_key_for(class);
+    if spec.trim().is_empty() {
+        // 값 제거: auto 로 덮어쓰고 주석 처리된 형태가 되지 않게 빈 문자열로 둔다.
+        crate::config::write_toml_key(&cfg.path, "[harness]", key, &crate::config::toml_string(""))?;
+        return Ok(format!("{} 수동 지정 해제 (자동 사용)", class.as_str()));
+    }
+    // 지정 형식 검증 — 연결된 프로바이더에서 찾을 수 있어야 한다.
+    let needs_tools = cfg
+        .file
+        .subagents
+        .get(profile_name_for(cfg, class))
+        .map(|s| !s.tools.is_empty())
+        .unwrap_or(false);
+    let (p, m) = resolve_spec(cfg, spec.trim(), needs_tools)?;
+    crate::config::write_toml_key(
+        &cfg.path,
+        "[harness]",
+        key,
+        &crate::config::toml_string(spec.trim()),
+    )?;
+    Ok(format!(
+        "{} 수동 모델: {} / {}",
+        class.as_str(),
+        p,
+        m
+    ))
+}
+
 /// 연결된(등록된) 모델만. 미연결 프로바이더는 절대 고르지 않는다.
+/// 사용자가 기본 연결(default_provider)을 지정했다면 그 안에서 자동 선택한다 —
+/// 기본 연결·기본 모델 설정이 자동 하네스보다 우선한다.
 pub fn pick_auto(
     cfg: &Config,
     class: TaskClass,
     sub: &crate::config::SubAgentConfig,
     needs_tools: bool,
 ) -> Result<(String, String, Option<String>)> {
-    let table = crate::ranks::load();
     let all = crate::auth::registered_models(cfg);
     if all.is_empty() {
         anyhow::bail!(
             "연결된 서비스가 없습니다. rafikx settings 또는 rafikx doctor 에서 번호로 연결하세요."
         );
     }
+
+    // ① 기본 연결 우선 — 사용자가 고른 서비스·모델을 존중한다.
+    let def = cfg.file.general.default_provider.clone();
+    if crate::auth::is_usable(cfg, &def) {
+        if let Ok(dp) = cfg.provider(&def) {
+            if !needs_tools || dp.supports_tools {
+                let model = pick_for_provider(cfg, &def, class, &sub.model_role, needs_tools)
+                    .unwrap_or_else(|| model_for_role(dp, &sub.model_role));
+                return Ok((def, model, None));
+            }
+        }
+    }
+
+    // ② 기본 연결을 못 쓰면(미연결·도구 미지원) 순위표로 전역 자동 선택.
+    let table = crate::ranks::load();
     let mut regs: Vec<crate::auth::RegisteredModel> = all
         .into_iter()
         .filter(|r| {
@@ -440,7 +507,9 @@ fn pick_for_provider(
     let Ok(p) = cfg.provider(name) else {
         return None;
     };
-    if p.model_auto || cfg.file.harness.selection.trim().eq_ignore_ascii_case("auto") {
+    // 프로바이더 자체 자동(model_auto)일 때만 그 안에서 순위 기반 선택.
+    // 사용자가 저장한 model 은 설정값이므로 존중한다 (selection=auto 라도 덮어쓰지 않음).
+    if p.model_auto {
         let regs: Vec<_> = crate::auth::registered_models(cfg)
             .into_iter()
             .filter(|r| r.provider == name)
@@ -570,6 +639,12 @@ where
                 ));
                 last_err = Some(e);
             }
+            Err(e) if is_auth_failure(&e) => {
+                crate::ui::live_warn(&format!(
+                    "{name} 키 인증 실패(401/403) — rafikx login 에서 키를 갱신하세요"
+                ));
+                last_err = Some(e);
+            }
             Err(e) if is_retryable(&e) => {
                 last_err = Some(e);
             }
@@ -580,6 +655,12 @@ where
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("'{name}' 사용 가능한 계정이 없습니다")))
+}
+
+/// 401/403 등 키 문제 — 재시도보다 재연결이 답이다.
+fn is_auth_failure(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    s.contains("401") || s.contains("403")
 }
 
 pub fn fallback_order(cfg: &Config, primary: &str, cli_provider: Option<&str>) -> Vec<String> {
@@ -628,6 +709,8 @@ pub async fn chat_with_fallback(
 ) -> Result<(String, ChatResponse)> {
     let original_model = req.model.clone();
     let primary = order.first().map(|s| s.as_str());
+    // 첫 번째(주 연결) 오류를 끝까지 보존한다 — 마지막 폴백의 오류가 원인을 가리지 않게.
+    let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err = None;
     for name in order {
         let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary) else {
@@ -641,10 +724,27 @@ pub async fn chat_with_fallback(
         .await
         {
             Ok(resp) => return Ok((name.clone(), resp)),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                crate::ui::live_warn(&format!(
+                    "{name} 호출 실패 ({}) → 다음 연결",
+                    short_err(&e)
+                ));
+                if Some(name.as_str()) == primary && primary_err.is_none() {
+                    primary_err = Some(e);
+                } else {
+                    last_err = Some(e);
+                }
+            }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
+    Err(primary_err
+        .or(last_err)
+        .unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
+}
+
+fn short_err(e: &anyhow::Error) -> String {
+    let s = format!("{e:#}");
+    s.chars().take(120).collect()
 }
 
 pub async fn stream_with_fallback<F>(
@@ -659,6 +759,7 @@ where
 {
     let original_model = req.model.clone();
     let primary = order.first().map(|s| s.as_str());
+    let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err = None;
     for name in order {
         let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary) else {
@@ -693,8 +794,17 @@ where
                 }
             }
         }
+        if last_err.is_some() && Some(name.as_str()) == primary && primary_err.is_none() {
+            primary_err = last_err.take();
+            crate::ui::live_warn(&format!(
+                "{name} 실패 ({}) → 다음 연결",
+                primary_err.as_ref().map(short_err).unwrap_or_default()
+            ));
+        }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
+    Err(primary_err
+        .or(last_err)
+        .unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
 }
 
 pub async fn chat_accounts(
@@ -753,9 +863,10 @@ async fn classify_llm(cfg: &Config, text: &str) -> Result<TaskClass> {
 
 pub fn print_binding(b: &Binding) {
     crate::ui::note(&format!(
-        "하네스  {} → {}  ·  {}",
+        "하네스  {} → {}  ·  {}/{}",
         b.class.as_str(),
         b.profile_name,
+        b.provider_name,
         crate::ui::bold(&b.model)
     ));
 }
@@ -851,6 +962,17 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          {extra}",
         cfg.workspace.display()
     );
+    // OMO 의 Rules Injection 수용: 워크스페이스 규칙 파일을 자동 주입 (경량 상한 8K).
+    for fname in ["AGENTS.md", "RAFIKX.md"] {
+        let p = cfg.workspace.join(fname);
+        if let Ok(body) = std::fs::read_to_string(&p) {
+            let trimmed: String = body.trim().chars().take(8000).collect();
+            if !trimmed.is_empty() {
+                s.push_str(&format!("\n\n[프로젝트 규칙 — {fname}]\n{trimmed}"));
+            }
+            break;
+        }
+    }
     if !lessons.trim().is_empty() {
         s.push('\n');
         s.push_str(lessons.trim_end());
@@ -1036,6 +1158,7 @@ async fn run_verify(
     let yes = agent::effective_yes(yes, &remote);
     for round in 0..3 {
         crate::ui::live_line(&format!("[검증] {cmd}"));
+        crate::spinner::set_label(&format!("검증 실행: {cmd}"));
         let input = serde_json::json!({"command": cmd});
         if tool.needs_approval(&input) && !yes {
             match tools::approval_preview("bash", &input, &ctx) {
@@ -1179,8 +1302,11 @@ mod tests {
     }
 
     #[test]
-    fn classifies_medium_from_obsidian_flag() {
-        assert_eq!(classify_rules("안녕", true), TaskClass::Medium);
+    fn obsidian_flag_alone_stays_simple() {
+        assert_eq!(classify_rules("안녕", true), TaskClass::Simple);
+        assert_eq!(classify_rules("안녕", false), TaskClass::Simple);
+        // 노트 관련 키워드는 여전히 medium
+        assert_eq!(classify_rules("내 노트 찾아줘", true), TaskClass::Medium);
     }
 
     #[test]
