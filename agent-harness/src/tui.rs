@@ -36,6 +36,8 @@ pub struct App {
     pub help: bool,
     pub status: String,
     pub tokens: String,
+    /// 풋터 표시용 컨텍스트·캐시 요약 문자열
+    pub ctx: String,
     pub binding: String,
     pub cwd: String,
     pub approval: Option<ApprovalPrompt>,
@@ -48,7 +50,8 @@ pub struct App {
     streaming: bool,
     quit: bool,
     quit_after: bool,
-    slash_hint_shown: bool,
+    /// 슬래시 명령 Enter 2회 확인용
+    pub slash_armed: bool,
 }
 
 pub struct ApprovalPrompt {
@@ -159,6 +162,7 @@ pub async fn run(
         help: false,
         status: "준비".into(),
         tokens: String::new(),
+        ctx: String::new(),
         approval: None,
         picker: None,
         secret: None,
@@ -169,7 +173,7 @@ pub async fn run(
         streaming: false,
         quit: false,
         quit_after: false,
-        slash_hint_shown: false,
+        slash_armed: false,
     };
     if app.transcript.is_empty() {
         app.transcript.push(Entry {
@@ -552,9 +556,17 @@ fn handle_key(
         KeyCode::Enter if shift || ctrl => insert_char(app, '\n'),
         KeyCode::Char('j') if ctrl => insert_char(app, '\n'),
         KeyCode::Enter => {
-            if !app.busy {
-                submit(app, local_ask, done_tx);
+            if app.busy {
+                return;
             }
+            // 슬래시 명령은 Enter 두 번으로 실행 (첫 번째는 확인)
+            if app.input.trim().starts_with('/') && !app.slash_armed {
+                app.slash_armed = true;
+                app.status = "슬래시 명령 — 다시 Enter 로 실행".into();
+                return;
+            }
+            app.slash_armed = false;
+            submit(app, local_ask, done_tx);
         }
         KeyCode::Backspace => backspace(app),
         KeyCode::Delete => delete(app),
@@ -565,18 +577,7 @@ fn handle_key(
         KeyCode::Up => history_prev(app),
         KeyCode::Down => history_next(app),
         KeyCode::Char('/') if app.input.is_empty() => {
-            // 슬래시 명령 목록 즉시 표시 (한 번)
-            if !app.slash_hint_shown {
-                for line in crate::chat::help_text().lines() {
-                    push(app, EntryKind::System, line.to_string());
-                }
-                push(
-                    app,
-                    EntryKind::System,
-                    "↑ 명령은 입력창에 그대로 치면 됩니다. 다시 보기: /help".to_string(),
-                );
-                app.slash_hint_shown = true;
-            }
+            // 명령 목록은 하단 팔레트가 담당 — 트랜스크립트에는 출력하지 않는다.
             insert_char(app, '/');
         }
         KeyCode::Char(c) if !ctrl => insert_char(app, c),
@@ -589,6 +590,15 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
     if line.is_empty() {
         return;
     }
+    if line == "/" {
+        // 명령 없이 "/" 만 — 하단 팔레트가 이미 보고 있으므로 아무것도 실행하지 않는다.
+        app.input.clear();
+        app.cursor = 0;
+        app.slash_armed = false;
+        app.status = "명령을 입력하세요".into();
+        return;
+    }
+    app.slash_armed = false;
     app.history.push(line.clone());
     app.history_idx = None;
     app.input.clear();
@@ -692,7 +702,33 @@ fn finish_turn(app: &mut App, done: TurnDone) {
     match done.result {
         Ok(info) => {
             app.status = format!("{}  {}", info.status, info.label);
-            app.tokens = format!("in {}  out {}", info.tokens_in, info.tokens_out);
+            let fmt_k = |n: u32| -> String {
+                if n >= 1_000_000 {
+                    format!("{:.0}M", n as f64 / 1e6)
+                } else if n >= 1_000 {
+                    format!("{:.0}k", n as f64 / 1e3)
+                } else {
+                    n.to_string()
+                }
+            };
+            app.tokens = format!("{}/{}", fmt_k(info.tokens_in), fmt_k(info.tokens_out));
+            if info.ctx_window > 0 {
+                let pct = (info.ctx_used.min(info.ctx_window)) * 100 / info.ctx_window;
+                let cache_pct = if info.tokens_in > 0 {
+                    info.cached_in * 100 / info.tokens_in
+                } else {
+                    0
+                };
+                app.ctx = format!(
+                    "ctx {}/{} ({}%) · cache {}%",
+                    fmt_k(info.ctx_used),
+                    fmt_k(info.ctx_window),
+                    pct,
+                    cache_pct
+                );
+            } else {
+                app.ctx.clear();
+            }
         }
         Err(e) => {
             push(app, EntryKind::Warn, format!("오류: {e:#}"));
@@ -723,6 +759,9 @@ fn start_compact(
                     status: "ok".into(),
                     tokens_in: 0,
                     tokens_out: 0,
+                    ctx_used: 0,
+                    ctx_window: 0,
+                    cached_in: 0,
                 })
             }
             Err(e) => Err(e),
@@ -865,6 +904,7 @@ fn insert_char(app: &mut App, c: char) {
     app.input.insert(app.cursor, c);
     app.cursor += c.len_utf8();
     app.history_idx = None;
+    app.slash_armed = false;
 }
 
 fn backspace(app: &mut App) {
@@ -874,6 +914,7 @@ fn backspace(app: &mut App) {
     let prev = prev_idx(&app.input, app.cursor);
     app.input.replace_range(prev..app.cursor, "");
     app.cursor = prev;
+    app.slash_armed = false;
 }
 
 fn delete(app: &mut App) {

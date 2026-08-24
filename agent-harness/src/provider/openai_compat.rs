@@ -312,6 +312,7 @@ fn finish_stream(
         },
         input_tokens,
         output_tokens,
+        cached_tokens: 0,
         limit,
     }
 }
@@ -459,6 +460,7 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
             .pointer("/usage/completion_tokens")
             .and_then(|x| x.as_u64())
             .unwrap_or(0) as u32,
+        cached_tokens: crate::provider::cached_tokens_from(&v),
         limit: LimitHint::default(),
     })
 }

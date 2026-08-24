@@ -28,6 +28,8 @@ pub struct Session {
     /// /file 로 붙인 첨부 (경로, 내용) — 다음 턴의 컨텍스트로 주입된 뒤 비운다.
     pub attachments: Vec<(String, String)>,
     pub dirty: bool,
+    /// 성공한 턴의 (provider, model) — 사용자가 직접 지정하지 않았을 때 연속성을 위해 재사용.
+    pub sticky: Option<(String, String)>,
 }
 
 /// 슬래시 명령 테이블 — TUI 하단 팔레트와 도움말이 함께 쓴다.
@@ -52,6 +54,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/status", "연결·사용량 요약"),
     ("/theme", "테마 변경"),
     ("/obsidian", "볼트 사용 on|off"),
+    ("/new", "새 세션 시작"),
     ("/save", "세션 저장"),
     ("/clear", "대화 지우기"),
     ("/quit", "종료"),
@@ -171,6 +174,7 @@ pub fn open_session(
             obsidian_on: false,
             attachments: Vec::new(),
             dirty: false,
+            sticky: None,
         });
     }
     Ok(Session {
@@ -185,6 +189,7 @@ pub fn open_session(
         obsidian_on: false,
         attachments: Vec::new(),
         dirty: false,
+        sticky: None,
     })
 }
 
@@ -228,6 +233,15 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             session.session_id = Some(id.clone());
             session.dirty = false;
             Ok(Slash::Continue(vec![format!("저장됨: {id}")]))
+        }
+        "/new" => {
+            session.messages.clear();
+            session.attachments.clear();
+            session.session_id = None;
+            session.dirty = false;
+            Ok(Slash::Continue(vec![
+                "새 세션을 시작합니다. 이전 대화는 /sessions 에서 찾을 수 있습니다.".into()
+            ]))
         }
         "/clear" => {
             session.messages.clear();
@@ -854,11 +868,21 @@ pub async fn run_turn(
     local_ask: Option<LocalAsk>,
 ) -> Result<TurnInfo> {
     let class = classify(&session.cfg, prompt, obsidian_on, forced_class).await?;
+    // 연속성: 사용자가 직접 고르지 않았으면 마지막 성공 조합(provider, model)을 재사용해
+    // 매 턴마다 다른 모델이 추첨되어 인증·리밋 오류가 나는 일을 막는다.
+    let (ov_provider, ov_model) = if session.provider.is_none() && session.model.is_none() {
+        match &session.sticky {
+            Some((sp, sm)) => (Some(sp.as_str()), Some(sm.as_str())),
+            None => (None, None),
+        }
+    } else {
+        (session.provider.as_deref(), session.model.as_deref())
+    };
     let mut binding = bind(
         &session.cfg,
         class,
-        session.provider.as_deref(),
-        session.model.as_deref(),
+        ov_provider,
+        ov_model,
     )?;
     // opencode 스타일 plan 모드 — 하네스 분류·모델 자동선택은 그대로 두고 도구만 제한.
     let plan = session.is_plan_mode();
@@ -982,15 +1006,24 @@ pub async fn run_turn(
             session.dirty = true;
             crate::lessons::maybe_spawn(&session.cfg, prompt, &outcome);
             crate::ui::print_footer();
+            // 성공한 조합을 세션에 고정(사용자 지정이 없을 때만) — 다음 턴도 같은 모델로 진행.
+            if session.provider.is_none() && session.model.is_none() {
+                session.sticky = Some((binding.provider_name.clone(), binding.model.clone()));
+            }
             Ok(TurnInfo {
                 run_id,
                 label: info_label,
                 status: outcome.status,
                 tokens_in: outcome.input_tokens,
                 tokens_out: outcome.output_tokens,
+                ctx_used: outcome.input_tokens.max(outcome.output_tokens),
+                ctx_window: binding.context_window,
+                cached_in: outcome.cached_tokens,
             })
         }
         Err(e) => {
+            // 실패한 조합 고정을 풀어 다음 턴에서 다시 선정하게 한다.
+            session.sticky = None;
             let _ = db.finish_run(&run_id, "fail", 0, 0, 0, Some(&e.to_string()));
             crate::graph::node("persist", "fail", &e.to_string(), Some("bind"));
             let fail = agent::AgentOutcome {
@@ -998,6 +1031,7 @@ pub async fn run_turn(
                 iterations: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_tokens: 0,
                 error: Some(e.to_string()),
                 messages: vec![],
                 changed_files: vec![],
@@ -1018,6 +1052,12 @@ pub struct TurnInfo {
     pub status: String,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    /// 마지막 요청의 컨텍스트 사용 추정치 (마지막 턴 입력 토큰)
+    pub ctx_used: u32,
+    /// 선택된 모델의 컨텍스트 창
+    pub ctx_window: u32,
+    /// 프롬프트 캐시 히트 토큰 누적
+    pub cached_in: u32,
 }
 
 fn persist(db: &Db, id: Option<&str>, messages: &mut [Message]) -> Result<String> {

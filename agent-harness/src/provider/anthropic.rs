@@ -150,6 +150,7 @@ impl AnthropicProvider {
                                 stop_reason,
                                 input_tokens,
                                 output_tokens,
+                                cached_tokens: crate::provider::cached_tokens_from(&v),
                                 limit: hint.clone(),
                             });
                         }
@@ -171,6 +172,7 @@ impl AnthropicProvider {
             stop_reason,
             input_tokens,
             output_tokens,
+            cached_tokens: 0,
             limit: hint,
         })
     }
@@ -291,6 +293,7 @@ fn parse_message_json(text: &str) -> Result<ChatResponse> {
             .pointer("/usage/output_tokens")
             .and_then(|x| x.as_u64())
             .unwrap_or(0) as u32,
+        cached_tokens: crate::provider::cached_tokens_from(&v),
         limit: LimitHint::default(),
     })
 }

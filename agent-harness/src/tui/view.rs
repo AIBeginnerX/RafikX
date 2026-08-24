@@ -365,8 +365,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         let hint = "? 키   /connect 키등록   /mode plan|build   /help   Ctrl+C 종료";
         line_spans.push(Span::styled(" ", Style::default()));
         line_spans.push(Span::styled(&app.status, Style::default().fg(th.code)));
-        line_spans.push(Span::raw("  "));
-        line_spans.push(Span::styled(&app.tokens, Style::default().fg(th.mute)));
+        if !app.tokens.is_empty() {
+            line_spans.push(Span::raw("  "));
+            line_spans.push(Span::styled(app.tokens.clone(), Style::default().fg(th.mute)));
+        }
+        if !app.ctx.is_empty() {
+            line_spans.push(Span::raw("  ·  "));
+            line_spans.push(Span::styled(app.ctx.clone(), Style::default().fg(th.code)));
+        }
+        line_spans.push(Span::raw("  ·  "));
+        line_spans.push(Span::styled(&app.cwd, Style::default().fg(th.mute)));
         line_spans.push(Span::raw("  "));
         line_spans.push(Span::styled(hint, Style::default().fg(th.secondary)));
     }
@@ -376,34 +384,46 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     );
 }
 
-/// 파란 계열 그라데이션의 슬라이딩 디지털 바. 프레임은 시간에서 유도(재그리기마다 움직인다).
+/// 파란 계열 그라데이션의 디지털 바(사각형). 어두운 베이스 위로 밝은 그라데이션 구간이 왕복한다.
 fn digital_bar(width: usize) -> Vec<Span<'static>> {
+    const BASE: (u8, u8, u8) = (24, 38, 96);
     const SHADES: [(u8, u8, u8); 6] = [
-        (30, 52, 148),
         (46, 82, 200),
         (66, 118, 240),
         (96, 156, 255),
         (140, 196, 255),
-        (186, 226, 255),
+        (170, 212, 255),
+        (210, 236, 255),
     ];
-    const RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as usize)
         .unwrap_or(0);
-    let offset = now / 110;
     let width = width.max(8);
+    let span_w = width / 2; // 밝게 빛나는 구간 길이
+    let period = (width + span_w) * 2;
+    let t = (now / 90) % period;
+    let head = if t < width + span_w { t } else { period - t }; // 왕복 위치
     let mut out = vec![Span::styled(
         "[",
         Style::default().fg(Color::Rgb(70, 100, 200)),
     )];
     for i in 0..width {
-        // 이동하는 디지털 파형 (0..15 삼각파)
-        let h = (i + offset) % 16;
-        let tri = if h < 8 { h } else { 15 - h };
-        let ch = RAMP[(tri * RAMP.len() / 8).min(RAMP.len() - 1)];
-        let shade = SHADES[i * SHADES.len() / width];
-        out.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(shade.0, shade.1, shade.2))));
+        // 머리 위치에서 뒤로 span_w 길이만큼 밝게
+        let bright = head >= span_w && i < head && i + span_w > head;
+        if bright {
+            let rel = (i - (head - span_w)) * SHADES.len() / span_w.max(1);
+            let shade = SHADES[rel.min(SHADES.len() - 1)];
+            out.push(Span::styled(
+                "█".to_string(),
+                Style::default().fg(Color::Rgb(shade.0, shade.1, shade.2)),
+            ));
+        } else {
+            out.push(Span::styled(
+                "█".to_string(),
+                Style::default().fg(Color::Rgb(BASE.0, BASE.1, BASE.2)),
+            ));
+        }
     }
     out.push(Span::styled(
         "]",

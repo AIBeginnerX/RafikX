@@ -1120,6 +1120,7 @@ pub async fn run_pipeline(
             iterations: 1,
             input_tokens: resp.input_tokens,
             output_tokens: resp.output_tokens,
+            cached_tokens: resp.cached_tokens,
             error: None,
             messages,
             changed_files: vec![],

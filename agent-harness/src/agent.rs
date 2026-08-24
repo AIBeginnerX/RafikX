@@ -22,6 +22,8 @@ pub struct AgentOutcome {
     pub iterations: u32,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// 누적 프롬프트 캐시 히트 토큰
+    pub cached_tokens: u32,
     pub error: Option<String>,
     pub messages: Vec<Message>,
     pub changed_files: Vec<String>,
@@ -37,6 +39,7 @@ impl Default for AgentOutcome {
             iterations: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: 0,
             error: None,
             messages: Vec::new(),
             changed_files: Vec::new(),
@@ -125,6 +128,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let mut iterations = 0u32;
     let mut input_tokens = 0u32;
     let mut output_tokens = 0u32;
+    let mut cached_tokens = 0u32;
     let mut denied_any = false;
     let mut call_counts: HashMap<String, u32> = HashMap::new();
     let mut changed_files: Vec<String> = Vec::new();
@@ -140,6 +144,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 iterations,
                 input_tokens,
                 output_tokens,
+                cached_tokens,
                 error: Some("반복 상한".into()),
                 messages,
                 changed_files,
@@ -187,6 +192,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         );
         input_tokens += resp.input_tokens;
         output_tokens += resp.output_tokens;
+        cached_tokens += resp.cached_tokens;
         crate::ui::live_status(&format!(
             "[tokens] in={} out={} (누적 in={} out={})",
             resp.input_tokens, resp.output_tokens, input_tokens, output_tokens
@@ -215,6 +221,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 iterations,
                 input_tokens,
                 output_tokens,
+                cached_tokens,
                 error: None,
                 messages,
                 changed_files,
@@ -234,6 +241,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 iterations,
                 input_tokens,
                 output_tokens,
+                cached_tokens,
                 error: None,
                 messages,
                 changed_files,
@@ -260,6 +268,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                     iterations,
                     input_tokens,
                     output_tokens,
+                    cached_tokens,
                     error: Some("동일 도구 3회 반복".into()),
                     messages,
                     changed_files,
