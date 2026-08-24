@@ -95,6 +95,8 @@ pub struct TurnResult {
     pub status: String,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    /// 이 답변에 걸린 시간 (밀리초)
+    pub elapsed_ms: u64,
     pub session_id: Option<String>,
     pub graph: Vec<graph::GraphNode>,
 }
@@ -331,6 +333,7 @@ pub async fn run_turn(
         status: info.status,
         tokens_in: info.tokens_in,
         tokens_out: info.tokens_out,
+        elapsed_ms: info.elapsed_ms,
         session_id: session.session_id.clone(),
         graph: nodes,
     })

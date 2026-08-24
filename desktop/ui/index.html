@@ -792,8 +792,9 @@
             renderRichInto(streamEl, final_text);
             attachCopy(streamEl.parentElement, () => final_text);
           }
+          const secs = ((r.turn.elapsed_ms || 0) / 1000).toFixed(1);
           document.getElementById("status").textContent =
-            r.turn.label + " · " + r.turn.status + " · in " + r.turn.tokens_in + " / out " + r.turn.tokens_out;
+            r.turn.label + " · " + r.turn.status + " · " + secs + "s · in " + r.turn.tokens_in + " / out " + r.turn.tokens_out;
           renderGraph(r.turn.run_id, r.turn.graph);
         }
         if (r.session_id) sid = r.session_id;

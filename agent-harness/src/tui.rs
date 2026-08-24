@@ -708,7 +708,11 @@ fn finish_turn(app: &mut App, done: TurnDone) {
     app.binding = binding_label(&app.session);
     match done.result {
         Ok(info) => {
-            app.status = format!("{}  {}", info.status, info.label);
+            let secs = info.elapsed_ms as f64 / 1000.0;
+            app.status = format!(
+                "{}  {}  ·  {:.1}s",
+                info.status, info.label, secs
+            );
             let fmt_k = |n: u32| -> String {
                 if n >= 1_000_000 {
                     format!("{:.0}M", n as f64 / 1e6)
@@ -769,6 +773,7 @@ fn start_compact(
                     ctx_used: 0,
                     ctx_window: 0,
                     cached_in: 0,
+                    elapsed_ms: 0,
                 })
             }
             Err(e) => Err(e),

@@ -871,6 +871,7 @@ pub async fn run_turn(
     obsidian_on: bool,
     local_ask: Option<LocalAsk>,
 ) -> Result<TurnInfo> {
+    let started = std::time::Instant::now();
     crate::spinner::set_label("질문 확인 중…");
     let class = classify(&session.cfg, prompt, obsidian_on, forced_class).await?;
     // 연속성: 사용자가 직접 고르지 않았으면 마지막 성공 조합(provider, model)을 재사용해
@@ -1024,6 +1025,7 @@ pub async fn run_turn(
                 ctx_used: outcome.input_tokens.max(outcome.output_tokens),
                 ctx_window: binding.context_window,
                 cached_in: outcome.cached_tokens,
+                elapsed_ms: started.elapsed().as_millis() as u64,
             })
         }
         Err(e) => {
@@ -1063,6 +1065,8 @@ pub struct TurnInfo {
     pub ctx_window: u32,
     /// 프롬프트 캐시 히트 토큰 누적
     pub cached_in: u32,
+    /// 이 답변에 걸린 시간 (밀리초)
+    pub elapsed_ms: u64,
 }
 
 fn persist(db: &Db, id: Option<&str>, messages: &mut [Message]) -> Result<String> {
