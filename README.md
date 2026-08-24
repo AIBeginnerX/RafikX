@@ -76,6 +76,21 @@ Windows는 rustup이 C++ 빌드 도구를 요청할 수 있습니다.
 
 설정 폴더: `~/.rafikx` (Windows는 `%USERPROFILE%\.rafikx`).
 
+### 자동 로그인 가져오기 (OAuth)
+
+Claude Code · Codex CLI · Gemini CLI 중 하나라도 로컬에 로그인돼 있으면,
+RafikX 실행 시 **별도 설정 없이** 그 로그인 정보를 자동으로 가져와 anthropic · openai · gemini 연결에 사용합니다.
+가져오기는 프로세스당 1회만 시도하고, 이미 연결된 서비스는 건드리지 않습니다.
+직접 로그인하려면 `rafikx` 첫 화면 또는 `/connect` 에서 브라우저 로그인·키 붙여넣기도 가능합니다.
+참고: xAI(Grok)는 공개 OAuth가 없어 콘솔 키 붙여넣기 방식입니다.
+
+### 기본 내장 프로바이더
+
+anthropic · openai · gemini · grok(xAI) · openrouter · opencode_zen · opencode_go · **minimax** · **commandcode** · groq · deepseek · mistral · together · fireworks · moonshot · glm · perplexity · cohere · qwen · local(Ollama).
+
+- **MiniMax**: [platform.minimax.io](https://platform.minimax.io) 에서 키 발급 (`MINIMAX_API_KEY`), OpenAI 호환 `https://api.minimax.io/v1`, 모델 예 `MiniMax-M2`.
+- **CommandCode**: [commandcode.ai](https://commandcode.ai) (`COMMANDCODE_API_KEY`), base_url 은 config.toml 에서 조정 가능.
+
 ---
 
 ## 5분 사용

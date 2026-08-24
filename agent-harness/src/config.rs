@@ -73,6 +73,26 @@ small_model = "minimax-m2.7"
 supports_tools = true
 
 # OpenCode Go — 같은 콘솔에서 구독 후 키. OPENCODE_GO_API_KEY 또는 OPENCODE_API_KEY.
+# MiniMax — https://platform.minimax.io 에서 키. OpenAI 호환 chat/completions.
+[providers.minimax]
+kind = "openai_compat"
+auth = "api_key"
+api_key_env = "MINIMAX_API_KEY"
+base_url = "https://api.minimax.io/v1"
+model = "MiniMax-M2"
+small_model = "MiniMax-M2"
+supports_tools = true
+
+# CommandCode — https://commandcode.ai . COMMANDCODE_API_KEY (base_url 은 설정에서 조정 가능).
+[providers.commandcode]
+kind = "openai_compat"
+auth = "api_key"
+api_key_env = "COMMANDCODE_API_KEY"
+base_url = "https://api.commandcode.ai/v1"
+model = "gpt-5.6-sol"
+small_model = "gpt-5.6-sol"
+supports_tools = true
+
 [providers.opencode_go]
 kind = "openai_compat"
 auth = "api_key"
@@ -668,6 +688,8 @@ fn merge_missing_providers(path: &Path, raw: &str) -> Result<String> {
         "openrouter",
         "opencode_zen",
         "opencode_go",
+        "minimax",
+        "commandcode",
         "groq",
         "deepseek",
         "mistral",
@@ -750,6 +772,8 @@ mod tests {
         assert!(DEFAULT_CONFIG.contains("[providers.opencode_zen]"));
         assert!(DEFAULT_CONFIG.contains("https://opencode.ai/zen/v1"));
         assert!(DEFAULT_CONFIG.contains("[providers.opencode_go]"));
+        assert!(DEFAULT_CONFIG.contains("[providers.minimax]"));
+        assert!(DEFAULT_CONFIG.contains("[providers.commandcode]"));
         assert!(DEFAULT_CONFIG.contains("https://opencode.ai/zen/go/v1"));
         let file: ConfigFile = toml::from_str(DEFAULT_CONFIG).expect("parse");
         let zen = file.providers.get("opencode_zen").expect("zen");

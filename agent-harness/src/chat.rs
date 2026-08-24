@@ -147,6 +147,10 @@ pub fn open_session(
     resume: Option<String>,
     announce: bool,
 ) -> Result<Session> {
+    // 공식 CLI 로컬 로그인이 있으면 자동으로 가져와 연결한다 (프로세스당 1회).
+    for note in crate::auth::auto_import_cli_logins(&cfg) {
+        crate::ui::note(&note);
+    }
     let db = Db::open(&Db::db_path()?)?;
     if let Some(id) = resume {
         let Some(row) = db.load_session(&id)? else {

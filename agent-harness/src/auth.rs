@@ -302,6 +302,20 @@ pub fn api_key_env_names(provider: &str, primary: &str) -> Vec<String> {
                 }
             }
         }
+        "minimax" => {
+            for n in ["MINIMAX_API_KEY", "MINIMAXI_API_KEY"] {
+                if !names.iter().any(|x| x == n) {
+                    names.push(n.to_string());
+                }
+            }
+        }
+        "commandcode" => {
+            for n in ["COMMANDCODE_API_KEY", "COMMAND_CODE_API_KEY"] {
+                if !names.iter().any(|x| x == n) {
+                    names.push(n.to_string());
+                }
+            }
+        }
         _ => {}
     }
     names
@@ -1580,6 +1594,8 @@ pub fn provider_label(name: &str) -> String {
         "perplexity" => "Perplexity".into(),
         "cohere" => "Cohere".into(),
         "qwen" => "Qwen (DashScope)".into(),
+        "minimax" => "MiniMax  (키)".into(),
+        "commandcode" => "CommandCode  (키)".into(),
         "local" => "로컬 (Ollama, 키 없음)".into(),
         other => other.to_string(),
     }
@@ -1828,6 +1844,36 @@ fn cli_credential_paths(name: &str) -> Vec<PathBuf> {
         _ => {}
     }
     out
+}
+
+/// 부팅 때 공식 CLI(Claude Code · Codex · Gemini)의 로컬 로그인 파일이 있고
+/// 아직 연결되지 않은 OAuth 프로바이더라면 조용히 가져온다. 프로세스당 1회만 시도.
+pub fn auto_import_cli_logins(cfg: &Config) -> Vec<String> {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_err() {
+        return Vec::new();
+    }
+    let mut notes = Vec::new();
+    for name in ["anthropic", "openai", "gemini"] {
+        let Some(p) = cfg.file.providers.get(name) else {
+            continue;
+        };
+        if is_connected(cfg, name) || auth_mode(name, p) != "oauth" {
+            continue;
+        }
+        if !cli_import_available(name) {
+            continue;
+        }
+        match import_official_cli(name, name) {
+            Ok(_) => notes.push(format!(
+                "{}: 로컬 로그인 정보를 {} 에서 자동으로 가져왔습니다.",
+                provider_label(name),
+                official_cli_label(name)
+            )),
+            Err(e) => crate::applog::info(&format!("auto-import {name}: {e}")),
+        }
+    }
+    notes
 }
 
 fn import_official_cli(name: &str, account_id: &str) -> Result<()> {

@@ -124,6 +124,9 @@ pub fn boot() -> Result<BootInfo> {
     // 주 1회 모델 순위 갱신은 백그라운드로 — 부트를 막지 않는다.
     crate::ranks::spawn_weekly_refresh();
     let cfg = Config::load(None)?;
+    for note in crate::auth::auto_import_cli_logins(&cfg) {
+        crate::ui::note(&note);
+    }
     Ok(boot_with(&cfg))
 }
 
