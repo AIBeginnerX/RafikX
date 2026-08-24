@@ -784,10 +784,13 @@ pub async fn stream_with_fallback<F>(
 where
     F: FnMut(&str),
 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let original_model = req.model.clone();
     let primary = order.first().map(|s| s.as_str());
     let mut primary_err: Option<anyhow::Error> = None;
-    let mut last_err = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    let emitted = AtomicUsize::new(0);
+
     for name in order {
         let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary) else {
             continue;
@@ -805,21 +808,44 @@ where
             let Ok(client) = build_provider_account(cfg, name, id) else {
                 continue;
             };
-            match client.chat_stream(&req, &mut on_text).await {
-                Ok(resp) => {
-                    crate::usage::record_success(id, &resp);
-                    return Ok((name.clone(), resp));
-                }
-                Err(e) if is_rate_limited(&e) => {
-                    crate::usage::mark_limited(id, crate::usage::parse_retry_after(&format!("{e:#}")));
-                    crate::ui::warn("리밋 → 다음 계정으로 전환");
-                    last_err = Some(e);
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    break;
+
+            // 스트림 실패(네트워크·5xx·미완료 EOF)는 짧은 백오프 뒤 같은 계정으로 재시도한다.
+            // 화면에 이미 텍스트가 흘러나간 뒤의 재시도·폴백은 중복 출력을 만드므로 금지한다.
+            let mut attempt = 0u32;
+            loop {
+                let mut track = |piece: &str| {
+                    emitted.fetch_add(piece.chars().count(), Ordering::Relaxed);
+                    on_text(piece);
+                };
+                match client.chat_stream(&req, &mut track).await {
+                    Ok(resp) => {
+                        crate::usage::record_success(id, &resp);
+                        return Ok((name.clone(), resp));
+                    }
+                    Err(e) if is_rate_limited(&e) => {
+                        crate::usage::mark_limited(id, crate::usage::parse_retry_after(&format!("{e:#}")));
+                        crate::ui::warn("리밋 → 다음 계정으로 전환");
+                        last_err = Some(e);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if is_retryable(last_err.as_ref().unwrap())
+                            && emitted.load(Ordering::Relaxed) == 0
+                            && attempt < 2
+                        {
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt))).await;
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
+            if emitted.load(Ordering::Relaxed) > 0 {
+                return Err(last_err.unwrap_or_else(|| anyhow!("응답 도중 스트림이 끊겼습니다")));
+            }
+            break;
         }
         if last_err.is_some() && Some(name.as_str()) == primary && primary_err.is_none() {
             primary_err = last_err.take();
@@ -986,6 +1012,10 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
         "You are RafikX, a personal CLI assistant.\n\
          Workspace: {}\n\
          If the user writes in Korean, reply in Korean.\n\
+         [도표 규칙] 비교·수치·비율을 시각화할 때 ASCII 아트 다이어그램(+---+, ->, 문자 박스)을 그리지 않는다.\n\
+         수치 비교는 반드시 아래 형식의 ```chart 블록으로 줘라 — 터미널이 실제 막대그래프로 렌더링한다.\n\
+         ```chart\n라벨1: 수치1\n라벨2: 수치2\n```\n\
+         항목 나열은 마크다운 표를 쓴다.\n\
          {extra}",
         cfg.workspace.display()
     );
@@ -1047,8 +1077,10 @@ pub async fn run_pipeline(
     let system = system_prompt(cfg, &binding.system_extra, &lessons_block);
 
     // 난이도 기반 단계별 실행 (dsh ctx.goals 영향 수용):
-    // 단순 업무는 즉답, medium 이상은 todo 스테이징. deepseek 엔진은 모든 도구 작업에 적용.
-    let engine_deep = cfg.file.general.engine.eq_ignore_ascii_case("deepseek");
+    // 단순 업무는 즉답, medium 이상은 todo 스테이징. deepseek/dk 엔진은 모든 도구 작업에 적용.
+    let engine = cfg.file.general.engine.to_ascii_lowercase();
+    let engine_deep = engine == "deepseek" || engine == "dk";
+    let engine_dk = engine == "dk";
     let staged = !binding.tools.is_empty()
         && (engine_deep || binding.class != crate::harness::TaskClass::Simple);
     let mut system = system;
@@ -1057,7 +1089,7 @@ pub async fn run_pipeline(
             "[하네스] {} 난이도{} — 단계별 실행(todo) 활성",
             binding.class.as_str(),
             if engine_deep {
-                " · deepseek 엔진"
+                " · dk/deepseek 엔진"
             } else {
                 ""
             }
@@ -1077,6 +1109,10 @@ pub async fn run_pipeline(
         if engine_deep {
             directive.push_str(" 각 단계 시작 시 `[N/총M] 단계명` 형식의 한 줄 상태를 출력한다. \
                 검증 가능한 작업(빌드·테스트·파일 수정)은 마지막에 검증 방법과 결과를 함께 남긴다.");
+        }
+        if engine_dk {
+            // DeepSeek DSH 호환 모드 — 사고 채널을 먼저 충분히 쓰고 답한다.
+            directive.push_str(" 답변 앞추측 없이 먼저 계획을 확정한 뒤 실행하고, 중간 추론은 출력하지 않는다.");
         }
         system.push_str(&directive);
     }

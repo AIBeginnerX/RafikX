@@ -12,6 +12,12 @@ pub struct Theme {
     pub body: (u8, u8, u8),
     pub mute: (u8, u8, u8),
     pub warn: (u8, u8, u8),
+    /// 오류 전용 붉은 계열.
+    pub err: (u8, u8, u8),
+    /// 오류 메시지 안의 중요 단어 강조용 다크 엘로우.
+    pub kw: (u8, u8, u8),
+    /// 코드블록·표 패널 배경 — 본문과 시각적으로 분리한다.
+    pub panel: (u8, u8, u8),
 }
 
 pub const RAFIKX: Theme = Theme {
@@ -24,6 +30,9 @@ pub const RAFIKX: Theme = Theme {
     body: (170, 170, 170),
     mute: (92, 97, 120),
     warn: (250, 200, 60),
+    err: (255, 92, 92),
+    kw: (216, 168, 32),
+    panel: (12, 18, 34),
 };
 
 /// opencode 느낌의 따뜻한 앰버 테마.
@@ -37,6 +46,9 @@ pub const OPAL: Theme = Theme {
     body: (200, 198, 190),
     mute: (110, 110, 118),
     warn: (255, 123, 114),
+    err: (244, 90, 90),
+    kw: (226, 178, 40),
+    panel: (26, 26, 31),
 };
 
 /// 청록 네온 계열.
@@ -50,6 +62,9 @@ pub const SYNTH: Theme = Theme {
     body: (180, 180, 210),
     mute: (100, 100, 140),
     warn: (255, 85, 85),
+    err: (255, 70, 104),
+    kw: (230, 184, 46),
+    panel: (18, 18, 44),
 };
 
 pub const THEMES: [&Theme; 3] = [&RAFIKX, &OPAL, &SYNTH];

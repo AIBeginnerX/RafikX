@@ -50,6 +50,12 @@ pub enum MdKind {
     Emphasis,
     Code,
     CodeBlock,
+    /// /model · /connect 같은 명령어 토큰 — 답변 안에서 강조색으로 표시된다.
+    Command,
+    /// 정렬된 표 — 셀 폭을 계산해 그리드로 재조립한 덩어리.
+    Table,
+    /// 유니코드 막대그래프 — ```chart 블록의 라벨:수치 행을 실제 도표로 그린다.
+    Chart,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,17 +66,35 @@ pub struct MdSeg {
 
 /// Lightweight markdown split for TUI styling. Not a full parser.
 pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
-    let mut out = Vec::new();
+    let lines: Vec<&str> = input.lines().collect();
+    let mut out: Vec<MdSeg> = Vec::new();
     let mut in_fence = false;
-    for line in input.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches('\n');
-        let nl = if line.ends_with('\n') { "\n" } else { "" };
-        if trimmed.starts_with("```") {
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.starts_with("```") {
+            let lang = line[3..].trim();
+            // ```chart 블록 — 라벨:수치 행을 유니코드 막대그래프로 그린다.
+            if matches!(lang, "chart" | "bar" | "graph") {
+                i += 1;
+                let mut body: Vec<&str> = Vec::new();
+                while i < lines.len() && !lines[i].starts_with("```") {
+                    body.push(lines[i]);
+                    i += 1;
+                }
+                i += 1; // 닫는 fence 소비
+                out.push(MdSeg {
+                    kind: MdKind::Chart,
+                    text: render_chart(&body),
+                });
+                continue;
+            }
             in_fence = !in_fence;
             out.push(MdSeg {
                 kind: MdKind::CodeBlock,
-                text: format!("{trimmed}{nl}"),
+                text: line.to_string(),
             });
+            i += 1;
             continue;
         }
         if in_fence {
@@ -78,16 +102,33 @@ pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
                 kind: MdKind::CodeBlock,
                 text: line.to_string(),
             });
+            i += 1;
             continue;
         }
-        if trimmed.starts_with('#') {
+        if line.starts_with('#') {
             out.push(MdSeg {
                 kind: MdKind::Heading,
                 text: line.to_string(),
             });
+            i += 1;
+            continue;
+        }
+        // 표 시작 — | 헤더 다음 줄이 |---| 구분자면 표 덩어리로 흡수한다.
+        if is_table_line(line) && i + 1 < lines.len() && is_table_delim(lines[i + 1]) {
+            let mut rows = vec![split_row(line)];
+            i += 2; // 헤더와 구분자 소비
+            while i < lines.len() && is_table_line(lines[i]) {
+                rows.push(split_row(lines[i]));
+                i += 1;
+            }
+            out.push(MdSeg {
+                kind: MdKind::Table,
+                text: render_grid(&rows),
+            });
             continue;
         }
         push_inline(line, &mut out);
+        i += 1;
     }
     if out.is_empty() {
         out.push(MdSeg {
@@ -95,7 +136,168 @@ pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
             text: String::new(),
         });
     }
+    upgrade_fenced_tables(&mut out);
     out
+}
+
+/// "라벨: 수치" 행을 유니코드 막대그래프로 변환한다. 파싱 불가한 입력은 원문을 돌려준다.
+fn render_chart(body: &[&str]) -> String {
+    let mut rows: Vec<(String, f64)> = Vec::new();
+    for l in body {
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let (label, num) = match t.split_once([':', ',']) {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => continue,
+        };
+        let value: f64 = num.trim_end_matches('%').trim().parse().unwrap_or(-1.0);
+        if label.is_empty() || value < 0.0 {
+            continue;
+        }
+        rows.push((label.to_string(), value));
+    }
+    if rows.is_empty() {
+        return body.join("\n");
+    }
+    let max_v = rows
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(0.0_f64, |a, b| a.max(b))
+        .max(1e-9);
+    let label_w = rows.iter().map(|(l, _)| display_width(l)).max().unwrap_or(0);
+    const BAR_MAX: usize = 26;
+    let mut out: Vec<String> = Vec::new();
+    for (label, v) in &rows {
+        let filled = ((*v / max_v) * BAR_MAX as f64).round() as usize;
+        let filled = filled.min(BAR_MAX);
+        let pad = label_w - display_width(label);
+        out.push(format!(
+            "{label}{} │{}{} {}",
+            " ".repeat(pad),
+            "█".repeat(filled),
+            "░".repeat(BAR_MAX - filled),
+            fmt_num(*v)
+        ));
+    }
+    out.join("\n")
+}
+
+fn fmt_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// 모델이 표를 ``` 블록 안에 통째로 담는 경우가 흔하다 — 본문이 전부 표 행이면
+/// 코드블록을 정렬 그리드로 승격시킨다.
+fn upgrade_fenced_tables(out: &mut Vec<MdSeg>) {
+    let mut i = 0usize;
+    while i < out.len() {
+        if !out[i].text.starts_with("```") || out[i].kind != MdKind::CodeBlock {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut body: Vec<String> = Vec::new();
+        let mut closed = false;
+        while j < out.len() {
+            if out[j].kind == MdKind::CodeBlock && out[j].text.starts_with("```") {
+                closed = true;
+                break;
+            }
+            body.push(out[j].text.clone());
+            j += 1;
+        }
+        let all_rows = !body.is_empty() && body.iter().all(|l| is_table_line(l));
+        if closed && all_rows && body.len() >= 2 {
+            let mut rows: Vec<Vec<String>> = body.iter().map(|l| split_row(l)).collect();
+            // 두 번째 줄이 |---|---| 구분자면 버린다.
+            if rows.len() > 1
+                && rows[1].iter().all(|c| c.is_empty() || c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+            {
+                let head = rows[0].clone();
+                let rest = rows.split_off(2);
+                rows = rest;
+                rows.insert(0, head);
+            }
+            let grid = render_grid(&rows);
+            out.splice(i..=j, std::iter::once(MdSeg { kind: MdKind::Table, text: grid }));
+        } else {
+            i = j.max(i + 1);
+        }
+    }
+}
+
+fn is_table_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.ends_with('|') && t.len() > 1
+}
+
+/// | --- | :---: | 같은 헤더 구분자 줄.
+fn is_table_delim(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') || !is_table_line(t) {
+        return false;
+    }
+    t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+fn split_row(line: &str) -> Vec<String> {
+    let t = line.trim().trim_start_matches('|').trim_end_matches('|');
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// 셀 폭(한글 2칸 포함)의 최댓값으로 그리드를 맞춰 재조립한다.
+fn render_grid(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; ncols];
+    for r in rows {
+        for (idx, cell) in r.iter().enumerate() {
+            let w = display_width(cell);
+            if w > widths[idx] {
+                widths[idx] = w;
+            }
+        }
+    }
+    let sep: String = {
+        let mut s = String::from("+");
+        for w in &widths {
+            s.push_str(&"-".repeat(w + 2));
+            s.push('+');
+        }
+        s
+    };
+    let fmt = |r: &[String]| -> String {
+        let mut s = String::from("|");
+        for idx in 0..ncols {
+            let cell = r.get(idx).map(String::as_str).unwrap_or("");
+            let pad = widths[idx].saturating_sub(display_width(cell));
+            s.push(' ');
+            s.push_str(cell);
+            s.push_str(&" ".repeat(pad));
+            s.push(' ');
+            s.push('|');
+        }
+        s
+    };
+    let mut body: Vec<String> = vec![sep.clone(), fmt(&rows[0]), sep.clone()];
+    for r in &rows[1..] {
+        body.push(fmt(r));
+    }
+    body.push(sep);
+    body.join("\n")
+}
+
+/// 실제 슬래시 명령어인지 검사 — /etc/hosts 같은 경로는 강조하지 않는다.
+fn is_known_command(tok: &str) -> bool {
+    crate::chat::SLASH_COMMANDS.iter().any(|(name, _)| *name == tok)
 }
 
 fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
@@ -111,6 +313,22 @@ fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
         }
     };
     while i < chars.len() {
+        // /명령어 토큰 — 공백 전까지를 하나의 강조 세그먼트로 묶는다.
+        if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1].is_ascii_alphabetic() {
+            flush(MdKind::Text, &mut buf, out);
+            let start = i;
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            let tok: String = chars[start..i].iter().collect();
+            let kind = if is_known_command(&tok) {
+                MdKind::Command
+            } else {
+                MdKind::Text
+            };
+            out.push(MdSeg { kind, text: tok });
+            continue;
+        }
         if chars[i] == '`' {
             flush(MdKind::Text, &mut buf, out);
             i += 1;
@@ -154,8 +372,9 @@ fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
 pub const KEY_HELP: &str = "\
 Enter            보내기\n\
 Ctrl+J / Shift+Enter  줄바꿈\n\
+Tab              plan(읽기전용)/build 모드 전환\n\
+Esc              생성 중단 · 도움말·선택·승인 닫기\n\
 Ctrl+C           종료 (실행 중이면 이번 턴이 끝난 뒤)\n\
-Esc              도움말·선택·승인 닫기\n\
 PgUp / PgDn      대화 스크롤\n\
 ?                이 도움말 (입력이 비었을 때)\n\
 /model /provider /connect  목록에서 고르기\n\
@@ -181,6 +400,57 @@ mod tests {
         assert!(segs.iter().any(|s| s.kind == MdKind::Heading));
         assert!(segs.iter().any(|s| s.kind == MdKind::Code && s.text == "code"));
         assert!(segs.iter().any(|s| s.kind == MdKind::Emphasis && s.text == "bold"));
+    }
+
+    #[test]
+    fn slash_commands_are_highlighted() {
+        let segs = markdown_segs("모드는 /mode plan 으로 바꾸세요. 경로 /etc/hosts 는 아니다.");
+        assert!(segs
+            .iter()
+            .any(|s| s.kind == MdKind::Command && s.text == "/mode"));
+        // 숫자·기호로 시작하면 명령어가 아니라 일반 텍스트다.
+        assert!(!segs
+            .iter()
+            .any(|s| s.kind == MdKind::Command && s.text.starts_with("/etc")));
+    }
+
+    #[test]
+    fn tables_render_as_aligned_grid() {
+        let md = "| 이름 | 값 |\n|---|---|\n| alpha | 1 |\n| 한글 | 22 |\n";
+        let segs = markdown_segs(md);
+        let table = segs
+            .iter()
+            .find(|s| s.kind == MdKind::Table)
+            .expect("table seg");
+        assert!(table.text.contains("+-------+----+"));
+        assert!(table.text.contains("| 이름  | 값 |"));
+        assert!(table.text.contains("| 한글  | 22 |"));
+        // 구분자 줄(---)은 그리드에서 사라진다.
+        assert!(!table.text.contains("---|"));
+    }
+
+    #[test]
+    fn fenced_tables_are_promoted_to_grids() {
+        // 모델이 표를 ``` 블록에 통째로 담는 경우도 그리드로 승격되어야 한다.
+        let md = "결과:\n```\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n끝";
+        let segs = markdown_segs(md);
+        assert!(segs.iter().any(|s| s.kind == MdKind::Table));
+        // 일반 코드블록은 그대로 유지된다.
+        let code = markdown_segs("```rust\nfn a() {}\n```");
+        assert!(!code.iter().any(|s| s.kind == MdKind::Table));
+    }
+
+    #[test]
+    fn chart_blocks_render_unicode_bars() {
+        let md = "```chart\nA: 100\nB: 50\n```\n";
+        let segs = markdown_segs(md);
+        let chart = segs
+            .iter()
+            .find(|s| s.kind == MdKind::Chart)
+            .expect("chart seg");
+        assert!(chart.text.contains('█'));
+        assert!(chart.text.contains("100"));
+        assert!(!chart.text.contains("```"));
     }
 
     #[test]

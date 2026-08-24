@@ -205,10 +205,13 @@ pub fn boot_with(cfg: &Config) -> BootInfo {
         harness_manual,
         ranks_status: crate::ranks::status_line(),
         appearance: cfg.file.ui.appearance.clone(),
-        engine: if cfg.file.general.engine.eq_ignore_ascii_case("deepseek") {
-            "deepseek".into()
-        } else {
-            "rafikx".into()
+        engine: {
+            let e = cfg.file.general.engine.to_ascii_lowercase();
+            if matches!(e.as_str(), "deepseek" | "dk" | "pi") {
+                e
+            } else {
+                "rafikx".into()
+            }
         },
         harness_rows,
         default_model,

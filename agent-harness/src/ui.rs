@@ -52,25 +52,25 @@ pub fn rule() {
 pub fn banner(subtitle: &str) {
     init();
     println!();
-    println!("{}", gold("╭──────────────────────────────────────────────────────────────╮"));
+    println!("{}", gold("+--------------------------------------------------------------+"));
     println!(
         "{} {} {}",
-        gold("│"),
+        gold("|"),
         pad_visible(
             &format!("{}  {}", gold("RAFIKX"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
             WIDTH - 2,
         ),
-        gold("│")
+        gold("|")
     );
     if !subtitle.is_empty() {
         println!(
             "{} {} {}",
-            gold("│"),
+            gold("|"),
             pad_visible(&dim(subtitle), WIDTH - 2),
-            gold("│")
+            gold("|")
         );
     }
-    println!("{}", gold("╰──────────────────────────────────────────────────────────────╯"));
+    println!("{}", gold("+--------------------------------------------------------------+"));
 }
 
 fn visible_len(s: &str) -> usize {
@@ -103,7 +103,7 @@ fn pad_visible(s: &str, width: usize) -> String {
 
 pub fn section(title: &str) {
     println!();
-    println!("{} {}", cyan("▸"), bold(title));
+    println!("{} {}", cyan(">"), bold(title));
 }
 
 pub fn ok(msg: &str) {
@@ -111,21 +111,21 @@ pub fn ok(msg: &str) {
         live_line(msg);
         return;
     }
-    println!("  {} {}", green("●"), msg);
+    println!("  {} {}", green("+"), msg);
 }
 
 pub fn warn(msg: &str) {
     if emit(Live::Warn(msg.to_string())) {
         return;
     }
-    println!("  {} {}", yellow("●"), msg);
+    println!("  {} {}", yellow("!"), msg);
 }
 
 pub fn fail(msg: &str) {
     if emit(Live::Warn(msg.to_string())) {
         return;
     }
-    println!("  {} {}", red("●"), msg);
+    println!("  {} {}", red("x"), msg);
 }
 
 pub fn note(msg: &str) {

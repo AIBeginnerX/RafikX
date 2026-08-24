@@ -52,6 +52,10 @@ pub struct App {
     quit_after: bool,
     /// 슬래시 명령 Enter 2회 확인용
     pub slash_armed: bool,
+    /// 실행 중 접수한 대기 프롬프트 큐 — 턴이 끝나면 순차 실행
+    pub queue: Vec<String>,
+    /// 현재 실행 중인 턴의 핸들 — Esc 인터럽트용
+    pub turn_handle: Option<tokio::task::JoinHandle<()>>,
     /// 새 릴리스 태그 — 있으면 U 키로 업그레이드 진행 가능
     pub upgrade: Option<String>,
     /// 업그레이드 진행 중 플래그
@@ -129,6 +133,8 @@ pub struct Entry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryKind {
     User,
+    /// 실행 대기 중인 프롬프트 — 턴 시작 시 User 로 승격된다.
+    Queued,
     Assistant,
     System,
     Tool,
@@ -187,6 +193,8 @@ pub async fn run(
         quit: false,
         quit_after: false,
         slash_armed: false,
+        queue: Vec::new(),
+        turn_handle: None,
         upgrade: None,
         upgrading: false,
     };
@@ -299,7 +307,7 @@ pub async fn run(
             }
             done = done_rx.recv() => {
                 if let Some(done) = done {
-                    finish_turn(&mut app, done);
+                    finish_turn(&mut app, done, &local_ask, &done_tx);
                     dirty = true;
                     if app.quit_after {
                         app.quit = true;
@@ -558,7 +566,25 @@ fn handle_key(
             }
         }
         KeyCode::Esc => {
-            app.help = false;
+            if app.help {
+                app.help = false;
+            } else if app.busy {
+                // opencode 스타일 interrupt — 실행 중 Esc 한 번으로 생성을 중단한다.
+                if let Some(h) = app.turn_handle.take() {
+                    h.abort();
+                }
+                app.busy = false;
+                app.streaming = false;
+                app.status = "중단됨".into();
+                push(app, EntryKind::Warn, "응답을 중단했습니다. (Esc)");
+            }
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            // opencode 스타일 — Tab 으로 plan/build 하네스 모드를 전환한다.
+            let next = if app.session.is_plan_mode() { "build" } else { "plan" };
+            app.session.mode = next.to_string();
+            app.binding = binding_label(&app.session);
+            app.status = format!("모드: {next}");
         }
         KeyCode::Char('u') | KeyCode::Char('U')
             if app.upgrade.is_some() && !app.upgrading && app.input.is_empty() =>
@@ -571,9 +597,6 @@ fn handle_key(
         KeyCode::Enter if shift || ctrl => insert_char(app, '\n'),
         KeyCode::Char('j') if ctrl => insert_char(app, '\n'),
         KeyCode::Enter => {
-            if app.busy {
-                return;
-            }
             // 슬래시 명령은 Enter 두 번으로 실행 (첫 번째는 확인)
             if app.input.trim().starts_with('/') && !app.slash_armed {
                 app.slash_armed = true;
@@ -614,6 +637,19 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
         return;
     }
     app.slash_armed = false;
+    if app.busy && !line.starts_with('/') {
+        // 실행 중 입력은 큐에 적립 — 현재 턴이 끝나면 순차 실행된다.
+        app.queue.push(line.clone());
+        push(app, EntryKind::Queued, line);
+        app.input.clear();
+        app.cursor = 0;
+        app.status = format!("실행 중 — 대기 {}건 (완료 후 자동 실행)", app.queue.len());
+        return;
+    }
+    if app.busy && line.starts_with('/') {
+        app.status = "실행 중입니다 — 슬래시 명령은 완료 후 사용하세요".into();
+        return;
+    }
     app.history.push(line.clone());
     app.history_idx = None;
     app.input.clear();
@@ -687,7 +723,7 @@ fn start_turn(
     local_ask: &LocalAsk,
     done_tx: &mpsc::UnboundedSender<TurnDone>,
 ) {
-    push(app, EntryKind::User, prompt.clone());
+    promote_queued(app, &prompt);
     app.busy = true;
     app.streaming = false;
     app.status = "실행 중…".into();
@@ -696,7 +732,7 @@ fn start_turn(
     let mut session = app.session.clone();
     let local_ask = local_ask.clone();
     let done_tx = done_tx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let result = chat::run_turn(
             &mut session,
             &prompt,
@@ -707,11 +743,31 @@ fn start_turn(
         .await;
         let _ = done_tx.send(TurnDone { result, session });
     });
+    app.turn_handle = Some(handle);
 }
 
-fn finish_turn(app: &mut App, done: TurnDone) {
+/// 큐잉된 프롬프트를 정식 User 엔트리로 바꾼다. 없으면 새로 push.
+fn promote_queued(app: &mut App, prompt: &str) {
+    if let Some(e) = app
+        .transcript
+        .iter_mut()
+        .find(|e| e.kind == EntryKind::Queued && e.text == prompt)
+    {
+        e.kind = EntryKind::User;
+        return;
+    }
+    push(app, EntryKind::User, prompt.to_string());
+}
+
+fn finish_turn(
+    app: &mut App,
+    done: TurnDone,
+    local_ask: &LocalAsk,
+    done_tx: &mpsc::UnboundedSender<TurnDone>,
+) {
     app.busy = false;
     app.streaming = false;
+    app.turn_handle = None;
     app.session = done.session;
     app.binding = binding_label(&app.session);
     match done.result {
@@ -753,6 +809,13 @@ fn finish_turn(app: &mut App, done: TurnDone) {
             push(app, EntryKind::Warn, format!("오류: {e:#}"));
             app.status = "실패".into();
         }
+    }
+
+    if !app.queue.is_empty() && !app.quit_after {
+        let next = app.queue.remove(0);
+        let class = app.session.class.clone();
+        let obsidian = app.session.obsidian_on;
+        start_turn(app, next, class, obsidian, local_ask, done_tx);
     }
 }
 
@@ -798,7 +861,10 @@ fn apply_live(app: &mut App, ev: Live) {
     app.follow = true;
     match ev {
         Live::Chunk(s) => {
-            if !app.streaming {
+            // 큐잉 엔트리 등이 사이에 끼어도 유실되지 않게, 붙일 곳이 없으면 새 답변을 연다.
+            if !app.streaming
+                || app.transcript.last().map(|e| e.kind) != Some(EntryKind::Assistant)
+            {
                 app.transcript.push(Entry {
                     kind: EntryKind::Assistant,
                     text: String::new(),

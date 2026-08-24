@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const FRAMES: &[char] = &['|', '/', '-', '\\'];
 const BAR_WIDTH: usize = 16;
 const SEGMENT: usize = 5;
 
@@ -110,7 +110,7 @@ fn render_bar(tick: usize) -> String {
     bar.push('[');
     for i in 0..BAR_WIDTH {
         let lit = i >= pos && i < pos + SEGMENT;
-        bar.push_str(if lit { "█" } else { "░" });
+        bar.push_str(if lit { "#" } else { "-" });
     }
     bar.push(']');
     bar
@@ -227,8 +227,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frames_are_braille() {
-        assert!(FRAMES.len() >= 8);
+    fn frames_are_font_safe_ascii() {
+        assert!(FRAMES.len() >= 4);
+        assert!(FRAMES.iter().all(|c| c.is_ascii()));
     }
 
     #[test]

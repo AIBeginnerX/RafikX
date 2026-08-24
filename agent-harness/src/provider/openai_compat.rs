@@ -23,6 +23,14 @@ pub struct OpenAiCompatProvider {
     account_id: String,
 }
 
+/// 멀티바이트(한글 3바이트)가 청크 경계에서 잘려도 깨지지 않게
+/// 바이트 버퍼에서 '\n' 위치까지만 안전하게 잘라낸다.
+fn drain_line(buf: &mut Vec<u8>) -> Option<String> {
+    let pos = buf.iter().position(|&b| b == b'\n')?;
+    let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+    Some(String::from_utf8_lossy(&line_bytes).into_owned())
+}
+
 impl OpenAiCompatProvider {
     pub fn new(base_url: String, api_key: Option<String>) -> Result<Self> {
         Self::create(base_url, api_key, CompatMode::ChatCompletions, String::new())
@@ -129,7 +137,7 @@ impl OpenAiCompatProvider {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut full_text = String::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
@@ -137,14 +145,10 @@ impl OpenAiCompatProvider {
         let mut tool_acc: Vec<(String, String, String)> = Vec::new();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("응답 스트림을 읽는 중 오류")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let mut line = buf[..pos].to_string();
-                buf = buf[pos + 1..].to_string();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
+            let chunk = chunk.context("응답 스트림이 중간에 끊겼습니다")?;
+            buf.extend_from_slice(&chunk);
+            while let Some(line) = drain_line(&mut buf) {
+                let line = line.trim_end_matches(['\n', '\r']);
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -183,6 +187,7 @@ impl OpenAiCompatProvider {
                             full_text.push_str(piece);
                         }
                     }
+                    // reasoning_content·reasoning 등 사고 필드는 의도적으로 무시한다.
                     if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                         for tc in tcs {
                             let idx = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
@@ -203,6 +208,14 @@ impl OpenAiCompatProvider {
                     }
                 }
             }
+        }
+
+        // 여기까지 도달했다는 것은 [DONE] 없이 연결이 닫혔다 뜻 — 미완료 응답이다.
+        if finish.is_none() && full_text.is_empty() && tool_acc.is_empty() {
+            anyhow::bail!("응답이 시작되기 전에 스트림이 종료되었습니다");
+        }
+        if finish.is_none() {
+            anyhow::bail!("응답이 완료되기 전에 스트림이 종료되었습니다 ({}자 수신)", full_text.chars().count());
         }
 
         Ok(finish_stream(
@@ -234,22 +247,22 @@ impl OpenAiCompatProvider {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut full_text = String::new();
         let mut tools: Vec<(String, String, String)> = Vec::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut finish = None::<String>;
+        let mut finished = false;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("응답 스트림을 읽는 중 오류")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let mut line = buf[..pos].to_string();
-                buf = buf[pos + 1..].to_string();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
+            if finished {
+                break;
+            }
+            let chunk = chunk.context("Codex 응답 스트림이 중간에 끊겼습니다")?;
+            buf.extend_from_slice(&chunk);
+            while let Some(line) = drain_line(&mut buf) {
+                let line = line.trim_end_matches(['\n', '\r']);
                 let line = line.trim();
                 if line.is_empty() || line.starts_with("event:") {
                     continue;
@@ -257,6 +270,7 @@ impl OpenAiCompatProvider {
                 let Some(data) = line.strip_prefix("data:") else { continue };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    finished = true;
                     break;
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
@@ -269,7 +283,17 @@ impl OpenAiCompatProvider {
                     &mut finish,
                     Some(&mut on_text),
                 );
+                if finish.is_some() {
+                    finished = true;
+                }
             }
+        }
+
+        if !finished && full_text.is_empty() && tools.is_empty() {
+            anyhow::bail!("응답이 시작되기 전에 Codex 스트림이 종료되었습니다");
+        }
+        if !finished {
+            anyhow::bail!("응답이 완료되기 전에 Codex 스트림이 종료되었습니다 ({}자 수신)", full_text.chars().count());
         }
 
         Ok(finish_stream(

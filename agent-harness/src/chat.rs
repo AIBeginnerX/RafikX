@@ -39,7 +39,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/login", "연결 마법사"),
     ("/provider", "기본 연결 변경"),
     ("/model", "모델 선택"),
-    ("/engine", "하네스 엔진 rafikx|deepseek"),
+    ("/engine", "하네스 엔진 rafikx|deepseek|dk|pi"),
     ("/mode", "plan(읽기전용)/build 전환"),
     ("/class", "분류 고정 simple|medium|advanced|dev"),
     ("/agent", "코딩 실행"),
@@ -295,24 +295,26 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
         }
         "/engine" => {
             let e = rest.trim().to_ascii_lowercase();
+            const ENGINES: &str = "rafikx|deepseek|dk|pi";
             if e.is_empty() {
-                let cur = if session.cfg.file.general.engine.eq_ignore_ascii_case("deepseek") {
-                    "deepseek"
-                } else {
-                    "rafikx"
-                };
+                let cur = session.cfg.file.general.engine.clone();
                 Ok(Slash::Continue(vec![format!(
-                    "현재 하네스 엔진: {cur}   ·   변경: /engine rafikx|deepseek"
+                    "현재 하네스 엔진: {cur}   ·   변경: /engine {ENGINES}"
                 )]))
-            } else if matches!(e.as_str(), "rafikx" | "deepseek") {
+            } else if matches!(e.as_str(), "rafikx" | "deepseek" | "dk" | "pi") {
+                let label = match e.as_str() {
+                    "dk" => "dk-harness (DeepSeek DSH 호환 모드)".into(),
+                    "pi" => "pi-harness (oh-my-pi 스타일)".into(),
+                    other => other.to_string(),
+                };
                 session.cfg.file.general.engine = e.clone();
                 match crate::api::set_engine(&e) {
-                    Ok(msg) => Ok(Slash::Continue(vec![msg])),
+                    Ok(msg) => Ok(Slash::Continue(vec![format!("하네스 엔진: {label}\n{msg}")])),
                     Err(err) => Ok(Slash::Continue(vec![format!("저장 실패: {err}")])),
                 }
             } else {
                 Ok(Slash::Continue(vec![
-                    "/engine rafikx|deepseek 중에서 고르세요.".into()
+                    format!("/engine {ENGINES} 중에서 고르세요.")
                 ]))
             }
         }

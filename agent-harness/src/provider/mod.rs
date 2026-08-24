@@ -150,6 +150,8 @@ pub fn is_retryable(err: &anyhow::Error) -> bool {
         || s.contains("http 504")
         || s.contains("timeout")
         || s.contains("timed out")
+        || s.contains("스트림이 종료되었습니다")
+        || s.contains("스트림이 중간에 끊겼습니다")
 }
 
 pub fn is_rate_limited(err: &anyhow::Error) -> bool {

@@ -16,6 +16,23 @@ pub struct AnthropicProvider {
     oauth: bool,
 }
 
+/// 멀티바이트(한글 3바이트)가 청크 경계에서 잘려도 깨지지 않게
+/// 바이트 버퍼에서 빈 줄("\n\n") 위치까지만 안전하게 잘라낸다.
+fn drain_event(buf: &mut Vec<u8>) -> Option<String> {
+    let pos = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| (i, 4))
+        .or_else(|| {
+            buf.windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|i| (i, 2))
+        })?;
+    let (idx, sep_len) = pos;
+    let event_bytes: Vec<u8> = buf.drain(..idx + sep_len).collect();
+    Some(String::from_utf8_lossy(&event_bytes).into_owned())
+}
+
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Result<Self> {
         Self::create(api_key, false)
@@ -96,21 +113,16 @@ impl AnthropicProvider {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut full_text = String::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut stop_reason = StopReason::Other;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("응답 스트림을 읽는 중 오류")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            loop {
-                let sep = buf.find("\n\n").or_else(|| buf.find("\r\n\r\n"));
-                let Some(pos) = sep else { break };
-                let sep_len = if buf[pos..].starts_with("\r\n\r\n") { 4 } else { 2 };
-                let event = buf[..pos].to_string();
-                buf = buf[pos + sep_len..].to_string();
+            let chunk = chunk.context("응답 스트림이 중간에 끊겼습니다")?;
+            buf.extend_from_slice(&chunk);
+            while let Some(event) = drain_event(&mut buf) {
                 if let Some(data) = sse_data(&event) {
                     if data.trim() == "[DONE]" {
                         continue;
@@ -167,14 +179,14 @@ impl AnthropicProvider {
             }
         }
 
-        Ok(ChatResponse {
-            content: vec![ContentBlock::Text { text: full_text }],
-            stop_reason,
-            input_tokens,
-            output_tokens,
-            cached_tokens: 0,
-            limit: hint,
-        })
+        // message_stop 이 오면 위에서 반환된다 — EOF 도달은 미완료 응답이다.
+        if full_text.is_empty() && input_tokens == 0 {
+            anyhow::bail!("응답이 시작되기 전에 Anthropic 스트림이 종료되었습니다");
+        }
+        anyhow::bail!(
+            "응답이 완료되기 전에 Anthropic 스트림이 종료되었습니다 ({}자 수신)",
+            full_text.chars().count()
+        );
     }
 }
 
