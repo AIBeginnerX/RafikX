@@ -23,6 +23,7 @@ pub mod spinner;
 pub mod tools;
 pub mod tools_more;
 pub mod ui;
+pub mod update;
 pub mod usage;
 #[cfg(feature = "telegram")]
 pub mod telegram;

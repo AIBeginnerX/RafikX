@@ -178,6 +178,22 @@ pub async fn run(
         });
     }
 
+    // 새 릴리스 확인 — 네트워크 조회가 시작을 막지 않도록 백그라운드로 돌린다.
+    let (upd_tx, mut upd_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let checked = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::update::latest_release(),
+        )
+        .await;
+        if let Ok(Ok(rel)) = checked {
+            let current = env!("CARGO_PKG_VERSION");
+            if let Some(notice) = crate::update::upgrade_notice(&rel, current) {
+                let _ = upd_tx.send(notice);
+            }
+        }
+    });
+
     let (live_tx, mut live_rx) = mpsc::unbounded_channel::<Live>();
     ui::set_live(Some(Arc::new(move |ev| {
         let _ = live_tx.send(ev);
@@ -278,6 +294,12 @@ pub async fn run(
             live = live_rx.recv() => {
                 if let Some(ev) = live {
                     apply_live(&mut app, ev);
+                    dirty = true;
+                }
+            }
+            upd = upd_rx.recv() => {
+                if let Some(notice) = upd {
+                    push(&mut app, EntryKind::Warn, notice);
                     dirty = true;
                 }
             }

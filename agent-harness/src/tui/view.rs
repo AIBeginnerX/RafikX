@@ -191,7 +191,11 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             EntryKind::Tool => ("tool", Style::default().fg(th.secondary)),
             EntryKind::Warn => ("!", Style::default().fg(th.warn)),
         };
-        lines.push(Line::from(Span::styled(format!(" {tag}"), style)));
+        // 시스템 안내는 태그 없이 본문만 (명령 목록 등에 sys 접두어가 거슬리므로)
+        match e.kind {
+            EntryKind::System => {}
+            _ => lines.push(Line::from(Span::styled(format!(" {tag}"), style))),
+        }
         if e.kind == EntryKind::Assistant {
             for seg in markdown_segs(&e.text) {
                 let st = match seg.kind {
@@ -220,7 +224,18 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                 )));
             }
         }
-        lines.push(Line::from(""));
+        // 줄간격 완화: 한 줄짜리 짧은 항목 사이엔 빈 줄을 넣지 않는다
+        let body_rows = if e.kind == EntryKind::Assistant {
+            markdown_segs(&e.text)
+                .iter()
+                .map(|s| s.text.split('\n').count())
+                .sum::<usize>()
+        } else {
+            e.text.split('\n').count()
+        };
+        if body_rows > 1 || matches!(e.kind, EntryKind::Tool | EntryKind::Warn) {
+            lines.push(Line::from(""));
+        }
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
