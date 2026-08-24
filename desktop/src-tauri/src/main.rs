@@ -258,8 +258,32 @@ fn resolve_approval(state: State<Shared>, id: String, choice: String) -> Result<
 }
 
 #[tauri::command]
-fn save_key(provider: String, key: String) -> Result<String, String> {
-    api::save_key(&provider, &key).map_err(err)
+async fn save_key(app: AppHandle, provider: String, key: String) -> Result<String, String> {
+    let out = api::save_key(&provider, &key).map_err(err)?;
+    // 키가 정상이면 원격 모델 목록을 자동으로 불러와 카탈로그에 저장한다.
+    let cfg = Config::load(None).ok();
+    let pname = provider.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(cfg) = cfg {
+            match rafikx::auth::list_remote_models(&cfg, &pname).await {
+                Ok(models) if !models.is_empty() => {
+                    let _ = rafikx::auth::save_catalog(&cfg, &pname, &models);
+                    if let Some(m) = rafikx::auth::pick_preferred(&models, &pname).0 {
+                        let _ = api::set_provider_model(&pname, &m);
+                    }
+                    let _ = app.emit(
+                        "live",
+                        LivePayload {
+                            kind: "system".into(),
+                            text: format!("[models] {pname} 사용 가능 {}개 — 기본 모델 자동 저장", models.len()),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(out)
 }
 
 #[tauri::command]

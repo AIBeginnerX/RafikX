@@ -66,6 +66,20 @@ pub struct Picker {
     pub selected: usize,
     pub kind: PickerKind,
     pub target: Option<String>,
+    /// 타이핑 검색어 (대소문자 무시 부분 일치)
+    pub query: String,
+}
+
+/// 검색어로 걸러진 항목의 원본 인덱스 목록.
+fn picker_visible(picker: &Picker) -> Vec<usize> {
+    let q = picker.query.trim().to_lowercase();
+    picker
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| q.is_empty() || it.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,6 +475,13 @@ fn handle_key(
     }
 
     if let Some(mut picker) = app.picker.take() {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let vis = picker_visible(&picker);
+        let vis_len = vis.len();
+        // 선택 커서를 필터된 목록 기준으로 보정
+        if picker.selected >= vis_len {
+            picker.selected = vis_len.saturating_sub(1);
+        }
         match k.code {
             KeyCode::Esc => {
                 app.status = "선택을 취소했습니다".into();
@@ -472,13 +493,31 @@ fn handle_key(
                 app.picker = Some(picker);
             }
             KeyCode::Down => {
-                if picker.selected + 1 < picker.items.len() {
+                if picker.selected + 1 < vis_len {
                     picker.selected += 1;
                 }
                 app.picker = Some(picker);
             }
-            KeyCode::Enter => apply_picker(app, picker),
-            KeyCode::Char('e') | KeyCode::Char('E') if picker.kind == PickerKind::Manage => {
+            KeyCode::Enter => {
+                if vis.is_empty() {
+                    app.status = "일치하는 항목이 없습니다".into();
+                    app.picker = Some(picker);
+                } else {
+                    picker.selected = vis[picker.selected];
+                    apply_picker(app, picker);
+                }
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.selected = 0;
+                app.picker = Some(picker);
+            }
+            KeyCode::Char('e') | KeyCode::Char('E')
+                if ctrl && picker.kind == PickerKind::Manage =>
+            {
+                if vis_len > 0 {
+                    picker.selected = vis[picker.selected];
+                }
                 if let Some(id) = picker.ids.get(picker.selected).cloned() {
                     if !id.is_empty() && id != CUSTOM_ID {
                         open_secret(app, &id);
@@ -489,7 +528,12 @@ fn handle_key(
                     app.picker = Some(picker);
                 }
             }
-            KeyCode::Char('d') | KeyCode::Char('D') if picker.kind == PickerKind::Manage => {
+            KeyCode::Char('d') | KeyCode::Char('D')
+                if ctrl && picker.kind == PickerKind::Manage =>
+            {
+                if vis_len > 0 {
+                    picker.selected = vis[picker.selected];
+                }
                 if let Some(id) = picker.ids.get(picker.selected).cloned() {
                     if !id.is_empty() && id != CUSTOM_ID {
                         ask_disconnect(app, &id);
@@ -500,14 +544,11 @@ fn handle_key(
                     app.picker = Some(picker);
                 }
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
-                let n = c.to_digit(10).unwrap_or(0) as usize;
-                if n >= 1 && n <= picker.items.len() {
-                    picker.selected = n - 1;
-                    apply_picker(app, picker);
-                } else {
-                    app.picker = Some(picker);
-                }
+            KeyCode::Char(c) if !ctrl => {
+                // 타이핑으로 목록을 검색한다
+                picker.query.push(c);
+                picker.selected = 0;
+                app.picker = Some(picker);
             }
             _ => {
                 app.picker = Some(picker);
@@ -993,6 +1034,7 @@ fn open_model_picker(app: &mut App) {
         selected: 0,
         kind: PickerKind::Model,
         target: None,
+        query: String::new(),
     });
 }
 
@@ -1015,6 +1057,7 @@ fn open_manage_picker(app: &mut App) {
         selected: 0,
         kind: PickerKind::Manage,
         target: None,
+        query: String::new(),
     });
 }
 
@@ -1050,6 +1093,7 @@ fn open_action_picker(app: &mut App, name: &str) {
         selected: 0,
         kind: PickerKind::Action,
         target: Some(name.to_string()),
+        query: String::new(),
     });
 }
 
@@ -1273,12 +1317,52 @@ fn finish_secret(app: &mut App, secret: SecretPrompt) {
                 app,
                 EntryKind::System,
                 format!(
-                    "{} 연결됨. 키는 대화에 남기지 않았습니다. /model 로 모델을 고르세요.",
+                    "{} 연결됨. 키는 대화에 남기지 않았습니다.",
                     crate::auth::provider_label(&secret.provider)
                 ),
             );
             app.binding = binding_label(&app.session);
-            app.status = "준비".into();
+            app.status = "모델 목록 조회 중…".into();
+
+            // 키가 정상이면 원격 모델 목록을 자동으로 불러와 저장하고,
+            // 순위 기준 기본 모델까지 골라 저장한다.
+            let cfg2 = app.session.cfg.clone();
+            let pname = secret.provider.clone();
+            tokio::spawn(async move {
+                let list = crate::auth::list_remote_models(&cfg2, &pname).await;
+                match list {
+                    Ok(models) if !models.is_empty() => {
+                        if let Err(e) = crate::auth::save_catalog(&cfg2, &pname, &models) {
+                            crate::applog::info(&format!("catalog save: {e}"));
+                        }
+                        let (main_m, _small) =
+                            crate::auth::pick_preferred(&models, &pname);
+                        let mut note = format!(
+                            "[models] {} 사용 가능 {}개 — /model 로 선택하세요",
+                            crate::auth::provider_label(&pname),
+                            models.len()
+                        );
+                        if let Some(m) = main_m {
+                            if crate::api::set_provider_model(&pname, &m).is_ok() {
+                                note.push_str(&format!(" · 기본 모델 {m} 저장"));
+                            }
+                        }
+                        crate::ui::live_line(&note);
+                    }
+                    Ok(_) => {
+                        crate::ui::live_line(&format!(
+                            "[models] {} 의 모델 목록을 가져오지 못했습니다. /model 에서 기본 모델을 쓰세요.",
+                            crate::auth::provider_label(&pname)
+                        ));
+                    }
+                    Err(e) => {
+                        crate::ui::live_warn(&format!(
+                            "[models] {} 모델 조회 실패: {e}",
+                            crate::auth::provider_label(&pname)
+                        ));
+                    }
+                }
+            });
         }
         Err(e) => {
             push(app, EntryKind::Warn, format!("연결 실패: {e:#}"));

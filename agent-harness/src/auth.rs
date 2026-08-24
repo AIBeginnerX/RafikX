@@ -1631,7 +1631,42 @@ pub fn catalog_models(cfg: &Config, name: &str) -> Vec<String> {
             out.push((*m).to_string());
         }
     }
+    // 원격에서 한 번이라도 불러온 모델 목록도 합친다 (연결 직후 자동 조회 결과).
+    for m in cached_catalog(cfg, name) {
+        if !out.iter().any(|x| x == &m) {
+            out.push(m);
+        }
+    }
     out
+}
+
+fn catalogs_file(cfg: &Config) -> std::path::PathBuf {
+    cfg.data_dir.join("catalogs.json")
+}
+
+/// 원격 모델 목록을 캐시에 저장한다 (/model · 하네스 선택이 이 목록을 쓴다).
+pub fn save_catalog(cfg: &Config, name: &str, list: &[String]) -> Result<()> {
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct Catalogs(std::collections::BTreeMap<String, Vec<String>>);
+    let path = catalogs_file(cfg);
+    let mut c: Catalogs = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    c.0.insert(name.to_string(), list.to_vec());
+    std::fs::create_dir_all(cfg.data_dir.clone())?;
+    std::fs::write(&path, serde_json::to_string(&c)?)?;
+    Ok(())
+}
+
+fn cached_catalog(cfg: &Config, name: &str) -> Vec<String> {
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct Catalogs(std::collections::BTreeMap<String, Vec<String>>);
+    std::fs::read_to_string(catalogs_file(cfg))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Catalogs>(&raw).ok())
+        .and_then(|mut c| c.0.remove(name))
+        .unwrap_or_default()
 }
 
 pub fn registered_models(cfg: &Config) -> Vec<RegisteredModel> {

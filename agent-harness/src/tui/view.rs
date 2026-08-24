@@ -475,26 +475,70 @@ fn draw_slash_palette(
 }
 
 fn draw_picker(f: &mut Frame, area: Rect, picker: &super::Picker, th: &Pal) {
+    // 검색어로 걸러진 항목만 보여준다 (번호 없음).
+    let q = picker.query.trim().to_lowercase();
+    let idxs: Vec<usize> = picker
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| q.is_empty() || it.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect();
+    let total = idxs.len();
     let vis = 14usize;
-    let start = picker.selected.saturating_sub(vis / 2);
-    let end = (start + vis).min(picker.items.len());
+    let sel = picker.selected.min(total.saturating_sub(1));
+    let start = sel.saturating_sub(vis / 2);
+    let end = (start + vis).min(total);
     let start = end.saturating_sub(vis).min(start);
+
     let mut lines = Vec::new();
-    for i in start..end {
-        let mark = if i == picker.selected { "▸" } else { " " };
-        let n = i + 1;
-        lines.push(format!("{mark} [{n}] {}", picker.items[i]));
-    }
-    lines.push(String::new());
-    let extra = if picker.kind == super::PickerKind::Manage {
-        "↑↓ 이동  Enter 선택  e 키수정  d 삭제  Esc 취소"
+    if q.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" {}개 · 입력하면 검색", total),
+            Style::default().fg(th.mute),
+        )));
     } else {
-        "↑↓ 이동   Enter 선택   Esc 취소"
+        lines.push(Line::from(vec![
+            Span::styled("검색: ", Style::default().fg(th.mute)),
+            Span::styled(picker.query.clone(), Style::default().fg(th.accent)),
+            Span::raw("_"),
+            Span::styled(format!("  ({total}개 일치)"), Style::default().fg(th.mute)),
+        ]));
+    }
+    for i in start..end {
+        let orig = idxs[i];
+        let mark = if i == sel { "▸ " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{mark}{}", picker.items[orig]),
+            Style::default().fg(if i == sel { th.accent } else { th.body }),
+        )));
+    }
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            "  일치하는 항목이 없습니다",
+            Style::default().fg(th.warn),
+        )));
+    }
+    lines.push(Line::from(""));
+    let extra = if picker.kind == super::PickerKind::Manage {
+        "입력 검색  ↑↓ 이동  Enter 선택  Ctrl+E 키수정  Ctrl+D 삭제  Esc 취소"
+    } else {
+        "입력 검색  ↑↓ 이동  Enter 선택  Esc 취소"
     };
     lines.push(extra.into());
-    let body = lines.join("\n");
-    let count = (end - start).min(16) as u16;
-    draw_overlay_sized(f, area, &picker.title, &body, 80, count.saturating_add(6), th);
+    let body = lines
+        .into_iter()
+        .map(|l| {
+            let mut out = String::new();
+            for span in l.spans {
+                out.push_str(&span.content);
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let shown = (end - start + 2).min(18) as u16;
+    draw_overlay_sized(f, area, &picker.title, &body, 80, shown.saturating_add(5), th);
 }
 
 #[allow(clippy::too_many_arguments)]
