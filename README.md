@@ -11,6 +11,8 @@ rafikx ask "이 폴더 README를 짧게 요약해줘"
 
 Windows · macOS · Linux. 명령 이름은 `rafikx` 입니다.
 
+터미널 표현: Kitty 키보드 프로토콜(지원 터미널에서 Shift+Enter 등 변형키 정확 인식, 미지원은 xterm 폴백) · syntect 코드블록 문법 하이라이트(oh-my-pi 스타일 어두운 패널) · 24bit 트루컬러 진행바.
+
 [설치](docs/INSTALL.md) · [보안](SECURITY.md) · [기여](CONTRIBUTING.md) · [운영 흐름](RAFIKX_WORKFLOW.html)
 
 ---

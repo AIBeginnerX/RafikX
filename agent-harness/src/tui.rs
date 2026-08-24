@@ -8,7 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -143,11 +144,16 @@ pub enum EntryKind {
 
 struct TermGuard;
 
+static KITTY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Drop for TermGuard {
     fn drop(&mut self) {
         ui::set_live(None);
         let _ = disable_raw_mode();
         let mut out = stdout();
+        if KITTY_ENABLED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen);
         let _ = out.flush();
     }
@@ -241,6 +247,24 @@ pub async fn run(
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste)
     .context("alternate screen")?;
+    // Kitty 키보드 프로토콜 — 지원 터미널(Ghostty·Kitty·WezTerm 등)에서
+    // Shift+Enter·Ctrl+Enter 같은 변형키 조합을 정확한 이벤트로 받는다.
+    // 미지원 터미널은 기존 xterm 이스케이프로 폴백한다.
+    let kitty_keys = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    KITTY_ENABLED.store(kitty_keys, std::sync::atomic::Ordering::SeqCst);
+    if kitty_keys {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )
+        .ok();
+    }
     let _guard = TermGuard;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
