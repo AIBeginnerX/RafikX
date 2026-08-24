@@ -177,7 +177,11 @@ async fn reflect_and_save(cfg: &Config, task: &str, trigger: &str, detail: &str)
         max_tokens: 256,
         stream: false,
     };
-    let (_name, resp) = harness::chat_with_fallback(cfg, &order, "small", req).await?;
+    // 백그라운드 반성 실패는 사용자 화면에 오류로 보이면 안 된다 — 로그로만.
+    harness::set_fallback_quiet(true);
+    let call = harness::chat_with_fallback(cfg, &order, "small", req).await;
+    harness::set_fallback_quiet(false);
+    let (_name, resp) = call?;
     let text = resp
         .content
         .iter()

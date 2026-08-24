@@ -203,11 +203,32 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             EntryKind::Tool => ("tool", Style::default().fg(th.secondary)),
             EntryKind::Warn => ("!", Style::default().fg(th.warn)),
         };
-        // 시스템 안내는 태그 없이 본문만 (명령 목록 등에 sys 접두어가 거슬리므로)
-        match e.kind {
-            EntryKind::System => {}
-            _ => lines.push(Line::from(Span::styled(format!(" {tag}"), style))),
-        }
+        // 컴팩트 레이아웃: 태그를 첫 줄에 인라인으로 붙이고 이후 줄은 세로선만.
+        let body_rows = if e.kind == EntryKind::Assistant {
+            markdown_segs(&e.text)
+                .iter()
+                .map(|seg| seg.text.split('\n').count())
+                .sum::<usize>()
+        } else {
+            e.text.split('\n').count()
+        };
+        let tag_pad = format!("{tag:<6}");
+        let mut first = true;
+        let push_row = |lines: &mut Vec<Line>, text: &str, st: Style, first: &mut bool| {
+            if *first {
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {tag_pad}│"), style),
+                    Span::styled(format!(" {text}"), st),
+                ]));
+                *first = false;
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("        │", Style::default().fg(th.mute)),
+                    Span::styled(format!(" {text}"), st),
+                ]));
+            }
+        };
+
         if e.kind == EntryKind::Assistant {
             for seg in markdown_segs(&e.text) {
                 let st = match seg.kind {
@@ -221,31 +242,29 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                     MdKind::Text => Style::default().fg(th.text),
                 };
                 for piece in seg.text.split('\n') {
-                    lines.push(Line::from(Span::styled(format!("  {piece}"), st)));
+                    push_row(&mut lines, piece, st, &mut first);
                 }
             }
-        } else {
+        } else if e.kind == EntryKind::System {
+            // 시스템 안내는 태그 없이 들여쓰기만 (sys 접두어가 거슬리므로)
             for row in e.text.split('\n') {
                 lines.push(Line::from(Span::styled(
-                    format!("  {row}"),
-                    Style::default().fg(if e.kind == EntryKind::Warn {
-                        th.warn
-                    } else {
-                        th.body
-                    }),
+                    format!("   · {row}"),
+                    Style::default().fg(th.mute),
                 )));
             }
-        }
-        // 줄간격 완화: 한 줄짜리 짧은 항목 사이엔 빈 줄을 넣지 않는다
-        let body_rows = if e.kind == EntryKind::Assistant {
-            markdown_segs(&e.text)
-                .iter()
-                .map(|s| s.text.split('\n').count())
-                .sum::<usize>()
         } else {
-            e.text.split('\n').count()
-        };
-        if body_rows > 1 || matches!(e.kind, EntryKind::Tool | EntryKind::Warn) {
+            let st = Style::default().fg(if e.kind == EntryKind::Warn {
+                th.warn
+            } else {
+                th.body
+            });
+            for row in e.text.split('\n') {
+                push_row(&mut lines, row, st, &mut first);
+            }
+        }
+        // 긴 블록·도구·경고 사이에만 빈 줄 — 짧은 메시지는 붙여 밀도 있게.
+        if body_rows > 2 || matches!(e.kind, EntryKind::Tool | EntryKind::Warn) {
             lines.push(Line::from(""));
         }
     }

@@ -871,6 +871,7 @@ pub async fn run_turn(
     obsidian_on: bool,
     local_ask: Option<LocalAsk>,
 ) -> Result<TurnInfo> {
+    crate::spinner::set_label("질문 확인 중…");
     let class = classify(&session.cfg, prompt, obsidian_on, forced_class).await?;
     // 연속성: 사용자가 직접 고르지 않았으면 마지막 성공 조합(provider, model)을 재사용해
     // 매 턴마다 다른 모델이 추첨되어 인증·리밋 오류가 나는 일을 막는다.

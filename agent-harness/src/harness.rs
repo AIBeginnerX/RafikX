@@ -640,7 +640,7 @@ where
                 last_err = Some(e);
             }
             Err(e) if is_auth_failure(&e) => {
-                crate::ui::live_warn(&format!(
+                fallback_warn(&format!(
                     "{name} 키 인증 실패(401/403) — rafikx login 에서 키를 갱신하세요"
                 ));
                 last_err = Some(e);
@@ -701,6 +701,24 @@ fn model_for_fallback(
     }
 }
 
+/// 백그라운드 작업(교훈 반성 등)이 폴백 실패를 화면에 띄우지 않게 하는 스위치.
+static FALLBACK_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fallback_quiet(quiet: bool) {
+    FALLBACK_QUIET.store(
+        quiet,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn fallback_warn(msg: &str) {
+    if FALLBACK_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::applog::info(&format!("fallback: {msg}"));
+    } else {
+        crate::ui::live_warn(msg);
+    }
+}
+
 pub async fn chat_with_fallback(
     cfg: &Config,
     order: &[String],
@@ -725,7 +743,7 @@ pub async fn chat_with_fallback(
         {
             Ok(resp) => return Ok((name.clone(), resp)),
             Err(e) => {
-                crate::ui::live_warn(&format!(
+                fallback_warn(&format!(
                     "{name} 호출 실패 ({}) → 다음 연결",
                     short_err(&e)
                 ));
@@ -796,7 +814,7 @@ where
         }
         if last_err.is_some() && Some(name.as_str()) == primary && primary_err.is_none() {
             primary_err = last_err.take();
-            crate::ui::live_warn(&format!(
+            fallback_warn(&format!(
                 "{name} 실패 ({}) → 다음 연결",
                 primary_err.as_ref().map(short_err).unwrap_or_default()
             ));
@@ -1157,6 +1175,7 @@ pub async fn run_pipeline(
 
     if binding.verify {
         crate::graph::node("verify", "start", "", Some("request"));
+        crate::spinner::set_label("검증 중…");
         outcome = run_verify(cfg, binding, task, yes, system, outcome, remote, local_ask).await?;
         crate::graph::node("verify", &outcome.status, "", Some("verify"));
     }

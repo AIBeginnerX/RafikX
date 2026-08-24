@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -138,12 +138,7 @@ impl Drop for TermGuard {
         ui::set_live(None);
         let _ = disable_raw_mode();
         let mut out = stdout();
-        let _ = execute!(
-            out,
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen);
         let _ = out.flush();
     }
 }
@@ -234,12 +229,7 @@ pub async fn run(
 
     enable_raw_mode().context("raw mode")?;
     let mut out = stdout();
-    execute!(
-        out,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)
     .context("alternate screen")?;
     let _guard = TermGuard;
     let backend = CrosstermBackend::new(out);
@@ -278,30 +268,6 @@ pub async fn run(
                     Some(Ok(Event::Paste(text))) => {
                         handle_paste(&mut app, &text);
                         dirty = true;
-                    }
-                    Some(Ok(Event::Mouse(m))) => {
-                        match m.kind {
-                            MouseEventKind::Down(MouseButton::Right)
-                            | MouseEventKind::Up(MouseButton::Right) => {
-                                if let Some(clip) = read_clipboard() {
-                                    handle_paste(&mut app, &clip);
-                                    dirty = true;
-                                }
-                            }
-                            MouseEventKind::ScrollUp => {
-                                app.follow = false;
-                                app.scroll = app.scroll.saturating_add(2);
-                                dirty = true;
-                            }
-                            MouseEventKind::ScrollDown => {
-                                app.scroll = app.scroll.saturating_sub(2);
-                                if app.scroll == 0 {
-                                    app.follow = true;
-                                }
-                                dirty = true;
-                            }
-                            _ => {}
-                        }
                     }
                     Some(Ok(Event::Resize(_, _))) => dirty = true,
                     Some(Err(e)) => anyhow::bail!("입력 이벤트: {e}"),
@@ -1469,14 +1435,8 @@ fn handle_paste(app: &mut App, raw: &str) {
     }
 }
 
-fn set_mouse_capture(on: bool) {
-    let mut out = stdout();
-    if on {
-        let _ = execute!(out, EnableMouseCapture);
-    } else {
-        let _ = execute!(out, DisableMouseCapture);
-    }
-}
+/// 마우스 캡처는 하지 않는다 — 터미널의 마우스 선택·복사를 그대로 쓴다 (no-op 호출 유지).
+fn set_mouse_capture(_on: bool) {}
 
 fn read_clipboard() -> Option<String> {
     #[cfg(windows)]
