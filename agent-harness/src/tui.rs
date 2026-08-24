@@ -1094,6 +1094,8 @@ fn apply_picker(app: &mut App, picker: Picker) {
         PickerKind::Model => {
             if id.is_empty() {
                 app.session.model = None;
+                // 자동 전환 시 영속 선택도 초기화
+                crate::chat::persist_last_choice(&app.session.cfg.clone(), "", "");
                 push(app, EntryKind::System, "모델을 하네스 자동으로 돌렸습니다.");
             } else {
                 app.session.model = Some(id.clone());
@@ -1107,10 +1109,15 @@ fn apply_picker(app: &mut App, picker: Picker) {
                         &r.provider,
                         &r.id,
                     );
+                    crate::chat::persist_last_choice(
+                        &app.session.cfg.clone(),
+                        &r.provider,
+                        &r.id,
+                    );
                     push(
                         app,
                         EntryKind::System,
-                        format!("모델: {} (기본 저장)", r.id),
+                        format!("모델: {} (저장 — 재시작 후에도 유지)", r.id),
                     );
                 } else {
                     push(app, EntryKind::System, format!("모델: {id} (세션 한정)"));

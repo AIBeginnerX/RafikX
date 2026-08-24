@@ -308,6 +308,11 @@ pub struct GeneralConfig {
     /// 하네스 엔진: rafikx (기본) | deepseek (dsh 영향 단계별 실행 강화). 옛 설정엔 없음 → rafikx.
     #[serde(default)]
     pub engine: String,
+    /// 마지막으로 성공/선택한 연결 — 재시작 후에도 같은 모델로 이어지게 하는 영속 선택.
+    #[serde(default)]
+    pub last_provider: String,
+    #[serde(default)]
+    pub last_model: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -395,7 +395,9 @@ pub fn set_default_provider(name: &str) -> Result<()> {
 
 pub fn set_provider_model(name: &str, model: &str) -> Result<()> {
     let cfg = Config::load(None)?;
-    accounts_ui::write_provider_model(&cfg, name, model)
+    accounts_ui::write_provider_model(&cfg, name, model)?;
+    crate::chat::persist_last_choice(&cfg, name, model);
+    Ok(())
 }
 
 pub fn add_custom_provider(name: &str, base_url: &str, model: &str) -> Result<()> {

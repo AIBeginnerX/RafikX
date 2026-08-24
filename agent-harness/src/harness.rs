@@ -184,6 +184,17 @@ pub fn bind(
     let (provider_name, model, verify_model) = if let (Some(p), Some(m)) =
         (provider_override, model_override)
     {
+        // 직접 지정 조합도 도구 지원 여부를 검사한다 — 미지원 모델로 코딩 프로필을
+        // 돌리면 답변이 비정상(도구 호출 불가·빈 응답)으로 나온다.
+        ensure_connected(cfg, p)?;
+        let pc = cfg.provider(p)?;
+        let needs_tools = !sub.tools.is_empty();
+        if needs_tools && !pc.supports_tools {
+            anyhow::bail!(
+                "'{p}' 연결은 도구를 지원하지 않습니다. 선택한 모델 '{m}' 은(는) 코딩 작업에 쓸 수 없습니다."
+            );
+        }
+        crate::applog::debug(&format!("bind: direct pair {p}/{m} tools_ok={}", pc.supports_tools));
         (p.to_string(), m.to_string(), None)
     } else if let Some(m) = model_override {
         let p = provider_override
@@ -712,11 +723,9 @@ pub fn set_fallback_quiet(quiet: bool) {
 }
 
 fn fallback_warn(msg: &str) {
-    if FALLBACK_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::applog::info(&format!("fallback: {msg}"));
-    } else {
-        crate::ui::live_warn(msg);
-    }
+    // 폴백 과정의 개별 실패(503·429·401 등)는 화면에 노출하지 않는다.
+    // 폴백이 성공하면 사용자는 최종 답변만 보고, 전부 실패했을 때만 오류가 전달된다.
+    crate::applog::debug(&format!("fallback: {msg}"));
 }
 
 pub async fn chat_with_fallback(

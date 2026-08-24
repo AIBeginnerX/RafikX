@@ -166,7 +166,7 @@ pub fn open_session(
                 row.title.unwrap_or_else(|| "(제목 없음)".into())
             );
         }
-        return Ok(Session {
+        return Ok(seed_last_choice(Session {
             cfg,
             yes,
             provider,
@@ -179,9 +179,9 @@ pub fn open_session(
             attachments: Vec::new(),
             dirty: false,
             sticky: None,
-        });
+        }));
     }
-    Ok(Session {
+    Ok(seed_last_choice(Session {
         cfg,
         yes,
         provider,
@@ -194,7 +194,32 @@ pub fn open_session(
         attachments: Vec::new(),
         dirty: false,
         sticky: None,
-    })
+    }))
+}
+
+/// 재시작 후에도 이전에 선택/성공한 (provider, model)을 이어받는다.
+/// 사용자가 명시적으로 지정한 경우에는 그 값을 우선한다.
+fn seed_last_choice(mut s: Session) -> Session {
+    if s.provider.is_none() || s.model.is_none() {
+        let lp = s.cfg.file.general.last_provider.trim();
+        let lm = s.cfg.file.general.last_model.trim();
+        if !lp.is_empty() && !lm.is_empty() && s.cfg.file.providers.contains_key(lp) {
+            if s.provider.is_none() {
+                s.provider = Some(lp.to_string());
+            }
+            if s.model.is_none() {
+                s.model = Some(lm.to_string());
+            }
+        }
+    }
+    s
+}
+
+/// 마지막 선택을 config 에 영속 저장 — 재시작 후에도 같은 모델로 실행.
+pub fn persist_last_choice(cfg: &Config, provider: &str, model: &str) {
+    use crate::config::{toml_string, write_toml_key};
+    let _ = write_toml_key(&cfg.path, "[general]", "last_provider", &toml_string(provider));
+    let _ = write_toml_key(&cfg.path, "[general]", "last_model", &toml_string(model));
 }
 
 pub fn save_if_dirty(session: &mut Session) -> Result<Option<String>> {
@@ -950,8 +975,12 @@ pub async fn run_turn(
         &binding.model,
         obsidian_on,
     );
-    applog::info(&format!(
-        "chat mode={} class={} profile={} provider={} model={}",
+    applog::debug(&format!(
+        "bind source={} ov_provider={:?} ov_model={:?} sticky={:?} mode={} class={} profile={} provider={} model={}",
+        if ov_provider.is_some() { "override" } else { "auto" },
+        ov_provider,
+        ov_model,
+        session.sticky,
         session.mode,
         binding.class.as_str(),
         binding.profile_name,
@@ -1016,6 +1045,12 @@ pub async fn run_turn(
             if session.provider.is_none() && session.model.is_none() {
                 session.sticky = Some((binding.provider_name.clone(), binding.model.clone()));
             }
+            // 영속화: 재시작해도 같은 조합으로 시작한다.
+            persist_last_choice(
+                &session.cfg.clone(),
+                &binding.provider_name,
+                &binding.model,
+            );
             Ok(TurnInfo {
                 run_id,
                 label: info_label,
