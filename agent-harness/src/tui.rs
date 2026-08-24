@@ -52,6 +52,10 @@ pub struct App {
     quit_after: bool,
     /// 슬래시 명령 Enter 2회 확인용
     pub slash_armed: bool,
+    /// 새 릴리스 태그 — 있으면 U 키로 업그레이드 진행 가능
+    pub upgrade: Option<String>,
+    /// 업그레이드 진행 중 플래그
+    pub upgrading: bool,
 }
 
 pub struct ApprovalPrompt {
@@ -183,6 +187,8 @@ pub async fn run(
         quit: false,
         quit_after: false,
         slash_armed: false,
+        upgrade: None,
+        upgrading: false,
     };
     if app.transcript.is_empty() {
         app.transcript.push(Entry {
@@ -283,6 +289,7 @@ pub async fn run(
             }
             upd = upd_rx.recv() => {
                 if let Some(notice) = upd {
+                    app.upgrade = crate::update::last_seen_tag();
                     push(&mut app, EntryKind::Warn, notice);
                     dirty = true;
                 }
@@ -557,6 +564,11 @@ fn handle_key(
         KeyCode::Esc => {
             app.help = false;
         }
+        KeyCode::Char('u') | KeyCode::Char('U')
+            if app.upgrade.is_some() && !app.upgrading && app.input.is_empty() =>
+        {
+            start_upgrade(app);
+        }
         KeyCode::Char('?') if app.input.is_empty() => {
             app.help = true;
         }
@@ -818,6 +830,16 @@ fn apply_live(app: &mut App, ev: Live) {
             push(app, EntryKind::Assistant, s);
         }
         Live::System(s) => {
+            if let Some(tag) = s.strip_prefix("[upgrade-ok]") {
+                app.upgrade = None;
+                push(app, EntryKind::System, format!("{tag} 설치 완료 — rafikx 를 다시 실행하면 새 버전으로 시작됩니다."));
+                return;
+            }
+            if s == "[upgrade-done]" {
+                app.upgrading = false;
+                app.status = "준비".into();
+                return;
+            }
             let kind = if s.contains("[도구]") {
                 EntryKind::Tool
             } else {
@@ -978,6 +1000,71 @@ fn history_next(app: &mut App) {
     app.history_idx = Some(i + 1);
     app.input = app.history[i + 1].clone();
     app.cursor = app.input.len();
+}
+
+/// U 키로 릴리스 업그레이드를 진행한다 (~/.rafikx-src pull + cargo install).
+fn start_upgrade(app: &mut App) {
+    if app.upgrading {
+        return;
+    }
+    app.upgrading = true;
+    let tag = app.upgrade.clone().unwrap_or_default();
+    app.status = format!("v{tag} 업그레이드 중… (완료까지 몇 분)");
+    crate::ui::live_line("업그레이드를 시작합니다. 진행 상황은 아래에 표시됩니다.");
+    tokio::spawn(async move {
+        let result = run_upgrade().await;
+        match result {
+            Ok(_) => crate::ui::live_line(&format!("[upgrade-ok] v{tag}")),
+            Err(e) => {
+                crate::ui::live_warn(&format!("업그레이드 실패: {e:#}"));
+                crate::ui::live_line(&format!(
+                    "수동 명령어: {}",
+                    crate::update::upgrade_command()
+                ));
+            }
+        }
+        crate::ui::live_line("[upgrade-done]");
+    });
+}
+
+async fn run_upgrade() -> Result<()> {
+    use tokio::process::Command;
+    let script = r#"
+set -e
+SRC="$HOME/.rafikx-src"
+if [ -d "$SRC/.git" ]; then
+  git -C "$SRC" fetch --depth 1 origin master
+  git -C "$SRC" checkout -q master
+  git -C "$SRC" reset -q --hard origin/master
+else
+  echo "NO_SRC"
+  exit 2
+fi
+cargo install --path "$SRC/agent-harness" --locked --force
+"#;
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .await?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let tail: String = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("
+");
+        if String::from_utf8_lossy(&out.stdout).contains("NO_SRC") {
+            anyhow::bail!("표준 설치 경로(~/.rafikx-src)가 없습니다. 아래 명령어로 직접 설치하세요");
+        }
+        anyhow::bail!("{}", tail)
+    }
 }
 
 fn open_model_picker(app: &mut App) {

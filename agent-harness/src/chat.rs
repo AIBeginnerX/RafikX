@@ -151,6 +151,27 @@ pub fn open_session(
     for note in crate::auth::auto_import_cli_logins(&cfg) {
         crate::ui::note(&note);
     }
+    // 새 릴리스 확인 (비동기 화면용과 별개로, 일반 채팅 시작 시 짧게 확인해서 안내만).
+    if announce {
+        // 별도 스레드에서 확인 (TUI의 async 런타임을 막지 않는다)
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                let _ = tx.send(rt.block_on(crate::update::latest_release()));
+            }
+        });
+        let checked = rx.recv_timeout(std::time::Duration::from_secs(4)).ok();
+        if let Some(Ok(rel)) = checked {
+            if let Some(notice) = crate::update::upgrade_notice(&rel, env!("CARGO_PKG_VERSION")) {
+                for line in notice.lines() {
+                    crate::ui::note(&format!("⚠ {line}"));
+                }
+            }
+        }
+    }
     let db = Db::open(&Db::db_path()?)?;
     if let Some(id) = resume {
         let Some(row) = db.load_session(&id)? else {

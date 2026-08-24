@@ -121,13 +121,26 @@ pub fn summarize_notes(notes: &str, max_lines: usize) -> Vec<String> {
         .collect()
 }
 
+/// 표준 설치 경로(~/.rafikx-src)에서 최신 소스를 받아 설치하는 명령.
+static LAST_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// TUI 가 U 키 동작에 쓰도록 감지된 최신 태그를 저장해 둔다.
+pub fn last_seen_tag() -> Option<String> {
+    LAST_TAG.get().cloned()
+}
+
+pub fn upgrade_command() -> &'static str {
+    "git -C ~/.rafikx-src pull && cargo install --path ~/.rafikx-src/agent-harness --locked --force"
+}
+
 /// 업그레이드 안내 문장을 만든다. 새 버전이 아니면 None.
 pub fn upgrade_notice(release: &Release, current: &str) -> Option<String> {
     if !is_newer(&release.tag, current) {
         return None;
     }
+    let _ = LAST_TAG.set(release.tag.clone());
     let mut out = vec![format!(
-        "새 버전 {} 이 있습니다 (현재 v{current}). 업그레이드: cargo install --path agent-harness --force",
+        "새 버전 {} 이 있습니다 (현재 v{current})",
         release.tag
     )];
     let summary = summarize_notes(&release.notes, 6);
@@ -140,6 +153,8 @@ pub fn upgrade_notice(release: &Release, current: &str) -> Option<String> {
     if !release.url.is_empty() {
         out.push(release.url.clone());
     }
+    out.push(format!("명령어: {}", upgrade_command()));
+    out.push("지금 업그레이드하려면 U 키를 누르세요.".into());
     Some(out.join("\n"))
 }
 
