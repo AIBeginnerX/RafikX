@@ -115,7 +115,10 @@ Windows는 rustup이 C++ 빌드 도구를 요청할 수 있습니다.
 
 ### opencode급 도구 · 모드 (v0.2)
 
-- **도구 13종**: read_file · list_dir · grep · glob · webfetch · edit_file · multi_edit · write_file · bash · todo_write · todo_read · obsidian_search · task(서브에이전트 위임).
+- **도구 15종**: read_file · list_dir · grep · glob · webfetch · web_search · edit_file · multi_edit · write_file · apply_patch · bash · todo_write · todo_read · obsidian_search · task(서브에이전트 위임).
+  - `web_search` 는 키 없이 웹 검색 결과(제목·URL·요약)를 돌려주고, 자세한 본문은 `webfetch` 로 읽습니다.
+  - `apply_patch` 는 여러 파일의 추가/수정/삭제를 codex 스타일 패치 한 번으로 적용합니다.
+  - `bash` 는 `timeout_secs`(5~600초), `grep` 은 `context`(앞뒤 문맥 줄) 파라미터를 지원합니다.
 - **plan / build 모드**: `/mode plan` 은 읽기 전용으로 계획만 세우고, `/mode build` 로 실행합니다.
 - **세션 명령**: `/sessions` `/resume <id>` `/compact`(대화 요약 압축) `/undo` `/tools` `/todo`.
 - **파일 첨부**: `@src/main.rs` 멘션 또는 `/file <경로>` 로 다음 질문에 파일을 붙입니다.
@@ -143,7 +146,7 @@ cargo install --path agent-harness --force
 
 ## 데스크탑 앱
 
-CLI와 **같은 하네스**를 쓰는 가벼운 창입니다 (Tauri 2, Electron 아님). 채팅, 연결/설정, 세션, Obsidian, 실행 그래프.
+CLI와 **같은 하네스**를 쓰는 가벼운 창입니다 (Tauri 2, Electron 아님). 채팅, 연결/설정, 세션, Obsidian, 실행 그래프. 코드펜스 하이라이트, 메시지 복사 버튼, 파일 드래그&드롭(@경로 첨부)을 지원합니다.
 
 자세한 설치·빌드: [docs/INSTALL.md](docs/INSTALL.md#데스크탑-앱).
 

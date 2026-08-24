@@ -108,6 +108,30 @@
     .msg.system .who { color: var(--violet); }
     .msg .body { white-space: pre-wrap; line-height: 1.55; font-size: 14.5px; }
     .msg.warn .body { color: var(--danger); }
+    /* 코드블록 · 인라인 코드 · 복사 버튼 */
+    pre.codeblock {
+      background: var(--input-bg); border: 1px solid var(--line); border-radius: 10px;
+      padding: 10px 12px; margin: 8px 0; overflow-x: auto;
+      font-family: "IBM Plex Mono", monospace; font-size: 12.5px; line-height: 1.5;
+      white-space: pre; color: var(--text);
+    }
+    body.theme-light pre.codeblock { background: #f0efe9; }
+    pre.codeblock .lang { display: block; color: var(--muted); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 4px; }
+    code.inline { font-family: "IBM Plex Mono", monospace; font-size: 13px; background: rgba(107,92,255,.14); padding: 1px 5px; border-radius: 4px; }
+    .copy-btn {
+      float: right; opacity: 0; transition: opacity .15s ease;
+      background: transparent; color: var(--muted); border: 1px solid var(--line);
+      border-radius: 6px; padding: 2px 8px; cursor: pointer; font: inherit; font-size: 11px;
+    }
+    .msg:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--gold); border-color: var(--violet); }
+    /* 드래그&드롭 안내 */
+    body.dragging::after {
+      content: "파일을 놓으면 @경로로 첨부됩니다";
+      position: fixed; inset: 10px; border: 2px dashed var(--violet); border-radius: 14px;
+      display: grid; place-items: center; color: var(--gold);
+      background: rgba(3,6,14,.72); font-size: 15px; z-index: 30; pointer-events: none;
+    }
     .composer { border-top: 1px solid var(--line); padding: 12px 20px 16px; background: var(--panel); }
     .composer-inner { max-width: 760px; margin: 0 auto; }
     textarea {
@@ -408,6 +432,62 @@
     let appearance = "auto";
 
     function esc(s) { return String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+    // ---- 마크다운 라이트: 코드펜스 + 인라인 코드만 (나머지는 그대로) ----------
+    function renderRichInto(el, text) {
+      const parts = String(text ?? "").split(/```/);
+      el.innerHTML = "";
+      parts.forEach((part, i) => {
+        if (i % 2 === 1) {
+          const nl = part.indexOf("\n");
+          const first = nl === -1 ? part : part.slice(0, nl);
+          const code = nl === -1 ? "" : part.slice(nl + 1).replace(/\n$/, "");
+          const isLang = /^[\w+#.-]{0,20}$/.test(first.trim()) && nl !== -1;
+          const lang = isLang ? first.trim() : "";
+          const body = isLang ? code : part.replace(/\n$/, "");
+          const pre = document.createElement("pre");
+          pre.className = "codeblock";
+          if (lang) {
+            const label = document.createElement("span");
+            label.className = "lang";
+            label.textContent = lang;
+            pre.appendChild(label);
+          }
+          pre.appendChild(document.createTextNode(body));
+          el.appendChild(pre);
+        } else {
+          const seg = document.createElement("span");
+          const chunks = part.split(/(`[^`\n]+`)/g);
+          for (const c of chunks) {
+            if (c.length > 2 && c.startsWith("`") && c.endsWith("`")) {
+              const s = document.createElement("code");
+              s.className = "inline";
+              s.textContent = c.slice(1, -1);
+              seg.appendChild(s);
+            } else if (c) {
+              seg.appendChild(document.createTextNode(c));
+            }
+          }
+          el.appendChild(seg);
+        }
+      });
+    }
+
+    function attachCopy(msgDiv, getText) {
+      const who = msgDiv.querySelector(".who");
+      if (!who) return;
+      const btn = document.createElement("button");
+      btn.className = "copy-btn";
+      btn.textContent = "복사";
+      btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(getText());
+          btn.textContent = "완료";
+          setTimeout(() => { btn.textContent = "복사"; }, 1500);
+        } catch (_) {}
+      });
+      who.appendChild(btn);
+    }
     function projectName(p) {
       const parts = String(p || "").split(/[\\/]/).filter(Boolean);
       return parts.length ? parts[parts.length - 1] : "(프로젝트 없음)";
@@ -416,7 +496,7 @@
       const box = document.getElementById("transcript");
       const m = document.createElement("div");
       m.className = "msg " + role + (extra ? " " + extra : "");
-      m.innerHTML = `<div class="who">${esc(role)}</div><div class="body"></div>`;
+      m.innerHTML = `<div class="who"><span>${esc(role)}</span></div><div class="body"></div>`;
       m.querySelector(".body").textContent = text;
       box.appendChild(m);
       box.scrollTop = box.scrollHeight;
@@ -624,7 +704,13 @@
       const sess = await invoke("new_session", { provider: null, model: null, class: null, resume: id });
       sid = sess.id;
       document.getElementById("transcript").innerHTML = "";
-      sess.messages.forEach(m => addMsg(m.role, m.text));
+      sess.messages.forEach(m => {
+        const div = addMsg(m.role, m.text);
+        if (m.role === "assistant") {
+          renderRichInto(div, m.text);
+          attachCopy(div.parentElement, () => div.textContent);
+        }
+      });
       document.getElementById("obsidian").checked = sess.obsidian_on;
       document.getElementById("mode").value = sess.mode === "plan" ? "plan" : "build";
       await refreshSessions();
@@ -679,6 +765,11 @@
           if (!streamEl.textContent.trim() && r.messages.length) {
             const last = [...r.messages].reverse().find(m => m.role === "assistant");
             if (last) streamEl.textContent = last.text;
+          }
+          if (streamEl.textContent.trim()) {
+            const final_text = streamEl.textContent;
+            renderRichInto(streamEl, final_text);
+            attachCopy(streamEl.parentElement, () => final_text);
           }
           document.getElementById("status").textContent =
             r.turn.label + " · " + r.turn.status + " · in " + r.turn.tokens_in + " / out " + r.turn.tokens_out;
@@ -888,6 +979,24 @@
       document.getElementById("prompt").addEventListener("keydown", e => {
         if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
       });
+
+      // ---- 파일 드래그&드롭 → @경로 첨부 ------------------------------------
+      let dragDepth = 0;
+      document.addEventListener("dragenter", e => { e.preventDefault(); dragDepth++; document.body.classList.add("dragging"); });
+      document.addEventListener("dragleave", e => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
+      document.addEventListener("dragover", e => e.preventDefault());
+      document.addEventListener("drop", e => {
+        e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging");
+      });
+      // Tauri 네이티브 드래그 이벤트 — 실제 전체 경로 제공
+      listen("tauri://drag-drop", ev => {
+        document.body.classList.remove("dragging");
+        const paths = (ev.payload && ev.payload.paths) || [];
+        if (!paths.length) return;
+        const ta = document.getElementById("prompt");
+        ta.value += (ta.value ? "\n" : "") + paths.map(p => "@" + p).join(" ");
+        ta.focus();
+      }).catch(() => {});
     }
 
     async function start() {

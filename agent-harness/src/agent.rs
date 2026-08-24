@@ -334,7 +334,7 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 Ok(out) => {
                     crate::graph::node("tool_post", &name, "ok", Some("tool_pre"));
                     crate::ui::live_line(&out);
-                    if name == "write_file" || name == "edit_file" || name == "multi_edit" {
+                    if matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit" | "apply_patch") {
                         if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
                             changed_files.push(p.to_string());
                         }

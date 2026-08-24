@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::BufRead;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -17,7 +16,7 @@ use crate::obsidian;
 use crate::provider::ToolSpec;
 
 use crate::agent::LocalAsk;
-use crate::tools_more::{GlobTool, MultiEdit, TaskTool, TodoRead, TodoWrite, WebFetch};
+use crate::tools_more::{ApplyPatch, GlobTool, MultiEdit, TaskTool, TodoRead, TodoWrite, WebFetch, WebSearch};
 
 pub const MAX_LIST_ITEMS: usize = 500;
 pub const MAX_GREP_LINES: usize = 200;
@@ -65,10 +64,12 @@ impl ToolRegistry {
                 Box::new(Grep),
                 Box::new(GlobTool),
                 Box::new(WebFetch),
+                Box::new(WebSearch),
                 Box::new(EditFile),
                 Box::new(MultiEdit),
                 Box::new(WriteFile),
                 Box::new(Bash),
+                Box::new(ApplyPatch),
                 Box::new(TodoWrite),
                 Box::new(TodoRead),
                 Box::new(ObsidianSearch),
@@ -84,6 +85,7 @@ impl ToolRegistry {
         "grep",
         "glob",
         "webfetch",
+        "web_search",
         "todo_read",
         "todo_write",
         "obsidian_search",
@@ -309,6 +311,12 @@ pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<Stri
             }
             Ok(format!("[승인] bash\ncommand: {command}"))
         }
+        "apply_patch" => {
+            let patch = str_field(input, "patch")?;
+            let ops = crate::tools_more::ApplyPatch::parse(patch)?;
+            let report = crate::tools_more::ApplyPatch::dry_run(&ctx.workspace, &ops)?;
+            Ok(format!("[승인] apply_patch\n{report}\n--- patch ---\n{patch}"))
+        }
         other => Ok(format!("[승인] {other}")),
     }
 }
@@ -433,7 +441,8 @@ impl Tool for Grep {
             "properties": {
                 "pattern": {"type": "string", "description": "정규식"},
                 "path": {"type": "string", "description": "검색 시작 경로. 선택"},
-                "glob": {"type": "string", "description": "파일 이름 글롭. 예: *.rs. 선택"}
+                "glob": {"type": "string", "description": "파일 이름 글롭. 예: *.rs. 선택"},
+                "context": {"type": "integer", "description": "일치 줄 앞뒤 문맥 줄 수(0-5). 기본 0"}
             },
             "required": ["pattern"]
         })
@@ -450,6 +459,11 @@ impl Tool for Grep {
             Some(g) if !g.is_empty() => Some(glob_to_regex(g)?),
             _ => None,
         };
+        let context = input
+            .get("context")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .clamp(0, 5) as usize;
         let mut hits = Vec::new();
         let walker = ignore::WalkBuilder::new(&root).hidden(false).git_ignore(true).build();
         for entry in walker.flatten() {
@@ -466,16 +480,46 @@ impl Tool for Grep {
                     continue;
                 }
             }
-            let Ok(file) = fs::File::open(path) else { continue };
-            let reader = std::io::BufReader::new(file);
-            for (i, line) in reader.lines().enumerate() {
-                if hits.len() >= MAX_GREP_LINES {
-                    break;
+            let Ok(text) = fs::read_to_string(path) else { continue };
+            let rel = path.strip_prefix(&ctx.workspace).unwrap_or(path);
+            let lines: Vec<&str> = text.lines().collect();
+            let matched: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| re.is_match(l))
+                .map(|(i, _)| i)
+                .collect();
+            if matched.is_empty() {
+                continue;
+            }
+            if context == 0 {
+                for i in matched.iter().take(MAX_GREP_LINES.saturating_sub(hits.len())) {
+                    hits.push(format!("{}:{}:{}", rel.display(), i + 1, lines[*i]));
                 }
-                let Ok(line) = line else { continue };
-                if re.is_match(&line) {
-                    let rel = path.strip_prefix(&ctx.workspace).unwrap_or(path);
-                    hits.push(format!("{}:{}:{line}", rel.display(), i + 1));
+            } else {
+                // 겹치는 범위를 병합해 블록으로 출력 (-- 구분자로 블록 분리)
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for &i in &matched {
+                    match ranges.last_mut() {
+                        Some(r) if i <= r.1 + 1 => r.1 = (i + context).min(lines.len().saturating_sub(1)),
+                        _ => ranges.push((
+                            i.saturating_sub(context),
+                            (i + context).min(lines.len().saturating_sub(1)),
+                        )),
+                    }
+                }
+                for (s, e) in ranges {
+                    if hits.len() >= MAX_GREP_LINES {
+                        break;
+                    }
+                    for i in s..=e {
+                        let mark = if matched.contains(&i) { ":" } else { "-" };
+                        hits.push(format!("{}{}{}:{}", rel.display(), mark, i + 1, lines[i]));
+                    }
+                    hits.push("--".to_string());
+                }
+                if hits.last().map(|h| h == "--").unwrap_or(false) {
+                    hits.pop();
                 }
             }
         }
@@ -577,13 +621,14 @@ impl Tool for Bash {
         "bash"
     }
     fn description(&self) -> &'static str {
-        "워크스페이스에서 명령을 실행합니다. 타임아웃 60초. 위험 명령은 차단됩니다."
+        "워크스페이스에서 명령을 실행합니다. 기본 타임아웃 60초(timeout_secs 로 최대 600초까지 조정). 위험 명령은 차단됩니다."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "command": {"type": "string"}
+                "command": {"type": "string"},
+                "timeout_secs": {"type": "integer", "description": "타임아웃 초. 5-600. 기본 60"}
             },
             "required": ["command"]
         })
@@ -596,9 +641,14 @@ impl Tool for Bash {
         if let Some(why) = bash_blocked(&command) {
             return Err(anyhow!("차단된 명령입니다 ({why})"));
         }
+        let timeout_secs = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(BASH_TIMEOUT_SECS)
+            .clamp(5, 600);
         let workspace = ctx.workspace.clone();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(run_bash(command, workspace))
+            tokio::runtime::Handle::current().block_on(run_bash(command, workspace, timeout_secs))
         })
     }
 }
@@ -675,7 +725,7 @@ fn bash_blocked(cmd: &str) -> Option<&'static str> {
     None
 }
 
-async fn run_bash(command: String, workspace: PathBuf) -> Result<String> {
+async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Result<String> {
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd");
@@ -700,7 +750,7 @@ async fn run_bash(command: String, workspace: PathBuf) -> Result<String> {
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
 
-    let wait = timeout(Duration::from_secs(BASH_TIMEOUT_SECS), async {
+    let wait = timeout(Duration::from_secs(timeout_secs), async {
         let mut tmp_out = [0u8; 4096];
         let mut tmp_err = [0u8; 4096];
         let mut stdout_done = false;
@@ -734,7 +784,7 @@ async fn run_bash(command: String, workspace: PathBuf) -> Result<String> {
     match wait {
         Err(_) => {
             let _ = child.kill().await;
-            Err(anyhow!("명령이 60초를 넘겨 중단되었습니다"))
+            Err(anyhow!("명령이 {timeout_secs}초를 넘겨 중단되었습니다"))
         }
         Ok(Err(e)) => Err(anyhow!("명령 실행 오류: {e}")),
         Ok(Ok(status)) => {

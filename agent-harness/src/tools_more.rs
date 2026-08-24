@@ -85,7 +85,7 @@ fn parse_todos(input: &Value) -> Result<Vec<TodoItem>> {
         let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
         let priority = t.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
         if !valid_status(status) {
-            return Err(anyhow!("status 는 pending|in_progress|complted 중 하나여야 합니다"));
+            return Err(anyhow!("status 는 pending|in_progress|completed 중 하나여야 합니다"));
         }
         if !valid_priority(priority) {
             return Err(anyhow!("priority 는 high|medium|low 중 하나여야 합니다"));
@@ -474,6 +474,400 @@ impl Tool for MultiEdit {
 }
 
 // ---------------------------------------------------------------------------
+// web_search — 키 없는 웹 검색 (DuckDuckGo HTML)
+// ---------------------------------------------------------------------------
+
+fn percent_encode_query(q: &str) -> String {
+    let mut out = String::new();
+    for b in q.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn decode_ddg_href(href: &str) -> String {
+    // DuckDuckGo 는 //duckduckgo.com/l/?uddg=<encoded>&rut=... 형태로 리다이렉트한다.
+    if let Some(pos) = href.find("uddg=") {
+        let rest = &href[pos + 5..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        let enc = &rest[..end];
+        let mut bytes = Vec::new();
+        let cs = enc.as_bytes();
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] == b'%' && i + 2 < cs.len() {
+                if let Ok(v) = u8::from_str_radix(&enc[i + 1..i + 3], 16) {
+                    bytes.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            bytes.push(cs[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        href.to_string()
+    }
+}
+
+fn text_of(html: &str) -> String {
+    let tags = Regex::new(r"(?s)<[^>]+>").expect("fixed regex");
+    tags.replace_all(html, " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub struct WebSearch;
+
+impl WebSearch {
+    pub const MAX_RESULTS: usize = 8;
+
+    async fn search(query: String) -> Result<String> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent("RafikX/0.3 (+web_search)")
+            .build()?;
+        let url = format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            percent_encode_query(&query)
+        );
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow!("검색 실패: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("HTTP {}", resp.status()));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let link_re = Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
+            .expect("fixed regex");
+        let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#)
+            .expect("fixed regex");
+        let snippets: Vec<String> = snippet_re
+            .captures_iter(&body)
+            .map(|c| text_of(&c[1]))
+            .collect();
+        let mut out = Vec::new();
+        for (i, cap) in link_re.captures_iter(&body).enumerate() {
+            if out.len() >= Self::MAX_RESULTS {
+                break;
+            }
+            let href = decode_ddg_href(&cap[1]);
+            let title = text_of(&cap[2]);
+            if title.is_empty() || href.is_empty() {
+                continue;
+            }
+            let snip = snippets.get(i).cloned().unwrap_or_default();
+            out.push(format!("{}. {}\n   {}\n   {}", out.len() + 1, title, href, snip));
+        }
+        if out.is_empty() {
+            return Err(anyhow!("검색 결과가 없습니다"));
+        }
+        Ok(out.join("\n"))
+    }
+}
+
+impl Tool for WebSearch {
+    fn name(&self) -> &'static str {
+        "web_search"
+    }
+    fn description(&self) -> &'static str {
+        "웹에서 최신 정보를 검색합니다. 제목·URL·요약을 반환합니다. 자세한 내용은 webfetch 로 본문을 읽으세요."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "검색어"}
+            },
+            "required": ["query"]
+        })
+    }
+    fn needs_approval(&self, _input: &Value) -> bool {
+        false
+    }
+    fn run(&self, input: Value, _ctx: &ToolCtx) -> Result<String> {
+        let query = input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("query 인자가 필요합니다"))?
+            .trim()
+            .to_string();
+        if query.is_empty() {
+            return Err(anyhow!("query 가 비어 있습니다"));
+        }
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(Self::search(query))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply_patch — 다중 파일 패치 (Add / Update / Delete 를 한 번에)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum PatchOp {
+    Add(String, String),
+    Update(String, Vec<(String, String)>), // (removed, added) 치환 목록
+    Delete(String),
+}
+
+pub struct ApplyPatch;
+
+impl ApplyPatch {
+    pub const NAME: &'static str = "apply_patch";
+
+    pub fn parse(patch: &str) -> Result<Vec<PatchOp>> {
+        let trimmed = patch.trim();
+        if !trimmed.starts_with("*** Begin Patch") {
+            return Err(anyhow!("패치는 *** Begin Patch 로 시작해야 합니다"));
+        }
+        let mut ops = Vec::new();
+        let mut cur_file: Option<String> = None;
+        let mut mode: Option<&'static str> = None; // "add" | "update" | "delete"
+        let mut add_buf = Vec::new();
+        let mut changes: Vec<(String, String)> = Vec::new();
+        let mut rem: Vec<String> = Vec::new();
+        let mut addl: Vec<String> = Vec::new();
+
+        let flush_change = |rem: &mut Vec<String>, addl: &mut Vec<String>, changes: &mut Vec<(String, String)>| {
+            if !rem.is_empty() || !addl.is_empty() {
+                changes.push((rem.join("\n"), addl.join("\n")));
+                rem.clear();
+                addl.clear();
+            }
+        };
+
+        for raw in trimmed.lines().skip(1) {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            if line == "*** End Patch" {
+                break;
+            }
+            if let Some(p) = line.strip_prefix("*** Add File: ") {
+                if let Some(f) = cur_file.take() {
+                    if mode == Some("add") {
+                        ops.push(PatchOp::Add(f, add_buf.join("\n")));
+                    } else if mode == Some("update") {
+                        flush_change(&mut rem, &mut addl, &mut changes);
+                        ops.push(PatchOp::Update(f, std::mem::take(&mut changes)));
+                    } else if mode == Some("delete") {
+                        ops.push(PatchOp::Delete(f));
+                    }
+                }
+                cur_file = Some(p.trim().to_string());
+                mode = Some("add");
+                add_buf.clear();
+                continue;
+            }
+            if let Some(p) = line.strip_prefix("*** Update File: ") {
+                if let Some(f) = cur_file.take() {
+                    if mode == Some("add") {
+                        ops.push(PatchOp::Add(f, add_buf.join("\n")));
+                    } else if mode == Some("update") {
+                        flush_change(&mut rem, &mut addl, &mut changes);
+                        ops.push(PatchOp::Update(f, std::mem::take(&mut changes)));
+                    } else if mode == Some("delete") {
+                        ops.push(PatchOp::Delete(f));
+                    }
+                }
+                cur_file = Some(p.trim().to_string());
+                mode = Some("update");
+                continue;
+            }
+            if let Some(p) = line.strip_prefix("*** Delete File: ") {
+                if let Some(f) = cur_file.take() {
+                    if mode == Some("add") {
+                        ops.push(PatchOp::Add(f, add_buf.join("\n")));
+                    } else if mode == Some("update") {
+                        flush_change(&mut rem, &mut addl, &mut changes);
+                        ops.push(PatchOp::Update(f, std::mem::take(&mut changes)));
+                    } else if mode == Some("delete") {
+                        ops.push(PatchOp::Delete(f));
+                    }
+                }
+                cur_file = Some(p.trim().to_string());
+                mode = Some("delete");
+                continue;
+            }
+            if line.starts_with("*** ") {
+                return Err(anyhow!("알 수 없는 패치 헤더: {line}"));
+            }
+            match mode {
+                Some("add") => {
+                    let c = line.strip_prefix('+').ok_or_else(|| {
+                        anyhow!("Add File 구간의 모든 줄은 + 로 시작해야 합니다: {line}")
+                    })?;
+                    add_buf.push(c.to_string());
+                }
+                Some("update") => {
+                    if line.starts_with("@@") || line.starts_with("## ") {
+                        // hunk 경계 — 문맥은 무시하고 누적된 변경을 확정
+                        continue;
+                    }
+                    if let Some(c) = line.strip_prefix('-') {
+                        if !addl.is_empty() {
+                            flush_change(&mut rem, &mut addl, &mut changes);
+                        }
+                        rem.push(c.to_string());
+                    } else if let Some(c) = line.strip_prefix('+') {
+                        addl.push(c.to_string());
+                    } else {
+                        // 문맥 줄 — 현재 변경을 확정
+                        flush_change(&mut rem, &mut addl, &mut changes);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(f) = cur_file {
+            match mode {
+                Some("add") => ops.push(PatchOp::Add(f, add_buf.join("\n"))),
+                Some("update") => {
+                    flush_change(&mut rem, &mut addl, &mut changes);
+                    ops.push(PatchOp::Update(f, changes));
+                }
+                Some("delete") => ops.push(PatchOp::Delete(f)),
+                _ => {}
+            }
+        }
+        if ops.is_empty() {
+            return Err(anyhow!("패치에 변경이 없습니다"));
+        }
+        Ok(ops)
+    }
+
+    /// 디스크에 쓰지 않고 문자열 위에서 미리 적용해본다 (승인 프리뷰용).
+    pub fn dry_run(root: &std::path::Path, ops: &[PatchOp]) -> Result<String> {
+        let mut report = Vec::new();
+        for op in ops {
+            match op {
+                PatchOp::Add(p, content) => {
+                    let f = root.join(p);
+                    if f.exists() {
+                        return Err(anyhow!("Add File 이지만 이미 존재합니다: {p}"));
+                    }
+                    report.push(format!("+ {p} ({}줄)", content.lines().count()));
+                }
+                PatchOp::Delete(p) => {
+                    let f = root.join(p);
+                    if !f.is_file() {
+                        return Err(anyhow!("Delete 대상 파일이 없습니다: {p}"));
+                    }
+                    report.push(format!("- {p}"));
+                }
+                PatchOp::Update(p, changes) => {
+                    let f = root.join(p);
+                    let body = fs::read_to_string(&f)
+                        .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {p}"))?;
+                    for (i, (o, n)) in changes.iter().enumerate() {
+                        let cnt = body.matches(o.as_str()).count();
+                        if cnt != 1 {
+                            return Err(anyhow!(
+                                "{p} 의 {i}번째 변경 블록이 {cnt}번 나타납니다. 정확히 1번이어야 합니다."
+                            ));
+                        }
+                        let _ = n;
+                    }
+                    report.push(format!("~ {p} ({}곳)", changes.len()));
+                }
+            }
+        }
+        Ok(report.join("\n"))
+    }
+
+    fn apply(ctx: &ToolCtx, ops: &[PatchOp]) -> Result<Vec<String>> {
+        let mut done = Vec::new();
+        for op in ops {
+            match op {
+                PatchOp::Add(rel, content) => {
+                    let f = crate::tools::resolve_tool_path(ctx, rel)?;
+                    if f.exists() {
+                        return Err(anyhow!("Add File 이지만 이미 존재합니다: {}", f.display()));
+                    }
+                    if let Some(parent) = f.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&f, content)?;
+                    done.push(format!("추가: {}", f.display()));
+                }
+                PatchOp::Delete(rel) => {
+                    let f = crate::tools::resolve_tool_path(ctx, rel)?;
+                    if !f.is_file() {
+                        return Err(anyhow!("삭제 대상이 파일이 아닙니다: {}", f.display()));
+                    }
+                    fs::remove_file(&f)?;
+                    done.push(format!("삭제: {}", f.display()));
+                }
+                PatchOp::Update(rel, changes) => {
+                    let f = crate::tools::resolve_tool_path(ctx, rel)?;
+                    let body = fs::read_to_string(&f)
+                        .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", f.display()))?;
+                    let mut updated = body.clone();
+                    for (o, n) in changes {
+                        let cnt = updated.matches(o.as_str()).count();
+                        if cnt != 1 {
+                            return Err(anyhow!(
+                                "{} 에서 변경 블록이 {cnt}번 나타납니다. 정확히 1번이어야 합니다.",
+                                f.display()
+                            ));
+                        }
+                        updated = updated.replacen(o.as_str(), n.as_str(), 1);
+                    }
+                    fs::write(&f, updated)?;
+                    done.push(format!("수정({}곳): {}", changes.len(), f.display()));
+                }
+            }
+        }
+        Ok(done)
+    }
+}
+
+impl Tool for ApplyPatch {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+    fn description(&self) -> &'static str {
+        "여러 파일에 걸친 패치를 한 번에 적용합니다. codex 스타일: *** Begin Patch / *** Add File · Update File · Delete File / *** End Patch. Update 의 -/+ 줄은 파일 안에 정확히 한 번 나타나야 합니다."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "patch": {"type": "string", "description": "*** Begin Patch ... *** End Patch 전체 텍스트"}
+            },
+            "required": ["patch"]
+        })
+    }
+    fn needs_approval(&self, _input: &Value) -> bool {
+        true
+    }
+    fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
+        let patch = input
+            .get("patch")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("patch 인자가 필요합니다"))?;
+        let ops = Self::parse(patch)?;
+        let done = Self::apply(ctx, &ops)?;
+        Ok(done.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // task — 서브에이전트 위임 (하네스 파이프라인 재사용, 재귀 금지)
 // ---------------------------------------------------------------------------
 
@@ -623,6 +1017,39 @@ mod tests {
         assert!(shown.contains("[x] 읽기"));
         assert!(shown.contains("[~] 고치기"));
         assert!(parse_todos(&json!({"todos":[{"content":"x","status":"weird"}]})).is_err());
+    }
+
+    #[test]
+    fn apply_patch_parse_and_dry_run() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-hello\n+안녕\n*** Add File: sub/b.txt\n+new\n*** End Patch";
+        let ops = ApplyPatch::parse(patch).unwrap();
+        assert_eq!(ops.len(), 2);
+        let dir = std::env::temp_dir().join("rafikx-apply-patch-test");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "hello world\n").unwrap();
+        let report = ApplyPatch::dry_run(&dir, &ops).unwrap();
+        assert!(report.contains("a.txt"));
+        assert!(report.contains("b.txt"));
+        // 중복·불일치 매칭은 dry_run 에서 거부
+        fs::write(dir.join("dup.txt"), "xx\n").unwrap();
+        let dup = ApplyPatch::parse(
+            "*** Begin Patch\n*** Update File: dup.txt\n-x\n-y\n*** End Patch",
+        )
+        .unwrap();
+        assert!(ApplyPatch::dry_run(&dir, &dup).is_err());
+        // Add 대상이 이미 존재하면 거부
+        let bad = ApplyPatch::parse("*** Begin Patch\n*** Add File: dup.txt\n+z\n*** End Patch").unwrap();
+        assert!(ApplyPatch::dry_run(&dir, &bad).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ddg_href_decodes_uddg_param() {
+        assert_eq!(
+            decode_ddg_href("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb&rut=1"),
+            "https://example.com/a?b"
+        );
+        assert_eq!(decode_ddg_href("https://plain.example.com"), "https://plain.example.com");
     }
 
     #[test]
