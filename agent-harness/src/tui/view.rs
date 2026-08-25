@@ -75,6 +75,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(input_height(app, area.width)),
             Constraint::Length(pal_h),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -84,7 +85,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     if pal_h > 0 {
         draw_slash_palette(f, chunks[3], &slash_hits, &th);
     }
-    draw_footer(f, app, chunks[4], &th);
+    draw_status_strip(f, app, chunks[4], &th);
+    draw_footer(f, app, chunks[5], &th);
 
     if app.help {
         draw_overlay(f, area, "키", super::md::KEY_HELP, &th);
@@ -613,6 +615,106 @@ fn cursor_xy(text: &str, cursor: usize, width: u16) -> (u16, u16) {
         x = x.min(width.saturating_sub(1));
     }
     (x, y)
+}
+
+/// 채팅창 아래 스트립 — [로고] RAFIKX │ [디지털바+Working] 실행 중 │ 작업 폴더
+fn draw_status_strip(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let mut spans: Vec<Span> = Vec::new();
+    // 선으로 그린 로고 마크 + 이름
+    spans.push(Span::styled(
+        " ◈ ",
+        Style::default().fg(th.secondary),
+    ));
+    spans.push(Span::styled(
+        "RAFIKX",
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(" │", Style::default().fg(th.mute)));
+
+    if app.busy {
+        // 작업 디지털 표시(진행바) → Working 모양(스피너)
+        spans.push(Span::raw(" "));
+        spans.extend(digital_bar(14));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as usize)
+            .unwrap_or(0);
+        let frame = SPINNER[(now / 120) % SPINNER.len()];
+        spans.push(Span::styled(
+            format!(" {frame} Working"),
+            Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+        ));
+        if let Some(phase) = crate::spinner::current_label() {
+            spans.push(Span::styled(format!(" · {phase}"), Style::default().fg(th.mute)));
+        }
+    } else {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "✓ Ready",
+            Style::default().fg(th.mute),
+        ));
+    }
+
+    spans.push(Span::styled(" │", Style::default().fg(th.mute)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        app.cwd.clone(),
+        Style::default().fg(th.secondary),
+    ));
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
+        area,
+    );
+}
+
+/// 파란 계열 그라데이션의 디지털 바(사각형) — 어두운 베이스 위로 밝은 구간이 왕복.
+fn digital_bar(width: usize) -> Vec<Span<'static>> {
+    const BASE: (u8, u8, u8) = (24, 38, 96);
+    const SHADES: [(u8, u8, u8); 6] = [
+        (46, 82, 200),
+        (66, 118, 240),
+        (96, 156, 255),
+        (140, 196, 255),
+        (170, 212, 255),
+        (210, 236, 255),
+    ];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as usize)
+        .unwrap_or(0);
+    let width = width.max(6);
+    let span_w = (width / 2).max(1);
+    let period = (width + span_w) * 2;
+    let t = (now / 90) % period;
+    let head = if t < width + span_w { t } else { period - t };
+    let mut out = vec![Span::styled(
+        "[",
+        Style::default().fg(Color::Rgb(70, 100, 200)),
+    )];
+    for i in 0..width {
+        // head 위치에서 뒤로 span_w 길이만큼 밝게
+        let bright = head >= span_w && i < head && i + span_w > head;
+        if bright {
+            let rel = (i - (head - span_w)) * SHADES.len() / span_w.max(1);
+            let shade = SHADES[rel.min(SHADES.len() - 1)];
+            out.push(Span::styled(
+                "█".to_string(),
+                Style::default().fg(Color::Rgb(shade.0, shade.1, shade.2)),
+            ));
+        } else {
+            out.push(Span::styled(
+                "█".to_string(),
+                Style::default().fg(Color::Rgb(BASE.0, BASE.1, BASE.2)),
+            ));
+        }
+    }
+    out.push(Span::styled(
+        "]",
+        Style::default().fg(Color::Rgb(70, 100, 200)),
+    ));
+    out
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {

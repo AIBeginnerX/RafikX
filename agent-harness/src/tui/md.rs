@@ -256,16 +256,23 @@ fn render_grid(rows: &[Vec<String>]) -> String {
             }
         }
     }
-    let sep: String = {
-        let mut s = String::from("+");
+    // 유니코드 박스 드로잉 — omo/omp 처럼 실제 도표 형태로 보이게 한다.
+    let hline = |l: &str, m: &str, r: &str| -> String {
+        let mut s = String::from(l);
         for w in &widths {
-            s.push_str(&"-".repeat(w + 2));
-            s.push('+');
+            s.push_str(&"─".repeat(w + 2));
+            s.push_str(m);
         }
+        // 마지막 교차점을 오른쪽 모서리로
+        s.pop();
+        s.push_str(r);
         s
     };
+    let top = hline("┌", "┬", "┐");
+    let mid = hline("├", "┼", "┤");
+    let bot = hline("└", "┴", "┘");
     let fmt = |r: &[String]| -> String {
-        let mut s = String::from("|");
+        let mut s = String::from("│");
         for idx in 0..ncols {
             let cell = r.get(idx).map(String::as_str).unwrap_or("");
             let pad = widths[idx].saturating_sub(display_width(cell));
@@ -273,15 +280,15 @@ fn render_grid(rows: &[Vec<String>]) -> String {
             s.push_str(cell);
             s.push_str(&" ".repeat(pad));
             s.push(' ');
-            s.push('|');
+            s.push('│');
         }
         s
     };
-    let mut body: Vec<String> = vec![sep.clone(), fmt(&rows[0]), sep.clone()];
+    let mut body: Vec<String> = vec![top, fmt(&rows[0]), mid];
     for r in &rows[1..] {
         body.push(fmt(r));
     }
-    body.push(sep);
+    body.push(bot);
     body.join("\n")
 }
 
@@ -403,9 +410,11 @@ mod tests {
             .iter()
             .find(|s| s.kind == MdKind::Table)
             .expect("table seg");
-        assert!(table.text.contains("+-------+----+"));
-        assert!(table.text.contains("| 이름  | 값 |"));
-        assert!(table.text.contains("| 한글  | 22 |"));
+        assert!(table.text.contains("┌───────┬────┐"));
+        assert!(table.text.contains("│ 이름  │ 값 │"));
+        assert!(table.text.contains("│ 한글  │ 22 │"));
+        assert!(table.text.contains("├───────┼────┤"));
+        assert!(table.text.ends_with("└───────┴────┘"));
         // 구분자 줄(---)은 그리드에서 사라진다.
         assert!(!table.text.contains("---|"));
     }
