@@ -1048,14 +1048,10 @@ pub async fn run_turn(
                 outcome.output_tokens
             ));
             if !outcome.messages.is_empty() {
-                // plan 모드에서 첫 사용자 메시지는 원문 질문으로 저장 (첨부 블록 제거)
-                if let Some(first) = outcome.messages.first_mut() {
-                    if first.role == Role::User {
-                        first.content = vec![ContentBlock::Text {
-                            text: original_prompt.clone(),
-                        }];
-                    }
-                }
+                // 프롬프트 캐시(omp/opencode 방식): 히스토리는 실제 모델에 보낸 그대로 보관한다.
+                // 첫 유저 메시지를 원문으로 재작성하면 다음 턴의 접두어가 달라져
+                // 공급자측 프롬프트 캐시가 매번 무효화되다.
+                let _ = &original_prompt;
                 session.messages = outcome.messages.clone();
             } else {
                 session.messages.push(Message::user_text(prompt));

@@ -1,12 +1,12 @@
-/// Display width — unicode-width 테이블 사용.
-/// 기존 "non-ASCII=2" 방식은 박스 드로잉(─│┌…)·라틴 확장·일본어 반각 등을
-/// 2칸으로 잘못 세어 표·테이블 정렬이 어긋났다. ratatui 와 동일한 기준으로 맞춘다.
+/// Display width: ASCII=1, other (Korean etc.)=2.
 pub fn ch_width(ch: char) -> usize {
-    use unicode_width::UnicodeWidthChar;
     if ch == '\n' || ch == '\r' {
-        return 0;
+        0
+    } else if ch.is_ascii() {
+        1
+    } else {
+        2
     }
-    ch.width().unwrap_or(0)
 }
 
 #[allow(dead_code)]
@@ -271,15 +271,27 @@ fn render_grid(rows: &[Vec<String>]) -> String {
     let top = hline("┌", "┬", "┐");
     let mid = hline("├", "┼", "┤");
     let bot = hline("└", "┴", "┘");
+    let pad_cell = |cell: &str, w: usize| -> String {
+        // 개행·탭은 정렬을 깨므로 공백으로 치환
+        let clean: String = cell
+            .chars()
+            .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+            .collect();
+        let d = display_width(&clean);
+        let mut out = String::with_capacity(w + 2);
+        out.push(' ');
+        out.push_str(&clean);
+        if d < w {
+            out.push_str(&" ".repeat(w - d));
+        }
+        out.push(' ');
+        out
+    };
     let fmt = |r: &[String]| -> String {
         let mut s = String::from("│");
         for idx in 0..ncols {
             let cell = r.get(idx).map(String::as_str).unwrap_or("");
-            let pad = widths[idx].saturating_sub(display_width(cell));
-            s.push(' ');
-            s.push_str(cell);
-            s.push_str(&" ".repeat(pad));
-            s.push(' ');
+            s.push_str(&pad_cell(cell, widths[idx]));
             s.push('│');
         }
         s

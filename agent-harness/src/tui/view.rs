@@ -318,10 +318,12 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         .max(1);
     let vis = area.height;
     let max_scroll = total.saturating_sub(vis);
+    // app.scroll 은 「바닥에서 몇 줄 위」 — ↑(휠 업)으로 늘려 과거를 보고,
+    // 0 이 되면 자동 follow 로 복귀한다.
     let scroll = if app.follow {
         max_scroll
     } else {
-        app.scroll.min(max_scroll)
+        max_scroll.saturating_sub(app.scroll.min(max_scroll))
     };
 
     let block = Block::default()
