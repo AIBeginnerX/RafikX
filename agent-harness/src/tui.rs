@@ -154,6 +154,11 @@ impl Drop for TermGuard {
         if KITTY_ENABLED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             let _ = execute!(out, PopKeyboardEnhancementFlags);
         }
+        {
+            use std::io::Write as _;
+            let _ = write!(out, "\x1b[?1007l");
+            let _ = out.flush();
+        }
         let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen);
         let _ = out.flush();
     }
@@ -264,6 +269,14 @@ pub async fn run(
             )
         )
         .ok();
+    }
+    // Alternate Scroll (DECSET 1007) — 대체 화면에서 마우스 휠을 ↑↓ 키로 변환.
+    // 마우스 캡처를 하지 않으므로 드래그 선택·복사는 그대로 유지된다.
+    // crossterm 에 1007 모드가 없어 raw escape 로 직접 켠다.
+    {
+        use std::io::Write as _;
+        let _ = write!(out, "\x1b[?1007h");
+        let _ = out.flush();
     }
     let _guard = TermGuard;
     let backend = CrosstermBackend::new(out);
@@ -636,6 +649,37 @@ fn handle_key(
         KeyCode::Right => app.cursor = next_idx(&app.input, app.cursor),
         KeyCode::Home => app.cursor = 0,
         KeyCode::End => app.cursor = app.input.len(),
+        KeyCode::PageUp => {
+            app.follow = false;
+            app.scroll = app.scroll.saturating_add(20);
+        }
+        KeyCode::PageDown => {
+            app.scroll = app.scroll.saturating_sub(20);
+            if app.scroll == 0 {
+                app.follow = true;
+            }
+        }
+        KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.follow = false;
+            app.scroll = app.scroll.saturating_add(4);
+        }
+        KeyCode::Down if k.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.scroll = app.scroll.saturating_sub(4);
+            if app.scroll == 0 {
+                app.follow = true;
+            }
+        }
+        KeyCode::Up if app.input.is_empty() => {
+            // 휠(Alternate Scroll)·빈 입력 상태의 ↑ — 지나간 화면 보기
+            app.follow = false;
+            app.scroll = app.scroll.saturating_add(4);
+        }
+        KeyCode::Down if app.input.is_empty() => {
+            app.scroll = app.scroll.saturating_sub(4);
+            if app.scroll == 0 {
+                app.follow = true;
+            }
+        }
         KeyCode::Up => history_prev(app),
         KeyCode::Down => history_next(app),
         KeyCode::Char('/') if app.input.is_empty() => {

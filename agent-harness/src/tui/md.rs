@@ -1,12 +1,12 @@
-/// Display width: ASCII=1, other (Korean etc.)=2. Good enough for cmd/WT.
+/// Display width — unicode-width 테이블 사용.
+/// 기존 "non-ASCII=2" 방식은 박스 드로잉(─│┌…)·라틴 확장·일본어 반각 등을
+/// 2칸으로 잘못 세어 표·테이블 정렬이 어긋났다. ratatui 와 동일한 기준으로 맞춘다.
 pub fn ch_width(ch: char) -> usize {
+    use unicode_width::UnicodeWidthChar;
     if ch == '\n' || ch == '\r' {
-        0
-    } else if ch.is_ascii() {
-        1
-    } else {
-        2
+        return 0;
     }
+    ch.width().unwrap_or(0)
 }
 
 #[allow(dead_code)]

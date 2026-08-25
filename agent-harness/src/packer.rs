@@ -164,13 +164,66 @@ pub fn packed_over_budget(before: usize, after: &[Message]) -> bool {
 }
 
 /// 모델별 컨텍스트 창. config 값이 있으면 우선.
+/// 알려진 모델 패밀리의 컨텍스트 창 — opencode/omp 의 모델 카탈로그 방식과 동일하게
+/// 모델 id 로 메타데이터를 먼저 조회한다. (부분 일치, 앞에서부터 우선)
+const MODEL_CONTEXTS: &[(&str, u32)] = &[
+    // OpenAI
+    ("gpt-5", 400_000),
+    ("codex", 400_000),
+    ("o4", 200_000),
+    ("o3", 200_000),
+    ("gpt-4.1", 1_000_000),
+    ("gpt-4o", 128_000),
+    // Anthropic
+    ("claude-opus", 200_000),
+    ("claude-sonnet", 200_000),
+    ("claude-haiku", 200_000),
+    ("claude-3", 200_000),
+    // Google
+    ("gemini-3", 1_000_000),
+    ("gemini-2.5-pro", 1_000_000),
+    ("gemini-2.5-flash", 1_000_000),
+    ("gemini-2", 128_000),
+    // xAI
+    ("grok-4", 256_000),
+    ("grok-code-fast", 256_000),
+    ("grok-3", 131_072),
+    // 기타 주요 모델
+    ("deepseek-v3", 128_000),
+    ("deepseek-r1", 128_000),
+    ("glm-5", 200_000),
+    ("glm-4", 128_000),
+    ("kimi-k2", 256_000),
+    ("minimax-m2", 204_800),
+    ("minimax-m3", 1_000_000),
+    ("qwen3-coder", 262_144),
+    ("qwen3", 131_072),
+    ("mistral-large", 128_000),
+    ("llama-4", 1_000_000),
+];
+
+fn model_context_from_catalog(model: &str) -> Option<u32> {
+    let n = crate::ranks::normalize_id(model);
+    for (pat, ctx) in MODEL_CONTEXTS {
+        if n.contains(pat) {
+            return Some(*ctx);
+        }
+    }
+    None
+}
+
 pub fn context_window_for(provider: &str, model: &str, p: Option<&ProviderConfig>) -> u32 {
+    // 1) config 명시값 최우선
     if let Some(p) = p {
         if let Some(n) = p.context_window {
             if n > 0 {
                 return n;
             }
         }
+    }
+    // 2) 모델 카탈로그 (opencode/omp 방식)
+    if let Some(ctx) = model_context_from_catalog(model) {
+        return ctx;
     }
     let n = crate::ranks::normalize_id(model);
     if crate::ranks::is_cheap_id(&n) {
@@ -202,6 +255,29 @@ pub fn context_window_for(provider: &str, model: &str, p: Option<&ProviderConfig
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn catalog_context_wins_over_provider_heuristics() {
+        // gemini 계열이지만 2.5 pro 는 1M — provider 휴리스틱(400k)보다 카탈로그 우선
+        assert_eq!(context_window_for("gemini", "gemini-2.5-pro", None), 1_000_000);
+        assert_eq!(context_window_for("xai", "grok-4", None), 256_000);
+        assert_eq!(context_window_for("opencode_zen", "minimax-m2.7", None), 204_800);
+        assert_eq!(context_window_for("anthropic", "claude-sonnet-4.6", None), 200_000);
+        // config 명시값이 카탈로그보다 우선
+        let pc = ProviderConfig {
+            kind: "openai_compat".into(),
+            auth: "api_key".into(),
+            api_key_env: "X".into(),
+            model: "m".into(),
+            small_model: None,
+            base_url: None,
+            supports_tools: true,
+            model_auto: false,
+            context_window: Some(55_000),
+            enabled: true,
+        };
+        assert_eq!(context_window_for("x", "gpt-5", Some(&pc)), 55_000);
+    }
 
     fn pair() -> Vec<Message> {
         vec![
