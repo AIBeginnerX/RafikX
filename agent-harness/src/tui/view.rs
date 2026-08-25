@@ -878,6 +878,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     line_spans.push(badge);
     line_spans.push(Span::raw(" "));
 
+    // 사용량(in/out · ctx·캐시)을 우선 배치 — 상태 문자가 길어도 잘리지 않게
+    if !app.tokens.is_empty() {
+        line_spans.push(Span::styled(app.tokens.clone(), Style::default().fg(th.mute)));
+        line_spans.push(Span::raw(" "));
+    }
+    if !app.ctx.is_empty() {
+        line_spans.push(Span::styled(app.ctx.clone(), Style::default().fg(th.mute)));
+        line_spans.push(Span::raw(" "));
+    }
+
     if app.busy {
         // opencode 동일 — braille 스피너 1문자 + 상태. 사고 스트리밍 중엔 Working.
         let thinking = app
@@ -906,17 +916,21 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             line_spans.push(Span::styled(format!(" {phase}"), Style::default().fg(th.code)));
         }
     } else {
-        line_spans.push(Span::styled(&app.status, Style::default().fg(th.code)));
+        // 남은 폭을 계산해 상태 문자를 잘라 넣는다 — 뒤 항목이 화면 밖으로 밀리지 않게
+        let used: usize = line_spans.iter().map(|sp| super::md::display_width(&sp.content)).sum();
+        let budget = (area.width as usize).saturating_sub(used + 8).max(10);
+        let short: String = app
+            .status
+            .chars()
+            .take(budget)
+            .collect::<String>();
+        let ell = if app.status.chars().count() > budget { "…" } else { "" };
+        line_spans.push(Span::styled(
+            format!("{short}{ell}"),
+            Style::default().fg(th.code),
+        ));
     }
 
-    if !app.tokens.is_empty() {
-        line_spans.push(Span::styled("  ·  ", Style::default().fg(th.mute)));
-        line_spans.push(Span::styled(app.tokens.clone(), Style::default().fg(th.mute)));
-    }
-    if !app.ctx.is_empty() {
-        line_spans.push(Span::raw(" "));
-        line_spans.push(Span::styled(app.ctx.clone(), Style::default().fg(th.mute)));
-    }
     if !app.queue.is_empty() {
         line_spans.push(Span::styled("  ·  ", Style::default().fg(th.mute)));
         line_spans.push(Span::styled(
@@ -975,6 +989,10 @@ fn slash_matches(app: &App) -> Vec<&'static (&'static str, &'static str)> {
         .collect();
     // 정확히 일치하는 명령은 맨 앞으로
     hits.sort_by_key(|(name, _)| name[1..].to_lowercase() != tok);
+    if hits.is_empty() && !tok.is_empty() {
+        // 검색 불일치 시에도 목록이 사라지지 않게 전체를 보여준다 (헤더에 불일치 표기)
+        return crate::chat::SLASH_COMMANDS.iter().collect();
+    }
     hits
 }
 
