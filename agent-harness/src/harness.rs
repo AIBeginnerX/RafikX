@@ -20,6 +20,22 @@ pub enum TaskClass {
     Dev,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessStrategy {
+    Single,
+    Multi,
+}
+
+impl HarnessStrategy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "single" => Some(Self::Single),
+            "multi" => Some(Self::Multi),
+            _ => None,
+        }
+    }
+}
+
 impl TaskClass {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -180,6 +196,8 @@ pub fn bind(
     let needs_tools = !sub.tools.is_empty();
     let selection = cfg.file.harness.selection.trim().to_ascii_lowercase();
     let manual = selection == "manual";
+    let strategy = HarnessStrategy::parse(&cfg.file.harness.strategy)
+        .unwrap_or(HarnessStrategy::Single);
 
     let (provider_name, model, verify_model) = if let (Some(p), Some(m)) =
         (provider_override, model_override)
@@ -213,6 +231,8 @@ pub fn bind(
         (p.to_string(), model, None)
     } else if manual {
         pick_manual(cfg, class, sub, needs_tools)?
+    } else if strategy == HarnessStrategy::Single {
+        pick_single(cfg, needs_tools)?
     } else {
         pick_auto(cfg, class, sub, needs_tools)?
     };
@@ -253,6 +273,53 @@ pub fn bind(
         context_window: window,
         verify_model,
     })
+}
+
+fn pick_single(
+    cfg: &Config,
+    needs_tools: bool,
+) -> Result<(String, String, Option<String>)> {
+    let registered = crate::auth::registered_models(cfg);
+    if let Some(model) = registered.iter().find(|item| {
+        crate::ranks::normalize_id(&item.id) == "minimax-m3"
+            && (!needs_tools
+                || cfg
+                    .provider(&item.provider)
+                    .map(|provider| provider.supports_tools)
+                    .unwrap_or(false))
+    }) {
+        return Ok((model.provider.clone(), model.id.clone(), None));
+    }
+    let default = cfg.file.general.default_provider.clone();
+    if crate::auth::is_usable(cfg, &default)
+        && let Ok(provider) = cfg.provider(&default)
+        && (!needs_tools || provider.supports_tools)
+    {
+        return Ok((default, provider.model.clone(), None));
+    }
+    let fallback = registered.into_iter().find(|item| {
+        !needs_tools
+            || cfg
+                .provider(&item.provider)
+                .map(|provider| provider.supports_tools)
+                .unwrap_or(false)
+    });
+    fallback
+        .map(|model| (model.provider, model.id, None))
+        .ok_or_else(|| anyhow!("사용 가능한 단일 모델 연결이 없습니다. /connect 로 모델을 연결하세요."))
+}
+
+pub fn set_strategy(cfg: &Config, strategy: HarnessStrategy) -> Result<()> {
+    let value = match strategy {
+        HarnessStrategy::Single => "single",
+        HarnessStrategy::Multi => "multi",
+    };
+    crate::config::write_toml_key(
+        &cfg.path,
+        "[harness]",
+        "strategy",
+        &crate::config::toml_string(value),
+    )
 }
 
 fn ensure_connected(cfg: &Config, name: &str) -> Result<()> {
@@ -405,19 +472,7 @@ pub fn pick_auto(
         );
     }
 
-    // ① 기본 연결 우선 — 사용자가 고른 서비스·모델을 존중한다.
-    let def = cfg.file.general.default_provider.clone();
-    if crate::auth::is_usable(cfg, &def) {
-        if let Ok(dp) = cfg.provider(&def) {
-            if !needs_tools || dp.supports_tools {
-                let model = pick_for_provider(cfg, &def, class, &sub.model_role, needs_tools)
-                    .unwrap_or_else(|| model_for_role(dp, &sub.model_role));
-                return Ok((def, model, None));
-            }
-        }
-    }
-
-    // ② 기본 연결을 못 쓰면(미연결·도구 미지원) 순위표로 전역 자동 선택.
+    // multi 전략은 기본 연결에 고정하지 않고 등록 모델 전체에서 비용·능력 기준으로 고른다.
     let table = crate::ranks::load();
     let mut regs: Vec<crate::auth::RegisteredModel> = all
         .into_iter()
@@ -1027,6 +1082,10 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          수치 비교는 반드시 아래 형식의 ```chart 블록으로 줘라 — 터미널이 실제 막대그래프로 렌더링한다.\n\
          ```chart\n라벨1: 수치1\n라벨2: 수치2\n```\n\
          항목 나열은 마크다운 표를 쓴다.\n\
+         [진행 규칙] 작업 중에는 현재 단계와 확인된 사실만 짧게 알리고, 근거 없는 완료를 주장하지 않는다.\n\
+         작업이 끝나면 변경·검증·남은 위험을 요약한다. 사용자의 선택이 필요하면 English option label과 번호를 함께 쓴다.\n\
+         커밋과 배포는 사용자가 번호로 명시적으로 선택하기 전에는 실행하지 않는다.\n\
+         독립 작업을 위임할 때만 task 도구를 쓰고 role과 model을 명시한다. 불필요한 위임으로 토큰을 낭비하지 않는다.\n\
          {extra}",
         cfg.workspace.display()
     );
@@ -1093,10 +1152,12 @@ pub async fn run_pipeline(
     let engine = cfg.file.general.engine.to_ascii_lowercase();
     let engine_deep = engine == "deepseek" || engine == "dk";
     let engine_dk = engine == "dk";
+    let engine_pi = engine == "pi";
     let staged = !binding.tools.is_empty()
         && (engine_deep || binding.class != crate::harness::TaskClass::Simple);
     let mut system = system;
     if staged {
+        crate::tools_more::clear_todos();
         crate::ui::live_line(&format!(
             "[하네스] {} 난이도{} — 단계별 실행(todo) 활성",
             binding.class.as_str(),
@@ -1128,6 +1189,16 @@ pub async fn run_pipeline(
         }
         system.push_str(&directive);
     }
+    if engine_pi {
+        crate::ui::live_line(
+            "[하네스] pi/oh-my-pi 엔진 — 모델 응답·도구 실행·사용량을 실시간 표시",
+        );
+        system.push_str(
+            "\n\n[pi harness]\n\
+             작업 중에는 지금 수행하는 단계와 도구 결과를 짧고 사실적으로 알리고, \
+             최종 답변과 분리하라. 공개 응답에 포함된 추론·진행 텍스트는 숨기지 않는다.",
+        );
+    }
 
     if binding.plan_first {
         let req = ChatRequest {
@@ -1144,7 +1215,9 @@ pub async fn run_pipeline(
                 crate::ui::live_line("[계획]");
                 for b in &resp.content {
                     if let ContentBlock::Text { text } = b {
-                        crate::ui::live_line(text);
+                        crate::ui::live_assistant(&format!(
+                            "[모델 작업]\n{text}\n[/모델 작업]"
+                        ));
                     }
                 }
             }
@@ -1195,7 +1268,9 @@ pub async fn run_pipeline(
             iterations: 1,
             input_tokens: resp.input_tokens,
             output_tokens: resp.output_tokens,
+            context_tokens: resp.input_tokens,
             cached_tokens: resp.cached_tokens,
+            cache_reported: resp.cache_reported,
             error: None,
             messages,
             changed_files: vec![],
@@ -1213,30 +1288,219 @@ pub async fn run_pipeline(
         ));
     }
 
-    let registry = ToolRegistry::with_names(&binding.tools);
-    let mut outcome = agent::run_agent(AgentRun {
-        cfg,
-        provider_name: &binding.provider_name,
-        model: &binding.model,
-        task,
-        yes,
-        max_iterations: binding.max_iterations,
-        system: system.clone(),
-        registry,
-        resume,
-        remote: remote.clone(),
-        local_ask: local_ask.clone(),
-        context_window: binding.context_window,
-    })
-    .await?;
+    let mut next_resume = resume;
+    let mut continuations = 0u8;
+    let mut stale_rounds = 0u8;
+    let mut previous_progress: Option<(usize, usize)> = None;
+    let mut total_input = 0u32;
+    let mut total_output = 0u32;
+    let mut total_iterations = 0u32;
+    let mut all_changed = Vec::new();
+    let mut all_tool_errors = Vec::new();
+    let mut all_denials = Vec::new();
+    if staged {
+        persist_goal_state(
+            task,
+            "active",
+            0,
+            0,
+            0,
+            next_resume.as_deref().unwrap_or(&[]),
+        );
+    }
 
-    if binding.verify {
+    let mut outcome = loop {
+        let registry = ToolRegistry::with_names(&binding.tools);
+        let resume_for_failure = next_resume.clone().unwrap_or_default();
+        let run = agent::run_agent(AgentRun {
+            cfg,
+            provider_name: &binding.provider_name,
+            model: &binding.model,
+            task,
+            yes,
+            max_iterations: binding.max_iterations,
+            system: system.clone(),
+            registry,
+            resume: next_resume.take(),
+            remote: remote.clone(),
+            local_ask: local_ask.clone(),
+            context_window: binding.context_window,
+        })
+        .await;
+        let mut current = match run {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if staged {
+                    let progress =
+                        crate::tools_more::todo_progress(&crate::tools_more::current_todos());
+                    persist_goal_state(
+                        task,
+                        "failed",
+                        progress.completed,
+                        progress.total,
+                        continuations,
+                        &resume_for_failure,
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        total_input = total_input.saturating_add(current.input_tokens);
+        total_output = total_output.saturating_add(current.output_tokens);
+        total_iterations = total_iterations.saturating_add(current.iterations);
+        for path in &current.changed_files {
+            if !all_changed.contains(path) {
+                all_changed.push(path.clone());
+            }
+        }
+        all_tool_errors.extend(current.tool_errors.clone());
+        all_denials.extend(current.deny_reasons.clone());
+
+        let todos = crate::tools_more::current_todos();
+        let progress = crate::tools_more::todo_progress(&todos);
+        let signature = (progress.completed, progress.total);
+        if previous_progress == Some(signature) {
+            stale_rounds = stale_rounds.saturating_add(1);
+        } else {
+            stale_rounds = 0;
+            previous_progress = Some(signature);
+        }
+        crate::graph::node(
+            "goal",
+            &format!("{}/{}", progress.completed, progress.total),
+            &format!("continuations={continuations} stale={stale_rounds}"),
+            Some("request"),
+        );
+        if staged
+            && progress.total > 0
+            && progress.completed == progress.total
+            && current.status == "limit"
+        {
+            current.status = "ok".into();
+            current.error = None;
+        }
+
+        let seeded_missing = staged && progress.total == 0 && continuations == 0;
+        let continuation_eligible = matches!(current.status.as_str(), "ok" | "limit");
+        let should_continue = continuation_eligible
+            && (seeded_missing
+                || goal_should_continue(
+                    progress.completed,
+                    progress.total,
+                    stale_rounds,
+                    continuations,
+                ));
+        if !should_continue {
+            if staged
+                && (progress.total == 0 || progress.completed < progress.total)
+                && continuation_eligible
+            {
+                current.status = "incomplete".into();
+                current.error = Some(format!(
+                    "목표 미완료: Todo {}/{} · 연속 정체 {}회",
+                    progress.completed, progress.total, stale_rounds
+                ));
+            }
+            persist_goal_state(
+                task,
+                if current.status == "ok"
+                    && progress.total > 0
+                    && progress.completed == progress.total
+                {
+                    "complete"
+                } else if current.status == "incomplete" {
+                    "blocked"
+                } else {
+                    "failed"
+                },
+                progress.completed,
+                progress.total,
+                continuations,
+                &current.messages,
+            );
+            current.input_tokens = total_input;
+            current.output_tokens = total_output;
+            current.iterations = total_iterations;
+            current.changed_files = all_changed;
+            current.tool_errors = all_tool_errors;
+            current.deny_reasons = all_denials;
+            break current;
+        }
+
+        continuations = continuations.saturating_add(1);
+        persist_goal_state(
+            task,
+            "active",
+            progress.completed,
+            progress.total,
+            continuations,
+            &current.messages,
+        );
+        crate::ui::live_line(&format!(
+            "[목표 계속] Todo {}/{} · 연속 실행 {continuations}/8",
+            progress.completed, progress.total
+        ));
+        crate::graph::node(
+            "goal_continue",
+            &format!("cycle {continuations}"),
+            &format!("{}/{}", progress.completed, progress.total),
+            Some("goal"),
+        );
+        let mut messages = current.messages;
+        messages.push(Message::user_text(
+            "목표가 아직 완료되지 않았다. 현재 Todo와 도구 결과를 확인하고, \
+             완료되지 않은 다음 항목부터 즉시 계속 실행하라. 이미 끝낸 작업은 반복하지 말고, \
+             항목을 마칠 때마다 todo_write 상태를 갱신하라. 모든 Todo가 완료된 뒤에만 최종 답변하라.",
+        ));
+        next_resume = Some(messages);
+    };
+
+    if binding.verify && outcome.status != "incomplete" {
         crate::graph::node("verify", "start", "", Some("request"));
         crate::spinner::set_label("검증 중…");
         outcome = run_verify(cfg, binding, task, yes, system, outcome, remote, local_ask).await?;
         crate::graph::node("verify", &outcome.status, "", Some("verify"));
     }
     Ok(outcome)
+}
+
+fn persist_goal_state(
+    objective: &str,
+    status: &str,
+    completed: usize,
+    total: usize,
+    continuations: u8,
+    messages: &[Message],
+) {
+    let Some(run_id) = crate::graph::current_run() else {
+        return;
+    };
+    let Ok(messages_json) = serde_json::to_string(messages) else {
+        return;
+    };
+    if let Ok(path) = Db::db_path()
+        && let Ok(db) = Db::open(&path)
+    {
+        let _ = db.save_goal(&crate::db::GoalRow {
+            id: run_id,
+            objective: objective.to_string(),
+            status: status.to_string(),
+            completed,
+            total,
+            continuations,
+            messages_json,
+        });
+    }
+}
+
+fn goal_should_continue(
+    completed: usize,
+    total: usize,
+    stale_rounds: u8,
+    continuations: u8,
+) -> bool {
+    total > 0 && completed < total && stale_rounds < 2 && continuations < 8
 }
 
 async fn run_verify(
@@ -1474,5 +1738,20 @@ mod tests {
         ];
         let cheap = pick_cheap(&flagships, &table, "anthropic").expect("ok flagship");
         assert!(cheap.id.contains("opus") || cheap.id.contains("gpt-5.6"));
+    }
+
+    #[test]
+    fn goal_continues_only_while_open_todos_make_progress() {
+        assert!(goal_should_continue(1, 3, 0, 0));
+        assert!(goal_should_continue(2, 3, 1, 1));
+        assert!(!goal_should_continue(3, 3, 1, 2));
+        assert!(!goal_should_continue(1, 1, 0, 0));
+    }
+
+    #[test]
+    fn harness_strategy_accepts_single_and_multi_only() {
+        assert_eq!(HarnessStrategy::parse("single"), Some(HarnessStrategy::Single));
+        assert_eq!(HarnessStrategy::parse("multi"), Some(HarnessStrategy::Multi));
+        assert_eq!(HarnessStrategy::parse("manual"), None);
     }
 }

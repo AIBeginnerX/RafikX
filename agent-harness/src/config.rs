@@ -9,7 +9,7 @@ use serde::Deserialize;
 pub const DEFAULT_CONFIG: &str = r#"# RafikX 설정 — API 키 원문은 여기에 적지 마세요.
 
 [general]
-default_provider = "anthropic"
+default_provider = "opencode_zen"
 workspace = "~/dev/playground"     # 파일/bash 도구 접근 루트 (이 밖은 차단)
 max_tokens = 8192
 max_context_chars = 200000
@@ -68,7 +68,7 @@ kind = "openai_compat"
 auth = "api_key"
 api_key_env = "OPENCODE_API_KEY"
 base_url = "https://opencode.ai/zen/v1"
-model = "glm-5.1"
+model = "minimax-m3"
 small_model = "minimax-m2.7"
 supports_tools = true
 
@@ -207,6 +207,7 @@ advanced = "thinker"
 dev      = "coder"
 fallback = ["anthropic", "openai", "gemini", "opencode_zen", "opencode_go", "local"]
 selection = "auto"             # auto | manual  (수동이면 아래 모델 ID)
+strategy = "single"            # single | multi  (한 모델 고정 | 역할별 자동 배치)
 # manual_design = ""           # 설계·구성 (advanced)
 # manual_verify = ""           # 검증
 # manual_debug = ""            # 디버깅 (dev)
@@ -348,6 +349,10 @@ fn default_selection() -> String {
     "auto".into()
 }
 
+fn default_harness_strategy() -> String {
+    "single".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct HarnessConfig {
     pub simple: String,
@@ -357,6 +362,8 @@ pub struct HarnessConfig {
     pub fallback: Vec<String>,
     #[serde(default = "default_selection")]
     pub selection: String,
+    #[serde(default = "default_harness_strategy")]
+    pub strategy: String,
     /// 수동 모드에서 각 분류가 쓸 모델 ("provider:model" 또는 모델 ID). 빈 값이면 자동.
     #[serde(default)]
     pub manual_simple: Option<String>,

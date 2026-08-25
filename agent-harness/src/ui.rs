@@ -161,6 +161,16 @@ pub enum Live {
     System(String),
     Warn(String),
     Status(String),
+    Todo(Vec<crate::tools_more::TodoItem>),
+    Agent(AgentProgress),
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentProgress {
+    pub id: String,
+    pub role: String,
+    pub model: String,
+    pub status: String,
 }
 
 type LiveFn = Arc<dyn Fn(Live) + Send + Sync>;
@@ -247,6 +257,14 @@ pub fn live_warn(s: &str) {
     if !emit(Live::Warn(s.to_string())) {
         warn(s);
     }
+}
+
+pub fn live_todo(items: &[crate::tools_more::TodoItem]) {
+    let _ = emit(Live::Todo(items.to_vec()));
+}
+
+pub fn live_agent(progress: AgentProgress) {
+    let _ = emit(Live::Agent(progress));
 }
 
 /// True when stdin or stdout is a pipe or redirected file (`echo hi | rafikx`).

@@ -253,6 +253,27 @@ pub fn unified_diff(old: &str, new: &str) -> String {
     out
 }
 
+pub fn code_change_summary(
+    action: &str,
+    path: &std::path::Path,
+    before: &str,
+    old: &str,
+    new: &str,
+) -> String {
+    let start = before
+        .find(old)
+        .map(|idx| before[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
+        .unwrap_or(1);
+    let removed = if old.is_empty() { 0 } else { old.lines().count().max(1) };
+    let added = if new.is_empty() { 0 } else { new.lines().count().max(1) };
+    let span = removed.max(added).max(1);
+    let end = start + span - 1;
+    format!(
+        "[코드 변경] {action} {}:{start}-{end} · +{added} -{removed}",
+        path.display()
+    )
+}
+
 pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<String> {
     match name {
         "write_file" => {
@@ -580,7 +601,9 @@ impl Tool for EditFile {
         }
         let updated = body.replacen(old_str, new_str, 1);
         fs::write(&resolved, updated)?;
-        Ok(format!("수정 완료: {}", resolved.display()))
+        Ok(code_change_summary(
+            "수정", &resolved, &body, old_str, new_str,
+        ))
     }
 }
 
@@ -608,11 +631,15 @@ impl Tool for WriteFile {
         let path = str_field(&input, "path")?;
         let content = str_field(&input, "content")?;
         let resolved = resolve_tool_path(ctx, path)?;
+        let before = fs::read_to_string(&resolved).unwrap_or_default();
+        let action = if resolved.exists() { "덮어쓰기" } else { "등록" };
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&resolved, content)?;
-        Ok(format!("저장 완료: {}", resolved.display()))
+        Ok(code_change_summary(
+            action, &resolved, &before, &before, content,
+        ))
     }
 }
 
@@ -851,6 +878,19 @@ mod tests {
         .unwrap();
         assert!(preview.contains("hello.txt"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn code_change_summary_includes_line_range_and_counts() {
+        let shown = code_change_summary(
+            "수정",
+            std::path::Path::new("src/main.rs"),
+            "one\ntwo\nthree\n",
+            "two",
+            "둘\n두번째",
+        );
+        assert!(shown.contains("src/main.rs:2-3"));
+        assert!(shown.contains("+2 -1"));
     }
 }
 

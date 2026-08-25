@@ -141,8 +141,11 @@ impl OpenAiCompatProvider {
         let mut full_text = String::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        let mut cached_tokens = 0u32;
+        let mut cache_reported = false;
         let mut finish = None::<String>;
         let mut tool_acc: Vec<(String, String, String)> = Vec::new();
+        let mut reasoning_started = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("응답 스트림이 중간에 끊겼습니다")?;
@@ -156,22 +159,28 @@ impl OpenAiCompatProvider {
                 let Some(data) = line.strip_prefix("data:") else { continue };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    if reasoning_started {
+                        on_text("\n[/모델 작업]\n");
+                    }
                     return Ok(finish_stream(
                         full_text,
                         tool_acc,
                         finish.as_deref(),
                         input_tokens,
                         output_tokens,
+                        cached_tokens,
+                        cache_reported,
                         hint.clone(),
                     ));
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-                if let Some(n) = v.pointer("/usage/prompt_tokens").and_then(|x| x.as_u64()) {
-                    input_tokens = n as u32;
-                }
-                if let Some(n) = v.pointer("/usage/completion_tokens").and_then(|x| x.as_u64()) {
-                    output_tokens = n as u32;
-                }
+                take_stream_usage(
+                    &v,
+                    &mut input_tokens,
+                    &mut output_tokens,
+                    &mut cached_tokens,
+                    &mut cache_reported,
+                );
                 let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) else {
                     continue;
                 };
@@ -183,11 +192,27 @@ impl OpenAiCompatProvider {
                 if let Some(delta) = choice.get("delta") {
                     if let Some(piece) = delta.get("content").and_then(|x| x.as_str()) {
                         if !piece.is_empty() {
+                            if reasoning_started {
+                                on_text("\n[/모델 작업]\n");
+                                reasoning_started = false;
+                            }
                             on_text(piece);
                             full_text.push_str(piece);
                         }
                     }
-                    // reasoning_content·reasoning 등 사고 필드는 의도적으로 무시한다.
+                    if let Some(piece) = delta
+                        .get("reasoning_content")
+                        .or_else(|| delta.get("reasoning"))
+                        .and_then(|x| x.as_str())
+                    {
+                        if !piece.is_empty() {
+                            if !reasoning_started {
+                                on_text("\n[모델 작업]\n");
+                                reasoning_started = true;
+                            }
+                            on_text(piece);
+                        }
+                    }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                         for tc in tcs {
                             let idx = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
@@ -217,6 +242,9 @@ impl OpenAiCompatProvider {
         if finish.is_none() {
             anyhow::bail!("응답이 완료되기 전에 스트림이 종료되었습니다 ({}자 수신)", full_text.chars().count());
         }
+        if reasoning_started {
+            on_text("\n[/모델 작업]\n");
+        }
 
         Ok(finish_stream(
             full_text,
@@ -224,6 +252,8 @@ impl OpenAiCompatProvider {
             finish.as_deref(),
             input_tokens,
             output_tokens,
+            cached_tokens,
+            cache_reported,
             hint,
         ))
     }
@@ -252,6 +282,8 @@ impl OpenAiCompatProvider {
         let mut tools: Vec<(String, String, String)> = Vec::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        let mut cached_tokens = 0u32;
+        let mut cache_reported = false;
         let mut finish = None::<String>;
         let mut finished = false;
 
@@ -280,6 +312,8 @@ impl OpenAiCompatProvider {
                     &mut tools,
                     &mut input_tokens,
                     &mut output_tokens,
+                    &mut cached_tokens,
+                    &mut cache_reported,
                     &mut finish,
                     Some(&mut on_text),
                 );
@@ -302,6 +336,8 @@ impl OpenAiCompatProvider {
             finish.as_deref(),
             input_tokens,
             output_tokens,
+            cached_tokens,
+            cache_reported,
             hint,
         ))
     }
@@ -313,6 +349,8 @@ fn finish_stream(
     finish: Option<&str>,
     input_tokens: u32,
     output_tokens: u32,
+    cached_tokens: u32,
+    cache_reported: bool,
     limit: LimitHint,
 ) -> ChatResponse {
     let mut content = Vec::new();
@@ -336,7 +374,8 @@ fn finish_stream(
         },
         input_tokens,
         output_tokens,
-        cached_tokens: 0,
+        cached_tokens,
+        cache_reported,
         limit,
     }
 }
@@ -348,6 +387,9 @@ fn build_body(req: &ChatRequest, stream: bool) -> Value {
         "max_tokens": req.max_tokens,
         "stream": stream,
     });
+    if stream {
+        body["stream_options"] = json!({"include_usage": true});
+    }
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools
@@ -485,6 +527,7 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
             .and_then(|x| x.as_u64())
             .unwrap_or(0) as u32,
         cached_tokens: crate::provider::cached_tokens_from(&v),
+        cache_reported: crate::provider::cached_tokens_entry(&v).is_some(),
         limit: LimitHint::default(),
     })
 }
@@ -631,6 +674,8 @@ fn parse_codex_response(text: &str) -> Result<ChatResponse> {
         collect_codex_output(output, &mut full_text, &mut tools);
     }
     take_usage(&v, &mut input_tokens, &mut output_tokens);
+    let cached_tokens = crate::provider::cached_tokens_from(&v);
+    let cache_reported = crate::provider::cached_tokens_entry(&v).is_some();
     if let Some(status) = v.get("status").and_then(|x| x.as_str()) {
         finish = Some(status.to_string());
     }
@@ -640,6 +685,8 @@ fn parse_codex_response(text: &str) -> Result<ChatResponse> {
         finish.as_deref(),
         input_tokens,
         output_tokens,
+        cached_tokens,
+        cache_reported,
         LimitHint::default(),
     ))
 }
@@ -650,6 +697,8 @@ fn apply_codex_event<F>(
     tools: &mut Vec<(String, String, String)>,
     input_tokens: &mut u32,
     output_tokens: &mut u32,
+    cached_tokens: &mut u32,
+    cache_reported: &mut bool,
     finish: &mut Option<String>,
     mut on_text: Option<&mut F>,
 ) where
@@ -674,11 +723,17 @@ fn apply_codex_event<F>(
     if kind.ends_with("completed") || kind == "response.completed" {
         *finish = Some("completed".into());
         if let Some(resp) = v.get("response") {
-            take_usage(resp, input_tokens, output_tokens);
+            take_stream_usage(
+                resp,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                cache_reported,
+            );
         }
-        take_usage(v, input_tokens, output_tokens);
+        take_stream_usage(v, input_tokens, output_tokens, cached_tokens, cache_reported);
     }
-    take_usage(v, input_tokens, output_tokens);
+    take_stream_usage(v, input_tokens, output_tokens, cached_tokens, cache_reported);
 }
 
 fn collect_codex_output(output: &Value, full_text: &mut String, tools: &mut Vec<(String, String, String)>) {
@@ -733,5 +788,48 @@ fn take_usage(v: &Value, input_tokens: &mut u32, output_tokens: &mut u32) {
         .and_then(|x| x.as_u64())
     {
         *output_tokens = n as u32;
+    }
+}
+
+fn take_stream_usage(
+    v: &Value,
+    input_tokens: &mut u32,
+    output_tokens: &mut u32,
+    cached_tokens: &mut u32,
+    cache_reported: &mut bool,
+) {
+    take_usage(v, input_tokens, output_tokens);
+    if let Some(cached) = crate::provider::cached_tokens_entry(v) {
+        *cached_tokens = cached;
+        *cache_reported = true;
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_usage_keeps_cached_prompt_tokens() {
+        let event = json!({
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 80,
+                "prompt_tokens_details": {"cached_tokens": 900}
+            }
+        });
+        let mut input = 0;
+        let mut output = 0;
+        let mut cached = 0;
+        let mut reported = false;
+        take_stream_usage(
+            &event,
+            &mut input,
+            &mut output,
+            &mut cached,
+            &mut reported,
+        );
+        assert_eq!((input, output, cached), (1200, 80, 900));
+        assert!(reported);
     }
 }

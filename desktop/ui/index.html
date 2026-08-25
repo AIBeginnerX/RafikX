@@ -350,12 +350,14 @@
             <div class="seg" id="engine-seg">
               <label><input type="radio" name="engine" value="rafikx" /> ◆ rafikx harness (기본)</label>
               <label><input type="radio" name="engine" value="deepseek" /> ◈ deepseek harness (단계별 실행 강화)</label>
+              <label><input type="radio" name="engine" value="dk" /> ◇ dk-harness (DeepSeek DSH 호환)</label>
+              <label><input type="radio" name="engine" value="pi" /> ● pi-harness (oh-my-pi 스타일 실시간 작업 표시)</label>
             </div>
             <div class="row" style="margin-top:10px">
               <button class="btn primary" id="btn-engine-save">엔진 저장</button>
               <span class="hint" id="engine-now"></span>
             </div>
-            <p class="hint">deepseek harness 는 DeepSeek Harness(dsh)의 단계별 실행 방식을 본뜬 엔진입니다. 모든 도구 작업을 todo 단계로 쪼개 실행하고 각 단계 상태와 검증 결과를 보고합니다.</p>
+            <p class="hint">deepseek/dk 는 도구 작업을 todo 단계로 쪼개 상태와 검증 결과를 보고합니다. pi 는 모델 응답·도구 실행·사용량을 대화창에 실시간 표시합니다.</p>
             <h4>분류별 모델 — 「(자동)」이면 순위 기반 자동 선정</h4>
             <div id="class-rows"></div>
             <p class="hint">순위 근거: Artificial Analysis 지능·코딩 지수 + LMArena 계열 Elo 교차 검증 (2곳 이상 점수가 모일 때만 상위 티어 재판정). 프롬프트 캐시가 켜져 있어 같은 하네스 반복 호출의 입력 토큰 비용이 절감됩니다.</p>

@@ -123,12 +123,12 @@ pub fn preferred_models(name: &str) -> &'static [&'static str] {
         "qwen" => &["qwen-max", "qwen-plus", "qwen-turbo"],
         "local" => &["qwen3:8b", "llama3.2", "qwen2.5"],
         "opencode_zen" => &[
+            "minimax-m3",
             "glm-5.1",
             "glm-5.2",
             "kimi-k2.7-code",
             "kimi-k2.6",
             "minimax-m2.7",
-            "minimax-m3",
             "deepseek-v4-flash",
             "deepseek-v4-pro",
             "big-pickle",

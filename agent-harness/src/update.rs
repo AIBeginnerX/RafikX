@@ -150,7 +150,7 @@ pub fn last_seen_tag() -> Option<String> {
 }
 
 pub fn upgrade_command() -> &'static str {
-    "git -C ~/.rafikx-src pull && cargo install --path ~/.rafikx-src/agent-harness --locked --force"
+    "rafikx update"
 }
 
 /// 업그레이드 안내 문장을 만든다. 새 버전이 아니면 None.
@@ -173,7 +173,7 @@ pub fn upgrade_notice(release: &Release, current: &str) -> Option<String> {
     if !release.url.is_empty() {
         out.push(release.url.clone());
     }
-    out.push("명령어: rafikx update".into());
+    out.push("업그레이드 명령어: RafikX update (터미널 입력: rafikx update)".into());
     out.push("지금 업그레이드하려면 U 키를 누르세요 (에이전트가 종료되며 업데이트가 실행됩니다).".into());
     Some(out.join("\n"))
 }
@@ -185,7 +185,10 @@ pub fn run_update_flow() -> anyhow::Result<()> {
     println!("현재 버전 v{current} — GitHub 확인 중…");
     let rel = latest_release()?;
     if !is_newer(&rel.tag, current) {
-        println!("최신 버전입니다 (v{current} == {}).", rel.tag);
+        println!(
+            "최신 버전을 사용 중입니다 (설치 v{current} · 공개 최신 {}).",
+            rel.tag
+        );
         return Ok(());
     }
     println!("새 버전 {} 이 있습니다.", rel.tag);
@@ -208,7 +211,20 @@ pub fn run_update_flow() -> anyhow::Result<()> {
 
 fn perform_install() -> anyhow::Result<()> {
     use std::process::Command;
-    let script = r#"
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(install_script())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("업그레이드 실패 (exit {})", status.code().unwrap_or(-1));
+    }
+    println!();
+    println!("업그레이드 완료 — `rafikx` 를 다시 실행하세요.");
+    Ok(())
+}
+
+fn install_script() -> &'static str {
+    r#"
 set -e
 SRC="$HOME/.rafikx-src"
 if [ -d "$SRC/.git" ]; then
@@ -216,27 +232,10 @@ if [ -d "$SRC/.git" ]; then
   git -C "$SRC" checkout -q master
   git -C "$SRC" reset -q --hard origin/master
 else
-  echo "NO_SRC"
-  exit 2
+  git clone --depth 1 --branch master https://github.com/AIBeginnerX/RafikX.git "$SRC"
 fi
 cargo install --path "$SRC/agent-harness" --locked --force
-"#;
-    // 상속된 stdio — cargo·git 진행 출력이 터미널에 그대로 흐른다.
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .status()?;
-    if !status.success() {
-        if let Some(2) = status.code() {
-            anyhow::bail!(
-                "표준 설치 경로(~/.rafikx-src)가 없습니다. 수동 설치: git clone https://github.com/AIBeginnerX/RafikX.git ~/.rafikx-src && cargo install --path ~/.rafikx-src/agent-harness --locked --force"
-            );
-        }
-        anyhow::bail!("업그레이드 실패 (exit {})", status.code().unwrap_or(-1));
-    }
-    println!();
-    println!("업그레이드 완료 — `rafikx` 를 다시 실행하세요.");
-    Ok(())
+"#
 }
 
 #[cfg(test)]
@@ -259,5 +258,12 @@ mod tests {
             summarize_notes(notes, 5),
             vec!["web_search 추가", "apply_patch 지원", "일반 문단"]
         );
+    }
+
+    #[test]
+    fn updater_bootstraps_missing_source_clone() {
+        let script = install_script();
+        assert!(script.contains("git clone --depth 1"));
+        assert!(script.contains("cargo install --path"));
     }
 }

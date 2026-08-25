@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -17,14 +17,23 @@ use crossterm::terminal::{
 use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{ApprovalChoice, LocalAsk};
 use crate::chat::{self, Session, Slash};
 use crate::config::Config;
+use crate::db::Db;
 use crate::provider::{ContentBlock, Message, Role};
 use crate::ui::{self, Live};
+
+pub(super) const STATUS_MARK: &str = " N·A·I ";
+pub(super) const STATUS_NAME: &str = "RAFIKX";
+pub(super) const STATUS_DIVIDER: &str = " │";
+pub(super) const APPROVAL_YES: &str = " [Yes]";
+pub(super) const APPROVAL_NO: &str = " [No]";
+pub(super) const APPROVAL_ALWAYS: &str = " [Always]";
 
 pub struct App {
     session: Session,
@@ -55,6 +64,14 @@ pub struct App {
     pub slash_armed: bool,
     /// 실행 중 접수한 대기 프롬프트 큐 — 턴이 끝나면 순차 실행
     pub queue: Vec<String>,
+    /// 현재 실행의 Todo 목록 — 하단 진행 패널에 즉시 반영된다.
+    pub todos: Vec<crate::tools_more::TodoItem>,
+    /// 실행 중이거나 끝난 서브에이전트 역할·모델·상태.
+    pub agents: Vec<crate::ui::AgentProgress>,
+    /// 완료 요약 화면이 활성화되면 직전 실행의 늦은 진행 이벤트를 버린다.
+    final_summary: bool,
+    /// 완료 뒤 사용자가 번호로 선택할 수 있는 후속 작업.
+    pending_actions: Vec<CompletionAction>,
     /// 현재 실행 중인 턴의 핸들 — Esc 인터럽트용
     pub turn_handle: Option<tokio::task::JoinHandle<()>>,
     /// 새 릴리스 태그 — 있으면 U 키로 업그레이드 진행 가능
@@ -63,9 +80,22 @@ pub struct App {
     pub upgrading: bool,
 }
 
+#[derive(Clone)]
+struct CompletionAction {
+    label: String,
+    prompt: Option<String>,
+}
+
 pub struct ApprovalPrompt {
     pub preview: String,
     tx: oneshot::Sender<ApprovalChoice>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ApprovalButton {
+    pub rect: Rect,
+    pub choice: ApprovalChoice,
+    pub label: &'static str,
 }
 
 pub struct Picker {
@@ -159,7 +189,12 @@ impl Drop for TermGuard {
             let _ = write!(out, "\x1b[?1007l");
             let _ = out.flush();
         }
-        let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            out,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = out.flush();
     }
 }
@@ -205,6 +240,10 @@ pub async fn run(
         quit_after: false,
         slash_armed: false,
         queue: Vec::new(),
+        todos: crate::tools_more::current_todos(),
+        agents: Vec::new(),
+        final_summary: false,
+        pending_actions: Vec::new(),
         turn_handle: None,
         upgrade: None,
         upgrading: false,
@@ -295,6 +334,31 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<TurnDone>();
+    if let Ok(path) = Db::db_path()
+        && let Ok(db) = Db::open(&path)
+        && let Ok(Some(goal)) = db.active_goal()
+        && goal.continuations < 8
+    {
+        if let Ok(messages) = serde_json::from_str::<Vec<Message>>(&goal.messages_json) {
+            app.session.messages = messages;
+        }
+        push(
+            &mut app,
+            EntryKind::System,
+            format!(
+                "중단된 목표를 자동 재개합니다: {} (Todo {}/{})",
+                goal.objective, goal.completed, goal.total
+            ),
+        );
+        start_turn(
+            &mut app,
+            goal.objective,
+            Some("dev".into()),
+            false,
+            &local_ask,
+            &done_tx,
+        );
+    }
     let mut dirty = true;
 
     loop {
@@ -323,6 +387,11 @@ pub async fn run(
                         handle_paste(&mut app, &text);
                         dirty = true;
                     }
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        let size = terminal.size().unwrap_or_default();
+                        handle_mouse(&mut app, mouse, size.width, size.height);
+                        dirty = true;
+                    }
                     Some(Ok(Event::Resize(_, _))) => dirty = true,
                     Some(Err(e)) => anyhow::bail!("입력 이벤트: {e}"),
                     None => break,
@@ -344,6 +413,7 @@ pub async fn run(
             }
             ask = ask_rx.recv() => {
                 if let Some((preview, tx)) = ask {
+                    set_mouse_capture(true);
                     app.approval = Some(ApprovalPrompt { preview, tx });
                     app.help = false;
                     dirty = true;
@@ -383,12 +453,15 @@ fn handle_key(
     if let Some(prompt) = app.approval.take() {
         match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
+                set_mouse_capture(false);
                 let _ = prompt.tx.send(ApprovalChoice::Yes);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                set_mouse_capture(false);
                 let _ = prompt.tx.send(ApprovalChoice::No);
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
+                set_mouse_capture(false);
                 let _ = prompt.tx.send(ApprovalChoice::Always);
             }
             _ => {
@@ -656,16 +729,6 @@ fn handle_key(
         KeyCode::Right => app.cursor = next_idx(&app.input, app.cursor),
         KeyCode::Home => app.cursor = 0,
         KeyCode::End => app.cursor = app.input.len(),
-        KeyCode::PageUp => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_add(20);
-        }
-        KeyCode::PageDown => {
-            app.scroll = app.scroll.saturating_sub(20);
-            if app.scroll == 0 {
-                app.follow = true;
-            }
-        }
         KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => {
             app.follow = false;
             app.scroll = app.scroll.saturating_add(4);
@@ -698,6 +761,133 @@ fn handle_key(
     }
 }
 
+fn handle_mouse(app: &mut App, mouse: MouseEvent, width: u16, height: u16) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+    let model = view::selected_model_label(app);
+    let Some(choice) = approval_popup_click(mouse.column, mouse.row, width, height)
+        .or_else(|| approval_click(mouse.column, mouse.row, height, &model))
+    else {
+        return;
+    };
+    if let Some(prompt) = app.approval.take() {
+        set_mouse_capture(false);
+        let _ = prompt.tx.send(choice);
+    }
+}
+
+pub(super) fn approval_popup_layout(area: Rect) -> (Rect, [ApprovalButton; 3]) {
+    let popup = view::overlay_rect(area, 72, 22);
+    let inner_x = popup.x.saturating_add(1);
+    let inner_width = popup.width.saturating_sub(2);
+    if inner_width < 23 {
+        let first_y = popup
+            .y
+            .saturating_add(popup.height.saturating_sub(5));
+        return (
+            popup,
+            [
+                ApprovalButton {
+                    rect: Rect::new(inner_x, first_y, 5.min(inner_width), 1),
+                    choice: ApprovalChoice::Yes,
+                    label: "[Yes]",
+                },
+                ApprovalButton {
+                    rect: Rect::new(
+                        inner_x,
+                        first_y.saturating_add(1),
+                        4.min(inner_width),
+                        1,
+                    ),
+                    choice: ApprovalChoice::No,
+                    label: "[No]",
+                },
+                ApprovalButton {
+                    rect: Rect::new(
+                        inner_x,
+                        first_y.saturating_add(2),
+                        8.min(inner_width),
+                        1,
+                    ),
+                    choice: ApprovalChoice::Always,
+                    label: "[Always]",
+                },
+            ],
+        );
+    }
+    let button_y = popup
+        .y
+        .saturating_add(popup.height.saturating_sub(3));
+    let group_width = 23u16;
+    let start = inner_x.saturating_add(inner_width.saturating_sub(group_width) / 2);
+    (
+        popup,
+        [
+            ApprovalButton {
+                rect: Rect::new(start, button_y, 5, 1),
+                choice: ApprovalChoice::Yes,
+                label: "[Yes]",
+            },
+            ApprovalButton {
+                rect: Rect::new(start.saturating_add(8), button_y, 4, 1),
+                choice: ApprovalChoice::No,
+                label: "[No]",
+            },
+            ApprovalButton {
+                rect: Rect::new(start.saturating_add(15), button_y, 8, 1),
+                choice: ApprovalChoice::Always,
+                label: "[Always]",
+            },
+        ],
+    )
+}
+
+fn approval_popup_click(
+    column: u16,
+    row: u16,
+    width: u16,
+    height: u16,
+) -> Option<ApprovalChoice> {
+    let area = Rect::new(0, 0, width, height);
+    let (_, buttons) = approval_popup_layout(area);
+    buttons
+        .into_iter()
+        .find(|button| {
+            button.rect.contains(ratatui::layout::Position::new(column, row))
+        })
+        .map(|button| button.choice)
+}
+
+fn approval_click(
+    column: u16,
+    row: u16,
+    height: u16,
+    model: &str,
+) -> Option<ApprovalChoice> {
+    if height < 2 || row != height.saturating_sub(2) {
+        return None;
+    }
+    let prefix = format!(
+        "{STATUS_MARK}{STATUS_NAME}{STATUS_DIVIDER} MODEL {model} ·"
+    );
+    let yes_start = crate::tui::md::display_width(&prefix) as u16;
+    let no_start = yes_start + crate::tui::md::display_width(APPROVAL_YES) as u16;
+    let always_start = no_start + crate::tui::md::display_width(APPROVAL_NO) as u16;
+    if (yes_start..no_start).contains(&column) {
+        Some(ApprovalChoice::Yes)
+    } else if (no_start..always_start).contains(&column) {
+        Some(ApprovalChoice::No)
+    } else if (always_start
+        ..always_start + crate::tui::md::display_width(APPROVAL_ALWAYS) as u16)
+        .contains(&column)
+    {
+        Some(ApprovalChoice::Always)
+    } else {
+        None
+    }
+}
+
 fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<TurnDone>) {
     let line = app.input.trim().to_string();
     if line.is_empty() {
@@ -712,6 +902,23 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
         return;
     }
     app.slash_armed = false;
+    if !app.busy
+        && let Ok(index) = line.parse::<usize>()
+        && let Some(action) = app.pending_actions.get(index.saturating_sub(1)).cloned()
+    {
+        app.pending_actions.clear();
+        app.input.clear();
+        app.cursor = 0;
+        push(app, EntryKind::System, format!("Selected: [{}] {}", index, action.label));
+        if let Some(prompt) = action.prompt {
+            start_turn(app, prompt, Some("dev".into()), false, local_ask, done_tx);
+        } else {
+            app.status = "완료".into();
+            push(app, EntryKind::System, "추가 작업 없이 종료합니다.");
+        }
+        return;
+    }
+    app.pending_actions.clear();
     if app.busy && !line.starts_with('/') {
         // 실행 중 입력은 큐에 적립 — 현재 턴이 끝나면 순차 실행된다.
         app.queue.push(line.clone());
@@ -798,6 +1005,8 @@ fn start_turn(
     local_ask: &LocalAsk,
     done_tx: &mpsc::UnboundedSender<TurnDone>,
 ) {
+    app.final_summary = false;
+    app.pending_actions.clear();
     promote_queued(app, &prompt);
     app.busy = true;
     app.streaming = false;
@@ -863,21 +1072,33 @@ fn finish_turn(
             };
             app.tokens = format!("{}/{}", fmt_k(info.tokens_in), fmt_k(info.tokens_out));
             if info.ctx_window > 0 {
-                let pct = (info.ctx_used.min(info.ctx_window)) * 100 / info.ctx_window;
-                let cache_pct = if info.tokens_in > 0 {
-                    info.cached_in * 100 / info.tokens_in
-                } else {
-                    0
-                };
+                let pct = info
+                    .ctx_used
+                    .min(info.ctx_window)
+                    .saturating_mul(100)
+                    .checked_div(info.ctx_window)
+                    .unwrap_or(0);
+                let cache =
+                    cache_usage_label(info.cached_in, info.ctx_used, info.cache_reported);
                 app.ctx = format!(
-                    "ctx {}/{} ({}%) · cache {}%",
+                    "ctx {}/{} ({}%) · {}",
                     fmt_k(info.ctx_used),
                     fmt_k(info.ctx_window),
                     pct,
-                    cache_pct
+                    cache
                 );
             } else {
                 app.ctx.clear();
+            }
+            if !info.run_id.is_empty() {
+                let (summary, actions) = completion_report(&info);
+                replace_with_final_summary(&mut app.transcript, summary);
+                app.todos.clear();
+                app.agents.clear();
+                app.scroll = 0;
+                app.follow = true;
+                app.final_summary = true;
+                app.pending_actions = actions;
             }
         }
         Err(e) => {
@@ -892,6 +1113,14 @@ fn finish_turn(
         let obsidian = app.session.obsidian_on;
         start_turn(app, next, class, obsidian, local_ask, done_tx);
     }
+}
+
+fn replace_with_final_summary(transcript: &mut Vec<Entry>, summary: String) {
+    transcript.clear();
+    transcript.push(Entry {
+        kind: EntryKind::Assistant,
+        text: summary,
+    });
 }
 
 fn start_compact(
@@ -919,7 +1148,9 @@ fn start_compact(
                     ctx_used: 0,
                     ctx_window: 0,
                     cached_in: 0,
+                    cache_reported: false,
                     elapsed_ms: 0,
+                    summary: chat::CompletionSummary::default(),
                 })
             }
             Err(e) => Err(e),
@@ -933,6 +1164,9 @@ fn push_live_system(text: String) {
 }
 
 fn apply_live(app: &mut App, ev: Live) {
+    if app.final_summary && ignore_after_final_summary(&ev) {
+        return;
+    }
     app.follow = true;
     match ev {
         Live::Chunk(s) => {
@@ -986,14 +1220,9 @@ fn apply_live(app: &mut App, ev: Live) {
         }
         Live::Warn(s) => push(app, EntryKind::Warn, s),
         Live::Status(s) => {
-            // "[tokens] in=N out=M (누적 in=A out=B)" 를 실시간 반영
+            // 모델 호출이 끝날 때마다 누적 사용량과 현재 컨텍스트·캐시를 반영한다.
             if s.starts_with("[tokens]") {
-                let nums: Vec<u32> = s
-                    .split(&['=', ' ', '(', ')'][..])
-                    .filter_map(|p| p.parse::<u32>().ok())
-                    .collect();
-                if nums.len() >= 4 {
-                    let (a, b) = (nums[2], nums[3]);
+                if let Some(metrics) = parse_token_metrics(&s) {
                     let fmt_k = |n: u32| -> String {
                         if n >= 1_000_000 {
                             format!("{:.0}M", n as f64 / 1e6)
@@ -1003,19 +1232,154 @@ fn apply_live(app: &mut App, ev: Live) {
                             n.to_string()
                         }
                     };
-                    app.tokens = format!("{}/{}", fmt_k(a), fmt_k(b));
+                    app.tokens = format!(
+                        "{}/{}",
+                        fmt_k(metrics.total_in),
+                        fmt_k(metrics.total_out)
+                    );
                     let win = crate::harness::current_ctx_window();
                     if win > 0 {
-                        let used = a.max(b);
-                        let pct = used.min(win) * 100 / win;
-                        app.ctx = format!("ctx {}/{} ({}%)", fmt_k(used), fmt_k(win), pct);
+                        let pct = metrics
+                            .context
+                            .min(win)
+                            .saturating_mul(100)
+                            .checked_div(win)
+                            .unwrap_or(0);
+                        let cache = metrics
+                            .cache
+                            .map(|n| cache_usage_label(n, metrics.context, true))
+                            .unwrap_or_else(|| "cache --".into());
+                        app.ctx = format!(
+                            "ctx {}/{} ({}%) · {}",
+                            fmt_k(metrics.context),
+                            fmt_k(win),
+                            pct,
+                            cache
+                        );
                     }
                 }
                 return;
             }
             app.status = s;
         }
+        Live::Todo(items) => {
+            app.todos = items;
+            app.follow = true;
+        }
+        Live::Agent(progress) => {
+            update_agent_progress(&mut app.agents, progress);
+            app.follow = true;
+        }
     }
+}
+
+fn ignore_after_final_summary(event: &Live) -> bool {
+    matches!(
+        event,
+        Live::Chunk(_)
+            | Live::Assistant(_)
+            | Live::System(_)
+            | Live::Warn(_)
+            | Live::Todo(_)
+            | Live::Agent(_)
+    )
+}
+
+fn update_agent_progress(
+    agents: &mut Vec<crate::ui::AgentProgress>,
+    progress: crate::ui::AgentProgress,
+) {
+    if let Some(existing) = agents.iter_mut().find(|item| item.id == progress.id) {
+        *existing = progress;
+    } else {
+        agents.push(progress);
+    }
+}
+
+fn cache_usage_label(cached: u32, context: u32, reported: bool) -> String {
+    if !reported {
+        return "cache --".into();
+    }
+    let percent = cached
+        .min(context)
+        .saturating_mul(100)
+        .checked_div(context)
+        .unwrap_or(0);
+    format!("cache {percent}%")
+}
+
+fn completion_report(info: &chat::TurnInfo) -> (String, Vec<CompletionAction>) {
+    let summary = &info.summary;
+    let files = if summary.changed_files.is_empty() {
+        "없음".into()
+    } else {
+        summary.changed_files.join(", ")
+    };
+    let mut text = format!(
+        "작업 완료 요약\n- 상태: {}\n- 진행: Todo {}/{} · 모델 반복 {}회\n- 변경: {}\n- 도구 오류: {}건\n- 개선 후보: {}",
+        info.status,
+        summary.completed_todos,
+        summary.total_todos,
+        summary.iterations,
+        files,
+        summary.tool_errors,
+        summary.improvement
+    );
+    let mut actions = Vec::new();
+    if !summary.changed_files.is_empty() {
+        actions.push(CompletionAction {
+            label: "Commit changes".into(),
+            prompt: Some(
+                "사용자가 Commit changes를 선택했다. 변경을 다시 검증하고 커밋 범위와 메시지를 제시한 뒤 커밋 승인을 요청하라. 배포하지 마라."
+                    .into(),
+            ),
+        });
+        actions.push(CompletionAction {
+            label: "Deploy changes".into(),
+            prompt: Some(
+                "사용자가 Deploy changes를 선택했다. 배포 대상·환경·위험을 확인하고 실제 외부 배포 직전에 명시적 승인을 요청하라."
+                    .into(),
+            ),
+        });
+    }
+    actions.push(CompletionAction {
+        label: "Apply improvement".into(),
+        prompt: Some(format!(
+            "다음 개선 후보를 현재 사용자 작업 방식에 맞게 최소 변경으로 적용하라: {}",
+            summary.improvement
+        )),
+    });
+    actions.push(CompletionAction {
+        label: "Finish".into(),
+        prompt: None,
+    });
+    text.push_str("\n\nChoose next action:");
+    for (index, action) in actions.iter().enumerate() {
+        text.push_str(&format!("\n[{}] {}", index + 1, action.label));
+    }
+    (text, actions)
+}
+
+struct TokenMetrics {
+    total_in: u32,
+    total_out: u32,
+    context: u32,
+    cache: Option<u32>,
+}
+
+fn parse_token_metrics(status: &str) -> Option<TokenMetrics> {
+    let value = |key: &str| {
+        status
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(key))
+            .and_then(|raw| raw.parse::<u32>().ok())
+    };
+    Some(TokenMetrics {
+        total_in: value("total_in=")?,
+        total_out: value("total_out=")?,
+        context: value("context=")?,
+        cache: value("cache="),
+    })
 }
 
 fn push(app: &mut App, kind: EntryKind, text: impl Into<String>) {
@@ -1031,6 +1395,16 @@ fn binding_label(session: &Session) -> String {
     let class = session.class.as_deref().unwrap_or("auto");
     let mode = if session.is_plan_mode() { "plan" } else { "build" };
     format!("{provider} · {model} · {class} · {mode}")
+}
+
+fn collapsed_input(input: &str) -> String {
+    let lines = input.lines().count().max(1);
+    let chars = input.chars().count();
+    if lines >= 4 || chars > 240 {
+        format!("[붙여넣기 {lines}줄 · {chars}자]")
+    } else {
+        input.to_string()
+    }
 }
 
 fn hydrate(messages: &[Message]) -> Vec<Entry> {
@@ -1196,7 +1570,7 @@ fn open_model_picker(app: &mut App) {
     ids.push(String::new());
     for r in &regs {
         items.push(format!("{} / {}", r.provider, r.id));
-        ids.push(r.id.clone());
+        ids.push(format!("{}\t{}", r.provider, r.id));
     }
     app.picker = Some(Picker {
         title: "모델".into(),
@@ -1293,17 +1667,21 @@ fn apply_picker(app: &mut App, picker: Picker) {
     match picker.kind {
         PickerKind::Model => {
             if id.is_empty() {
+                app.session.provider = None;
                 app.session.model = None;
                 // 자동 전환 시 영속 선택도 초기화
                 crate::chat::persist_last_choice(&app.session.cfg.clone(), "", "");
                 push(app, EntryKind::System, "모델을 하네스 자동으로 돌렸습니다.");
             } else {
-                app.session.model = Some(id.clone());
+                let (selected_provider, selected_model) =
+                    id.split_once('\t').unwrap_or(("", id.as_str()));
+                app.session.model = Some(selected_model.to_string());
                 // 영속화 — 재시작 후에도 동일 모델 사용
                 if let Some(r) = crate::auth::registered_models(&app.session.cfg)
                     .into_iter()
-                    .find(|r| r.id == id)
+                    .find(|r| r.provider == selected_provider && r.id == selected_model)
                 {
+                    app.session.provider = Some(r.provider.clone());
                     let _ = crate::accounts_ui::write_provider_model(
                         &app.session.cfg,
                         &r.provider,
@@ -1320,7 +1698,11 @@ fn apply_picker(app: &mut App, picker: Picker) {
                         format!("모델: {} (저장 — 재시작 후에도 유지)", r.id),
                     );
                 } else {
-                    push(app, EntryKind::System, format!("모델: {id} (세션 한정)"));
+                    push(
+                        app,
+                        EntryKind::System,
+                        format!("모델: {selected_model} (세션 한정)"),
+                    );
                 }
             }
             app.binding = binding_label(&app.session);
@@ -1647,8 +2029,14 @@ fn handle_paste(app: &mut App, raw: &str) {
     }
 }
 
-/// 마우스 캡처는 하지 않는다 — 터미널의 마우스 선택·복사를 그대로 쓴다 (no-op 호출 유지).
-fn set_mouse_capture(_on: bool) {}
+fn set_mouse_capture(on: bool) {
+    let mut out = stdout();
+    if on {
+        let _ = execute!(out, EnableMouseCapture);
+    } else {
+        let _ = execute!(out, DisableMouseCapture);
+    }
+}
 
 fn read_clipboard() -> Option<String> {
     #[cfg(windows)]
@@ -1725,5 +2113,168 @@ fn enable_utf8() {
                 let _ = SetConsoleMode(h, mode | 0x0004);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn long_paste_is_collapsed_without_losing_payload() {
+        let pasted = "첫 줄\n둘째 줄\n셋째 줄\n넷째 줄\n다섯째 줄\n여섯째 줄\n일곱째 줄";
+        assert_eq!(collapsed_input(pasted), "[붙여넣기 7줄 · 36자]");
+        assert_eq!(pasted.lines().count(), 7);
+    }
+
+    #[test]
+    fn cache_label_is_actual_reuse_percentage_only() {
+        assert_eq!(cache_usage_label(900, 1_200, true), "cache 75%");
+        assert_eq!(cache_usage_label(0, 0, false), "cache --");
+    }
+
+    #[test]
+    fn approval_status_clicks_map_to_english_options() {
+        let model = "minimax-m3";
+        let prefix = format!(
+            "{STATUS_MARK}{STATUS_NAME}{STATUS_DIVIDER} MODEL {model} ·"
+        );
+        let yes = crate::tui::md::display_width(&prefix) as u16;
+        let no = yes + crate::tui::md::display_width(APPROVAL_YES) as u16;
+        let always = no + crate::tui::md::display_width(APPROVAL_NO) as u16;
+        assert_eq!(
+            approval_click(yes + 1, 8, 10, model),
+            Some(ApprovalChoice::Yes)
+        );
+        assert_eq!(
+            approval_click(no + 1, 8, 10, model),
+            Some(ApprovalChoice::No)
+        );
+        assert_eq!(
+            approval_click(always + 1, 8, 10, model),
+            Some(ApprovalChoice::Always)
+        );
+        assert_eq!(approval_click(2, 8, 10, model), None);
+    }
+
+    #[test]
+    fn approval_popup_buttons_are_directly_mouse_selectable() {
+        assert_eq!(
+            approval_popup_click(40, 23, 100, 30),
+            Some(ApprovalChoice::Yes)
+        );
+        assert_eq!(
+            approval_popup_click(48, 23, 100, 30),
+            Some(ApprovalChoice::No)
+        );
+        assert_eq!(
+            approval_popup_click(56, 23, 100, 30),
+            Some(ApprovalChoice::Always)
+        );
+        assert_eq!(approval_popup_click(40, 22, 100, 30), None);
+    }
+
+    #[test]
+    fn approval_popup_stacks_buttons_on_narrow_terminals() {
+        assert_eq!(
+            approval_popup_click(2, 5, 18, 10),
+            Some(ApprovalChoice::Yes)
+        );
+        assert_eq!(
+            approval_popup_click(2, 6, 18, 10),
+            Some(ApprovalChoice::No)
+        );
+        assert_eq!(
+            approval_popup_click(2, 7, 18, 10),
+            Some(ApprovalChoice::Always)
+        );
+    }
+
+    #[test]
+    fn agent_progress_updates_role_model_and_status_in_place() {
+        let mut agents = Vec::new();
+        update_agent_progress(
+            &mut agents,
+            crate::ui::AgentProgress {
+                id: "agent-1".into(),
+                role: "reviewer".into(),
+                model: "minimax-m3".into(),
+                status: "running".into(),
+            },
+        );
+        update_agent_progress(
+            &mut agents,
+            crate::ui::AgentProgress {
+                id: "agent-1".into(),
+                role: "reviewer".into(),
+                model: "minimax-m3".into(),
+                status: "ok".into(),
+            },
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, "ok");
+    }
+
+    #[test]
+    fn changed_files_offer_commit_deploy_improvement_and_finish() {
+        let info = chat::TurnInfo {
+            run_id: "run-1".into(),
+            label: "dev".into(),
+            status: "ok".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            ctx_used: 0,
+            ctx_window: 0,
+            cached_in: 0,
+            cache_reported: false,
+            elapsed_ms: 1,
+            summary: chat::CompletionSummary {
+                changed_files: vec!["src/main.rs".into()],
+                iterations: 1,
+                completed_todos: 1,
+                total_todos: 1,
+                tool_errors: 0,
+                improvement: "검증 유지".into(),
+            },
+        };
+        let (_, actions) = completion_report(&info);
+        let labels: Vec<&str> = actions.iter().map(|action| action.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Commit changes",
+                "Deploy changes",
+                "Apply improvement",
+                "Finish"
+            ]
+        );
+    }
+
+    #[test]
+    fn final_summary_replaces_faded_work_stream() {
+        let mut transcript = vec![
+            Entry {
+                kind: EntryKind::Assistant,
+                text: "[모델 작업]\n조사 중".into(),
+            },
+            Entry {
+                kind: EntryKind::Tool,
+                text: "[도구] read_file".into(),
+            },
+        ];
+        replace_with_final_summary(&mut transcript, "Comprehensive result".into());
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].kind, EntryKind::Assistant);
+        assert_eq!(transcript[0].text, "Comprehensive result");
+    }
+
+    #[test]
+    fn final_summary_ignores_late_work_events() {
+        assert!(ignore_after_final_summary(&Live::Chunk("late".into())));
+        assert!(ignore_after_final_summary(&Live::Assistant("late".into())));
+        assert!(ignore_after_final_summary(&Live::System("[도구] late".into())));
+        assert!(!ignore_after_final_summary(&Live::Status(
+            "[tokens] total_in=1 total_out=1 context=1".into()
+        )));
     }
 }

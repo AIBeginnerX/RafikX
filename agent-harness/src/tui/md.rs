@@ -1,12 +1,8 @@
+use unicode_width::UnicodeWidthChar;
+
 /// Display width: ASCII=1, other (Korean etc.)=2.
 pub fn ch_width(ch: char) -> usize {
-    if ch == '\n' || ch == '\r' {
-        0
-    } else if ch.is_ascii() {
-        1
-    } else {
-        2
-    }
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 #[allow(dead_code)]
@@ -85,24 +81,24 @@ impl MdSeg {
 }
 
 /// Lightweight markdown split for TUI styling. Not a full parser.
+#[cfg(test)]
 pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
     markdown_segs_with_width(input, None)
 }
 
 /// max_w 가 주어지면 표가 그 폭을 넘지 않도록 셀 내용을 자동 줄바꿈한다 (반응형).
 pub fn markdown_segs_with_width(input: &str, max_w: Option<usize>) -> Vec<MdSeg> {
-    let _ = max_w; // 아래 render_grid 호출부에서 사용
-    markdown_segs_impl(input)
+    markdown_segs_impl(input, max_w)
 }
 
-fn markdown_segs_impl(input: &str) -> Vec<MdSeg> {
+fn markdown_segs_impl(input: &str, max_w: Option<usize>) -> Vec<MdSeg> {
     let lines: Vec<&str> = input.lines().collect();
     let mut out: Vec<MdSeg> = Vec::new();
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i];
-        if line.starts_with("```") {
-            let lang = line[3..].trim();
+        if let Some(fence) = line.strip_prefix("```") {
+            let lang = fence.trim();
             // ```chart 블록 — 라벨:수치 행을 유니코드 막대그래프로 그린다.
             if matches!(lang, "chart" | "bar" | "graph") {
                 i += 1;
@@ -112,7 +108,7 @@ fn markdown_segs_impl(input: &str) -> Vec<MdSeg> {
                     i += 1;
                 }
                 i += 1; // 닫는 fence 소비
-                out.push(MdSeg::plain(MdKind::Chart, render_chart(&body)));
+                out.push(MdSeg::plain(MdKind::Chart, render_chart(&body, max_w)));
                 continue;
             }
             // 일반 코드블록 — fence 전체를 하나의 세그먼트로 묶어 하이라이팅한다.
@@ -143,7 +139,10 @@ fn markdown_segs_impl(input: &str) -> Vec<MdSeg> {
                 rows.push(split_row(lines[i]));
                 i += 1;
             }
-            out.push(MdSeg::plain(MdKind::Table, render_grid(&rows)));
+            out.push(MdSeg::plain(
+                MdKind::Table,
+                render_grid_with_width(&rows, max_w),
+            ));
             continue;
         }
         push_inline(line, &mut out);
@@ -152,12 +151,12 @@ fn markdown_segs_impl(input: &str) -> Vec<MdSeg> {
     if out.is_empty() {
         out.push(MdSeg::plain(MdKind::Text, ""));
     }
-    upgrade_fenced_tables(&mut out);
+    upgrade_fenced_tables(&mut out, max_w);
     out
 }
 
 /// "라벨: 수치" 행을 유니코드 막대그래프로 변환한다. 파싱 불가한 입력은 원문을 돌려준다.
-fn render_chart(body: &[&str]) -> String {
+fn render_chart(body: &[&str], max_w: Option<usize>) -> String {
     let mut rows: Vec<(String, f64)> = Vec::new();
     for l in body {
         let t = l.trim();
@@ -182,22 +181,58 @@ fn render_chart(body: &[&str]) -> String {
         .map(|(_, v)| *v)
         .fold(0.0_f64, |a, b| a.max(b))
         .max(1e-9);
-    let label_w = rows.iter().map(|(l, _)| display_width(l)).max().unwrap_or(0);
-    const BAR_MAX: usize = 26;
+    let available = max_w.unwrap_or(48).max(1);
+    if available < 10 {
+        return rows
+            .iter()
+            .flat_map(|(label, value)| wrap_text(&format!("{label} {}", fmt_num(*value)), available))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let value_w = rows
+        .iter()
+        .map(|(_, v)| display_width(&fmt_num(*v)))
+        .max()
+        .unwrap_or(1);
+    let natural_label = rows
+        .iter()
+        .map(|(l, _)| display_width(l))
+        .max()
+        .unwrap_or(0);
+    let label_w = natural_label.min((available / 3).max(1));
+    let bar_w = available
+        .saturating_sub(label_w + value_w + 4)
+        .max(1);
     let mut out: Vec<String> = Vec::new();
     for (label, v) in &rows {
-        let filled = ((*v / max_v) * BAR_MAX as f64).round() as usize;
-        let filled = filled.min(BAR_MAX);
-        let pad = label_w - display_width(label);
+        let label = truncate_width(label, label_w);
+        let filled = ((*v / max_v) * bar_w as f64).round() as usize;
+        let filled = filled.min(bar_w);
+        let pad = label_w.saturating_sub(display_width(&label));
+        let value = fmt_num(*v);
         out.push(format!(
-            "{label}{} │{}{} {}",
+            "{label}{} │{}{} {:>value_w$}",
             " ".repeat(pad),
             "█".repeat(filled),
-            "░".repeat(BAR_MAX - filled),
-            fmt_num(*v)
+            "░".repeat(bar_w - filled),
+            value,
         ));
     }
     out.join("\n")
+}
+
+fn truncate_width(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = ch_width(ch);
+        if used + w > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
 }
 
 fn fmt_num(v: f64) -> String {
@@ -209,12 +244,12 @@ fn fmt_num(v: f64) -> String {
 }
 
 /// 코드블록 안에 통째로 담긴 표(모델이 흔히 그렇게 출력함)도 그리드로 승격시킨다.
-fn upgrade_fenced_tables(out: &mut Vec<MdSeg>) {
-    for i in 0..out.len() {
-        if out[i].kind != MdKind::CodeBlock {
+fn upgrade_fenced_tables(out: &mut [MdSeg], max_w: Option<usize>) {
+    for segment in out {
+        if segment.kind != MdKind::CodeBlock {
             continue;
         }
-        let body_lines: Vec<&str> = out[i].text.split('\n').collect();
+        let body_lines: Vec<&str> = segment.text.split('\n').collect();
         if body_lines.len() < 2 || !body_lines.iter().all(|l| is_table_line(l)) {
             continue;
         }
@@ -227,8 +262,8 @@ fn upgrade_fenced_tables(out: &mut Vec<MdSeg>) {
         {
             rows.remove(1);
         }
-        let grid = render_grid(&rows);
-        out[i] = MdSeg::plain(MdKind::Table, grid);
+        let grid = render_grid_with_width(&rows, max_w);
+        *segment = MdSeg::plain(MdKind::Table, grid);
     }
 }
 
@@ -251,17 +286,45 @@ fn split_row(line: &str) -> Vec<String> {
     t.split('|').map(|c| c.trim().to_string()).collect()
 }
 
-/// 셀 폭(한글 2칸 포함)의 최댓값으로 그리드를 맞춰 재조립한다.
-fn render_grid(rows: &[Vec<String>]) -> String {
-    render_grid_with_width(rows, None)
-}
-
 /// max_w 를 넘으면 셀 내용을 여러 물리 행으로 나눠 표를 좁힌다 (반응형 박스).
 fn render_grid_with_width(rows: &[Vec<String>], max_w: Option<usize>) -> String {
     if rows.is_empty() {
         return String::new();
     }
     let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if ncols == 0 {
+        return String::new();
+    }
+    if let Some(max_w) = max_w {
+        if max_w < 44 {
+            let headers = &rows[0];
+            let data = if rows.len() > 1 { &rows[1..] } else { rows };
+            let mut compact = Vec::new();
+            for (row_index, row) in data.iter().enumerate() {
+                for column in 0..ncols {
+                    let header = headers.get(column).map(String::as_str).unwrap_or("");
+                    let value = row.get(column).map(String::as_str).unwrap_or("");
+                    let line = if header.is_empty() {
+                        value.to_string()
+                    } else {
+                        format!("{header}: {value}")
+                    };
+                    compact.extend(wrap_text(&line, max_w.max(1)));
+                }
+                if row_index + 1 < data.len() {
+                    compact.push(String::new());
+                }
+            }
+            return compact.join("\n");
+        }
+        if max_w < ncols.saturating_mul(4).saturating_add(1) {
+            return rows
+                .iter()
+                .flat_map(|row| wrap_text(&row.join(" | "), max_w.max(1)))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
     // 자연 폭 계산
     let natural = |rows: &[Vec<String>]| -> Vec<usize> {
         let mut widths = vec![0usize; ncols];
@@ -288,7 +351,11 @@ fn render_grid_with_width(rows: &[Vec<String>], max_w: Option<usize>) -> String 
         })
         .collect();
     if let Some(max_w) = max_w {
-        let min_col = 6usize;
+        let min_col = max_w
+            .saturating_sub(ncols.saturating_mul(3).saturating_add(1))
+            .checked_div(ncols)
+            .unwrap_or(1)
+            .clamp(1, 6);
         let mut guard = 0;
         while total_of(&widths) > max_w && guard < 40 {
             guard += 1;
@@ -522,6 +589,40 @@ mod tests {
         assert!(chart.text.contains('█'));
         assert!(chart.text.contains("100"));
         assert!(!chart.text.contains("```"));
+    }
+
+    #[test]
+    fn box_drawing_characters_use_single_terminal_column() {
+        assert_eq!(ch_width('│'), 1);
+        assert_eq!(ch_width('┌'), 1);
+        assert_eq!(ch_width('한'), 2);
+    }
+
+    #[test]
+    fn charts_and_tables_fit_requested_width() {
+        let chart = markdown_segs_with_width("```chart\n긴라벨: 100\nB: 50\n```", Some(18));
+        assert!(chart.iter().all(|seg| {
+            seg.text
+                .lines()
+                .all(|line| display_width(line) <= 18)
+        }));
+
+        let table = markdown_segs_with_width(
+            "| 이름 | 아주 긴 설명 |\n|---|---|\n| 항목 | 창 너비에 맞춰 줄바꿈되어야 한다 |",
+            Some(22),
+        );
+        assert!(table.iter().all(|seg| {
+            seg.text
+                .lines()
+                .all(|line| display_width(line) <= 22)
+        }));
+        assert!(
+            table
+                .iter()
+                .flat_map(|seg| seg.text.lines())
+                .all(|line| !line.contains('┌')),
+            "좁은 표는 겹치는 박스 대신 세로형 레이아웃을 사용해야 한다"
+        );
     }
 
     #[test]

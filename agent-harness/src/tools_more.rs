@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
@@ -24,6 +25,39 @@ pub struct TodoItem {
     pub priority: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TodoProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub percent: usize,
+}
+
+pub fn todo_progress(items: &[TodoItem]) -> TodoProgress {
+    let completed = items
+        .iter()
+        .filter(|item| item.status == "completed")
+        .count();
+    let total = items.len();
+    TodoProgress {
+        completed,
+        total,
+        percent: completed
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0),
+    }
+}
+
+pub fn has_open_todos() -> bool {
+    current_todos()
+        .iter()
+        .any(|item| item.status != "completed")
+}
+
+pub fn clear_todos() {
+    store_todos(&[]);
+}
+
 fn todo_slot() -> &'static Mutex<Vec<TodoItem>> {
     static SLOT: OnceLock<Mutex<Vec<TodoItem>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(Vec::new()))
@@ -37,6 +71,7 @@ fn store_todos(items: &[TodoItem]) {
     if let Ok(mut g) = todo_slot().lock() {
         *g = items.to_vec();
     }
+    crate::ui::live_todo(items);
 }
 
 pub fn render_todos(items: &[TodoItem]) -> String {
@@ -463,13 +498,20 @@ impl Tool for MultiEdit {
         let resolved = crate::tools::resolve_tool_path(ctx, path)?;
         let body = fs::read_to_string(&resolved)
             .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", resolved.display()))?;
-        let updated = Self::apply(&body, &edits)?;
+        let mut updated = body.clone();
+        let mut reports = Vec::new();
+        for (old, new) in &edits {
+            reports.push(crate::tools::code_change_summary(
+                "수정",
+                &resolved,
+                &updated,
+                old,
+                new,
+            ));
+            updated = Self::apply(&updated, &[(old.clone(), new.clone())])?;
+        }
         fs::write(&resolved, updated)?;
-        Ok(format!(
-            "{}곳 수정 완료: {}",
-            edits.len(),
-            resolved.display()
-        ))
+        Ok(reports.join("\n"))
     }
 }
 
@@ -803,15 +845,21 @@ impl ApplyPatch {
                         fs::create_dir_all(parent)?;
                     }
                     fs::write(&f, content)?;
-                    done.push(format!("추가: {}", f.display()));
+                    done.push(crate::tools::code_change_summary(
+                        "등록", &f, "", "", content,
+                    ));
                 }
                 PatchOp::Delete(rel) => {
                     let f = crate::tools::resolve_tool_path(ctx, rel)?;
                     if !f.is_file() {
                         return Err(anyhow!("삭제 대상이 파일이 아닙니다: {}", f.display()));
                     }
+                    let body = fs::read_to_string(&f)
+                        .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", f.display()))?;
                     fs::remove_file(&f)?;
-                    done.push(format!("삭제: {}", f.display()));
+                    done.push(crate::tools::code_change_summary(
+                        "삭제", &f, &body, &body, "",
+                    ));
                 }
                 PatchOp::Update(rel, changes) => {
                     let f = crate::tools::resolve_tool_path(ctx, rel)?;
@@ -826,10 +874,12 @@ impl ApplyPatch {
                                 f.display()
                             ));
                         }
+                        done.push(crate::tools::code_change_summary(
+                            "수정", &f, &updated, o, n,
+                        ));
                         updated = updated.replacen(o.as_str(), n.as_str(), 1);
                     }
                     fs::write(&f, updated)?;
-                    done.push(format!("수정({}곳): {}", changes.len(), f.display()));
                 }
             }
         }
@@ -889,14 +939,25 @@ impl TaskTool {
         cfg: crate::config::Config,
         prompt: String,
         class: Option<String>,
+        role: Option<String>,
+        model: Option<String>,
     ) -> Result<String> {
         let tc = Self::resolve_class(&prompt, class.as_deref());
-        // 모델 자동선택은 bind() 안에서 그대로 이루어진다.
-        let binding = crate::harness::bind(&cfg, tc, None, None)?;
+        let binding = crate::harness::bind(&cfg, tc, None, model.as_deref())?;
+        static NEXT_AGENT: AtomicU64 = AtomicU64::new(1);
+        let agent_id = format!("agent-{}", NEXT_AGENT.fetch_add(1, Ordering::Relaxed));
+        let role = role.unwrap_or_else(|| binding.profile_name.clone());
+        crate::ui::live_agent(crate::ui::AgentProgress {
+            id: agent_id.clone(),
+            role: role.clone(),
+            model: binding.model.clone(),
+            status: "running".into(),
+        });
         crate::ui::live_line(&format!(
-            "[task] {} → {} ({})",
+            "[task] {} · {} → {} ({})",
+            agent_id,
             binding.class.as_str(),
-            binding.profile_name,
+            role,
             binding.model
         ));
         // 재귀 방지: 안쪽 실행에서는 task 도구를 제거한다.
@@ -910,7 +971,28 @@ impl TaskTool {
             tools,
             ..binding.clone()
         };
-        let outcome = crate::harness::run_pipeline(&cfg, &binding, &prompt, false, None, None, None, None).await?;
+        let outcome = match crate::harness::run_pipeline(
+            &cfg, &binding, &prompt, false, None, None, None, None,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::ui::live_agent(crate::ui::AgentProgress {
+                    id: agent_id,
+                    role,
+                    model: binding.model.clone(),
+                    status: "failed".into(),
+                });
+                return Err(error);
+            }
+        };
+        crate::ui::live_agent(crate::ui::AgentProgress {
+            id: agent_id,
+            role,
+            model: binding.model.clone(),
+            status: outcome.status.clone(),
+        });
         let summary = crate::agent::assistant_text(&outcome.messages);
         Ok(format!(
             "[task 결과] class={} profile={} model={} status={}\n{summary}",
@@ -927,14 +1009,16 @@ impl Tool for TaskTool {
         Self::NAME
     }
     fn description(&self) -> &'static str {
-        "하나의 작업을 독립된 서브에이전트에게 위임합니다. 조사·분석 등 분리된 맥락이 필요할 때 쓰세요. class 는 simple|medium|advanced|dev."
+        "독립된 작업만 서브에이전트에게 위임합니다. role과 필요한 경우 model을 명시하세요. 불필요한 위임은 토큰을 낭비합니다."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "위임할 작업 지시"},
-                "class": {"type": "string", "enum": ["simple", "medium", "advanced", "dev"], "description": "강제 분류. 생략 시 규칙 분류"}
+                "class": {"type": "string", "enum": ["simple", "medium", "advanced", "dev"], "description": "강제 분류. 생략 시 규칙 분류"},
+                "role": {"type": "string", "description": "화면에 표시할 짧은 역할 이름"},
+                "model": {"type": "string", "description": "등록된 모델 ID. 생략하면 하네스가 능력과 비용에 따라 선택"}
             },
             "required": ["prompt"]
         })
@@ -956,12 +1040,20 @@ impl Tool for TaskTool {
             .get("class")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let role = input
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let model = input
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let cfg = crate::config::Config::load(None)?;
         let ask = ctx.local_ask.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let _ = ask; // 승인 흐름은 안쪽 run_pipeline 에서 원래 채널(local_ask)을 쓴다
-                Self::delegate(cfg, prompt, class).await
+            Self::delegate(cfg, prompt, class, role, model).await
             })
         })
     }
@@ -1017,6 +1109,10 @@ mod tests {
         assert!(shown.contains("[x] 읽기"));
         assert!(shown.contains("[~] 고치기"));
         assert!(parse_todos(&json!({"todos":[{"content":"x","status":"weird"}]})).is_err());
+        let progress = todo_progress(&items);
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 2);
+        assert_eq!(progress.percent, 50);
     }
 
     #[test]
@@ -1063,6 +1159,17 @@ mod tests {
         // "*" 필터는 with_names 에서 처리되므로 여기선 제거 로직만 확인
         assert_eq!(filtered.len(), 1);
         assert_ne!(TaskTool::NAME, "task_renamed");
+    }
+
+    #[test]
+    fn task_schema_supports_explicit_role_and_model_routing() {
+        let schema = TaskTool.input_schema();
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+        assert!(properties.contains_key("role"));
+        assert!(properties.contains_key("model"));
     }
 
     #[test]

@@ -22,8 +22,11 @@ pub struct AgentOutcome {
     pub iterations: u32,
     pub input_tokens: u32,
     pub output_tokens: u32,
-    /// 누적 프롬프트 캐시 히트 토큰
+    /// 마지막 모델 요청이 실제로 사용한 입력 컨텍스트 토큰
+    pub context_tokens: u32,
+    /// 마지막 모델 요청에서 재사용한 프롬프트 캐시 토큰
     pub cached_tokens: u32,
+    pub cache_reported: bool,
     pub error: Option<String>,
     pub messages: Vec<Message>,
     pub changed_files: Vec<String>,
@@ -39,7 +42,9 @@ impl Default for AgentOutcome {
             iterations: 0,
             input_tokens: 0,
             output_tokens: 0,
+            context_tokens: 0,
             cached_tokens: 0,
+            cache_reported: false,
             error: None,
             messages: Vec::new(),
             changed_files: Vec::new(),
@@ -129,6 +134,8 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let mut input_tokens = 0u32;
     let mut output_tokens = 0u32;
     let mut cached_tokens = 0u32;
+    let mut cache_reported = false;
+    let mut context_tokens = 0u32;
     let mut denied_any = false;
     let mut call_counts: HashMap<String, u32> = HashMap::new();
     let mut changed_files: Vec<String> = Vec::new();
@@ -144,7 +151,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 iterations,
                 input_tokens,
                 output_tokens,
+                context_tokens,
                 cached_tokens,
+                cache_reported,
                 error: Some("반복 상한".into()),
                 messages,
                 changed_files,
@@ -177,13 +186,25 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             messages: messages.clone(),
             tools: registry.specs(),
             max_tokens: cfg.file.general.max_tokens,
-            stream: false,
+            stream: true,
         };
 
         // 프로바이더 폴백: 주 연결 실패(4xx·5xx·리밋) 시 fallback_order 의 다음 연결로.
         // 주 연결은 원래 모델을 그대로 쓰고, 이후 연결은 role(main) 기준 모델을 쓴다.
         let order = crate::harness::fallback_order(cfg, provider_name, None);
-        let (_used, resp) = crate::harness::chat_with_fallback(cfg, &order, "main", req).await?;
+        crate::ui::live_line(&format!("[모델 작업] 반복 {iterations} · 응답 스트리밍 중"));
+        let mut streamed = false;
+        let (_used, resp) = crate::harness::stream_with_fallback(
+            cfg,
+            &order,
+            "main",
+            req,
+            |piece| {
+                streamed = true;
+                crate::ui::live_chunk(piece);
+            },
+        )
+        .await?;
         crate::graph::node(
             "request",
             model,
@@ -192,13 +213,28 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         );
         input_tokens += resp.input_tokens;
         output_tokens += resp.output_tokens;
-        cached_tokens += resp.cached_tokens;
+        cached_tokens = resp.cached_tokens;
+        cache_reported = resp.cache_reported;
+        context_tokens = if provider_name == "anthropic" {
+            resp.input_tokens.saturating_add(resp.cached_tokens)
+        } else {
+            resp.input_tokens
+        };
         crate::ui::live_status(&format!(
-            "[tokens] in={} out={} (누적 in={} out={})",
-            resp.input_tokens, resp.output_tokens, input_tokens, output_tokens
+            "[tokens] total_in={} total_out={} context={} cache={}",
+            input_tokens,
+            output_tokens,
+            context_tokens,
+            if cache_reported {
+                cached_tokens.to_string()
+            } else {
+                "n/a".into()
+            }
         ));
 
-        print_text_blocks(&resp);
+        if !streamed {
+            print_text_blocks(&resp);
+        }
 
         let tool_uses: Vec<(String, String, serde_json::Value)> = resp
             .content
@@ -221,7 +257,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 iterations,
                 input_tokens,
                 output_tokens,
+                context_tokens,
                 cached_tokens,
+                cache_reported,
                 error: None,
                 messages,
                 changed_files,
@@ -241,7 +279,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 iterations,
                 input_tokens,
                 output_tokens,
+                context_tokens,
                 cached_tokens,
+                cache_reported,
                 error: None,
                 messages,
                 changed_files,
@@ -268,7 +308,9 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                     iterations,
                     input_tokens,
                     output_tokens,
+                    context_tokens,
                     cached_tokens,
+                    cache_reported,
                     error: Some("동일 도구 3회 반복".into()),
                     messages,
                     changed_files,
@@ -342,10 +384,12 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             match tool.run(input.clone(), &ctx) {
                 Ok(out) => {
                     crate::graph::node("tool_post", &name, "ok", Some("tool_pre"));
-                    crate::ui::live_line(&out);
-                    if matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit" | "apply_patch") {
-                        if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
-                            changed_files.push(p.to_string());
+                    if name != "todo_write" {
+                        crate::ui::live_line(&out);
+                    }
+                    for path in changed_paths(&name, &input) {
+                        if !changed_files.contains(&path) {
+                            changed_files.push(path);
                         }
                     }
                     results.push(ContentBlock::ToolResult {
@@ -373,6 +417,33 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             content: results,
         });
     }
+}
+
+fn changed_paths(name: &str, input: &serde_json::Value) -> Vec<String> {
+    if matches!(name, "write_file" | "edit_file" | "multi_edit") {
+        return input
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default();
+    }
+    if name != "apply_patch" {
+        return Vec::new();
+    }
+    let Some(patch) = input.get("patch").and_then(|value| value.as_str()) else {
+        return Vec::new();
+    };
+    crate::tools_more::ApplyPatch::parse(patch)
+        .map(|ops| {
+            ops.into_iter()
+                .map(|op| match op {
+                    crate::tools_more::PatchOp::Add(path, _)
+                    | crate::tools_more::PatchOp::Update(path, _)
+                    | crate::tools_more::PatchOp::Delete(path) => path,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn print_text_blocks(resp: &ChatResponse) {

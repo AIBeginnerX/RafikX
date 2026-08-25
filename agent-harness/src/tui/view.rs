@@ -4,9 +4,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::md::{markdown_segs, MdKind};
+use super::md::MdKind;
 use super::{App, EntryKind};
 use crate::palette::{self, Theme};
+
+const CONTINUATION_PREFIX: &str = "       ";
 
 /// ratatui 색으로 변환한 팔레트.
 pub struct Pal {
@@ -61,32 +63,43 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // 입력이 "/" 로 시작하면 하단에 명령 팔레트를 깐다 (최대 5개 + 총 개수).
     let slash_hits = slash_matches(app);
-    let pal_h = if slash_hits.is_empty() {
+    let wanted_pal_h = if slash_hits.is_empty() {
         0u16
     } else {
-        (slash_hits.len().min(9) + 1) as u16
+        slash_palette_height(slash_hits.len())
     };
+    let rows = responsive_rows(
+        area.width,
+        area.height,
+        todo_panel_height(app, area.width),
+        wanted_pal_h,
+        input_height(app, area.width),
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(input_height(app, area.width)),
-            Constraint::Length(pal_h),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(rows[0]),
+            Constraint::Length(rows[1]),
+            Constraint::Length(rows[2]),
+            Constraint::Length(rows[3]),
+            Constraint::Length(rows[4]),
+            Constraint::Length(rows[5]),
+            Constraint::Length(rows[6]),
         ])
         .split(area);
 
     draw_header(f, app, chunks[0], &th);
     draw_transcript_frame(f, app, chunks[1], &th);
-    draw_input(f, app, chunks[2], &th);
-    if pal_h > 0 {
-        draw_slash_palette(f, chunks[3], &slash_hits, &th);
+    if rows[2] > 0 {
+        draw_todo_panel(f, app, chunks[2], &th);
     }
-    draw_status_strip(f, app, chunks[4], &th);
-    draw_footer(f, app, chunks[5], &th);
+    draw_input(f, app, chunks[3], &th);
+    if rows[4] > 0 {
+        draw_slash_palette(f, chunks[4], &slash_hits, &th);
+    }
+    draw_status_strip(f, app, chunks[5], &th);
+    draw_footer(f, app, chunks[6], &th);
 
     if app.help {
         draw_overlay(f, area, "키", super::md::KEY_HELP, &th);
@@ -146,12 +159,132 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_overlay(f, area, &c.title, &c.body, &th);
     }
     if let Some(p) = &app.approval {
-        let body = format!(
-            "{}\n\n[y] 이번만   [n] 거부   [a] 이번 실행 모두",
-            p.preview
-        );
-        draw_overlay(f, area, "도구 승인", &body, &th);
+        draw_approval_popup(f, area, &p.preview, &th);
     }
+}
+
+fn slash_palette_height(hit_count: usize) -> u16 {
+    if hit_count == 0 {
+        0
+    } else {
+        // 상단 경계선 1행 + 개수 헤더 1행 + 실제 명령 목록.
+        (hit_count.min(9) + 2) as u16
+    }
+}
+
+fn responsive_rows(
+    _width: u16,
+    height: u16,
+    wanted_todo: u16,
+    wanted_palette: u16,
+    wanted_input: u16,
+) -> [u16; 7] {
+    let header = u16::from(height >= 5);
+    let status = u16::from(height >= 3);
+    let footer = u16::from(height >= 4);
+    let fixed = header + status + footer;
+    let remaining = height.saturating_sub(fixed);
+    let input = wanted_input.max(1).min(remaining);
+    let after_input = remaining.saturating_sub(input);
+    let todo = if height >= 8 {
+        wanted_todo.min(after_input.saturating_sub(3))
+    } else {
+        0
+    };
+    let after_todo = after_input.saturating_sub(todo);
+    let palette = if height >= 8 {
+        wanted_palette.min(after_todo.saturating_sub(3))
+    } else {
+        0
+    };
+    let transcript = after_todo.saturating_sub(palette);
+    [header, transcript, todo, input, palette, status, footer]
+}
+
+fn todo_panel_height(app: &App, width: u16) -> u16 {
+    if app.todos.is_empty() && app.agents.is_empty() {
+        0
+    } else {
+        let content_width = width.saturating_sub(4).max(1) as usize;
+        let todo_rows = app
+            .todos
+            .iter()
+            .map(|item| super::md::wrap_text(&item.content, content_width).len().max(1))
+            .sum();
+        progress_panel_height(todo_rows, app.agents.len(), width)
+    }
+}
+
+fn progress_panel_height(todo_count: usize, agent_count: usize, _width: u16) -> u16 {
+    (todo_count + agent_count + 2).min(u16::MAX as usize) as u16
+}
+
+fn draw_todo_panel(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
+    if area.height == 0 || (app.todos.is_empty() && app.agents.is_empty()) {
+        return;
+    }
+    let progress = crate::tools_more::todo_progress(&app.todos);
+    let bar_width = area.width.saturating_sub(28).clamp(4, 20) as usize;
+    let filled = progress
+        .completed
+        .saturating_mul(bar_width)
+        .checked_div(progress.total)
+        .unwrap_or(0);
+    let mut rows = vec![Line::from(vec![
+        Span::styled(
+            format!(" Todo {}/{} ", progress.completed, progress.total),
+            Style::default().fg(th.secondary).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("■".repeat(filled), Style::default().fg(th.accent)),
+        Span::styled("·".repeat(bar_width - filled), Style::default().fg(th.mute)),
+        Span::styled(
+            format!(" {}%", progress.percent),
+            Style::default().fg(th.mute),
+        ),
+    ])];
+    for item in &app.todos {
+        let (mark, style) = match item.status.as_str() {
+            "completed" => (
+                "o",
+                Style::default()
+                    .fg(th.mute)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+            "in_progress" => (
+                "●",
+                Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+            ),
+            _ => ("○", Style::default().fg(th.body)),
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), style),
+            Span::styled(item.content.clone(), style),
+        ]));
+    }
+    for agent in &app.agents {
+        let (mark, color) = match agent.status.as_str() {
+            "running" => ("●", th.code),
+            "failed" | "denied" => ("!", th.err),
+            _ => ("o", th.mute),
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{} · {} · {}", agent.role, agent.model, agent.status),
+                Style::default().fg(color),
+            ),
+        ]));
+    }
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(th.mute))
+        .style(Style::default().bg(th.bg));
+    f.render_widget(
+        Paragraph::new(rows)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
@@ -168,18 +301,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         Span::raw(" "),
         // 하네스 정보 (모델명 제외 — 자동/수동 + 엔진)
         Span::styled(
-            format!(
-                "하네스 {} · {}",
-                if app.session.cfg.file.harness.selection.eq_ignore_ascii_case("manual") {
-                    "수동"
-                } else {
-                    "자동"
-                },
-                if app.session.cfg.file.general.engine.eq_ignore_ascii_case("deepseek") {
-                    "deepseek"
-                } else {
-                    "rafikx"
-                }
+            harness_header_label(
+                app.session
+                    .cfg
+                    .file
+                    .harness
+                    .selection
+                    .eq_ignore_ascii_case("manual"),
+                app.session.cfg.file.general.engine.as_str(),
             ),
             Style::default().fg(th.code),
         ),
@@ -192,26 +321,31 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
 
 /// 대화 영역을 테두리로 감싼 뒤 내부에 트랜스크립트를 그린다.
 fn draw_transcript_frame(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
+    if area.width < 4 || area.height < 3 {
+        draw_transcript(f, app, area, th);
+        return;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(th.mute))
         .style(Style::default().bg(th.bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    draw_transcript(f, app, inner, &th);
+    draw_transcript(f, app, inner, th);
 }
 
 fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let mut lines: Vec<Line> = Vec::new();
     for e in &app.transcript {
-        let text = if e.kind == EntryKind::Assistant {
-            compact_blank(&hide_thinking(&e.text))
-        } else {
-            e.text.clone()
+        let text = match e.kind {
+            EntryKind::Assistant => compact_blank(&display_model_work(&e.text)),
+            EntryKind::User | EntryKind::Queued => super::collapsed_input(&e.text),
+            _ => e.text.clone(),
         };
         if text.trim().is_empty() && e.kind == EntryKind::Assistant {
             continue;
         }
+        let role = coding_role(&text);
         let (tag, style) = match e.kind {
             EntryKind::User => (
                 "you",
@@ -223,7 +357,13 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                 Style::default().fg(th.code).add_modifier(Modifier::BOLD),
             ),
             EntryKind::System => ("sys", Style::default().fg(th.mute)),
-            EntryKind::Tool => ("tool", Style::default().fg(th.secondary)),
+            EntryKind::Tool => match role {
+                CodeRole::Create => ("create", Style::default().fg(Color::Green)),
+                CodeRole::Edit => ("edit", Style::default().fg(th.warn)),
+                CodeRole::Delete => ("delete", Style::default().fg(th.err)),
+                CodeRole::Verify => ("verify", Style::default().fg(th.secondary)),
+                CodeRole::Other => ("tool", Style::default().fg(th.secondary)),
+            },
             EntryKind::Warn => (
                 "!",
                 Style::default()
@@ -237,52 +377,63 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         let push_row = |lines: &mut Vec<Line>, text: &str, st: Style, first: &mut bool| {
             if *first {
                 lines.push(Line::from(vec![
-                    Span::styled(format!(" {tag_pad}|"), style),
+                    Span::styled(format!(" {tag_pad}"), style),
                     Span::styled(format!(" {text}"), st),
                 ]));
                 *first = false;
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled("        |", Style::default().fg(th.mute)),
+                    Span::styled(CONTINUATION_PREFIX, Style::default().fg(th.mute)),
                     Span::styled(format!(" {text}"), st),
                 ]));
             }
         };
 
         if e.kind == EntryKind::Assistant {
-            // 반응형 표 — 채팅창 폭에 맞춰 셀 자동 줄바꿈
-            let segs = crate::tui::md::markdown_segs_with_width(&text, Some(area.width.max(24) as usize));
-            for seg in &segs {
-                // 코드블록은 oh-my-pi 스타일 syntax highlighting 으로 그린다.
-                if seg.kind == MdKind::CodeBlock {
-                    push_code_rows(
-                        &mut lines,
-                        &seg.text,
-                        seg.lang.as_deref(),
-                        th,
-                        &tag_pad,
-                        &mut first,
-                    );
+            let content_width = area.width.saturating_sub(8).max(1) as usize;
+            for (is_work, section) in split_model_work(&text) {
+                if is_work {
+                    let work_style = Style::default()
+                        .fg(th.mute)
+                        .add_modifier(Modifier::ITALIC);
+                    push_row(&mut lines, "모델 작업", work_style, &mut first);
+                    for row in super::md::wrap_text(&section, content_width) {
+                        push_row(&mut lines, &row, work_style, &mut first);
+                    }
                     continue;
                 }
-                let st = match seg.kind {
-                    MdKind::Heading => Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
-                    MdKind::Emphasis => Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
-                    MdKind::Code | MdKind::CodeBlock | MdKind::Table | MdKind::Chart => {
-                        // oh-my-pi 스타일 — 코드/표/차트를 어두운 패널 배경으로 본문과 분리한다.
-                        Style::default().fg(th.code).bg(th.panel)
+                let segs =
+                    crate::tui::md::markdown_segs_with_width(&section, Some(content_width));
+                for seg in &segs {
+                    if seg.kind == MdKind::CodeBlock {
+                        push_code_rows(
+                            &mut lines,
+                            &seg.text,
+                            seg.lang.as_deref(),
+                            th,
+                            &tag_pad,
+                            &mut first,
+                        );
+                        continue;
                     }
-                    MdKind::Command => Style::default()
-                        .fg(th.secondary)
-                        .add_modifier(Modifier::BOLD),
-                    MdKind::Text => Style::default().fg(th.text),
-                };
-                for piece in seg.text.split('\n') {
-                    push_row(&mut lines, piece, st, &mut first);
+                    let st = match seg.kind {
+                        MdKind::Heading => Style::default()
+                            .fg(th.accent)
+                            .add_modifier(Modifier::BOLD),
+                        MdKind::Emphasis => Style::default()
+                            .fg(th.accent)
+                            .add_modifier(Modifier::BOLD),
+                        MdKind::Code | MdKind::CodeBlock | MdKind::Table | MdKind::Chart => {
+                            Style::default().fg(th.code).bg(th.panel)
+                        }
+                        MdKind::Command => Style::default()
+                            .fg(th.secondary)
+                            .add_modifier(Modifier::BOLD),
+                        MdKind::Text => Style::default().fg(th.text),
+                    };
+                    for piece in seg.text.split('\n') {
+                        push_row(&mut lines, piece, st, &mut first);
+                    }
                 }
             }
         } else if e.kind == EntryKind::System {
@@ -300,11 +451,11 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                 for row in text.split('\n') {
                     let mut spans: Vec<Span> = Vec::new();
                     if first {
-                        spans.push(Span::styled(format!(" {tag_pad}|"), style));
+                        spans.push(Span::styled(format!(" {tag_pad}"), style));
                         first = false;
                     } else {
                         spans.push(Span::styled(
-                            "        |",
+                            CONTINUATION_PREFIX,
                             Style::default().fg(th.mute),
                         ));
                     }
@@ -312,7 +463,13 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                     lines.push(Line::from(spans));
                 }
             } else {
-                let st = Style::default().fg(th.body);
+                let st = match role {
+                    CodeRole::Create => Style::default().fg(Color::Green),
+                    CodeRole::Edit => Style::default().fg(th.warn),
+                    CodeRole::Delete => Style::default().fg(th.err),
+                    CodeRole::Verify => Style::default().fg(th.secondary),
+                    CodeRole::Other => Style::default().fg(th.body),
+                };
                 for row in text.split('\n') {
                     push_row(&mut lines, row, st, &mut first);
                 }
@@ -365,6 +522,29 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         Paragraph::new(visible).block(block),
         area,
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeRole {
+    Create,
+    Edit,
+    Delete,
+    Verify,
+    Other,
+}
+
+fn coding_role(text: &str) -> CodeRole {
+    if text.contains("[코드 변경] 등록") {
+        CodeRole::Create
+    } else if text.contains("[코드 변경] 수정") {
+        CodeRole::Edit
+    } else if text.contains("[코드 변경] 삭제") {
+        CodeRole::Delete
+    } else if text.contains("[검증]") || text.contains("test result:") {
+        CodeRole::Verify
+    } else {
+        CodeRole::Other
+    }
 }
 
 /// 스팬 열을 지정 폭의 비주얼 행들로 자른다 (스타일 유지).
@@ -445,7 +625,8 @@ fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
 
 fn input_height(app: &App, width: u16) -> u16 {
     let w = width.saturating_sub(2).max(8) as usize;
-    let rows = super::md::wrap_text(&app.input, w).len().max(1);
+    let shown = super::collapsed_input(&app.input);
+    let rows = super::md::wrap_text(&shown, w).len().max(1);
     (rows as u16).clamp(1, 8)
 }
 
@@ -553,12 +734,15 @@ fn push_code_rows(
         let mut all: Vec<Span> = Vec::with_capacity(row_spans.len() + 1);
         if *first {
             all.push(Span::styled(
-                format!(" {tag_pad}|"),
+                format!(" {tag_pad}"),
                 Style::default().fg(th.code).add_modifier(Modifier::BOLD),
             ));
             *first = false;
         } else {
-            all.push(Span::styled("        |", Style::default().fg(th.mute)));
+            all.push(Span::styled(
+                CONTINUATION_PREFIX,
+                Style::default().fg(th.mute),
+            ));
         }
         all.extend(row_spans);
         lines.push(Line::from(all));
@@ -629,27 +813,67 @@ fn highlight_code(code: &str, lang: Option<&str>, th: &Pal) -> Vec<Vec<Span<'sta
     out
 }
 
-/// 모델의 사고 블록(<think>…</think>)을 화면에서 숨긴다. 미완결 블록도 숨김.
-pub fn hide_thinking(s: &str) -> String {
+/// 공급자가 공개 응답으로 보낸 작업 블록을 일반 답변과 구분해 그대로 표시한다.
+pub fn display_model_work(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    'outer: loop {
-        for open in THINK_OPEN {
-            if let Some(i) = rest.find(open) {
-                out.push_str(&rest[..i]);
-                let after = &rest[i + open.len()..];
-                for close in THINK_CLOSE {
-                    if let Some(j) = after.find(close) {
-                        rest = &after[j + close.len()..];
-                        continue 'outer;
-                    }
-                }
-                return out;
-            }
+    loop {
+        let Some((start, open)) = THINK_OPEN
+            .iter()
+            .filter_map(|open| rest.find(open).map(|i| (i, *open)))
+            .min_by_key(|(i, _)| *i)
+        else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + open.len()..];
+        out.push_str("\n[모델 작업]\n");
+        if let Some((end, close)) = THINK_CLOSE
+            .iter()
+            .filter_map(|close| after.find(close).map(|i| (i, *close)))
+            .min_by_key(|(i, _)| *i)
+        {
+            out.push_str(&after[..end]);
+            out.push_str("\n[/모델 작업]\n");
+            rest = &after[end + close.len()..];
+        } else {
+            out.push_str(after);
+            return out;
         }
-        out.push_str(rest);
-        return out;
     }
+}
+
+fn split_model_work(text: &str) -> Vec<(bool, String)> {
+    const OPEN: &str = "[모델 작업]";
+    const CLOSE: &str = "[/모델 작업]";
+    let mut sections = Vec::new();
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find(OPEN) else {
+            let plain = rest.trim_matches('\n');
+            if !plain.is_empty() {
+                sections.push((false, plain.to_string()));
+            }
+            break;
+        };
+        let plain = rest[..start].trim_matches('\n');
+        if !plain.is_empty() {
+            sections.push((false, plain.to_string()));
+        }
+        let work = &rest[start + OPEN.len()..];
+        if let Some(end) = work.find(CLOSE) {
+            sections.push((true, work[..end].trim_matches('\n').to_string()));
+            rest = &work[end + CLOSE.len()..];
+        } else {
+            sections.push((true, work.trim_matches('\n').to_string()));
+            break;
+        }
+    }
+    if sections.is_empty() {
+        sections.push((false, String::new()));
+    }
+    sections
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
@@ -667,7 +891,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             Modifier::BOLD
         });
     let mut lines: Vec<Line> = Vec::new();
-    let mut rows = app.input.split('\n');
+    let shown = super::collapsed_input(&app.input);
+    let mut rows = shown.split('\n');
     let first = rows.next().unwrap_or("");
     lines.push(Line::from(vec![
         Span::styled(format!("{mark} "), mark_style),
@@ -681,7 +906,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     }
     f.render_widget(Paragraph::new(lines).style(Style::default().bg(th.bg)), area);
 
-    if !app.busy
+    if shown == app.input
+        && !app.busy
         && app.approval.is_none()
         && !app.help
         && app.picker.is_none()
@@ -728,18 +954,41 @@ fn cursor_xy(text: &str, cursor: usize, width: u16) -> (u16, u16) {
 fn draw_status_strip(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let mut spans: Vec<Span> = Vec::new();
-    // 선으로 그린 로고 마크 + 이름
+    // 이미지 프로토콜 없이 모든 터미널에서 보이는 NAI 선형 마크.
     spans.push(Span::styled(
-        " ◈ ",
-        Style::default().fg(th.secondary),
+        super::STATUS_MARK,
+        Style::default()
+            .fg(if app.busy { th.code } else { th.secondary })
+            .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(
-        "RAFIKX",
+        super::STATUS_NAME,
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled(" │", Style::default().fg(th.mute)));
+    spans.push(Span::styled(
+        super::STATUS_DIVIDER,
+        Style::default().fg(th.mute),
+    ));
+    spans.push(Span::styled(
+        status_model_label(&selected_model_label(app)),
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(" ·", Style::default().fg(th.mute)));
 
-    if app.busy {
+    if app.approval.is_some() {
+        spans.push(Span::styled(
+            super::APPROVAL_YES,
+            Style::default().fg(Color::Green),
+        ));
+        spans.push(Span::styled(
+            super::APPROVAL_NO,
+            Style::default().fg(th.err),
+        ));
+        spans.push(Span::styled(
+            super::APPROVAL_ALWAYS,
+            Style::default().fg(th.warn),
+        ));
+    } else if app.busy {
         // 작업 디지털 표시(진행바) → Working 모양(스피너)
         spans.push(Span::raw(" "));
         spans.extend(digital_bar(14));
@@ -752,53 +1001,12 @@ fn draw_status_strip(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             format!(" {frame} Working"),
             Style::default().fg(th.code).add_modifier(Modifier::BOLD),
         ));
-        if let Some(phase) = crate::spinner::current_label() {
-            spans.push(Span::styled(format!(" · {phase}"), Style::default().fg(th.mute)));
-        }
     } else {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             "✓ Ready",
             Style::default().fg(th.mute),
         ));
-    }
-
-    // 선택된 모델의 컨텍스트 창 — 실행 전에도 즉시 확인 가능 (세션 재진입 포함)
-    {
-        let cfg = &app.session.cfg;
-        let (pname, mname) = match (&app.session.provider, &app.session.model) {
-            (Some(p), Some(m)) => (p.clone(), m.clone()),
-            _ => {
-                let dp = cfg.file.general.default_provider.clone();
-                let dm = cfg
-                    .provider(&dp)
-                    .map(|x| x.model.clone())
-                    .unwrap_or_default();
-                (dp, dm)
-            }
-        };
-        let win = if crate::harness::current_ctx_window() > 0 {
-            crate::harness::current_ctx_window()
-        } else {
-            crate::packer::context_window_for(&pname, &mname, cfg.provider(&pname).ok())
-        };
-        if win > 0 {
-            let fmt_k = |n: u32| -> String {
-                if n >= 1_000_000 {
-                    format!("{:.0}M", n as f64 / 1e6)
-                } else if n >= 1_000 {
-                    format!("{:.0}k", n as f64 / 1e3)
-                } else {
-                    n.to_string()
-                }
-            };
-            spans.push(Span::styled(" │", Style::default().fg(th.mute)));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!("ctx {}", fmt_k(win)),
-                Style::default().fg(th.code),
-            ));
-        }
     }
 
     f.render_widget(
@@ -877,14 +1085,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     };
     line_spans.push(badge);
     line_spans.push(Span::raw(" "));
+    line_spans.push(Span::styled(
+        selected_model_label(app),
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+    ));
+    line_spans.push(Span::raw(" "));
 
     // 사용량(in/out · ctx·캐시)을 우선 배치 — 상태 문자가 길어도 잘리지 않게
     if !app.tokens.is_empty() {
         line_spans.push(Span::styled(app.tokens.clone(), Style::default().fg(th.mute)));
         line_spans.push(Span::raw(" "));
     }
-    if !app.ctx.is_empty() {
-        line_spans.push(Span::styled(app.ctx.clone(), Style::default().fg(th.mute)));
+    let context = if app.ctx.is_empty() {
+        selected_context_label(app)
+    } else {
+        app.ctx.clone()
+    };
+    if !context.is_empty() {
+        line_spans.push(Span::styled(context, Style::default().fg(th.mute)));
         line_spans.push(Span::raw(" "));
     }
 
@@ -894,7 +1112,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             .transcript
             .last()
             .filter(|e| e.kind == EntryKind::Assistant)
-            .map(|e| hide_thinking(&e.text).trim().is_empty())
+            .map(|e| display_model_work(&e.text).trim().is_empty())
             .unwrap_or(false);
         if thinking {
             line_spans.push(Span::styled(
@@ -912,19 +1130,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                 braille_spin().to_string(),
                 Style::default().fg(th.code),
             ));
-            let phase = crate::spinner::current_label().unwrap_or_else(|| "실행 중".into());
-            line_spans.push(Span::styled(format!(" {phase}"), Style::default().fg(th.code)));
+            line_spans.push(Span::styled(" Working", Style::default().fg(th.code)));
         }
     } else {
-        // 남은 폭을 계산해 상태 문자를 잘라 넣는다 — 뒤 항목이 화면 밖으로 밀리지 않게
+        // 남은 폭을 계산해 영어 상태를 넣는다 — 뒤 항목이 화면 밖으로 밀리지 않게
         let used: usize = line_spans.iter().map(|sp| super::md::display_width(&sp.content)).sum();
         let budget = (area.width as usize).saturating_sub(used + 8).max(10);
-        let short: String = app
-            .status
-            .chars()
-            .take(budget)
-            .collect::<String>();
-        let ell = if app.status.chars().count() > budget { "…" } else { "" };
+        let state = footer_state_label(&app.status);
+        let short: String = state.chars().take(budget).collect::<String>();
+        let ell = if state.chars().count() > budget { "…" } else { "" };
         line_spans.push(Span::styled(
             format!("{short}{ell}"),
             Style::default().fg(th.code),
@@ -934,7 +1148,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     if !app.queue.is_empty() {
         line_spans.push(Span::styled("  ·  ", Style::default().fg(th.mute)));
         line_spans.push(Span::styled(
-            format!("대기 {}건", app.queue.len()),
+            format!("Queued {}", app.queue.len()),
+            Style::default().fg(th.secondary),
+        ));
+    }
+    if !app.todos.is_empty() {
+        let progress = crate::tools_more::todo_progress(&app.todos);
+        line_spans.push(Span::styled("  ·  ", Style::default().fg(th.mute)));
+        line_spans.push(Span::styled(
+            format!("Todo {}/{}", progress.completed, progress.total),
             Style::default().fg(th.secondary),
         ));
     }
@@ -943,6 +1165,79 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         Paragraph::new(Line::from(line_spans)).style(Style::default().bg(th.bg)),
         area,
     );
+}
+
+pub(super) fn selected_model_label(app: &App) -> String {
+    app.session
+        .model
+        .clone()
+        .or_else(|| {
+            app.session
+                .cfg
+                .provider(&app.session.cfg.file.general.default_provider)
+                .ok()
+                .map(|provider| provider.model.clone())
+        })
+        .unwrap_or_else(|| "auto".into())
+}
+
+fn harness_header_label(manual: bool, engine: &str) -> String {
+    format!(
+        "Harness {} · {engine}",
+        if manual { "Manual" } else { "Auto" }
+    )
+}
+
+fn footer_state_label(status: &str) -> &'static str {
+    let normalized = status.trim().to_ascii_lowercase();
+    if normalized.contains("fail")
+        || normalized.contains("error")
+        || status.contains("실패")
+        || status.contains("오류")
+    {
+        "Failed"
+    } else if normalized.contains("stop")
+        || normalized.contains("interrupt")
+        || status.contains("중단")
+    {
+        "Stopped"
+    } else {
+        "Ready"
+    }
+}
+
+fn status_model_label(model: &str) -> String {
+    format!(" MODEL {model}")
+}
+
+fn selected_context_label(app: &App) -> String {
+    let cfg = &app.session.cfg;
+    let (provider, model) = match (&app.session.provider, &app.session.model) {
+        (Some(provider), Some(model)) => (provider.as_str(), model.as_str()),
+        _ => {
+            let provider = cfg.file.general.default_provider.as_str();
+            let model = cfg
+                .provider(provider)
+                .map(|p| p.model.as_str())
+                .unwrap_or("");
+            (provider, model)
+        }
+    };
+    let window = crate::packer::context_window_for(provider, model, cfg.provider(provider).ok());
+    if window == 0 {
+        return String::new();
+    }
+    format!("ctx 0/{}", format_tokens(window))
+}
+
+fn format_tokens(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// 부팅 후 경과 밀리초 기반 프레임 인덱스 — ratatui 리드로우 주기와 무관하게 균등 회전.
@@ -969,7 +1264,11 @@ fn box_spin() -> &'static str {
 
 /// 입력이 "/명령 접두어" 형태일 때 일치하는 명령 목록 (공백이 들어가면 숨긴다).
 fn slash_matches(app: &App) -> Vec<&'static (&'static str, &'static str)> {
-    let t = app.input.trim_start();
+    slash_hits_for(&app.input)
+}
+
+fn slash_hits_for(input: &str) -> Vec<&'static (&'static str, &'static str)> {
+    let t = input.trim_start();
     if !t.starts_with('/') {
         return Vec::new();
     }
@@ -1104,17 +1403,8 @@ fn draw_field_overlay(
     _masked: bool,
     th: &Pal,
 ) -> Option<Rect> {
-    let w = area.width.saturating_sub(8).min(76).max(36);
-    let h = 14u16.min(area.height.saturating_sub(4)).max(10);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
+    let rect = overlay_rect(area, 76, 14);
+    f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -1201,17 +1491,8 @@ fn draw_overlay_sized(
     max_h: u16,
     th: &Pal,
 ) {
-    let w = area.width.saturating_sub(8).min(max_w).max(24);
-    let h = area.height.saturating_sub(4).min(max_h).max(8);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
+    let rect = overlay_rect(area, max_w, max_h);
+    f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -1231,24 +1512,110 @@ fn draw_overlay_sized(
     );
 }
 
+pub(super) fn overlay_rect(area: Rect, max_w: u16, max_h: u16) -> Rect {
+    let tight = area.width <= max_w.saturating_add(4)
+        || area.height <= max_h.saturating_add(2);
+    if tight {
+        return area;
+    }
+    let width = max_w.min(area.width).max(1);
+    let height = max_h.min(area.height).max(1);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+fn draw_approval_popup(f: &mut Frame, area: Rect, preview: &str, th: &Pal) {
+    let (rect, buttons) = super::approval_popup_layout(area);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Tool approval ",
+            Style::default()
+                .fg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(th.accent))
+        .style(Style::default().bg(th.bg).fg(th.text));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let preview_height = inner.height.saturating_sub(4);
+    f.render_widget(
+        Paragraph::new(preview)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(th.text)),
+        Rect::new(inner.x, inner.y, inner.width, preview_height),
+    );
+    if inner.height >= 3 && inner.width >= 23 {
+        f.render_widget(
+            Paragraph::new("Select with mouse or press Y / N / A")
+                .style(Style::default().fg(th.mute)),
+            Rect::new(
+                inner.x,
+                rect.y.saturating_add(rect.height.saturating_sub(5)),
+                inner.width,
+                1,
+            ),
+        );
+    }
+    for button in buttons {
+        let color = match button.choice {
+            crate::agent::ApprovalChoice::Yes => Color::Green,
+            crate::agent::ApprovalChoice::No => th.err,
+            crate::agent::ApprovalChoice::Always => th.warn,
+        };
+        f.render_widget(
+            Paragraph::new(button.label).style(
+                Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
+            button.rect,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn hide_thinking_removes_complete_and_open_blocks() {
+    fn model_work_keeps_complete_thinking_visible() {
         assert_eq!(
-            hide_thinking("before<think>secret</think>after"),
-            "beforeafter"
+            display_model_work("before<think>검토 중</think>after"),
+            "before\n[모델 작업]\n검토 중\n[/모델 작업]\nafter"
         );
-        // 스트리밍 중 닫히지 않은 블록도 숨긴다.
-        assert_eq!(hide_thinking("before<think>still going"), "before");
     }
 
     #[test]
-    fn hide_thinking_keeps_plain_text() {
+    fn model_work_keeps_open_thinking_visible_while_streaming() {
+        assert_eq!(
+            display_model_work("before<think>아직 검토 중"),
+            "before\n[모델 작업]\n아직 검토 중"
+        );
+    }
+
+    #[test]
+    fn model_work_keeps_plain_text() {
         let s = "일반 답변입니다";
-        assert_eq!(hide_thinking(s), s);
+        assert_eq!(display_model_work(s), s);
+    }
+
+    #[test]
+    fn model_work_sections_are_separated_from_final_answer() {
+        let sections = split_model_work(
+            "[모델 작업]\n파일을 분석 중\n[/모델 작업]\n최종 답변",
+        );
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].0);
+        assert_eq!(sections[0].1, "파일을 분석 중");
+        assert!(!sections[1].0);
+        assert_eq!(sections[1].1, "최종 답변");
     }
 
     #[test]
@@ -1256,5 +1623,66 @@ mod tests {
         let line = Line::from("한글은 두 칸씩".to_string());
         assert_eq!(wrapped_rows(&line, 100), 1);
         assert!(wrapped_rows(&line, 4) >= 3);
+    }
+
+    #[test]
+    fn narrow_layout_never_allocates_more_rows_than_available() {
+        for height in 1..16 {
+            let rows = responsive_rows(18, height, 4, 9, 3);
+            assert!(rows.iter().copied().sum::<u16>() <= height);
+            if height < 8 {
+                assert_eq!(rows[4], 0, "좁은 높이에서는 명령 팔레트를 접어야 한다");
+                assert_eq!(rows[2], 0, "좁은 높이에서는 Todo 패널을 접어야 한다");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_overlay_uses_one_full_screen_box() {
+        let area = Rect::new(0, 0, 45, 15);
+        assert_eq!(overlay_rect(area, 72, 22), area);
+        let wide = Rect::new(0, 0, 120, 40);
+        assert_eq!(overlay_rect(wide, 72, 22), Rect::new(24, 9, 72, 22));
+    }
+
+    #[test]
+    fn transcript_prefix_reclaims_pipe_column() {
+        assert_eq!(crate::tui::md::display_width(CONTINUATION_PREFIX), 7);
+        assert_eq!(CONTINUATION_PREFIX, "       ");
+        assert_eq!(crate::tui::md::display_width(" rafikx"), 7);
+    }
+
+    #[test]
+    fn exact_slash_command_stays_visible_with_arguments() {
+        let hits = slash_hits_for("/model gpt-5");
+        assert_eq!(hits.first().map(|(name, _)| *name), Some("/model"));
+        assert_eq!(slash_palette_height(hits.len()), 3);
+    }
+
+    #[test]
+    fn todo_panel_requests_every_item_row() {
+        assert_eq!(progress_panel_height(8, 0, 100), 10);
+    }
+
+    #[test]
+    fn code_changes_have_distinct_visual_roles() {
+        assert_eq!(coding_role("[코드 변경] 등록 src/a.rs:1-2"), CodeRole::Create);
+        assert_eq!(coding_role("[코드 변경] 수정 src/a.rs:1-2"), CodeRole::Edit);
+        assert_eq!(coding_role("[코드 변경] 삭제 src/a.rs:1-2"), CodeRole::Delete);
+        assert_eq!(coding_role("[검증] cargo test"), CodeRole::Verify);
+    }
+
+    #[test]
+    fn initial_status_bar_names_the_selected_model() {
+        assert_eq!(status_model_label("minimax-m3"), " MODEL minimax-m3");
+    }
+
+    #[test]
+    fn top_and_bottom_bar_labels_are_english() {
+        assert_eq!(harness_header_label(false, "rafikx"), "Harness Auto · rafikx");
+        assert_eq!(harness_header_label(true, "pi"), "Harness Manual · pi");
+        assert_eq!(footer_state_label("준비"), "Ready");
+        assert_eq!(footer_state_label("실패"), "Failed");
+        assert_eq!(footer_state_label("중단됨"), "Stopped");
     }
 }

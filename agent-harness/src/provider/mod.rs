@@ -76,21 +76,27 @@ pub struct ChatResponse {
     pub output_tokens: u32,
     /// 프롬프트 캐시 히트 토큰 (제공자가 보고할 때만 0보다 크다).
     pub cached_tokens: u32,
+    /// 공급자 응답에 캐시 사용량 필드가 실제 포함됐는지 여부.
+    pub cache_reported: bool,
     pub limit: LimitHint,
 }
 
 /// 응답 JSON에서 캐시 히트 토큰을 끌어낸다 (Anthropic·OpenAI 호환 형식 모두).
 pub fn cached_tokens_from(v: &serde_json::Value) -> u32 {
+    cached_tokens_entry(v).unwrap_or(0)
+}
+
+pub fn cached_tokens_entry(v: &serde_json::Value) -> Option<u32> {
     for ptr in [
         "/usage/cache_read_input_tokens",
         "/usage/prompt_tokens_details/cached_tokens",
         "/usage/cached_content_token_count",
     ] {
         if let Some(n) = v.pointer(ptr).and_then(|x| x.as_u64()) {
-            return n as u32;
+            return Some(n as u32);
         }
     }
-    0
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

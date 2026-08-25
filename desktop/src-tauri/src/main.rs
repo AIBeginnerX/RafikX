@@ -95,6 +95,18 @@ fn install_live(app: AppHandle) {
             Live::System(t) => ("system", t),
             Live::Warn(t) => ("warn", t),
             Live::Status(t) => ("status", t),
+            Live::Todo(items) => (
+                "todo",
+                items
+                    .into_iter()
+                    .map(|item| format!("{}:{}", item.status, item.content))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Live::Agent(agent) => (
+                "agent",
+                format!("{}:{}:{}:{}", agent.id, agent.role, agent.model, agent.status),
+            ),
         };
         let _ = app.emit(
             "live",

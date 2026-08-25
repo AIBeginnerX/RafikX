@@ -79,6 +79,17 @@ impl Db {
               created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_graph_run ON graph_events(run_id, seq);
+            CREATE TABLE IF NOT EXISTS goals (
+              id TEXT PRIMARY KEY,
+              objective TEXT NOT NULL,
+              status TEXT NOT NULL,
+              completed INTEGER NOT NULL DEFAULT 0,
+              total INTEGER NOT NULL DEFAULT 0,
+              continuations INTEGER NOT NULL DEFAULT 0,
+              messages_json TEXT NOT NULL DEFAULT '[]',
+              updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status, updated_at);
             "#,
         )?;
         let db = Self { conn };
@@ -494,6 +505,60 @@ impl Db {
         Ok(out)
     }
 
+    pub fn save_goal(&self, goal: &GoalRow) -> Result<()> {
+        if goal.status == "active" {
+            self.conn.execute(
+                "UPDATE goals SET status = 'superseded', updated_at = ?1 WHERE status = 'active' AND id <> ?2",
+                rusqlite::params![now_secs(), goal.id],
+            )?;
+        }
+        self.conn.execute(
+            "INSERT INTO goals (id, objective, status, completed, total, continuations, messages_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+               objective = excluded.objective,
+               status = excluded.status,
+               completed = excluded.completed,
+               total = excluded.total,
+               continuations = excluded.continuations,
+               messages_json = excluded.messages_json,
+               updated_at = excluded.updated_at",
+            rusqlite::params![
+                goal.id,
+                goal.objective,
+                goal.status,
+                goal.completed as i64,
+                goal.total as i64,
+                i64::from(goal.continuations),
+                goal.messages_json,
+                now_secs()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_goal(&self) -> Result<Option<GoalRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, objective, status, completed, total, continuations, messages_json
+                 FROM goals WHERE status = 'active' ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(GoalRow {
+                        id: row.get(0)?,
+                        objective: row.get(1)?,
+                        status: row.get(2)?,
+                        completed: row.get::<_, i64>(3)? as usize,
+                        total: row.get::<_, i64>(4)? as usize,
+                        continuations: row.get::<_, i64>(5)? as u8,
+                        messages_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn add_lesson(
         &self,
         trigger: &str,
@@ -737,6 +802,17 @@ pub struct GraphEventRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct GoalRow {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    pub completed: usize,
+    pub total: usize,
+    pub continuations: u8,
+    pub messages_json: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunRow {
     #[allow(dead_code)]
     pub id: String,
@@ -862,6 +938,44 @@ mod tests {
         assert!(matches!(w2, LessonWrite::Bumped { .. }));
         let rows = db.lessons_for_inject("edit_file 원문", 5, 2).unwrap();
         assert!(!rows.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn active_goal_persists_continuation_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "rafikx-goal-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("data.db")).unwrap();
+        db.save_goal(&GoalRow {
+            id: "run-1".into(),
+            objective: "기능 완성".into(),
+            status: "active".into(),
+            completed: 2,
+            total: 5,
+            continuations: 3,
+            messages_json: "[]".into(),
+        })
+        .unwrap();
+        let goal = db.active_goal().unwrap().expect("active goal");
+        assert_eq!(goal.objective, "기능 완성");
+        assert_eq!((goal.completed, goal.total, goal.continuations), (2, 5, 3));
+        db.save_goal(&GoalRow {
+            id: "run-1".into(),
+            objective: "기능 완성".into(),
+            status: "complete".into(),
+            completed: 5,
+            total: 5,
+            continuations: 3,
+            messages_json: "[]".into(),
+        })
+        .unwrap();
+        assert!(db.active_goal().unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

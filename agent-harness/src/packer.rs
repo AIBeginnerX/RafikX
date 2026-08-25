@@ -3,6 +3,13 @@ use crate::config::ProviderConfig;
 use crate::provider::{ContentBlock, Message, Role, ToolSpec};
 
 const KEEP_TAIL: usize = 8;
+pub const AUTO_COMPACT_PERCENT: u32 = 80;
+
+pub const fn needs_auto_compaction(used: u32, window: u32) -> bool {
+    window > 0
+        && used.saturating_mul(100)
+            >= window.saturating_mul(AUTO_COMPACT_PERCENT)
+}
 
 /// 대략적인 토큰 수 (문자/4). 정밀 토크나이저는 쓰지 않는다.
 pub fn estimate_tokens(s: &str) -> usize {
@@ -347,5 +354,13 @@ mod tests {
                 i += 1;
             }
         }
+    }
+
+    #[test]
+    fn auto_compaction_starts_at_eighty_percent() {
+        assert!(!needs_auto_compaction(799, 1_000));
+        assert!(needs_auto_compaction(800, 1_000));
+        assert!(needs_auto_compaction(1_000, 1_000));
+        assert!(!needs_auto_compaction(800, 0));
     }
 }

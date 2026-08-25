@@ -117,7 +117,10 @@ impl AnthropicProvider {
         let mut full_text = String::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        let mut cached_tokens = 0u32;
+        let mut cache_reported = false;
         let mut stop_reason = StopReason::Other;
+        let mut thinking_started = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("응답 스트림이 중간에 끊겼습니다")?;
@@ -133,17 +136,37 @@ impl AnthropicProvider {
                     };
                     match v.get("type").and_then(|t| t.as_str()) {
                         Some("message_start") => {
-                            input_tokens = v
-                                .pointer("/message/usage/input_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0) as u32;
+                            take_stream_input_usage(
+                                &v,
+                                &mut input_tokens,
+                                &mut cached_tokens,
+                                &mut cache_reported,
+                            );
                         }
                         Some("content_block_delta") => {
                             if v.pointer("/delta/type").and_then(|x| x.as_str()) == Some("text_delta") {
                                 if let Some(piece) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
                                     if !piece.is_empty() {
+                                        if thinking_started {
+                                            on_text("\n[/모델 작업]\n");
+                                            thinking_started = false;
+                                        }
                                         on_text(piece);
                                         full_text.push_str(piece);
+                                    }
+                                }
+                            } else if v.pointer("/delta/type").and_then(|x| x.as_str())
+                                == Some("thinking_delta")
+                            {
+                                if let Some(piece) =
+                                    v.pointer("/delta/thinking").and_then(|x| x.as_str())
+                                {
+                                    if !piece.is_empty() {
+                                        if !thinking_started {
+                                            on_text("\n[모델 작업]\n");
+                                            thinking_started = true;
+                                        }
+                                        on_text(piece);
                                     }
                                 }
                             }
@@ -157,12 +180,22 @@ impl AnthropicProvider {
                             }
                         }
                         Some("message_stop") => {
+                            if thinking_started {
+                                on_text("\n[/모델 작업]\n");
+                            }
+                            if let Some(stopped_cache) =
+                                crate::provider::cached_tokens_entry(&v)
+                            {
+                                cached_tokens = stopped_cache;
+                                cache_reported = true;
+                            }
                             return Ok(ChatResponse {
                                 content: vec![ContentBlock::Text { text: full_text }],
                                 stop_reason,
                                 input_tokens,
                                 output_tokens,
-                                cached_tokens: crate::provider::cached_tokens_from(&v),
+                                cached_tokens,
+                                cache_reported,
                                 limit: hint.clone(),
                             });
                         }
@@ -306,6 +339,7 @@ fn parse_message_json(text: &str) -> Result<ChatResponse> {
             .and_then(|x| x.as_u64())
             .unwrap_or(0) as u32,
         cached_tokens: crate::provider::cached_tokens_from(&v),
+        cache_reported: crate::provider::cached_tokens_entry(&v).is_some(),
         limit: LimitHint::default(),
     })
 }
@@ -323,6 +357,52 @@ fn sse_data(event: &str) -> Option<&str> {
     } else {
         // 여러 data: 줄을 합치되, 실제로는 한 줄 JSON.
         Some(data_lines[0])
+    }
+}
+
+fn take_stream_input_usage(
+    v: &Value,
+    input_tokens: &mut u32,
+    cached_tokens: &mut u32,
+    cache_reported: &mut bool,
+) {
+    if let Some(n) = v
+        .pointer("/message/usage/input_tokens")
+        .and_then(|x| x.as_u64())
+    {
+        *input_tokens = n as u32;
+    }
+    let cached = v
+        .pointer("/message/usage/cache_read_input_tokens")
+        .or_else(|| v.pointer("/usage/cache_read_input_tokens"))
+        .and_then(|x| x.as_u64());
+    if let Some(cached) = cached {
+        *cached_tokens = cached as u32;
+        *cache_reported = true;
+    }
+}
+
+#[cfg(test)]
+mod streaming_usage_tests {
+    use super::*;
+
+    #[test]
+    fn message_start_keeps_cache_read_tokens_until_stop() {
+        let event = json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 200,
+                    "cache_read_input_tokens": 800
+                }
+            }
+        });
+        let mut input = 0;
+        let mut cached = 0;
+        let mut reported = false;
+        take_stream_input_usage(&event, &mut input, &mut cached, &mut reported);
+        assert_eq!((input, cached), (200, 800));
+        assert!(reported);
     }
 }
 

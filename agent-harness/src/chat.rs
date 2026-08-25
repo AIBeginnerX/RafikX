@@ -13,6 +13,42 @@ use crate::provider::{ChatRequest, ContentBlock, Message, Role};
 /// plan 모드에서 허용되는 읽기 전용 도구만 남긴다.
 const MAX_ATTACH_CHARS: usize = 80_000;
 
+#[derive(Clone, Debug, Default)]
+pub struct CompletionSummary {
+    pub changed_files: Vec<String>,
+    pub iterations: u32,
+    pub completed_todos: usize,
+    pub total_todos: usize,
+    pub tool_errors: usize,
+    pub improvement: String,
+}
+
+impl CompletionSummary {
+    fn from_outcome(outcome: &agent::AgentOutcome, model: &str) -> Self {
+        let todos = crate::tools_more::current_todos();
+        let progress = crate::tools_more::todo_progress(&todos);
+        let improvement = if !outcome.tool_errors.is_empty() {
+            "실패한 도구의 전제조건을 교훈으로 저장하고 다음 실행에서는 확인 후 호출합니다.".into()
+        } else if outcome.iterations >= 8 {
+            "긴 작업을 더 작은 Todo로 나누고 독립 조사만 저비용 서브에이전트에 배치합니다.".into()
+        } else if crate::ranks::normalize_id(model) == "minimax-m3" {
+            "MiniMax-M3의 긴 컨텍스트를 세션 안에서 재사용하고 독립 작업만 위임해 토큰 중복을 줄입니다.".into()
+        } else if outcome.changed_files.is_empty() {
+            "도구로 확인한 근거와 추론을 분리해 다음 답변의 검증 가능성을 높입니다.".into()
+        } else {
+            "변경 파일별 최소 검증을 유지하고 반복 수정 패턴만 재사용 교훈으로 저장합니다.".into()
+        };
+        Self {
+            changed_files: outcome.changed_files.clone(),
+            iterations: outcome.iterations,
+            completed_todos: progress.completed,
+            total_todos: progress.total,
+            tool_errors: outcome.tool_errors.len(),
+            improvement,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Session {
     pub cfg: Config,
@@ -24,6 +60,8 @@ pub struct Session {
     pub mode: String,
     pub session_id: Option<String>,
     pub messages: Vec<Message>,
+    /// 직전 모델 요청이 사용한 컨텍스트 토큰. 다음 턴의 자동 압축 판단에 사용한다.
+    pub last_context_tokens: u32,
     pub obsidian_on: bool,
     /// /file 로 붙인 첨부 (경로, 내용) — 다음 턴의 컨텍스트로 주입된 뒤 비운다.
     pub attachments: Vec<(String, String)>,
@@ -40,6 +78,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/provider", "기본 연결 변경"),
     ("/model", "모델 선택"),
     ("/engine", "하네스 엔진 rafikx|deepseek|dk|pi"),
+    ("/harness", "Harness strategy single|multi"),
     ("/mode", "plan(읽기전용)/build 전환"),
     ("/class", "분류 고정 simple|medium|advanced|dev"),
     ("/agent", "코딩 실행"),
@@ -51,6 +90,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/undo", "마지막 질문 되돌리기"),
     ("/tools", "도구 목록"),
     ("/todo", "작업 목록 보기"),
+    ("/goal", "장기 목표 상태"),
     ("/status", "연결·사용량 요약"),
     ("/theme", "테마 변경"),
     ("/obsidian", "볼트 사용 on|off"),
@@ -191,13 +231,14 @@ pub fn open_session(
             mode: "build".into(),
             session_id: Some(row.id),
             messages,
+            last_context_tokens: 0,
             obsidian_on: false,
             attachments: Vec::new(),
             dirty: false,
             sticky: None,
         }));
     }
-    Ok(seed_last_choice(Session {
+    Ok(seed_default_choice(Session {
         cfg,
         yes,
         provider,
@@ -206,11 +247,30 @@ pub fn open_session(
         mode: "build".into(),
         session_id: None,
         messages: Vec::new(),
+        last_context_tokens: 0,
         obsidian_on: false,
         attachments: Vec::new(),
         dirty: false,
         sticky: None,
     }))
+}
+
+fn default_new_session_pair(cfg: &Config) -> Option<(String, String)> {
+    crate::auth::registered_models(cfg)
+        .into_iter()
+        .find(|model| crate::ranks::normalize_id(&model.id) == "minimax-m3")
+        .map(|model| (model.provider, model.id))
+}
+
+fn seed_default_choice(mut session: Session) -> Session {
+    if session.provider.is_none()
+        && session.model.is_none()
+        && let Some((provider, model)) = default_new_session_pair(&session.cfg)
+    {
+        session.provider = Some(provider);
+        session.model = Some(model);
+    }
+    session
 }
 
 /// 재시작 후에도 이전에 선택/성공한 (provider, model)을 이어받는다.
@@ -220,11 +280,22 @@ fn seed_last_choice(mut s: Session) -> Session {
         let lp = s.cfg.file.general.last_provider.trim();
         let lm = s.cfg.file.general.last_model.trim();
         if !lp.is_empty() && !lm.is_empty() && s.cfg.file.providers.contains_key(lp) {
+            let valid_pair = crate::auth::registered_models(&s.cfg)
+                .iter()
+                .any(|r| r.provider == lp && r.id == lm);
+            let selected_model = if valid_pair {
+                lm.to_string()
+            } else {
+                s.cfg
+                    .provider(lp)
+                    .map(|p| p.model.clone())
+                    .unwrap_or_default()
+            };
             if s.provider.is_none() {
                 s.provider = Some(lp.to_string());
             }
-            if s.model.is_none() {
-                s.model = Some(lm.to_string());
+            if s.model.is_none() && !selected_model.is_empty() {
+                s.model = Some(selected_model);
             }
         }
     }
@@ -289,8 +360,16 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             session.attachments.clear();
             session.session_id = None;
             session.dirty = false;
+            session.sticky = None;
+            if let Some((provider, model)) = default_new_session_pair(&session.cfg) {
+                session.provider = Some(provider);
+                session.model = Some(model);
+            }
             Ok(Slash::Continue(vec![
-                "새 세션을 시작합니다. 이전 대화는 /sessions 에서 찾을 수 있습니다.".into()
+                format!(
+                    "새 세션을 시작합니다. 기본 모델: {}",
+                    session.model.as_deref().unwrap_or("auto")
+                )
             ]))
         }
         "/clear" => {
@@ -321,6 +400,35 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 Ok(Slash::Continue(vec![
                     format!("/engine {ENGINES} 중에서 고르세요.")
                 ]))
+            }
+        }
+        "/harness" => {
+            let strategy = rest.trim().to_ascii_lowercase();
+            if strategy.is_empty() {
+                return Ok(Slash::Continue(vec![format!(
+                    "Harness strategy: {}   ·   /harness single|multi",
+                    session.cfg.file.harness.strategy
+                )]));
+            }
+            let Some(parsed) = crate::harness::HarnessStrategy::parse(&strategy) else {
+                return Ok(Slash::Continue(vec![
+                    "Choose: [1] Single  [2] Multi   ·   /harness single|multi".into(),
+                ]));
+            };
+            match crate::harness::set_strategy(&session.cfg, parsed)
+                .and_then(|_| session.cfg.reload())
+            {
+                Ok(cfg) => {
+                    session.cfg = cfg;
+                    session.sticky = None;
+                    Ok(Slash::Continue(vec![format!(
+                        "Harness strategy: {}",
+                        session.cfg.file.harness.strategy
+                    )]))
+                }
+                Err(error) => Ok(Slash::Continue(vec![format!(
+                    "Harness strategy 저장 실패: {error:#}"
+                )])),
             }
         }
         "/mode" => {
@@ -461,6 +569,16 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
         "/todo" => Ok(Slash::Continue(vec![crate::tools_more::render_todos(
             &crate::tools_more::current_todos(),
         )])),
+        "/goal" => {
+            let active = db.active_goal()?;
+            Ok(Slash::Continue(vec![match active {
+                Some(goal) => format!(
+                    "진행 중 목표: {} · Todo {}/{} · 연속 실행 {}/8",
+                    goal.objective, goal.completed, goal.total, goal.continuations
+                ),
+                None => "진행 중인 장기 목표가 없습니다.".into(),
+            }]))
+        }
         "/status" => {
             let cfg = &session.cfg;
             let db2 = Db::open(&Db::db_path()?)?;
@@ -643,6 +761,7 @@ pub(crate) fn help_text() -> String {
      /tools                현재 모드에서 쓸 수 있는 도구\n\
      /status               연결·하네스·오늘 사용량 요약\n\
      /todo                 작업 목록 보기\n\
+     /goal                 장기 목표·자동 연속 실행 상태\n\
      /file <경로>          다음 질문에 파일 첨부 (@src/main.rs 멘션도 가능)\n\
      /sessions · /resume <id>   세션 목록 · 이어하기\n\
      /find <검색어>         지난 세션 내용 검색\n\
@@ -721,11 +840,13 @@ fn apply_model_choice(
     }
     if let Some(nums) = crate::menu::parse_numbers(rest, regs.len(), false, true) {
         if nums.first() == Some(&0) {
+            session.provider = None;
             *model = None;
             return "모델을 하네스 자동으로 돌렸습니다.".into();
         }
         if let Some(i) = nums.first() {
             if let Some(r) = regs.get(i - 1) {
+                session.provider = Some(r.provider.clone());
                 *model = Some(r.id.clone());
                 // 영속화: 프로바이더 기본 모델로도 저장
                 let _ = crate::accounts_ui::write_provider_model(&session.cfg, &r.provider, &r.id);
@@ -736,6 +857,7 @@ fn apply_model_choice(
     // 직접 입력 — 등록 목록에서 역방향 매칭되면 영속화
     *model = Some(rest.to_string());
     if let Some(r) = regs.iter().find(|r| r.id == rest) {
+        session.provider = Some(r.provider.clone());
         let _ = crate::accounts_ui::write_provider_model(&session.cfg, &r.provider, &r.id);
         return format!("모델: {rest} (기본 저장)");
     }
@@ -904,6 +1026,12 @@ pub async fn compact_session(session: &mut Session) -> Result<usize> {
     let summary = summarize_messages(&session.cfg, &session.messages).await?;
     let len = summary.chars().count();
     session.messages = vec![Message::user_text(format!("[이전 대화 요약]\n{summary}"))];
+    session.last_context_tokens = session
+        .messages
+        .iter()
+        .map(crate::packer::message_tokens)
+        .sum::<usize>()
+        .min(u32::MAX as usize) as u32;
     session.dirty = true;
     Ok(len)
 }
@@ -926,17 +1054,17 @@ pub async fn run_turn(
     // 매 턴마다 다른 모델이 추첨되어 인증·리밋 오류가 나는 일을 막는다.
     let (ov_provider, ov_model) = if session.provider.is_none() && session.model.is_none() {
         match &session.sticky {
-            Some((sp, sm)) => (Some(sp.as_str()), Some(sm.as_str())),
+            Some((sp, sm)) => (Some(sp.clone()), Some(sm.clone())),
             None => (None, None),
         }
     } else {
-        (session.provider.as_deref(), session.model.as_deref())
+        (session.provider.clone(), session.model.clone())
     };
     let mut binding = bind(
         &session.cfg,
         class,
-        ov_provider,
-        ov_model,
+        ov_provider.as_deref(),
+        ov_model.as_deref(),
     )?;
     // opencode 스타일 plan 모드 — 하네스 분류·모델 자동선택은 그대로 두고 도구만 제한.
     let plan = session.is_plan_mode();
@@ -978,6 +1106,28 @@ pub async fn run_turn(
                 }
                 Err(e) => crate::ui::live_warn(&format!("Obsidian 컨텍스트를 넣지 못했습니다: {e}")),
             }
+        }
+    }
+
+    let estimated_context = session
+        .messages
+        .iter()
+        .map(crate::packer::message_tokens)
+        .sum::<usize>()
+        .saturating_add(crate::packer::estimate_tokens(&task))
+        .min(u32::MAX as usize) as u32;
+    let context_used = session.last_context_tokens.max(estimated_context);
+    if session.messages.len() > 1
+        && crate::packer::needs_auto_compaction(context_used, binding.context_window)
+    {
+        crate::ui::live_status("Compacting context at 80%");
+        match compact_session(session).await {
+            Ok(len) => crate::ui::live_line(&format!(
+                "[context] 자동 압축 완료 · 연속성 요약 {len}자"
+            )),
+            Err(error) => crate::ui::live_warn(&format!(
+                "[context] 자동 압축 실패 · 기존 안전 packer로 계속합니다: {error:#}"
+            )),
         }
     }
 
@@ -1034,7 +1184,8 @@ pub async fn run_turn(
     )
     .await
     {
-        Ok(mut outcome) => {
+        Ok(outcome) => {
+            let summary = CompletionSummary::from_outcome(&outcome, &binding.model);
             agent::record_finish(&db, &run_id, &outcome)?;
             crate::graph::node("persist", &outcome.status, "", Some("bind"));
             crate::ui::live_status(&format!(
@@ -1057,6 +1208,7 @@ pub async fn run_turn(
                 session.messages.push(Message::user_text(prompt));
             }
             agent::sanitize_tool_pairs(&mut session.messages);
+            session.last_context_tokens = outcome.context_tokens;
             session.dirty = true;
             crate::lessons::maybe_spawn(&session.cfg, prompt, &outcome);
             crate::ui::print_footer();
@@ -1076,10 +1228,12 @@ pub async fn run_turn(
                 status: outcome.status,
                 tokens_in: outcome.input_tokens,
                 tokens_out: outcome.output_tokens,
-                ctx_used: outcome.input_tokens.max(outcome.output_tokens),
+                ctx_used: outcome.context_tokens,
                 ctx_window: binding.context_window,
                 cached_in: outcome.cached_tokens,
+                cache_reported: outcome.cache_reported,
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                summary,
             })
         }
         Err(e) => {
@@ -1092,7 +1246,9 @@ pub async fn run_turn(
                 iterations: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                context_tokens: 0,
                 cached_tokens: 0,
+                cache_reported: false,
                 error: Some(e.to_string()),
                 messages: vec![],
                 changed_files: vec![],
@@ -1117,10 +1273,13 @@ pub struct TurnInfo {
     pub ctx_used: u32,
     /// 선택된 모델의 컨텍스트 창
     pub ctx_window: u32,
-    /// 프롬프트 캐시 히트 토큰 누적
+    /// 마지막 모델 요청에서 재사용한 프롬프트 캐시 토큰
     pub cached_in: u32,
+    /// 공급자가 캐시 사용량을 보고했는지 여부
+    pub cache_reported: bool,
     /// 이 답변에 걸린 시간 (밀리초)
     pub elapsed_ms: u64,
+    pub summary: CompletionSummary,
 }
 
 fn persist(db: &Db, id: Option<&str>, messages: &mut [Message]) -> Result<String> {
@@ -1170,6 +1329,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_session_prefers_connected_minimax_m3() {
+        let cfg = Config::load(None).expect("config");
+        let pair = default_new_session_pair(&cfg);
+        if crate::auth::registered_models(&cfg)
+            .iter()
+            .any(|model| crate::ranks::normalize_id(&model.id) == "minimax-m3")
+        {
+            assert_eq!(
+                pair.as_ref().map(|(_, model)| crate::ranks::normalize_id(model)),
+                Some("minimax-m3".into())
+            );
+        }
+    }
+
+    #[test]
+    fn completion_summary_uses_observed_outcome_only() {
+        let outcome = crate::agent::AgentOutcome {
+            status: "ok".into(),
+            iterations: 4,
+            changed_files: vec!["src/main.rs".into()],
+            ..Default::default()
+        };
+        let summary = CompletionSummary::from_outcome(&outcome, "minimax-m3");
+        assert_eq!(summary.changed_files, vec!["src/main.rs"]);
+        assert_eq!(summary.iterations, 4);
+        assert!(summary.improvement.contains("MiniMax-M3"));
+    }
+
+    #[test]
     fn engine_slash_end_to_end() {
         let cfg_path = Config::load(None).expect("config");
         let mut s = Session {
@@ -1181,6 +1369,7 @@ mod tests {
             mode: "build".into(),
             session_id: None,
             messages: vec![],
+            last_context_tokens: 0,
             obsidian_on: false,
             attachments: vec![],
             dirty: false,
