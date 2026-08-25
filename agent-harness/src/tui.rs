@@ -1081,22 +1081,23 @@ fn finish_turn(
                 let cache =
                     cache_usage_label(info.cached_in, info.ctx_used, info.cache_reported);
                 app.ctx = format!(
-                    "ctx {}/{} ({}%) · {}",
+                    "ctx {}/{} ({}%) · {} · compact auto · mem {}",
                     fmt_k(info.ctx_used),
                     fmt_k(info.ctx_window),
                     pct,
-                    cache
+                    cache,
+                    if app.session.obsidian_on { "on" } else { "off" }
                 );
             } else {
                 app.ctx.clear();
             }
             if !info.run_id.is_empty() {
                 let (summary, actions) = completion_report(&info);
-                replace_with_final_summary(&mut app.transcript, summary);
+                replace_with_final_response(&mut app.transcript, info.answer, summary);
                 app.todos.clear();
                 app.agents.clear();
-                app.scroll = 0;
-                app.follow = true;
+                app.scroll = u16::MAX;
+                app.follow = false;
                 app.final_summary = true;
                 app.pending_actions = actions;
             }
@@ -1115,10 +1116,20 @@ fn finish_turn(
     }
 }
 
-fn replace_with_final_summary(transcript: &mut Vec<Entry>, summary: String) {
+fn replace_with_final_response(
+    transcript: &mut Vec<Entry>,
+    answer: String,
+    summary: String,
+) {
     transcript.clear();
+    if !answer.trim().is_empty() {
+        transcript.push(Entry {
+            kind: EntryKind::Assistant,
+            text: answer,
+        });
+    }
     transcript.push(Entry {
-        kind: EntryKind::Assistant,
+        kind: EntryKind::System,
         text: summary,
     });
 }
@@ -1150,6 +1161,7 @@ fn start_compact(
                     cached_in: 0,
                     cache_reported: false,
                     elapsed_ms: 0,
+                    answer: String::new(),
                     summary: chat::CompletionSummary::default(),
                 })
             }
@@ -1250,11 +1262,12 @@ fn apply_live(app: &mut App, ev: Live) {
                             .map(|n| cache_usage_label(n, metrics.context, true))
                             .unwrap_or_else(|| "cache --".into());
                         app.ctx = format!(
-                            "ctx {}/{} ({}%) · {}",
+                            "ctx {}/{} ({}%) · {} · compact auto · mem {}",
                             fmt_k(metrics.context),
                             fmt_k(win),
                             pct,
-                            cache
+                            cache,
+                            if app.session.obsidian_on { "on" } else { "off" }
                         );
                     }
                 }
@@ -1280,6 +1293,7 @@ fn ignore_after_final_summary(event: &Live) -> bool {
             | Live::Assistant(_)
             | Live::System(_)
             | Live::Warn(_)
+            | Live::Status(_)
             | Live::Todo(_)
             | Live::Agent(_)
     )
@@ -1315,16 +1329,54 @@ fn completion_report(info: &chat::TurnInfo) -> (String, Vec<CompletionAction>) {
     } else {
         summary.changed_files.join(", ")
     };
+    let context = if info.ctx_window == 0 {
+        "unknown".into()
+    } else {
+        let pct = info
+            .ctx_used
+            .min(info.ctx_window)
+            .saturating_mul(100)
+            .checked_div(info.ctx_window)
+            .unwrap_or(0);
+        format!(
+            "{}/{} ({}%)",
+            format_run_tokens(info.ctx_used),
+            format_run_tokens(info.ctx_window),
+            pct
+        )
+    };
+    let cache = cache_usage_label(info.cached_in, info.ctx_used, info.cache_reported);
+    let compaction = if summary.auto_compacted {
+        "ran"
+    } else {
+        "standby"
+    };
+    let memory = if summary.memory_enabled {
+        format!("{} source(s)", summary.memory_sources)
+    } else {
+        "off".into()
+    };
     let mut text = format!(
-        "작업 완료 요약\n- 상태: {}\n- 진행: Todo {}/{} · 모델 반복 {}회\n- 변경: {}\n- 도구 오류: {}건\n- 개선 후보: {}",
+        "Run summary · {} {} · {:.1}s · {}/{}\n  Context {} · {} · compact auto ({}) · memory {}\n  Work    Todo {}/{} · {} iteration(s) · {} change(s) · {} tool error(s)\n  Improve {}",
+        completion_mark(&info.status),
         info.status,
+        info.elapsed_ms as f64 / 1000.0,
+        summary.provider,
+        summary.model,
+        context,
+        cache,
+        compaction,
+        memory,
         summary.completed_todos,
         summary.total_todos,
         summary.iterations,
-        files,
+        summary.changed_files.len(),
         summary.tool_errors,
         summary.improvement
     );
+    if !summary.changed_files.is_empty() {
+        text.push_str(&format!("\n  Files   {files}"));
+    }
     let mut actions = Vec::new();
     if !summary.changed_files.is_empty() {
         actions.push(CompletionAction {
@@ -1358,6 +1410,24 @@ fn completion_report(info: &chat::TurnInfo) -> (String, Vec<CompletionAction>) {
         text.push_str(&format!("\n[{}] {}", index + 1, action.label));
     }
     (text, actions)
+}
+
+fn format_run_tokens(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn completion_mark(status: &str) -> &'static str {
+    if status.eq_ignore_ascii_case("ok") {
+        "✓"
+    } else {
+        "!"
+    }
 }
 
 struct TokenMetrics {
@@ -2228,12 +2298,18 @@ mod upgrade_tests {
             cached_in: 0,
             cache_reported: false,
             elapsed_ms: 1,
+            answer: "완료".into(),
             summary: chat::CompletionSummary {
                 changed_files: vec!["src/main.rs".into()],
                 iterations: 1,
                 completed_todos: 1,
                 total_todos: 1,
                 tool_errors: 0,
+                provider: "minimax".into(),
+                model: "minimax-m3".into(),
+                auto_compacted: false,
+                memory_enabled: false,
+                memory_sources: 0,
                 improvement: "검증 유지".into(),
             },
         };
@@ -2251,7 +2327,7 @@ mod upgrade_tests {
     }
 
     #[test]
-    fn final_summary_replaces_faded_work_stream() {
+    fn final_response_keeps_answer_before_run_summary() {
         let mut transcript = vec![
             Entry {
                 kind: EntryKind::Assistant,
@@ -2262,10 +2338,13 @@ mod upgrade_tests {
                 text: "[도구] read_file".into(),
             },
         ];
-        replace_with_final_summary(&mut transcript, "Comprehensive result".into());
-        assert_eq!(transcript.len(), 1);
+        let answer = "| model |\n|---|\n| minimax-m3 |";
+        replace_with_final_response(&mut transcript, answer.into(), "Run summary".into());
+        assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].kind, EntryKind::Assistant);
-        assert_eq!(transcript[0].text, "Comprehensive result");
+        assert_eq!(transcript[0].text, answer);
+        assert_eq!(transcript[1].kind, EntryKind::System);
+        assert_eq!(transcript[1].text, "Run summary");
     }
 
     #[test]
@@ -2273,8 +2352,15 @@ mod upgrade_tests {
         assert!(ignore_after_final_summary(&Live::Chunk("late".into())));
         assert!(ignore_after_final_summary(&Live::Assistant("late".into())));
         assert!(ignore_after_final_summary(&Live::System("[도구] late".into())));
-        assert!(!ignore_after_final_summary(&Live::Status(
+        assert!(ignore_after_final_summary(&Live::Status(
             "[tokens] total_in=1 total_out=1 context=1".into()
         )));
+    }
+
+    #[test]
+    fn completion_mark_never_labels_non_success_as_success() {
+        assert_eq!(completion_mark("ok"), "✓");
+        assert_eq!(completion_mark("denied"), "!");
+        assert_eq!(completion_mark("limit"), "!");
     }
 }

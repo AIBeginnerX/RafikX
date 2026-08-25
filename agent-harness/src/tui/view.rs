@@ -20,9 +20,12 @@ pub struct Pal {
     pub body: Color,
     pub mute: Color,
     pub warn: Color,
+    pub success: Color,
     pub err: Color,
     pub kw: Color,
     pub panel: Color,
+    pub border: Color,
+    pub thinking: Color,
 }
 
 fn rgb(c: (u8, u8, u8)) -> Color {
@@ -47,9 +50,12 @@ pub fn theme_of(app: &App) -> Pal {
         body: rgb(t.body),
         mute: rgb(t.mute),
         warn: rgb(t.warn),
+        success: rgb(t.success),
         err: rgb(t.err),
         kw: rgb(t.kw),
         panel: rgb(t.panel),
+        border: rgb(t.border),
+        thinking: rgb(t.thinking),
     }
 }
 
@@ -277,7 +283,7 @@ fn draw_todo_panel(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     }
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(th.mute))
+        .border_style(Style::default().fg(th.border))
         .style(Style::default().bg(th.bg));
     f.render_widget(
         Paragraph::new(rows)
@@ -321,6 +327,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
 
 /// 대화 영역을 테두리로 감싼 뒤 내부에 트랜스크립트를 그린다.
 fn draw_transcript_frame(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
+    f.render_widget(Clear, area);
     if area.width < 4 || area.height < 3 {
         draw_transcript(f, app, area, th);
         return;
@@ -394,7 +401,7 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             for (is_work, section) in split_model_work(&text) {
                 if is_work {
                     let work_style = Style::default()
-                        .fg(th.mute)
+                        .fg(th.thinking)
                         .add_modifier(Modifier::ITALIC);
                     push_row(&mut lines, "모델 작업", work_style, &mut first);
                     for row in super::md::wrap_text(&section, content_width) {
@@ -437,12 +444,36 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                 }
             }
         } else if e.kind == EntryKind::System {
-            // 시스템 안내는 태그 없이 들여쓰기만 (sys 접두어가 거슬리므로)
-            for row in text.split('\n') {
-                lines.push(Line::from(Span::styled(
-                    format!("   · {row}"),
-                    Style::default().fg(th.mute),
-                )));
+            if text.starts_with("Run summary") {
+                for (index, row) in text.split('\n').enumerate() {
+                    let style = if index == 0 {
+                        Style::default()
+                            .fg(th.code)
+                            .add_modifier(Modifier::BOLD)
+                    } else if row.trim_start().starts_with('✓') {
+                        Style::default()
+                            .fg(th.success)
+                            .add_modifier(Modifier::BOLD)
+                    } else if row.trim_start().starts_with('!') {
+                        Style::default()
+                            .fg(th.err)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th.body)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("   {row}"),
+                        style,
+                    )));
+                }
+            } else {
+                // 시스템 안내는 태그 없이 들여쓰기만 (sys 접두어가 거슬리므로)
+                for row in text.split('\n') {
+                    lines.push(Line::from(Span::styled(
+                        format!("   · {row}"),
+                        Style::default().fg(th.mute),
+                    )));
+                }
             }
         } else {
             let failed_tool = e.kind == EntryKind::Tool && text.contains("도구 오류");
@@ -513,7 +544,11 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     };
     let start = off as usize;
     let end = (start + vis as usize).min(visual.len());
-    let visible: Vec<Line> = visual[start..end].to_vec();
+    let visible: Vec<Line> = visual[start..end]
+        .iter()
+        .cloned()
+        .map(|line| pad_line_to_width(line, width, th.bg))
+        .collect();
 
     let block = Block::default()
         .borders(Borders::NONE)
@@ -623,6 +658,25 @@ fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
         .collect()
 }
 
+fn pad_line_to_width(
+    mut line: Line<'static>,
+    width: usize,
+    background: Color,
+) -> Line<'static> {
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|span| super::md::display_width(&span.content))
+        .sum();
+    if used < width {
+        line.spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(background),
+        ));
+    }
+    line
+}
+
 fn input_height(app: &App, width: u16) -> u16 {
     let w = width.saturating_sub(2).max(8) as usize;
     let shown = super::collapsed_input(&app.input);
@@ -646,13 +700,17 @@ fn wrapped_rows(line: &Line<'_>, width: u16) -> u16 {
 const THINK_OPEN: &[&str] = &["<think>", "<thinking>"];
 const THINK_CLOSE: &[&str] = &["</think>", "</thinking>"];
 
-/// 모델이 단락 구분용으로 남기는 빈 줄을 코드블록 안에서만 보존하고 밖에서는 제거해
-/// 화면 밀도를 높인다.
+/// 모델 답변의 단락 구분은 한 줄만 보존하고 연속된 빈 줄만 접는다.
 fn compact_blank(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_fence = false;
+    let mut pending_blank = false;
     for line in s.split('\n') {
         if line.trim_start().starts_with("```") {
+            if pending_blank && !out.is_empty() {
+                out.push('\n');
+                pending_blank = false;
+            }
             in_fence = !in_fence;
             out.push_str(line);
             out.push('\n');
@@ -664,7 +722,14 @@ fn compact_blank(s: &str) -> String {
             continue;
         }
         if line.trim().is_empty() {
+            if !out.is_empty() {
+                pending_blank = true;
+            }
             continue;
+        }
+        if pending_blank {
+            out.push('\n');
+            pending_blank = false;
         }
         out.push_str(line);
         out.push('\n');
@@ -989,23 +1054,23 @@ fn draw_status_strip(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             Style::default().fg(th.warn),
         ));
     } else if app.busy {
-        // 작업 디지털 표시(진행바) → Working 모양(스피너)
-        spans.push(Span::raw(" "));
-        spans.extend(digital_bar(14));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as usize)
-            .unwrap_or(0);
-        let frame = SPINNER[(now / 120) % SPINNER.len()];
+        let frame = SPINNER[spin_frame_index(120, SPINNER.len())];
         spans.push(Span::styled(
-            format!(" {frame} Working"),
+            format!(" {frame}"),
             Style::default().fg(th.code).add_modifier(Modifier::BOLD),
         ));
+        spans.push(Span::styled(
+            format!(" {}", active_status_label(&app.status)),
+            Style::default()
+                .fg(th.mute)
+                .add_modifier(Modifier::ITALIC),
+        ));
     } else {
+        let idle = footer_state_label(&app.status);
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            "✓ Ready",
-            Style::default().fg(th.mute),
+            format!("{} {idle}", idle_status_mark(&app.status)),
+            Style::default().fg(idle_status_color(&app.status, th)),
         ));
     }
 
@@ -1015,149 +1080,88 @@ fn draw_status_strip(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     );
 }
 
-/// 파란 계열 그라데이션의 디지털 바(사각형) — 어두운 베이스 위로 밝은 구간이 왕복.
-fn digital_bar(width: usize) -> Vec<Span<'static>> {
-    const BASE: (u8, u8, u8) = (24, 38, 96);
-    const SHADES: [(u8, u8, u8); 6] = [
-        (46, 82, 200),
-        (66, 118, 240),
-        (96, 156, 255),
-        (140, 196, 255),
-        (170, 212, 255),
-        (210, 236, 255),
-    ];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as usize)
-        .unwrap_or(0);
-    let width = width.max(6);
-    let span_w = (width / 2).max(1);
-    let period = (width + span_w) * 2;
-    let t = (now / 90) % period;
-    let head = if t < width + span_w { t } else { period - t };
-    let mut out = vec![Span::styled(
-        "[",
-        Style::default().fg(Color::Rgb(70, 100, 200)),
-    )];
-    for i in 0..width {
-        // head 위치에서 뒤로 span_w 길이만큼 밝게
-        let bright = head >= span_w && i < head && i + span_w > head;
-        if bright {
-            let rel = (i - (head - span_w)) * SHADES.len() / span_w.max(1);
-            let shade = SHADES[rel.min(SHADES.len() - 1)];
-            out.push(Span::styled(
-                "█".to_string(),
-                Style::default().fg(Color::Rgb(shade.0, shade.1, shade.2)),
-            ));
-        } else {
-            out.push(Span::styled(
-                "█".to_string(),
-                Style::default().fg(Color::Rgb(BASE.0, BASE.1, BASE.2)),
-            ));
-        }
-    }
-    out.push(Span::styled(
-        "]",
-        Style::default().fg(Color::Rgb(70, 100, 200)),
-    ));
-    out
-}
-
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
-    let mut line_spans: Vec<Span> = Vec::new();
-    // opencode footer 규격 — [모드 배지][spinner+상태][사용량][큐 힌트]
-    let badge = if app.session.is_plan_mode() {
-        Span::styled(
-            " PLAN ",
-            Style::default()
-                .fg(th.bg)
-                .bg(th.secondary)
-                .add_modifier(Modifier::BOLD),
-        )
+    let badge_text = if app.session.is_plan_mode() {
+        " PLAN "
     } else {
-        Span::styled(
-            " BUILD ",
-            Style::default()
-                .fg(th.bg)
-                .bg(th.code)
-                .add_modifier(Modifier::BOLD),
-        )
+        " BUILD "
     };
-    line_spans.push(badge);
-    line_spans.push(Span::raw(" "));
-    line_spans.push(Span::styled(
-        selected_model_label(app),
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-    ));
-    line_spans.push(Span::raw(" "));
-
-    // 사용량(in/out · ctx·캐시)을 우선 배치 — 상태 문자가 길어도 잘리지 않게
-    if !app.tokens.is_empty() {
-        line_spans.push(Span::styled(app.tokens.clone(), Style::default().fg(th.mute)));
-        line_spans.push(Span::raw(" "));
-    }
+    let badge_style = Style::default()
+        .fg(th.bg)
+        .bg(if app.session.is_plan_mode() {
+            th.secondary
+        } else {
+            th.code
+        })
+        .add_modifier(Modifier::BOLD);
+    let model = selected_model_label(app);
     let context = if app.ctx.is_empty() {
         selected_context_label(app)
     } else {
         app.ctx.clone()
     };
-    if !context.is_empty() {
-        line_spans.push(Span::styled(context, Style::default().fg(th.mute)));
-        line_spans.push(Span::raw(" "));
-    }
-
-    if app.busy {
-        // opencode 동일 — braille 스피너 1문자 + 상태. 사고 스트리밍 중엔 Working.
-        let thinking = app
-            .transcript
-            .last()
-            .filter(|e| e.kind == EntryKind::Assistant)
-            .map(|e| display_model_work(&e.text).trim().is_empty())
-            .unwrap_or(false);
-        if thinking {
-            line_spans.push(Span::styled(
-                box_spin().to_string(),
-                Style::default().fg(th.kw).add_modifier(Modifier::BOLD),
-            ));
-            line_spans.push(Span::styled(
-                " Working",
-                Style::default()
-                    .fg(th.mute)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        } else {
-            line_spans.push(Span::styled(
-                braille_spin().to_string(),
-                Style::default().fg(th.code),
-            ));
-            line_spans.push(Span::styled(" Working", Style::default().fg(th.code)));
-        }
+    let state = if app.busy {
+        format!("{} {}", braille_spin(), active_status_label(&app.status))
     } else {
-        // 남은 폭을 계산해 영어 상태를 넣는다 — 뒤 항목이 화면 밖으로 밀리지 않게
-        let used: usize = line_spans.iter().map(|sp| super::md::display_width(&sp.content)).sum();
-        let budget = (area.width as usize).saturating_sub(used + 8).max(10);
-        let state = footer_state_label(&app.status);
-        let short: String = state.chars().take(budget).collect::<String>();
-        let ell = if state.chars().count() > budget { "…" } else { "" };
-        line_spans.push(Span::styled(
-            format!("{short}{ell}"),
-            Style::default().fg(th.code),
+        footer_state_label(&app.status).into()
+    };
+    let mut secondary = Vec::new();
+    if !app.tokens.is_empty() {
+        secondary.push((app.tokens.clone(), Style::default().fg(th.mute)));
+    }
+    secondary.push((
+        state,
+        Style::default().fg(if app.busy {
+            th.code
+        } else {
+            idle_status_color(&app.status, th)
+        }),
+    ));
+    if !app.todos.is_empty() {
+        let progress = crate::tools_more::todo_progress(&app.todos);
+        secondary.push((
+            format!("Todo {}/{}", progress.completed, progress.total),
+            Style::default().fg(th.secondary),
         ));
     }
-
     if !app.queue.is_empty() {
-        line_spans.push(Span::styled("  ·  ", Style::default().fg(th.mute)));
-        line_spans.push(Span::styled(
+        secondary.push((
             format!("Queued {}", app.queue.len()),
             Style::default().fg(th.secondary),
         ));
     }
-    if !app.todos.is_empty() {
-        let progress = crate::tools_more::todo_progress(&app.todos);
-        line_spans.push(Span::styled("  ·  ", Style::default().fg(th.mute)));
+
+    let width = area.width as usize;
+    let left_width = super::md::display_width(badge_text)
+        + 1
+        + super::md::display_width(&model);
+    let right_budget = width.saturating_sub(left_width + 1);
+    let shown_context = truncate_display(&context, right_budget);
+    let right_width = super::md::display_width(&shown_context);
+    let mut line_spans = vec![
+        Span::styled(badge_text, badge_style),
+        Span::raw(" "),
+        Span::styled(
+            model,
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut used = left_width + right_width;
+    for (text, style) in secondary {
+        let needed = 3 + super::md::display_width(&text);
+        if used + needed + 1 > width {
+            continue;
+        }
+        line_spans.push(Span::styled(" · ", Style::default().fg(th.border)));
+        line_spans.push(Span::styled(text, style));
+        used += needed;
+    }
+    if right_width > 0 {
+        let padding = width.saturating_sub(used).max(1);
+        line_spans.push(Span::raw(" ".repeat(padding)));
         line_spans.push(Span::styled(
-            format!("Todo {}/{}", progress.completed, progress.total),
-            Style::default().fg(th.secondary),
+            shown_context,
+            context_usage_style(&context, th),
         ));
     }
 
@@ -1165,6 +1169,28 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         Paragraph::new(Line::from(line_spans)).style(Style::default().bg(th.bg)),
         area,
     );
+}
+
+fn truncate_display(text: &str, width: usize) -> String {
+    if super::md::display_width(text) <= width {
+        return text.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let target = width.saturating_sub(1);
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = super::md::ch_width(ch);
+        if used + ch_width > target {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 pub(super) fn selected_model_label(app: &App) -> String {
@@ -1206,6 +1232,32 @@ fn footer_state_label(status: &str) -> &'static str {
     }
 }
 
+fn idle_status_mark(status: &str) -> &'static str {
+    match footer_state_label(status) {
+        "Failed" => "!",
+        "Stopped" => "■",
+        "Ready" => "✓",
+        _ => "?",
+    }
+}
+
+fn idle_status_color(status: &str, th: &Pal) -> Color {
+    match footer_state_label(status) {
+        "Failed" => th.err,
+        "Stopped" => th.warn,
+        "Ready" => th.success,
+        _ => th.mute,
+    }
+}
+
+fn active_status_label(status: &str) -> &'static str {
+    if status.starts_with("Compacting") {
+        "Auto-compacting"
+    } else {
+        "Working"
+    }
+}
+
 fn status_model_label(model: &str) -> String {
     format!(" MODEL {model}")
 }
@@ -1227,7 +1279,29 @@ fn selected_context_label(app: &App) -> String {
     if window == 0 {
         return String::new();
     }
-    format!("ctx 0/{}", format_tokens(window))
+    format!(
+        "ctx 0/{} (auto) · mem {}",
+        format_tokens(window),
+        if app.session.obsidian_on { "on" } else { "off" }
+    )
+}
+
+fn context_usage_style(context: &str, th: &Pal) -> Style {
+    let percent = context
+        .split('(')
+        .nth(1)
+        .and_then(|part| part.split_once("%)"))
+        .map(|(raw, _)| raw)
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(0);
+    let color = if percent > 90 {
+        th.err
+    } else if percent > 70 {
+        th.warn
+    } else {
+        th.mute
+    };
+    Style::default().fg(color)
 }
 
 fn format_tokens(n: u32) -> String {
@@ -1241,12 +1315,16 @@ fn format_tokens(n: u32) -> String {
 }
 
 /// 부팅 후 경과 밀리초 기반 프레임 인덱스 — ratatui 리드로우 주기와 무관하게 균등 회전.
-fn spin_frame<'a>(frames: &[&'a str], interval_ms: u64) -> &'a str {
+fn spin_frame_index(interval_ms: u64, frame_count: usize) -> usize {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    frames[(ms / interval_ms) as usize % frames.len()]
+    (ms / interval_ms) as usize % frame_count
+}
+
+fn spin_frame<'a>(frames: &[&'a str], interval_ms: u64) -> &'a str {
+    frames[spin_frame_index(interval_ms, frames.len())]
 }
 
 /// opencode 동일 braille 10-frame (80ms).
@@ -1255,11 +1333,6 @@ fn braille_spin() -> &'static str {
         &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
         80,
     )
-}
-
-/// 사각형 도트가 도는 박스형 회전 — Working 표시용.
-fn box_spin() -> &'static str {
-    spin_frame(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"], 80)
 }
 
 /// 입력이 "/명령 접두어" 형태일 때 일치하는 명령 목록 (공백이 들어가면 숨긴다).
@@ -1607,6 +1680,15 @@ mod tests {
     }
 
     #[test]
+    fn final_answer_preserves_single_paragraph_spacing() {
+        assert_eq!(compact_blank("첫 문단\n\n둘째 문단"), "첫 문단\n\n둘째 문단");
+        assert_eq!(
+            compact_blank("첫 문단\n\n\n\n둘째 문단"),
+            "첫 문단\n\n둘째 문단"
+        );
+    }
+
+    #[test]
     fn model_work_sections_are_separated_from_final_answer() {
         let sections = split_model_work(
             "[모델 작업]\n파일을 분석 중\n[/모델 작업]\n최종 답변",
@@ -1684,5 +1766,30 @@ mod tests {
         assert_eq!(footer_state_label("준비"), "Ready");
         assert_eq!(footer_state_label("실패"), "Failed");
         assert_eq!(footer_state_label("중단됨"), "Stopped");
+        assert_eq!(idle_status_mark("준비"), "✓");
+        assert_eq!(idle_status_mark("실패"), "!");
+        assert_eq!(idle_status_mark("중단됨"), "■");
+        assert_eq!(
+            active_status_label("Compacting context at 80%"),
+            "Auto-compacting"
+        );
+        assert_eq!(active_status_label("도구 실행 중"), "Working");
+    }
+
+    #[test]
+    fn footer_truncation_respects_terminal_columns() {
+        let shown = truncate_display("ctx 800k/1.0M (80%) · compact auto", 18);
+        assert!(super::super::md::display_width(&shown) <= 18);
+    }
+
+    #[test]
+    fn transcript_rows_overwrite_every_terminal_column() {
+        let padded = pad_line_to_width(Line::from("짧은 답변"), 20, Color::Black);
+        let width: usize = padded
+            .spans
+            .iter()
+            .map(|span| super::super::md::display_width(&span.content))
+            .sum();
+        assert_eq!(width, 20);
     }
 }

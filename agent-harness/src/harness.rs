@@ -1083,7 +1083,9 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          ```chart\n라벨1: 수치1\n라벨2: 수치2\n```\n\
          항목 나열은 마크다운 표를 쓴다.\n\
          [진행 규칙] 작업 중에는 현재 단계와 확인된 사실만 짧게 알리고, 근거 없는 완료를 주장하지 않는다.\n\
-         작업이 끝나면 변경·검증·남은 위험을 요약한다. 사용자의 선택이 필요하면 English option label과 번호를 함께 쓴다.\n\
+         [최종 답변 규칙] 사용자가 요구한 직접 답변과 산출물을 먼저 완전하게 제시한다. 질문에는 답하고, 요청한 표·도표·코드·분석을 생략하지 않는다.\n\
+         그 뒤에만 변경·검증·남은 위험을 간결하게 요약한다. 상태 요약만으로 직접 답변이나 산출물을 대체하지 않는다.\n\
+         사용자의 선택이 필요하면 English option label과 번호를 함께 쓴다.\n\
          커밋과 배포는 사용자가 번호로 명시적으로 선택하기 전에는 실행하지 않는다.\n\
          독립 작업을 위임할 때만 task 도구를 쓰고 role과 model을 명시한다. 불필요한 위임으로 토큰을 낭비하지 않는다.\n\
          {extra}",
@@ -1145,7 +1147,12 @@ pub async fn run_pipeline(
     } else {
         crate::graph::node("pre_step", "lessons", "none", Some("bind"));
     }
-    let system = system_prompt(cfg, &binding.system_extra, &lessons_block);
+    let mut system = system_prompt(cfg, &binding.system_extra, &lessons_block);
+    system.push_str(&format!(
+        "\n\n[현재 실행 정보]\nProvider: {}\nModel: {}\nContext window: {} tokens\n\
+         사용자가 현재 provider, model, context window를 물으면 이 값을 그대로 답한다.",
+        binding.provider_name, binding.model, binding.context_window
+    ));
 
     // 난이도 기반 단계별 실행 (dsh ctx.goals 영향 수용):
     // 단순 업무는 즉답, medium 이상은 todo 스테이징. deepseek/dk 엔진은 모든 도구 작업에 적용.

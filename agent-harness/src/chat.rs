@@ -20,11 +20,23 @@ pub struct CompletionSummary {
     pub completed_todos: usize,
     pub total_todos: usize,
     pub tool_errors: usize,
+    pub provider: String,
+    pub model: String,
+    pub auto_compacted: bool,
+    pub memory_enabled: bool,
+    pub memory_sources: usize,
     pub improvement: String,
 }
 
 impl CompletionSummary {
-    fn from_outcome(outcome: &agent::AgentOutcome, model: &str) -> Self {
+    fn from_outcome(
+        outcome: &agent::AgentOutcome,
+        provider: &str,
+        model: &str,
+        auto_compacted: bool,
+        memory_enabled: bool,
+        memory_sources: usize,
+    ) -> Self {
         let todos = crate::tools_more::current_todos();
         let progress = crate::tools_more::todo_progress(&todos);
         let improvement = if !outcome.tool_errors.is_empty() {
@@ -44,9 +56,59 @@ impl CompletionSummary {
             completed_todos: progress.completed,
             total_todos: progress.total,
             tool_errors: outcome.tool_errors.len(),
+            provider: provider.into(),
+            model: model.into(),
+            auto_compacted,
+            memory_enabled,
+            memory_sources,
             improvement,
         }
     }
+}
+
+fn final_assistant_answer(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::Assistant)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .map(|answer| strip_thinking_blocks(&answer))
+        .find(|answer| !answer.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn strip_thinking_blocks(text: &str) -> String {
+    const TAGS: [(&str, &str); 3] = [
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+        ("[모델 작업]", "[/모델 작업]"),
+    ];
+    let mut current = text.to_string();
+    for (open, close) in TAGS {
+        loop {
+            let Some(start) = current.find(open) else {
+                break;
+            };
+            let after_open = start + open.len();
+            let Some(relative_end) = current[after_open..].find(close) else {
+                current.truncate(start);
+                break;
+            };
+            let end = after_open + relative_end + close.len();
+            current.replace_range(start..end, "");
+        }
+    }
+    current.trim().to_string()
 }
 
 #[derive(Clone)]
@@ -256,10 +318,14 @@ pub fn open_session(
 }
 
 fn default_new_session_pair(cfg: &Config) -> Option<(String, String)> {
-    crate::auth::registered_models(cfg)
-        .into_iter()
-        .find(|model| crate::ranks::normalize_id(&model.id) == "minimax-m3")
-        .map(|model| (model.provider, model.id))
+    cfg.file
+        .providers
+        .get("minimax")
+        .filter(|provider| {
+            provider.enabled
+                && crate::ranks::normalize_id(&provider.model) == "minimax-m3"
+        })
+        .map(|provider| ("minimax".into(), provider.model.clone()))
 }
 
 fn seed_default_choice(mut session: Session) -> Session {
@@ -1048,6 +1114,8 @@ pub async fn run_turn(
     local_ask: Option<LocalAsk>,
 ) -> Result<TurnInfo> {
     let started = std::time::Instant::now();
+    let mut memory_sources = 0usize;
+    let mut auto_compacted = false;
     crate::spinner::set_label("질문 확인 중…");
     let class = classify(&session.cfg, prompt, obsidian_on, forced_class).await?;
     // 연속성: 사용자가 직접 고르지 않았으면 마지막 성공 조합(provider, model)을 재사용해
@@ -1094,6 +1162,7 @@ pub async fn run_turn(
         } else {
             match obsidian::ask_context(&session.cfg, prompt) {
                 Ok(ctx) => {
+                    memory_sources = ctx.sources.len();
                     if ctx.sources.is_empty() {
                         crate::ui::live_line("[Obsidian] 검색 결과 없음");
                     } else {
@@ -1122,14 +1191,18 @@ pub async fn run_turn(
     {
         crate::ui::live_status("Compacting context at 80%");
         match compact_session(session).await {
-            Ok(len) => crate::ui::live_line(&format!(
-                "[context] 자동 압축 완료 · 연속성 요약 {len}자"
-            )),
+            Ok(len) => {
+                auto_compacted = true;
+                crate::ui::live_line(&format!(
+                    "[context] 자동 압축 완료 · 연속성 요약 {len}자"
+                ));
+            }
             Err(error) => crate::ui::live_warn(&format!(
                 "[context] 자동 압축 실패 · 기존 안전 packer로 계속합니다: {error:#}"
             )),
         }
     }
+    crate::ui::live_status("Working");
 
     let db = Db::open(&Db::db_path()?)?;
     let run_id = db.start_run(
@@ -1185,7 +1258,15 @@ pub async fn run_turn(
     .await
     {
         Ok(outcome) => {
-            let summary = CompletionSummary::from_outcome(&outcome, &binding.model);
+            let answer = final_assistant_answer(&outcome.messages);
+            let summary = CompletionSummary::from_outcome(
+                &outcome,
+                &binding.provider_name,
+                &binding.model,
+                auto_compacted,
+                obsidian_on,
+                memory_sources,
+            );
             agent::record_finish(&db, &run_id, &outcome)?;
             crate::graph::node("persist", &outcome.status, "", Some("bind"));
             crate::ui::live_status(&format!(
@@ -1233,6 +1314,7 @@ pub async fn run_turn(
                 cached_in: outcome.cached_tokens,
                 cache_reported: outcome.cache_reported,
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                answer,
                 summary,
             })
         }
@@ -1279,6 +1361,8 @@ pub struct TurnInfo {
     pub cache_reported: bool,
     /// 이 답변에 걸린 시간 (밀리초)
     pub elapsed_ms: u64,
+    /// 모델이 사용자의 요청에 직접 답한 최종 Markdown 본문.
+    pub answer: String,
     pub summary: CompletionSummary,
 }
 
@@ -1329,18 +1413,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_session_prefers_connected_minimax_m3() {
+    fn new_session_prefers_minimax_provider_minimax_m3() {
         let cfg = Config::load(None).expect("config");
         let pair = default_new_session_pair(&cfg);
-        if crate::auth::registered_models(&cfg)
-            .iter()
-            .any(|model| crate::ranks::normalize_id(&model.id) == "minimax-m3")
-        {
-            assert_eq!(
-                pair.as_ref().map(|(_, model)| crate::ranks::normalize_id(model)),
-                Some("minimax-m3".into())
-            );
-        }
+        assert_eq!(
+            pair.map(|(provider, model)| (provider, crate::ranks::normalize_id(&model))),
+            Some(("minimax".into(), "minimax-m3".into()))
+        );
     }
 
     #[test]
@@ -1351,10 +1430,38 @@ mod tests {
             changed_files: vec!["src/main.rs".into()],
             ..Default::default()
         };
-        let summary = CompletionSummary::from_outcome(&outcome, "minimax-m3");
+        let summary =
+            CompletionSummary::from_outcome(
+                &outcome,
+                "minimax",
+                "minimax-m3",
+                false,
+                false,
+                0,
+            );
         assert_eq!(summary.changed_files, vec!["src/main.rs"]);
         assert_eq!(summary.iterations, 4);
         assert!(summary.improvement.contains("MiniMax-M3"));
+    }
+
+    #[test]
+    fn final_answer_preserves_table_and_model_identity() {
+        let answer = "| model | provider |\n|---|---|\n| minimax-m3 | minimax |\n\n모델은 minimax-m3입니다.";
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: format!("<think>내부 추론</think>\n{answer}"),
+            }],
+        }, Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            }],
+        }];
+
+        assert_eq!(final_assistant_answer(&messages), answer);
     }
 
     #[test]

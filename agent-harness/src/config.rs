@@ -9,7 +9,7 @@ use serde::Deserialize;
 pub const DEFAULT_CONFIG: &str = r#"# RafikX 설정 — API 키 원문은 여기에 적지 마세요.
 
 [general]
-default_provider = "opencode_zen"
+default_provider = "minimax"
 workspace = "~/dev/playground"     # 파일/bash 도구 접근 루트 (이 밖은 차단)
 max_tokens = 8192
 max_context_chars = 200000
@@ -79,7 +79,7 @@ kind = "openai_compat"
 auth = "api_key"
 api_key_env = "MINIMAX_API_KEY"
 base_url = "https://api.minimax.io/v1"
-model = "MiniMax-M2"
+model = "minimax-m3"
 small_model = "MiniMax-M2"
 supports_tools = true
 
@@ -788,6 +788,11 @@ mod tests {
         assert!(DEFAULT_CONFIG.contains("[providers.commandcode]"));
         assert!(DEFAULT_CONFIG.contains("https://opencode.ai/zen/go/v1"));
         let file: ConfigFile = toml::from_str(DEFAULT_CONFIG).expect("parse");
+        assert_eq!(file.general.default_provider, "minimax");
+        assert_eq!(
+            file.providers.get("minimax").map(|provider| provider.model.as_str()),
+            Some("minimax-m3")
+        );
         let zen = file.providers.get("opencode_zen").expect("zen");
         assert_eq!(zen.api_key_env, "OPENCODE_API_KEY");
         assert_eq!(zen.kind, "openai_compat");
