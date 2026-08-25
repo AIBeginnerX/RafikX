@@ -978,7 +978,36 @@ fn apply_live(app: &mut App, ev: Live) {
             push(app, kind, s);
         }
         Live::Warn(s) => push(app, EntryKind::Warn, s),
-        Live::Status(s) => app.status = s,
+        Live::Status(s) => {
+            // "[tokens] in=N out=M (누적 in=A out=B)" 를 실시간 반영
+            if s.starts_with("[tokens]") {
+                let nums: Vec<u32> = s
+                    .split(&['=', ' ', '(', ')'][..])
+                    .filter_map(|p| p.parse::<u32>().ok())
+                    .collect();
+                if nums.len() >= 4 {
+                    let (a, b) = (nums[2], nums[3]);
+                    let fmt_k = |n: u32| -> String {
+                        if n >= 1_000_000 {
+                            format!("{:.0}M", n as f64 / 1e6)
+                        } else if n >= 1_000 {
+                            format!("{:.0}k", n as f64 / 1e3)
+                        } else {
+                            n.to_string()
+                        }
+                    };
+                    app.tokens = format!("{}/{}", fmt_k(a), fmt_k(b));
+                    let win = crate::harness::current_ctx_window();
+                    if win > 0 {
+                        let used = a.max(b);
+                        let pct = used.min(win) * 100 / win;
+                        app.ctx = format!("ctx {}/{} ({}%)", fmt_k(used), fmt_k(win), pct);
+                    }
+                }
+                return;
+            }
+            app.status = s;
+        }
     }
 }
 

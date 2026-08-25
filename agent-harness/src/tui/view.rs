@@ -311,31 +311,117 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         )));
     }
 
-    let total: u16 = lines
-        .iter()
-        .map(|l| wrapped_rows(l, area.width))
-        .sum::<u16>()
-        .max(1);
+    // ratatui 의 Wrap+scroll 은 논리 줄 기준이라 자동 줄바꿈된 긴 답변에서
+    // 내용이 건너뛰어져(검은 영역·윗줄만 표시) 보이는 문제가 있다.
+    // 모든 논리 줄을 그리기 전에 비주얼 행으로 직접 자르고 Wrap 없이 윈도잉한다.
+    let width = area.width.max(1) as usize;
+    let mut visual: Vec<Line> = Vec::with_capacity(lines.len());
+    for l in &lines {
+        if wrapped_rows(l, area.width) <= 1 {
+            visual.push(l.clone());
+        } else {
+            for row in wrap_spans(&l.spans, width) {
+                visual.push(Line::from(row));
+            }
+        }
+    }
+    let total = visual.len() as u16;
     let vis = area.height;
     let max_scroll = total.saturating_sub(vis);
     // app.scroll 은 「바닥에서 몇 줄 위」 — ↑(휠 업)으로 늘려 과거를 보고,
     // 0 이 되면 자동 follow 로 복귀한다.
-    let scroll = if app.follow {
+    let off = if app.follow {
         max_scroll
     } else {
         max_scroll.saturating_sub(app.scroll.min(max_scroll))
     };
+    let start = off as usize;
+    let end = (start + vis as usize).min(visual.len());
+    let visible: Vec<Line> = visual[start..end].to_vec();
 
     let block = Block::default()
         .borders(Borders::NONE)
         .style(Style::default().bg(th.bg));
     f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+        Paragraph::new(visible).block(block),
         area,
     );
+}
+
+/// 스팬 열을 지정 폭의 비주얼 행들로 자른다 (스타일 유지).
+fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
+    #[derive(Clone)]
+    struct Piece {
+        text: String,
+        fg: Color,
+        bg: Option<Color>,
+        bold: bool,
+    }
+    let mut rows: Vec<Vec<Piece>> = Vec::new();
+    let mut cur: Vec<Piece> = Vec::new();
+    let mut cur_w = 0usize;
+
+    let flush = |cur: &mut Vec<Piece>, rows: &mut Vec<Vec<Piece>>| {
+        let taken = std::mem::take(cur);
+        if taken.is_empty() {
+            rows.push(vec![Piece {
+                text: " ".into(),
+                fg: Color::White,
+                bg: None,
+                bold: false,
+            }]);
+        } else {
+            rows.push(taken);
+        }
+    };
+
+    for sp in spans {
+        let fg = match sp.style.fg {
+            Some(c) => c,
+            None => Color::Reset,
+        };
+        let bg = sp.style.bg;
+        let bold = sp
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD);
+        for ch in sp.content.chars() {
+            let cw = super::md::ch_width(ch).max(1);
+            if cur_w + cw > width && cur_w > 0 {
+                flush(&mut cur, &mut rows);
+                cur_w = 0;
+            }
+            match cur.last_mut() {
+                Some(p) if p.fg == fg && p.bg == bg && p.bold == bold => p.text.push(ch),
+                _ => cur.push(Piece {
+                    text: ch.to_string(),
+                    fg,
+                    bg,
+                    bold,
+                }),
+            }
+            cur_w += cw;
+        }
+    }
+    flush(&mut cur, &mut rows);
+
+    rows.into_iter()
+        .map(|pieces| {
+            pieces
+                .into_iter()
+                .map(|p| {
+                    let mut st = Style::default().fg(p.fg);
+                    if let Some(bg) = p.bg {
+                        st = st.bg(bg);
+                    }
+                    if p.bold {
+                        st = st.add_modifier(Modifier::BOLD);
+                    }
+                    Span::styled(p.text, st)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn input_height(app: &App, width: u16) -> u16 {

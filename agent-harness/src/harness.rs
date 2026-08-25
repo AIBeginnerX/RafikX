@@ -712,6 +712,17 @@ fn model_for_fallback(
     }
 }
 
+/// 진행 중 턴의 컨텍스트 창 — TUI 실시간 사용량 표시가 읽는다.
+pub static CURRENT_CTX_WINDOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_current_ctx_window(v: u32) {
+    CURRENT_CTX_WINDOW.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn current_ctx_window() -> u32 {
+    CURRENT_CTX_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 백그라운드 작업(교훈 반성 등)이 폴백 실패를 화면에 띄우지 않게 하는 스위치.
 static FALLBACK_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1047,6 +1058,7 @@ pub async fn run_pipeline(
     remote: Option<agent::RemoteApproval>,
     local_ask: Option<agent::LocalAsk>,
 ) -> Result<AgentOutcome> {
+    crate::harness::set_current_ctx_window(binding.context_window);
     let role = cfg
         .file
         .subagents
