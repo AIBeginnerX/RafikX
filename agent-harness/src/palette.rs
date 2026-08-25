@@ -81,7 +81,29 @@ pub const SYNTH: Theme = Theme {
     thinking: (128, 128, 172),
 };
 
-pub const THEMES: [&Theme; 3] = [&RAFIKX, &OPAL, &SYNTH];
+/// Claude Code 스타일 — Anthropic 공식 브랜드 팔레트 기반.
+/// Dark #141413 · Light #faf9f5 · Mid Gray #b0aea5 · Light Gray #e8e6dc,
+/// 액센트 Orange #d97757 · Blue #6a9bcc · Green #788c5d.
+/// (success/code 는 다크 배경 가독성을 위해 브랜드 톤을 유지한 채 밝기만 보정.)
+pub const CLAUDE: Theme = Theme {
+    name: "claude",
+    bg: (20, 20, 19),
+    accent: (217, 119, 87),
+    secondary: (106, 155, 204),
+    code: (137, 180, 216),
+    text: (250, 249, 245),
+    body: (232, 230, 220),
+    mute: (176, 174, 165),
+    warn: (224, 175, 104),
+    success: (137, 162, 106),
+    err: (224, 85, 85),
+    kw: (203, 158, 76),
+    panel: (30, 30, 28),
+    border: (64, 62, 56),
+    thinking: (122, 120, 112),
+};
+
+pub const THEMES: [&Theme; 4] = [&RAFIKX, &OPAL, &SYNTH, &CLAUDE];
 
 pub fn by_name(name: &str) -> &'static Theme {
     let n = name.trim().to_ascii_lowercase();
@@ -100,6 +122,17 @@ mod tests {
     fn falls_back_to_default() {
         assert_eq!(by_name("없는것").name, "rafikx");
         assert_eq!(by_name("opal").name, "opal");
-        assert_eq!(names().len(), 3);
+        assert_eq!(by_name("claude").name, "claude");
+        assert_eq!(names().len(), 4);
+    }
+
+    #[test]
+    fn claude_theme_uses_anthropic_brand_colors() {
+        let t = by_name("claude");
+        assert_eq!(t.bg, (20, 20, 19)); // #141413
+        assert_eq!(t.accent, (217, 119, 87)); // #d97757
+        assert_eq!(t.secondary, (106, 155, 204)); // #6a9bcc
+        assert_eq!(t.text, (250, 249, 245)); // #faf9f5
+        assert_eq!(t.mute, (176, 174, 165)); // #b0aea5
     }
 }

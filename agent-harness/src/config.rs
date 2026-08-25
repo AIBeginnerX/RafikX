@@ -283,7 +283,7 @@ allow_agent = false
 approval_timeout_secs = 300
 
 [ui]
-theme = "rafikx"                   # rafikx | opal | synth
+theme = "rafikx"                   # rafikx | opal | synth | claude
 appearance = "auto"                # 데스크탑: light | dark | auto (시간대 자동)
 "#;
 
@@ -317,7 +317,7 @@ pub struct GeneralConfig {
     /// 첫 실행 마법사를 이미 지났으면 true. 옛 설정에는 없음 → false.
     #[serde(default)]
     pub setup_done: bool,
-    /// 하네스 엔진: rafikx (기본) | deepseek/dk (단계별 실행) | pi | self (Self-Harness
+    /// 하네스 엔진: rafikx (기본) | deepseek (단계별 실행) | pi | self (Self-Harness
     /// 자기개선 루프, arXiv:2606.09498). 옛 설정엔 없음 → rafikx.
     #[serde(default)]
     pub engine: String,

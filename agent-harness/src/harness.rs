@@ -1357,8 +1357,7 @@ pub async fn run_pipeline(
     // 난이도 기반 단계별 실행 (dsh ctx.goals 영향 수용):
     // 단순 업무는 즉답, medium 이상은 todo 스테이징. deepseek/dk 엔진은 모든 도구 작업에 적용.
     let engine = cfg.file.general.engine.to_ascii_lowercase();
-    let engine_deep = engine == "deepseek" || engine == "dk";
-    let engine_dk = engine == "dk";
+    let engine_deep = engine == "deepseek";
     let engine_pi = engine == "pi";
     let engine_self = engine == "self";
     let staged = !binding.tools.is_empty()
@@ -1370,7 +1369,7 @@ pub async fn run_pipeline(
             "[하네스] {} 난이도{} — 단계별 실행(todo) 활성",
             binding.class.as_str(),
             if engine_deep {
-                " · dk/deepseek 엔진"
+                " · deepseek 엔진"
             } else {
                 ""
             }
@@ -1390,10 +1389,6 @@ pub async fn run_pipeline(
         if engine_deep {
             directive.push_str(" 각 단계 시작 시 `[N/총M] 단계명` 형식의 한 줄 상태를 출력한다. \
                 검증 가능한 작업(빌드·테스트·파일 수정)은 마지막에 검증 방법과 결과를 함께 남긴다.");
-        }
-        if engine_dk {
-            // DeepSeek DSH 호환 모드 — 사고 채널을 먼저 충분히 쓰고 답한다.
-            directive.push_str(" 답변 앞추측 없이 먼저 계획을 확정한 뒤 실행하고, 중간 추론은 출력하지 않는다.");
         }
         system.push_str(&directive);
     }
