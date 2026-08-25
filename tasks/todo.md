@@ -1,3 +1,22 @@
+# TUI 멈춤(CPU 96% 스핀) 원인 분석·수정 (2026-08-26 새벽)
+
+증상: 벤치마크 작업 중 TUI 멈춤. PID 6987 이 52분 경과에 CPU 시간 51분(96%).
+
+- [x] 원인 1 (근본): tokio::select! 의 닫힌 채널 스핀 — 버전 확인 태스크가
+      upd_tx 를 drop 하면 upd_rx.recv() 가 매 반복 즉시 None → 메인 루프가
+      CPU 스핀 → 런타임 포화로 스트리밍 청크 처리가 굶어 "스트림 출력 중단"
+      fail 로 연쇄. 수정: None 받은 채널(upd/live/ask)은 `, if open` 가드로
+      비활성화. 검증: pty 실구동 17초에 CPU 0.2% (수정 전 96%).
+- [x] 원인 2 (기여): anthropic 429 retry_after=45 미존중 — 단일 계정이면
+      리밋 중에도 대기 없이 재호출해 3~10초 간격 429 폭풍 (debug.log 도배).
+      수정: try_accounts·stream_with_fallback 모두 리밋(>20s) 계정은 마지막
+      계정이어도 건너뛰고 다음 연결로 폴백.
+- [x] 멈춘 6987 TERM 정상 종료, 설치본 갱신 (0.6.3, 커밋 전 워킹트리)
+- 잔여(기록만): Esc 인터럽트 시 finish_run 미호출 → runs 에 미종결 행 잔존
+      (run-9). goals 는 failed/complete 라 auto-resume 위험 없음.
+
+---
+
 # oh-my-pi 답변 형식 + /engine provider mode + 역할 자동 배정 (2026-08-25 밤)
 
 - [x] 'Choose next action' 제거 — tui.rs CompletionAction 메뉴·Improve 서사 전부

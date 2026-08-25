@@ -837,14 +837,18 @@ where
         if wait > 0 && wait <= 20 {
             crate::ui::note(&format!("계정 대기 {wait}초 후 재시도…"));
             tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-        } else if wait > 20 && i + 1 < ids.len() {
+        } else if wait > 20 {
+            // retry_after 존중: 리밋이 긴 계정은 마지막 계정이어도 두드리지
+            // 않는다 — 이 연결을 건너뛰면 폴백 체인이 다른 연결을 쓴다.
+            // (예전에는 단일 계정이면 대기 없이 재호출해 429 폭풍이 났다.)
             crate::ui::note(&format!(
-                "{} 리밋 {}분 → 다른 계정",
+                "{} 리밋 {}분 → 건너뜀",
                 crate::accounts::get(id)
                     .map(|a| a.label)
                     .unwrap_or_else(|| id.clone()),
                 (wait + 59) / 60
             ));
+            let _ = i;
             continue;
         }
         let Ok(client) = build_provider_account(cfg, name, id) else {
@@ -1027,7 +1031,10 @@ where
         let ids = account_ids_for(name);
         for (i, id) in ids.iter().enumerate() {
             let wait = crate::usage::seconds_left(id);
-            if wait > 20 && i + 1 < ids.len() {
+            if wait > 20 {
+                // retry_after 존중 — 마지막 계정이어도 리밋 중이면 건너뛰고
+                // 다음 연결로 폴백한다 (429 재시도 폭풍 방지).
+                let _ = i;
                 continue;
             }
             if wait > 0 && wait <= 20 {

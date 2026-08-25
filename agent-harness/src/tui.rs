@@ -351,6 +351,12 @@ pub async fn run(
         );
     }
     let mut dirty = true;
+    // 닫힌 mpsc 채널의 recv() 는 즉시 None 을 반환한다 — select! 가 그 브랜치를
+    // 매 반복 완료시켜 메인 루프가 CPU 스핀(96%)에 빠진다 (실측: 버전 확인
+    // 태스크가 upd_tx 를 drop 한 직후부터). None 을 받은 채널은 비활성화한다.
+    let mut upd_open = true;
+    let mut live_open = true;
+    let mut ask_open = true;
 
     loop {
         if app.quit {
@@ -389,25 +395,34 @@ pub async fn run(
                     _ => {}
                 }
             }
-            live = live_rx.recv() => {
-                if let Some(ev) = live {
-                    apply_live(&mut app, ev);
-                    dirty = true;
+            live = live_rx.recv(), if live_open => {
+                match live {
+                    Some(ev) => {
+                        apply_live(&mut app, ev);
+                        dirty = true;
+                    }
+                    None => live_open = false,
                 }
             }
-            upd = upd_rx.recv() => {
-                if let Some(notice) = upd {
-                    app.upgrade = crate::update::last_seen_tag();
-                    push(&mut app, EntryKind::Warn, notice);
-                    dirty = true;
+            upd = upd_rx.recv(), if upd_open => {
+                match upd {
+                    Some(notice) => {
+                        app.upgrade = crate::update::last_seen_tag();
+                        push(&mut app, EntryKind::Warn, notice);
+                        dirty = true;
+                    }
+                    None => upd_open = false,
                 }
             }
-            ask = ask_rx.recv() => {
-                if let Some((preview, tx)) = ask {
-                    set_mouse_capture(true);
-                    app.approval = Some(ApprovalPrompt { preview, tx });
-                    app.help = false;
-                    dirty = true;
+            ask = ask_rx.recv(), if ask_open => {
+                match ask {
+                    Some((preview, tx)) => {
+                        set_mouse_capture(true);
+                        app.approval = Some(ApprovalPrompt { preview, tx });
+                        app.help = false;
+                        dirty = true;
+                    }
+                    None => ask_open = false,
                 }
             }
             done = done_rx.recv() => {
