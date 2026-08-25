@@ -219,12 +219,19 @@ pub async fn run(
     // 새 릴리스 확인 — 네트워크 조회가 시작을 막지 않도록 백그라운드로 돌린다.
     let (upd_tx, mut upd_rx) = mpsc::unbounded_channel::<String>();
     // 동기 조회(git/gh)라 별도 스레드에서 — 시작을 막지 않는다.
-    std::thread::spawn(move || {
-        if let Ok(rel) = crate::update::latest_release() {
+    std::thread::spawn(move || match crate::update::latest_release() {
+        Ok(rel) => {
             let current = env!("CARGO_PKG_VERSION");
             if let Some(notice) = crate::update::upgrade_notice(&rel, current) {
                 let _ = upd_tx.send(notice);
+            } else {
+                let _ = upd_tx.send(format!(
+                    "버전 확인: 최신입니다 (v{current})"
+                ));
             }
+        }
+        Err(e) => {
+            let _ = upd_tx.send(format!("버전 확인 실패: {e:#}"));
         }
     });
 

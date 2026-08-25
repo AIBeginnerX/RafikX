@@ -165,6 +165,27 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" v{version} "), Style::default().fg(th.mute)),
+        Span::raw(" "),
+        // 하네스 정보 (모델명 제외 — 자동/수동 + 엔진)
+        Span::styled(
+            format!(
+                "하네스 {} · {}",
+                if app.session.cfg.file.harness.selection.eq_ignore_ascii_case("manual") {
+                    "수동"
+                } else {
+                    "자동"
+                },
+                if app.session.cfg.file.general.engine.eq_ignore_ascii_case("deepseek") {
+                    "deepseek"
+                } else {
+                    "rafikx"
+                }
+            ),
+            Style::default().fg(th.code),
+        ),
+        Span::raw("  "),
+        // 프로젝트 경로
+        Span::styled(&app.cwd, Style::default().fg(th.secondary)),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)), area);
 }
@@ -229,7 +250,9 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         };
 
         if e.kind == EntryKind::Assistant {
-            for seg in markdown_segs(&text) {
+            // 반응형 표 — 채팅창 폭에 맞춰 셀 자동 줄바꿈
+            let segs = crate::tui::md::markdown_segs_with_width(&text, Some(area.width.max(24) as usize));
+            for seg in &segs {
                 // 코드블록은 oh-my-pi 스타일 syntax highlighting 으로 그린다.
                 if seg.kind == MdKind::CodeBlock {
                     push_code_rows(
@@ -933,18 +956,26 @@ fn box_spin() -> &'static str {
 /// 입력이 "/명령 접두어" 형태일 때 일치하는 명령 목록 (공백이 들어가면 숨긴다).
 fn slash_matches(app: &App) -> Vec<&'static (&'static str, &'static str)> {
     let t = app.input.trim_start();
-    if !t.starts_with('/') || t.chars().any(char::is_whitespace) {
+    if !t.starts_with('/') {
         return Vec::new();
     }
-    let tok = &t[1..];
-    crate::chat::SLASH_COMMANDS
+    // 인자를 입력하는 중에도 목록 유지 — 명령 토큰(첫 단어)만 검색
+    let tok = t[1..]
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let tok = tok.as_str();
+    let mut hits: Vec<&'static (&'static str, &'static str)> = crate::chat::SLASH_COMMANDS
         .iter()
-        // 포함 검색 — "model" 처럼 단어를 쳐도 /model 이 잡힌다
+        // 포함 검색 — "model" 을 쳐도 /model 이 잡힌다 (설명어도 검색 대상)
         .filter(|(name, desc)| {
-            name[1..].to_lowercase().contains(&tok.to_lowercase())
-                || desc.to_lowercase().contains(&tok.to_lowercase())
+            name[1..].to_lowercase().contains(tok) || desc.to_lowercase().contains(tok)
         })
-        .collect()
+        .collect();
+    // 정확히 일치하는 명령은 맨 앞으로
+    hits.sort_by_key(|(name, _)| name[1..].to_lowercase() != tok);
+    hits
 }
 
 fn draw_slash_palette(

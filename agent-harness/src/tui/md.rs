@@ -86,6 +86,16 @@ impl MdSeg {
 
 /// Lightweight markdown split for TUI styling. Not a full parser.
 pub fn markdown_segs(input: &str) -> Vec<MdSeg> {
+    markdown_segs_with_width(input, None)
+}
+
+/// max_w 가 주어지면 표가 그 폭을 넘지 않도록 셀 내용을 자동 줄바꿈한다 (반응형).
+pub fn markdown_segs_with_width(input: &str, max_w: Option<usize>) -> Vec<MdSeg> {
+    let _ = max_w; // 아래 render_grid 호출부에서 사용
+    markdown_segs_impl(input)
+}
+
+fn markdown_segs_impl(input: &str) -> Vec<MdSeg> {
     let lines: Vec<&str> = input.lines().collect();
     let mut out: Vec<MdSeg> = Vec::new();
     let mut i = 0usize;
@@ -243,27 +253,84 @@ fn split_row(line: &str) -> Vec<String> {
 
 /// 셀 폭(한글 2칸 포함)의 최댓값으로 그리드를 맞춰 재조립한다.
 fn render_grid(rows: &[Vec<String>]) -> String {
+    render_grid_with_width(rows, None)
+}
+
+/// max_w 를 넘으면 셀 내용을 여러 물리 행으로 나눠 표를 좁힌다 (반응형 박스).
+fn render_grid_with_width(rows: &[Vec<String>], max_w: Option<usize>) -> String {
     if rows.is_empty() {
         return String::new();
     }
     let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    let mut widths = vec![0usize; ncols];
-    for r in rows {
-        for (idx, cell) in r.iter().enumerate() {
-            let w = display_width(cell);
-            if w > widths[idx] {
-                widths[idx] = w;
+    // 자연 폭 계산
+    let natural = |rows: &[Vec<String>]| -> Vec<usize> {
+        let mut widths = vec![0usize; ncols];
+        for r in rows {
+            for (idx, cell) in r.iter().enumerate() {
+                let w = display_width(cell);
+                if w > widths[idx] {
+                    widths[idx] = w;
+                }
+            }
+        }
+        widths
+    };
+    let mut widths = natural(rows);
+    let total_of = |ws: &[usize]| ws.iter().map(|w| w + 3).sum::<usize>() + 1;
+
+    // 반응형: 상한을 넘으면 넓은 열부터 축소해 셀을 줄바꿈
+    let mut wrapped_rows: Vec<Vec<Vec<String>>> = rows
+        .iter()
+        .map(|r| {
+            (0..ncols)
+                .map(|i| vec![r.get(i).cloned().unwrap_or_default()])
+                .collect()
+        })
+        .collect();
+    if let Some(max_w) = max_w {
+        let min_col = 6usize;
+        let mut guard = 0;
+        while total_of(&widths) > max_w && guard < 40 {
+            guard += 1;
+            // 가장 넓은 열(최소폭 이상) 찾기
+            let (bi, _) = match widths
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| **w > min_col)
+                .max_by_key(|(_, w)| *w)
+            {
+                Some(x) => x,
+                None => break,
+            };
+            widths[bi] -= 2.max((widths[bi] - min_col) / 4).min(widths[bi] - min_col).max(1);
+            // 해당 열의 셀들을 새 폭에 맞게 재포장
+            for roww in wrapped_rows.iter_mut() {
+                let cell_lines = &mut roww[bi];
+                let joined = cell_lines.join(" ");
+                let mut lines = Vec::new();
+                let mut cur = String::new();
+                let mut cw = 0usize;
+                for ch in joined.chars() {
+                    let cwid = ch_width(ch).max(1);
+                    if cw + cwid > widths[bi].max(min_col) && cw > 0 {
+                        lines.push(std::mem::take(&mut cur));
+                        cw = 0;
+                    }
+                    cur.push(ch);
+                    cw += cwid;
+                }
+                lines.push(cur);
+                *cell_lines = lines;
             }
         }
     }
-    // 유니코드 박스 드로잉 — omo/omp 처럼 실제 도표 형태로 보이게 한다.
+
     let hline = |l: &str, m: &str, r: &str| -> String {
         let mut s = String::from(l);
         for w in &widths {
             s.push_str(&"─".repeat(w + 2));
             s.push_str(m);
         }
-        // 마지막 교차점을 오른쪽 모서리로
         s.pop();
         s.push_str(r);
         s
@@ -272,7 +339,6 @@ fn render_grid(rows: &[Vec<String>]) -> String {
     let mid = hline("├", "┼", "┤");
     let bot = hline("└", "┴", "┘");
     let pad_cell = |cell: &str, w: usize| -> String {
-        // 개행·탭은 정렬을 깨므로 공백으로 치환
         let clean: String = cell
             .chars()
             .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
@@ -282,29 +348,32 @@ fn render_grid(rows: &[Vec<String>]) -> String {
         out.push(' ');
         out.push_str(&clean);
         if d < w {
-            out.push_str(&" ".repeat(w - d));
+            out.push_str(&" ".repeat(w.saturating_sub(d)));
         }
         out.push(' ');
         out
     };
-    let fmt = |r: &[String]| -> String {
+    // 감싼 셀의 li 번째 물리 행으로 그리드 한 줄 생성
+    let line_at = |roww: &Vec<Vec<String>>, li: usize| -> String {
         let mut s = String::from("│");
-        for idx in 0..ncols {
-            let cell = r.get(idx).map(String::as_str).unwrap_or("");
-            s.push_str(&pad_cell(cell, widths[idx]));
+        for ci in 0..ncols {
+            let cell = roww[ci].get(li).map(String::as_str).unwrap_or("");
+            s.push_str(&pad_cell(cell, widths[ci]));
             s.push('│');
         }
         s
     };
-    let mut body: Vec<String> = vec![top, fmt(&rows[0]), mid];
-    for r in &rows[1..] {
-        body.push(fmt(r));
+    let mut body: Vec<String> = vec![top, line_at(&wrapped_rows[0], 0), mid];
+    for roww in &wrapped_rows[1..] {
+        let h = roww.iter().map(|c| c.len()).max().unwrap_or(1);
+        for li in 0..h {
+            body.push(line_at(roww, li));
+        }
     }
     body.push(bot);
     body.join("\n")
 }
 
-/// 실제 슬래시 명령어인지 검사 — /etc/hosts 같은 경로는 강조하지 않는다.
 fn is_known_command(tok: &str) -> bool {
     crate::chat::SLASH_COMMANDS.iter().any(|(name, _)| *name == tok)
 }
@@ -462,3 +531,4 @@ mod tests {
         assert!(KEY_HELP.contains("y / n / a"));
     }
 }
+
