@@ -165,10 +165,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" v{version} "), Style::default().fg(th.mute)),
-        Span::raw(" "),
-        Span::styled(&app.binding, Style::default().fg(th.code)),
-        Span::raw("  "),
-        Span::styled(&app.cwd, Style::default().fg(th.secondary)),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)), area);
 }
@@ -744,12 +740,43 @@ fn draw_status_strip(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         ));
     }
 
-    spans.push(Span::styled(" │", Style::default().fg(th.mute)));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        app.cwd.clone(),
-        Style::default().fg(th.secondary),
-    ));
+    // 선택된 모델의 컨텍스트 창 — 실행 전에도 즉시 확인 가능 (세션 재진입 포함)
+    {
+        let cfg = &app.session.cfg;
+        let (pname, mname) = match (&app.session.provider, &app.session.model) {
+            (Some(p), Some(m)) => (p.clone(), m.clone()),
+            _ => {
+                let dp = cfg.file.general.default_provider.clone();
+                let dm = cfg
+                    .provider(&dp)
+                    .map(|x| x.model.clone())
+                    .unwrap_or_default();
+                (dp, dm)
+            }
+        };
+        let win = if crate::harness::current_ctx_window() > 0 {
+            crate::harness::current_ctx_window()
+        } else {
+            crate::packer::context_window_for(&pname, &mname, cfg.provider(&pname).ok())
+        };
+        if win > 0 {
+            let fmt_k = |n: u32| -> String {
+                if n >= 1_000_000 {
+                    format!("{:.0}M", n as f64 / 1e6)
+                } else if n >= 1_000 {
+                    format!("{:.0}k", n as f64 / 1e3)
+                } else {
+                    n.to_string()
+                }
+            };
+            spans.push(Span::styled(" │", Style::default().fg(th.mute)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("ctx {}", fmt_k(win)),
+                Style::default().fg(th.code),
+            ));
+        }
+    }
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
@@ -912,7 +939,11 @@ fn slash_matches(app: &App) -> Vec<&'static (&'static str, &'static str)> {
     let tok = &t[1..];
     crate::chat::SLASH_COMMANDS
         .iter()
-        .filter(|(name, _)| name[1..].starts_with(tok))
+        // 포함 검색 — "model" 처럼 단어를 쳐도 /model 이 잡힌다
+        .filter(|(name, desc)| {
+            name[1..].to_lowercase().contains(&tok.to_lowercase())
+                || desc.to_lowercase().contains(&tok.to_lowercase())
+        })
         .collect()
 }
 
