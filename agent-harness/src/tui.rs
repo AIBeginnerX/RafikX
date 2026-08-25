@@ -70,20 +70,12 @@ pub struct App {
     pub agents: Vec<crate::ui::AgentProgress>,
     /// 완료 요약 화면이 활성화되면 직전 실행의 늦은 진행 이벤트를 버린다.
     final_summary: bool,
-    /// 완료 뒤 사용자가 번호로 선택할 수 있는 후속 작업.
-    pending_actions: Vec<CompletionAction>,
     /// 현재 실행 중인 턴의 핸들 — Esc 인터럽트용
     pub turn_handle: Option<tokio::task::JoinHandle<()>>,
     /// 새 릴리스 태그 — 있으면 U 키로 업그레이드 진행 가능
     pub upgrade: Option<String>,
     /// 업그레이드 진행 중 플래그
     pub upgrading: bool,
-}
-
-#[derive(Clone)]
-struct CompletionAction {
-    label: String,
-    prompt: Option<String>,
 }
 
 pub struct ApprovalPrompt {
@@ -243,7 +235,6 @@ pub async fn run(
         todos: crate::tools_more::current_todos(),
         agents: Vec::new(),
         final_summary: false,
-        pending_actions: Vec::new(),
         turn_handle: None,
         upgrade: None,
         upgrading: false,
@@ -902,23 +893,6 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
         return;
     }
     app.slash_armed = false;
-    if !app.busy
-        && let Ok(index) = line.parse::<usize>()
-        && let Some(action) = app.pending_actions.get(index.saturating_sub(1)).cloned()
-    {
-        app.pending_actions.clear();
-        app.input.clear();
-        app.cursor = 0;
-        push(app, EntryKind::System, format!("Selected: [{}] {}", index, action.label));
-        if let Some(prompt) = action.prompt {
-            start_turn(app, prompt, Some("dev".into()), false, local_ask, done_tx);
-        } else {
-            app.status = "완료".into();
-            push(app, EntryKind::System, "추가 작업 없이 종료합니다.");
-        }
-        return;
-    }
-    app.pending_actions.clear();
     if app.busy && !line.starts_with('/') {
         // 실행 중 입력은 큐에 적립 — 현재 턴이 끝나면 순차 실행된다.
         app.queue.push(line.clone());
@@ -987,6 +961,9 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
             Ok(Slash::Compact) => {
                 start_compact(app, done_tx);
             }
+            Ok(Slash::AssignRoles) => {
+                start_assign(app, done_tx);
+            }
             Err(e) => push(app, EntryKind::Warn, format!("{e:#}")),
         }
         return;
@@ -1006,7 +983,6 @@ fn start_turn(
     done_tx: &mpsc::UnboundedSender<TurnDone>,
 ) {
     app.final_summary = false;
-    app.pending_actions.clear();
     promote_queued(app, &prompt);
     app.busy = true;
     app.streaming = false;
@@ -1092,14 +1068,13 @@ fn finish_turn(
                 app.ctx.clear();
             }
             if !info.run_id.is_empty() {
-                let (summary, actions) = completion_report(&info);
+                let summary = completion_report(&info);
                 replace_with_final_response(&mut app.transcript, info.answer, summary);
                 app.todos.clear();
                 app.agents.clear();
                 app.scroll = u16::MAX;
                 app.follow = false;
                 app.final_summary = true;
-                app.pending_actions = actions;
             }
         }
         Err(e) => {
@@ -1153,6 +1128,51 @@ fn start_compact(
                 Ok(chat::TurnInfo {
                     run_id: String::new(),
                     label: "compact 완료".into(),
+                    status: "ok".into(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    ctx_used: 0,
+                    ctx_window: 0,
+                    cached_in: 0,
+                    cache_reported: false,
+                    elapsed_ms: 0,
+                    answer: String::new(),
+                    summary: chat::CompletionSummary::default(),
+                })
+            }
+            Err(e) => Err(e),
+        };
+        let _ = done_tx.send(TurnDone { result, session });
+    });
+}
+
+/// /engine multi — 등록 연결의 모델을 원격 조회해 역할별로 자동 배정한다.
+/// 네트워크 조회가 껴 있어 start_compact 와 같은 백그라운드 턴으로 돈다.
+fn start_assign(
+    app: &mut App,
+    done_tx: &mpsc::UnboundedSender<TurnDone>,
+) {
+    if app.busy {
+        return;
+    }
+    push(app, EntryKind::System, "Provider 모델을 조회해 역할별로 배정하는 중…");
+    app.busy = true;
+    app.status = "역할 배정 중…".into();
+    let mut session = app.session.clone();
+    let done_tx = done_tx.clone();
+    tokio::spawn(async move {
+        let result = match crate::harness::auto_assign_roles(&session.cfg).await {
+            Ok(notes) => {
+                for n in notes {
+                    push_live_system(n);
+                }
+                if let Ok(cfg) = session.cfg.reload() {
+                    session.cfg = cfg;
+                }
+                session.sticky = None;
+                Ok(chat::TurnInfo {
+                    run_id: String::new(),
+                    label: "역할 배정 완료".into(),
                     status: "ok".into(),
                     tokens_in: 0,
                     tokens_out: 0,
@@ -1322,7 +1342,9 @@ fn cache_usage_label(cached: u32, context: u32, reported: bool) -> String {
     format!("cache {percent}%")
 }
 
-fn completion_report(info: &chat::TurnInfo) -> (String, Vec<CompletionAction>) {
+/// 턴 종료 통계 한 블록만 출력한다 — oh-my-pi 스타일: 후속 행동 메뉴 없음,
+/// 개선 제안 서사 없음. 다음 행동은 사용자가 입력한다.
+fn completion_report(info: &chat::TurnInfo) -> String {
     let summary = &info.summary;
     let files = if summary.changed_files.is_empty() {
         "없음".into()
@@ -1357,7 +1379,7 @@ fn completion_report(info: &chat::TurnInfo) -> (String, Vec<CompletionAction>) {
         "off".into()
     };
     let mut text = format!(
-        "Run summary · {} {} · {:.1}s · {}/{}\n  Context {} · {} · compact auto ({}) · memory {}\n  Work    Todo {}/{} · {} iteration(s) · {} change(s) · {} tool error(s)\n  Improve {}",
+        "Run summary · {} {} · {:.1}s · {}/{}\n  Context {} · {} · compact auto ({}) · memory {}\n  Work    Todo {}/{} · {} iteration(s) · {} change(s) · {} tool error(s)",
         completion_mark(&info.status),
         info.status,
         info.elapsed_ms as f64 / 1000.0,
@@ -1371,45 +1393,12 @@ fn completion_report(info: &chat::TurnInfo) -> (String, Vec<CompletionAction>) {
         summary.total_todos,
         summary.iterations,
         summary.changed_files.len(),
-        summary.tool_errors,
-        summary.improvement
+        summary.tool_errors
     );
     if !summary.changed_files.is_empty() {
         text.push_str(&format!("\n  Files   {files}"));
     }
-    let mut actions = Vec::new();
-    if !summary.changed_files.is_empty() {
-        actions.push(CompletionAction {
-            label: "Commit changes".into(),
-            prompt: Some(
-                "사용자가 Commit changes를 선택했다. 변경을 다시 검증하고 커밋 범위와 메시지를 제시한 뒤 커밋 승인을 요청하라. 배포하지 마라."
-                    .into(),
-            ),
-        });
-        actions.push(CompletionAction {
-            label: "Deploy changes".into(),
-            prompt: Some(
-                "사용자가 Deploy changes를 선택했다. 배포 대상·환경·위험을 확인하고 실제 외부 배포 직전에 명시적 승인을 요청하라."
-                    .into(),
-            ),
-        });
-    }
-    actions.push(CompletionAction {
-        label: "Apply improvement".into(),
-        prompt: Some(format!(
-            "다음 개선 후보를 현재 사용자 작업 방식에 맞게 최소 변경으로 적용하라: {}",
-            summary.improvement
-        )),
-    });
-    actions.push(CompletionAction {
-        label: "Finish".into(),
-        prompt: None,
-    });
-    text.push_str("\n\nChoose next action:");
-    for (index, action) in actions.iter().enumerate() {
-        text.push_str(&format!("\n[{}] {}", index + 1, action.label));
-    }
-    (text, actions)
+    text
 }
 
 fn format_run_tokens(n: u32) -> String {
@@ -2286,7 +2275,7 @@ mod upgrade_tests {
     }
 
     #[test]
-    fn changed_files_offer_commit_deploy_improvement_and_finish() {
+    fn completion_report_has_no_next_action_menu() {
         let info = chat::TurnInfo {
             run_id: "run-1".into(),
             label: "dev".into(),
@@ -2310,20 +2299,15 @@ mod upgrade_tests {
                 auto_compacted: false,
                 memory_enabled: false,
                 memory_sources: 0,
-                improvement: "검증 유지".into(),
             },
         };
-        let (_, actions) = completion_report(&info);
-        let labels: Vec<&str> = actions.iter().map(|action| action.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            vec![
-                "Commit changes",
-                "Deploy changes",
-                "Apply improvement",
-                "Finish"
-            ]
-        );
+        let text = completion_report(&info);
+        assert!(text.contains("Run summary"));
+        assert!(text.contains("Files   src/main.rs"));
+        // oh-my-pi 스타일: 턴 종료 후 행동 선택 메뉴·개선 서사를 출력하지 않는다.
+        assert!(!text.contains("Choose next action"));
+        assert!(!text.contains("Improve"));
+        assert!(!text.contains("[1]"));
     }
 
     #[test]

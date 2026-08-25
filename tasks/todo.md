@@ -1,3 +1,30 @@
+# oh-my-pi 답변 형식 + /engine provider mode + 역할 자동 배정 (2026-08-25 밤)
+
+- [x] 'Choose next action' 제거 — tui.rs CompletionAction 메뉴·Improve 서사 전부
+      삭제, Run summary 통계만 유지, 숫자 선택 로직·pending_actions 제거
+- [x] oh-my-pi (github.com/can1357/oh-my-pi) system-prompt.md + default
+      personality 분석 → harness.rs system_prompt() 전면 재작성:
+      RFC 2119 규약 / 엔지니어링 원칙 / 증거 우선 간결 페르소나(결론 먼저·
+      [INFERENCE] 표기·선택지 메뉴 금지) / 6단계 워크플로 / 전달 계약 / 안전
+- [x] /engine 2단계 흐름: 엔진 선택 → Provider mode [1] Single [2] Multi
+      (CLI 는 번호 입력, TUI 는 /engine single <연결> · /engine multi 안내)
+- [x] /engine single <연결>: default_provider 고정 + strategy=single
+      (pick_single 이 default 를 minimax-m3 특례보다 우선하도록 수정)
+- [x] /engine multi: 신규 auto_assign_roles — 연결별 원격 모델 조회(12s 타임아웃,
+      실패 시 등록 폴백) → ranks 점수화 → 역할별 배정(simple=최저비용,
+      medium=cheap 최고점, advanced/dev=최고점+도구, verify=차순위) →
+      [harness] manual_* 저장 + selection=manual + strategy=multi.
+      ':batch/:free' 라우터 변형 제외.
+- [x] 실측 배정: simple=minimax/M2, medium=openrouter/qwen3.7-flash,
+      dev·advanced=openrouter/claude-opus-5-fast, verify=claude-opus-5
+- [x] 판정 버그 수정: todo 미등록 + ok 종료를 incomplete 로 강등하던 로직 제거
+      (todo 를 등록하고도 못 끝낸 경우만 미완료) — minimax 실측 재현·해소
+- [x] engine_slash_end_to_end 가 실제 config 의 engine 을 오염시키던 문제 수정
+      (원래 값 저장·복원) — 사용자 self 설정이 rafikx 로 되돌아가던 3번째 발생
+- [x] cargo test 129 통과, 설치본 갱신, engine=self 보존 확인
+
+---
+
 # Self-Harness 엔진 적용 (arXiv:2606.09498)
 
 논문 "Self-Harness: Harnesses That Improve Themselves"의 3단계 루프

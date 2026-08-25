@@ -119,6 +119,8 @@ pub struct SlashResult {
     pub agent_task: Option<String>,
     /// true 면 호출자가 compact_session 을 실행해야 한다.
     pub compact: bool,
+    /// true 면 호출자가 assign_roles 를 실행해야 한다 (/engine multi).
+    pub assign: bool,
 }
 
 pub fn boot() -> Result<BootInfo> {
@@ -349,26 +351,47 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             quit: false,
             agent_task: None,
             compact: false,
+            assign: false,
         }),
         Slash::Quit => Ok(SlashResult {
             notes: "세션을 닫습니다.".into(),
             quit: true,
             agent_task: None,
             compact: false,
+            assign: false,
         }),
         Slash::Agent(task) => Ok(SlashResult {
             notes: String::new(),
             quit: false,
             agent_task: Some(task),
             compact: false,
+            assign: false,
         }),
         Slash::Compact => Ok(SlashResult {
             notes: String::new(),
             quit: false,
             agent_task: None,
             compact: true,
+            assign: false,
+        }),
+        Slash::AssignRoles => Ok(SlashResult {
+            notes: String::new(),
+            quit: false,
+            agent_task: None,
+            compact: false,
+            assign: true,
         }),
     }
+}
+
+/// /engine multi 공용 실행 — 등록 연결의 모델을 조회해 역할별로 배정한다.
+pub async fn assign_roles(session: &mut Session) -> Result<String> {
+    let notes = crate::harness::auto_assign_roles(&session.cfg).await?;
+    if let Ok(cfg) = session.cfg.reload() {
+        session.cfg = cfg;
+    }
+    session.sticky = None;
+    Ok(notes.join("\n"))
 }
 
 /// /compact 공용 실행 — 세션 메시지를 요약 하나로 압축한다.

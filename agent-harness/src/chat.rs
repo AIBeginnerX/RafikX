@@ -25,7 +25,6 @@ pub struct CompletionSummary {
     pub auto_compacted: bool,
     pub memory_enabled: bool,
     pub memory_sources: usize,
-    pub improvement: String,
 }
 
 impl CompletionSummary {
@@ -39,17 +38,6 @@ impl CompletionSummary {
     ) -> Self {
         let todos = crate::tools_more::current_todos();
         let progress = crate::tools_more::todo_progress(&todos);
-        let improvement = if !outcome.tool_errors.is_empty() {
-            "실패한 도구의 전제조건을 교훈으로 저장하고 다음 실행에서는 확인 후 호출합니다.".into()
-        } else if outcome.iterations >= 8 {
-            "긴 작업을 더 작은 Todo로 나누고 독립 조사만 저비용 서브에이전트에 배치합니다.".into()
-        } else if crate::ranks::normalize_id(model) == "minimax-m3" {
-            "MiniMax-M3의 긴 컨텍스트를 세션 안에서 재사용하고 독립 작업만 위임해 토큰 중복을 줄입니다.".into()
-        } else if outcome.changed_files.is_empty() {
-            "도구로 확인한 근거와 추론을 분리해 다음 답변의 검증 가능성을 높입니다.".into()
-        } else {
-            "변경 파일별 최소 검증을 유지하고 반복 수정 패턴만 재사용 교훈으로 저장합니다.".into()
-        };
         Self {
             changed_files: outcome.changed_files.clone(),
             iterations: outcome.iterations,
@@ -61,7 +49,6 @@ impl CompletionSummary {
             auto_compacted,
             memory_enabled,
             memory_sources,
-            improvement,
         }
     }
 }
@@ -139,7 +126,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/login", "연결 마법사"),
     ("/provider", "기본 연결 변경"),
     ("/model", "모델 선택"),
-    ("/engine", "하네스 엔진 rafikx|deepseek|dk|pi|self"),
+    ("/engine", "하네스 엔진 rafikx|deepseek|dk|pi|self · provider mode single|multi"),
     ("/harness", "Harness strategy single|multi"),
     ("/mode", "plan(읽기전용)/build 전환"),
     ("/class", "분류 고정 simple|medium|advanced|dev"),
@@ -224,6 +211,20 @@ pub async fn cmd_chat(
                         Ok(s) => println!("대화를 요약해 압축했습니다 ({s}자)."),
                         Err(e) => println!("압축 실패: {e:#}"),
                     };
+                }
+                Slash::AssignRoles => {
+                    match crate::harness::auto_assign_roles(&session.cfg).await {
+                        Ok(notes) => {
+                            for n in notes {
+                                println!("{n}");
+                            }
+                            if let Ok(cfg) = session.cfg.reload() {
+                                session.cfg = cfg;
+                            }
+                            session.sticky = None;
+                        }
+                        Err(e) => println!("역할 배정 실패: {e:#}"),
+                    }
                 }
             }
             continue;
@@ -396,6 +397,8 @@ pub enum Slash {
     Agent(String),
     /// /compact — 대화 요약으로 압축 (비동기)
     Compact,
+    /// /engine multi — 등록 모델 원격 조회 후 역할별 자동 배정 (비동기)
+    AssignRoles,
 }
 
 /// /engine 에서 선택 가능한 엔진인지 판정한다.
@@ -444,30 +447,69 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             Ok(Slash::Continue(vec!["대화 맥락을 지웠습니다.".into()]))
         }
         "/engine" => {
-            let e = rest.trim().to_ascii_lowercase();
+            let arg = rest.trim().to_ascii_lowercase();
             const ENGINES: &str = "rafikx|deepseek|dk|pi|self";
-            if e.is_empty() {
+            // provider 모드 서브커맨드 — 하네스 선택 뒤의 두 번째 단계.
+            if arg == "multi" {
+                return Ok(Slash::AssignRoles);
+            }
+            if let Some(sub) = arg.strip_prefix("single") {
+                return engine_single(session, sub.trim(), read_stdin);
+            }
+            if arg.is_empty() {
                 let cur = session.cfg.file.general.engine.clone();
+                let strategy = session.cfg.file.harness.strategy.clone();
                 let mut notes = vec![format!(
-                    "현재 하네스 엔진: {cur}   ·   변경: /engine {ENGINES}"
+                    "현재 하네스 엔진: {cur} · provider mode: {strategy}   ·   변경: /engine {ENGINES}"
                 )];
                 if cur.eq_ignore_ascii_case("self") {
                     notes.extend(crate::self_harness::status_lines(&db));
                 }
+                notes.push(
+                    "provider mode 변경: /engine single <연결>  ·  /engine multi (역할 자동 배정)"
+                        .into(),
+                );
                 Ok(Slash::Continue(notes))
-            } else if is_valid_engine(&e) {
-                let label = match e.as_str() {
+            } else if is_valid_engine(&arg) {
+                let label = match arg.as_str() {
                     "dk" => "dk-harness (DeepSeek DSH 호환 모드)".into(),
                     "pi" => "pi-harness (oh-my-pi 스타일)".into(),
                     "self" => "self-harness (자기개선 루프 · arXiv:2606.09498)".into(),
                     other => other.to_string(),
                 };
-                session.cfg.file.general.engine = e.clone();
-                match crate::api::set_engine(&e) {
+                session.cfg.file.general.engine = arg.clone();
+                match crate::api::set_engine(&arg) {
                     Ok(msg) => {
                         let mut notes = vec![format!("하네스 엔진: {label}\n{msg}")];
-                        if e == "self" {
+                        if arg == "self" {
                             notes.extend(crate::self_harness::status_lines(&db));
+                        }
+                        // 2단계: provider 모드 선택 — 하나만 쓸지, 역할별 자동 배정일지.
+                        if read_stdin {
+                            for n in &notes {
+                                println!("{n}");
+                            }
+                            notes.clear();
+                            println!(
+                                "Provider mode  [1] Single — 하나의 연결만 사용  [2] Multi — 등록 모델을 역할별 자동 배정"
+                            );
+                            print!("번호> ");
+                            io::stdout().flush()?;
+                            let mut line = String::new();
+                            io::stdin().read_line(&mut line)?;
+                            match line.trim() {
+                                "1" => return engine_single(session, "", true),
+                                "2" => return Ok(Slash::AssignRoles),
+                                _ => notes.push(
+                                    "모드 선택을 건너뜁니다. 나중에 /engine single|multi 로 지정하세요."
+                                        .into(),
+                                ),
+                            }
+                        } else {
+                            notes.push(
+                                "Provider mode 선택: /engine single <연결>  ·  /engine multi (역할 자동 배정)"
+                                    .into(),
+                            );
                         }
                         Ok(Slash::Continue(notes))
                     }
@@ -475,7 +517,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 }
             } else {
                 Ok(Slash::Continue(vec![
-                    format!("/engine {ENGINES} 중에서 고르세요.")
+                    format!("/engine {ENGINES} 중에서 고르거나, /engine single|multi 로 provider mode 를 정하세요.")
                 ]))
             }
         }
@@ -831,6 +873,68 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             "알 수 없는 명령입니다. /help".into(),
         ])),
     }
+}
+
+/// /engine single [연결] — 하나의 연결만 쓰는 provider 모드.
+/// 인자가 없으면 연결 목록을 보여주고 (CLI 는 번호 입력, TUI 는 명령 안내),
+/// 인자가 있으면 그 연결을 기본으로 고정하고 strategy=single 로 저장한다.
+fn engine_single(session: &mut Session, arg: &str, read_stdin: bool) -> Result<Slash> {
+    let names = crate::auth::usable_names(&session.cfg);
+    if names.is_empty() {
+        return Ok(Slash::Continue(vec![
+            "연결된 서비스가 없습니다. rafikx settings 에서 먼저 연결하세요.".into(),
+        ]));
+    }
+    let apply = |session: &mut Session, name: &str| -> String {
+        match crate::harness::set_single_provider(&session.cfg, name) {
+            Ok(msg) => {
+                if let Ok(cfg) = session.cfg.reload() {
+                    session.cfg = cfg;
+                }
+                session.provider = None;
+                session.model = None;
+                session.sticky = None;
+                msg
+            }
+            Err(e) => format!("single 설정 실패: {e:#}"),
+        }
+    };
+    let resolve = |names: &[String], token: &str| -> Option<String> {
+        if let Some(nums) = crate::menu::parse_numbers(token, names.len(), false, false) {
+            if let Some(i) = nums.first() {
+                return names.get(i.saturating_sub(1)).cloned();
+            }
+        }
+        let alias = crate::auth::resolve_provider_alias(token).unwrap_or_else(|| token.to_string());
+        names.iter().find(|n| **n == alias).cloned()
+    };
+    if !arg.is_empty() {
+        return Ok(Slash::Continue(vec![match resolve(&names, arg) {
+            Some(name) => apply(session, &name),
+            None => format!("'{arg}' 연결을 찾지 못했습니다. /engine single <연결이름|번호>"),
+        }]));
+    }
+    let mut notes = vec!["Single — 사용할 연결을 고르세요:".into()];
+    for (i, n) in names.iter().enumerate() {
+        notes.push(format!("  [{}] {}", i + 1, crate::auth::provider_label(n)));
+    }
+    if read_stdin {
+        for n in &notes {
+            println!("{n}");
+        }
+        notes.clear();
+        print!("번호> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        notes.push(match resolve(&names, line.trim()) {
+            Some(name) => apply(session, &name),
+            None => "선택을 건너뜁니다. /engine single <연결이름> 으로 지정하세요.".into(),
+        });
+    } else {
+        notes.push("지정: /engine single <연결이름|번호>".into());
+    }
+    Ok(Slash::Continue(notes))
 }
 
 pub(crate) fn help_text() -> String {
@@ -1452,7 +1556,6 @@ mod tests {
             );
         assert_eq!(summary.changed_files, vec!["src/main.rs"]);
         assert_eq!(summary.iterations, 4);
-        assert!(summary.improvement.contains("MiniMax-M3"));
     }
 
     #[test]
@@ -1478,6 +1581,13 @@ mod tests {
     #[test]
     fn engine_slash_end_to_end() {
         let cfg_path = Config::load(None).expect("config");
+        // 이 테스트는 실제 config 를 대상으로 돈다 — 사용자가 고른 엔진을
+        // 마지막에 반드시 원래 값으로 복원한다 (rafikx 고정 복원은 실제 설정을
+        // 오염시켰던 전력이 있다).
+        let original_engine = {
+            let e = cfg_path.file.general.engine.trim().to_ascii_lowercase();
+            if is_valid_engine(&e) { e } else { "rafikx".to_string() }
+        };
         let mut s = Session {
             cfg: cfg_path,
             yes: true,
@@ -1524,9 +1634,9 @@ mod tests {
             _ => panic!("expected Continue"),
         }
 
-        // rafikx 로 원복해 테스트 흔적을 정리한다.
-        let _ = handle_slash(&mut s, "/engine rafikx", false);
-        assert_eq!(s.cfg.file.general.engine, "rafikx");
+        // 사용자가 쓰던 원래 엔진으로 복원해 테스트 흔적을 남기지 않는다.
+        let _ = handle_slash(&mut s, &format!("/engine {original_engine}"), false);
+        assert_eq!(s.cfg.file.general.engine, original_engine);
     }
 
     #[test]

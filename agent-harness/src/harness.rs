@@ -279,6 +279,15 @@ fn pick_single(
     cfg: &Config,
     needs_tools: bool,
 ) -> Result<(String, String, Option<String>)> {
+    // Single 모드 계약: 사용자가 지정한 기본 연결(default_provider) 하나만 쓴다.
+    // (/engine single <연결> 이 이 값을 저장한다.)
+    let default = cfg.file.general.default_provider.clone();
+    if crate::auth::is_usable(cfg, &default)
+        && let Ok(provider) = cfg.provider(&default)
+        && (!needs_tools || provider.supports_tools)
+    {
+        return Ok((default, provider.model.clone(), None));
+    }
     let registered = crate::auth::registered_models(cfg);
     if let Some(model) = registered.iter().find(|item| {
         crate::ranks::normalize_id(&item.id) == "minimax-m3"
@@ -289,13 +298,6 @@ fn pick_single(
                     .unwrap_or(false))
     }) {
         return Ok((model.provider.clone(), model.id.clone(), None));
-    }
-    let default = cfg.file.general.default_provider.clone();
-    if crate::auth::is_usable(cfg, &default)
-        && let Ok(provider) = cfg.provider(&default)
-        && (!needs_tools || provider.supports_tools)
-    {
-        return Ok((default, provider.model.clone(), None));
     }
     let fallback = registered.into_iter().find(|item| {
         !needs_tools
@@ -454,6 +456,166 @@ pub fn set_manual_model(cfg: &Config, class: TaskClass, spec: &str) -> Result<St
         p,
         m
     ))
+}
+
+/// /engine single <연결> — 지정한 하나의 연결만 쓰도록 저장한다.
+/// default_provider 를 바꾸고 selection=auto, strategy=single 로 되돌린다.
+pub fn set_single_provider(cfg: &Config, provider: &str) -> Result<String> {
+    ensure_connected(cfg, provider)?;
+    crate::accounts_ui::set_default_provider(cfg, provider)?;
+    set_selection_mode(cfg, "auto")?;
+    set_strategy(cfg, HarnessStrategy::Single)?;
+    let model = cfg
+        .provider(provider)
+        .map(|p| p.model.clone())
+        .unwrap_or_default();
+    Ok(format!(
+        "Provider mode: single — 모든 작업을 {provider} / {model} 하나로 처리합니다."
+    ))
+}
+
+/// /engine multi — 역할별 모델 자동 배정 후보.
+struct RoleCandidate {
+    provider: String,
+    id: String,
+    score: i32,
+    cheap: bool,
+    tools: bool,
+}
+
+/// /engine multi — 등록된 연결마다 사용 가능한 모델을 원격 조회해 가져오고,
+/// 모델 순위표(ranks)로 점수화한 뒤 각 역할에 가장 알맞은 모델을 미리 배정한다.
+/// 배정 결과는 [harness] manual_simple/medium/design/debug/verify 에
+/// "provider:model" 로 고정되고 selection=manual, strategy=multi 로 저장된다.
+pub async fn auto_assign_roles(cfg: &Config) -> Result<Vec<String>> {
+    let names = crate::auth::usable_names(cfg);
+    if names.is_empty() {
+        anyhow::bail!("연결된 서비스가 없습니다. rafikx settings 에서 먼저 연결하세요.");
+    }
+    let table = crate::ranks::load();
+    let mut pool: Vec<RoleCandidate> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    notes.push(format!("Provider {}곳의 모델을 조회합니다…", names.len()));
+
+    for name in &names {
+        let Ok(p) = cfg.provider(name) else { continue };
+        let tools = p.supports_tools;
+        let remote = tokio::time::timeout(
+            Duration::from_secs(12),
+            crate::auth::list_remote_models(cfg, name),
+        )
+        .await;
+        let (ids, source) = match remote {
+            Ok(Ok(list)) if !list.is_empty() => (list, "원격"),
+            _ => {
+                // 원격 조회 실패·빈 목록 → 그 연결의 등록/기본 모델로 폴백.
+                let mut ids: Vec<String> = crate::auth::registered_models(cfg)
+                    .into_iter()
+                    .filter(|r| &r.provider == name)
+                    .map(|r| r.id)
+                    .collect();
+                if ids.is_empty() {
+                    ids.push(p.model.clone());
+                    if let Some(small) = &p.small_model {
+                        ids.push(small.clone());
+                    }
+                }
+                (ids, "등록")
+            }
+        };
+        let mut added = 0usize;
+        for id in ids {
+            if id.trim().is_empty() {
+                continue;
+            }
+            // ':batch'·':free' 같은 라우터 변형은 대화형 코딩에 부적합(지연·제한).
+            // 기본 변형만 후보로 쓴다. (수동 지정 형식 'provider:model' 과의
+            // 혼동도 함께 피한다.)
+            if id.contains(':') {
+                continue;
+            }
+            let norm = crate::ranks::normalize_id(&id);
+            if pool
+                .iter()
+                .any(|c| &c.provider == name && crate::ranks::normalize_id(&c.id) == norm)
+            {
+                continue;
+            }
+            // 순위표 미등재 모델은 잡음(embedding·tts 등)일 수 있어 제외하되,
+            // 그 연결의 기본 모델은 점수 0 후보로 유지한다.
+            let score = match crate::ranks::score_of(&table, &id) {
+                Some(s) => s,
+                None if id == p.model || Some(&id) == p.small_model.as_ref() => 0,
+                None => continue,
+            };
+            pool.push(RoleCandidate {
+                provider: name.clone(),
+                id: id.clone(),
+                score,
+                cheap: crate::ranks::is_cheap_id(&id),
+                tools,
+            });
+            added += 1;
+        }
+        notes.push(format!("  {name}: {source} 목록에서 후보 {added}개"));
+    }
+    if pool.is_empty() {
+        anyhow::bail!("배정할 후보 모델이 없습니다. 연결과 모델 순위표(ranks)를 확인하세요.");
+    }
+
+    // 역할 배정 — simple 외의 프로파일은 전부 도구를 쓰므로 tools 지원을 요구한다.
+    let strongest = |exclude: Option<&RoleCandidate>| -> Option<&RoleCandidate> {
+        pool.iter()
+            .filter(|c| c.tools)
+            .filter(|c| {
+                exclude.is_none_or(|e| !(c.provider == e.provider && c.id == e.id))
+            })
+            .max_by_key(|c| c.score)
+    };
+    let dev = strongest(None)
+        .ok_or_else(|| anyhow!("도구를 지원하는 연결이 없어 dev 역할을 배정할 수 없습니다."))?;
+    let advanced = dev;
+    let verify = strongest(Some(dev)).unwrap_or(dev);
+    let medium = pool
+        .iter()
+        .filter(|c| c.tools && c.cheap)
+        .max_by_key(|c| c.score)
+        .unwrap_or(dev);
+    let simple = pool
+        .iter()
+        .filter(|c| c.cheap)
+        .min_by_key(|c| c.score)
+        .unwrap_or(medium);
+
+    let spec = |c: &RoleCandidate| format!("{}:{}", c.provider, c.id);
+    set_manual_model(cfg, TaskClass::Simple, &spec(simple))?;
+    set_manual_model(cfg, TaskClass::Medium, &spec(medium))?;
+    set_manual_model(cfg, TaskClass::Advanced, &spec(advanced))?;
+    set_manual_model(cfg, TaskClass::Dev, &spec(dev))?;
+    crate::config::write_toml_key(
+        &cfg.path,
+        "[harness]",
+        "manual_verify",
+        &crate::config::toml_string(&spec(verify)),
+    )?;
+    set_selection_mode(cfg, "manual")?;
+    set_strategy(cfg, HarnessStrategy::Multi)?;
+
+    notes.push("Provider mode: multi — 역할별 자동 배정 완료 (selection=manual)".into());
+    for (role, c) in [
+        ("simple", simple),
+        ("medium", medium),
+        ("advanced", advanced),
+        ("dev", dev),
+        ("verify", verify),
+    ] {
+        notes.push(format!(
+            "  {role:8} → {} / {}  (score {})",
+            c.provider, c.id, c.score
+        ));
+    }
+    notes.push("되돌리기: /engine single <연결이름>".into());
+    Ok(notes)
 }
 
 /// 연결된(등록된) 모델만. 미연결 프로바이더는 절대 고르지 않는다.
@@ -1073,21 +1235,59 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
     }
 }
 
+/// oh-my-pi (github.com/can1357/oh-my-pi) 의 시스템 프롬프트 구성을 RafikX 에
+/// 이식한 것: RFC 2119 규약 → 엔지니어링 원칙 → 증거 우선 간결 페르소나 →
+/// 6단계 워크플로 → 전달 계약 → Critical. 답변 끝 행동 선택 메뉴는 금지한다.
 pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
     let mut s = format!(
-        "You are RafikX, a personal CLI assistant.\n\
+        "You are RafikX, a coding agent for the terminal.\n\
          Workspace: {}\n\
          If the user writes in Korean, reply in Korean.\n\
-         [도표 규칙] 비교·수치·비율을 시각화할 때 ASCII 아트 다이어그램(+---+, ->, 문자 박스)을 그리지 않는다.\n\
-         수치 비교는 반드시 아래 형식의 ```chart 블록으로 줘라 — 터미널이 실제 막대그래프로 렌더링한다.\n\
-         ```chart\n라벨1: 수치1\n라벨2: 수치2\n```\n\
-         항목 나열은 마크다운 표를 쓴다.\n\
-         [진행 규칙] 작업 중에는 현재 단계와 확인된 사실만 짧게 알리고, 근거 없는 완료를 주장하지 않는다.\n\
-         [최종 답변 규칙] 사용자가 요구한 직접 답변과 산출물을 먼저 완전하게 제시한다. 질문에는 답하고, 요청한 표·도표·코드·분석을 생략하지 않는다.\n\
-         그 뒤에만 변경·검증·남은 위험을 간결하게 요약한다. 상태 요약만으로 직접 답변이나 산출물을 대체하지 않는다.\n\
-         사용자의 선택이 필요하면 English option label과 번호를 함께 쓴다.\n\
-         커밋과 배포는 사용자가 번호로 명시적으로 선택하기 전에는 실행하지 않는다.\n\
-         독립 작업을 위임할 때만 task 도구를 쓰고 role과 model을 명시한다. 불필요한 위임으로 토큰을 낭비하지 않는다.\n\
+         \n\
+         [규약]\n\
+         RFC 2119 키워드를 쓴다: MUST(반드시), NEVER(절대 금지), SHOULD(권장), AVOID(지양), MAY(허용).\n\
+         \n\
+         [엔지니어링]\n\
+         - 정확성이 먼저다. 그다음이 6개월 뒤의 유지보수성이다.\n\
+         - 취향을 적용한다: 무게 없는 코드는 지우고, 불필요한 추상화는 거부하고, 지루한(boring) 해법을 선호한다. 설계는 철저하고 우아하게.\n\
+         - 예상 밖의 저장소 변경은 사용자의 작업이다. 적응한다.\n\
+         - 사용자의 말이 최우선이다: 사용자가 보고한 상태(오류·실패·관찰)는 ground truth 다. 그대로 근거로 행동하고, 이미 보고된 사실을 재확인하려고 검사를 다시 돌리지 않는다(NEVER).\n\
+         \n\
+         [말투 — 증거 우선 간결 엔지니어]\n\
+         - 모든 문장은 사실·결정·리스크 중 하나다. 의례·헤징·자기요약·필러·과장은 금지(NEVER).\n\
+         - 명확하다면 완전한 문장 대신 조각 표현도 허용(MAY). 기술 독자를 가정하고, 뻔한 단계를 서술하거나 기초를 과잉 설명하지 않는다.\n\
+         - 구체적으로: 정확한 파일·심볼·API·상태 필드·엣지케이스·검증 방법을 적는다.\n\
+         - 결론 먼저, 증거 다음. 추론은 사실→제약→트레이드오프→결정→검증 순으로 압축한다.\n\
+         - 불확실하면 주장하는 그 자리에서 밝히고, 트레이드오프에 이름을 붙이고, 안전한(boring) 쪽을 고른다.\n\
+         - 형식은 요청에 맞춘다(MUST). 산문은 짧게, 증거·검증·차단 사유는 완전하게.\n\
+         - 관측하지 않은 주장에는 [INFERENCE] 를 붙인다.\n\
+         - 답변 끝에 다음 행동 선택지 목록이나 번호 메뉴를 붙이지 않는다(NEVER). 후속 제안이 정말 필요하면 한 문장으로 끝낸다.\n\
+         - 리스크를 숨긴 계획이나 틀린 주장에는 반박한다: 리스크를 명명하고 증거를 보이고 대안을 제시한다. 사용자가 기각하면 그 결정을 실행하고 재논쟁하지 않는다.\n\
+         \n\
+         [워크플로]\n\
+         1 Scope — 요청을 파악한다. 다중 파일 작업은 파일보다 계획이 먼저다.\n\
+         2 Research — 편집 전에 조각이 아니라 구획을 읽는다. 기존 패턴을 재사용한다(MUST); 기존 관례 옆에 두 번째 관례를 만드는 것은 금지다. 도구 실패나 읽은 뒤 바뀐 파일은 다시 읽고 행동한다.\n\
+         3 Decompose — todo 를 갱신한다. 하네스가 단계별 실행(todo)을 지시하면 반드시 따른다(MUST); 그 지시가 없는 사소한 요청만 건너뛴다.\n\
+         4 Implement — 원인을 고친다. 요청 없이 증상 억제·입력 특수케이스 처리 금지(NEVER). 이관은 깨끗하게: 모든 호출부를 옮기고 낡은 코드·별칭·재수출·주석을 제거한다. 새 파일보다 기존 파일 갱신을 선호한다.\n\
+         5 Verify — 검증 없는 산출물 전달 금지(NEVER). 버그 수정은 재현→수정→재현 소멸 확인. 스모크는 테스트 파일이 아니라 실제 실행이다: 실행하고, 바뀐 경로를 통과시키고, 결과를 관찰한다.\n\
+         6 Cleanup — 스모크가 작업을 증명한 뒤의 마지막 단계다. 실험·일회성 조사에는 테스트·문서 정리를 만들지 않는다.\n\
+         \n\
+         [전달 계약]\n\
+         - 완전한 산출물 전에 멈추지 않는다(NEVER). 단계 경계·todo 전환·중간 단계는 멈출 이유가 아니다: 같은 턴에서 계속한다.\n\
+         - 출력을 지어내지 않는다(NEVER): 코드·도구·테스트·문서에 대한 주장은 근거가 있어야 한다.\n\
+         - 더 쉬운 문제로 바꿔치기하지 않는다(NEVER): 요청에 없는 재시도·검증·텔레메트리·추상화를 멋대로 더하지 않고, 증상만 가리지 않는다. 실제 요청만 푼다.\n\
+         - '완료' = 명세된 end-to-end 동작 + 모든 수락 기준. 스텁·플레이스홀더·mock·no-op·'TODO: implement'·'일단 MVP' 는 미완이다(NEVER). 범위 축소는 이 대화에서 사용자의 명시적 승인이 있을 때만.\n\
+         - 도구·저장소·파일로 알 수 있는 정보를 사용자에게 묻지 않는다(NEVER). 반쯤 푼 작업을 떠넘기지 않는다.\n\
+         - blocked 선언 전에 도구와 컨텍스트로 정말 확인 불가한지 먼저 확인한다. 검사 1회 실패는 blocked 가 아니다. 도달 가능한 작업은 끝내고, 정확히 무엇이 없고 무엇을 시도했는지 밝힌다.\n\
+         \n\
+         [안전]\n\
+         - 커밋과 배포는 사용자가 명시적으로 요청하기 전에는 실행하지 않는다(NEVER).\n\
+         - 내가 만들지 않은 무관한 코드 삭제·파괴적 git 명령 전에는 확인을 받는다. 이관이 낡게 만든 코드는 범위 안이다.\n\
+         - task 위임은 사용자가 병렬을 요청했거나 진짜 독립 슬라이스가 있을 때만 쓴다. 최상위 계획을 위임하지 않는다.\n\
+         \n\
+         [하네스 표기]\n\
+         - 수치 비교는 ```chart 블록(한 줄에 '라벨: 수치')으로 — 터미널이 실제 막대그래프로 렌더링한다. ASCII 아트 도표(+---+, ->, 문자 박스)는 금지.\n\
+         - 항목 나열은 마크다운 표를 쓴다.\n\
          {extra}",
         cfg.workspace.display()
     );
@@ -1424,8 +1624,12 @@ pub async fn run_pipeline(
                     continuations,
                 ));
         if !should_continue {
+            // todo 를 등록하고도 못 끝낸 경우만 미완료다. todo 자체를 만들지 않고
+            // ok 로 끝난 턴은 모델이 단계화가 불필요한 작업으로 판단한 것 —
+            // 검증된 산출물이 있으면 완료로 인정한다 (성공을 실패로 오표시 금지).
             if staged
-                && (progress.total == 0 || progress.completed < progress.total)
+                && progress.total > 0
+                && progress.completed < progress.total
                 && continuation_eligible
             {
                 current.status = "incomplete".into();
@@ -1436,10 +1640,7 @@ pub async fn run_pipeline(
             }
             persist_goal_state(
                 task,
-                if current.status == "ok"
-                    && progress.total > 0
-                    && progress.completed == progress.total
-                {
+                if current.status == "ok" && progress.completed >= progress.total {
                     "complete"
                 } else if current.status == "incomplete" {
                     "blocked"
