@@ -40,7 +40,7 @@ pub struct BootInfo {
     pub default_model: String,
     /// 데스크탑 배경 모드: light | dark | auto
     pub appearance: String,
-    /// 하네스 엔진: rafikx (기본) | deepseek
+    /// 하네스 엔진: rafikx (기본) | deepseek | dk | pi | self
     pub engine: String,
     pub obsidian: ObsidianInfo,
     pub providers: Vec<ProviderInfo>,
@@ -207,7 +207,7 @@ pub fn boot_with(cfg: &Config) -> BootInfo {
         appearance: cfg.file.ui.appearance.clone(),
         engine: {
             let e = cfg.file.general.engine.to_ascii_lowercase();
-            if matches!(e.as_str(), "deepseek" | "dk" | "pi") {
+            if matches!(e.as_str(), "deepseek" | "dk" | "pi" | "self") {
                 e
             } else {
                 "rafikx".into()
@@ -483,11 +483,11 @@ pub async fn remote_models(provider: &str) -> Result<Vec<String>> {
     auth::list_remote_models(&cfg, provider).await
 }
 
-/// 하네스 엔진 저장 (rafikx | deepseek | dk | pi).
+/// 하네스 엔진 저장 (rafikx | deepseek | dk | pi | self).
 pub fn set_engine(name: &str) -> Result<String> {
     let e = name.trim().to_ascii_lowercase();
     if !crate::chat::is_valid_engine(&e) {
-        anyhow::bail!("엔진은 rafikx|deepseek|dk|pi 중 하나여야 합니다");
+        anyhow::bail!("엔진은 rafikx|deepseek|dk|pi|self 중 하나여야 합니다");
     }
     let cfg = Config::load(None)?;
     crate::config::write_toml_key(
@@ -500,6 +500,7 @@ pub fn set_engine(name: &str) -> Result<String> {
         "dk" => " — DeepSeek DSH 호환 모드(단계별 실행)",
         "pi" => " — oh-my-pi 스타일 모드",
         "deepseek" => " — 모든 도구 작업을 단계별(todo) 실행합니다",
+        "self" => " — Self-Harness 자기개선 루프 (실패 채굴→하네스 수정 제안→회귀 검증 후 승격)",
         _ => " — 기본 파이프라인",
     };
     Ok(format!("하네스 엔진: {e}{note}"))

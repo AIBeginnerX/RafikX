@@ -819,6 +819,9 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
                 outcome.output_tokens
             );
             lessons::maybe_spawn(&cfg, prompt, &outcome);
+            // 단발 실행은 여기서 프로세스가 끝난다 — Self-Harness 관찰(실패 채굴·
+            // 제안)이 백그라운드에서 abort 되지 않게 완료를 기다린다.
+            rafikx::self_harness::flush_observations(std::time::Duration::from_secs(120)).await;
             ui::print_footer();
             Ok(())
         }

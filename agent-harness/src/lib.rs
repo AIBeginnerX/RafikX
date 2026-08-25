@@ -18,6 +18,7 @@ pub mod packer;
 pub mod palette;
 pub mod provider;
 pub mod ranks;
+pub mod self_harness;
 pub mod settings;
 pub mod spinner;
 pub mod tools;

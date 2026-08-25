@@ -90,6 +90,46 @@ impl Db {
               updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status, updated_at);
+            -- Self-Harness (arXiv:2606.09498): 에피소드 기록·실패 클러스터·후보 수정
+            CREATE TABLE IF NOT EXISTS sh_episodes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at INTEGER NOT NULL,
+              harness_version INTEGER NOT NULL,
+              trial_id INTEGER,
+              success INTEGER NOT NULL,
+              signature TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_sh_episodes ON sh_episodes(harness_version, trial_id, created_at);
+            CREATE TABLE IF NOT EXISTS sh_evidence (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              signature TEXT NOT NULL UNIQUE,
+              cause TEXT NOT NULL,
+              causal TEXT NOT NULL,
+              mechanism TEXT NOT NULL,
+              support INTEGER NOT NULL DEFAULT 1,
+              sample_task TEXT NOT NULL DEFAULT '',
+              sample_detail TEXT NOT NULL DEFAULT '',
+              addressed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sh_candidates (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at INTEGER NOT NULL,
+              evidence_id INTEGER NOT NULL,
+              surface TEXT NOT NULL,
+              new_value TEXT NOT NULL,
+              audit_json TEXT NOT NULL DEFAULT '{}',
+              state TEXT NOT NULL DEFAULT 'proposed',
+              base_version INTEGER NOT NULL,
+              target_signature TEXT NOT NULL DEFAULT '',
+              baseline_success REAL NOT NULL DEFAULT 0,
+              baseline_target INTEGER NOT NULL DEFAULT 0,
+              trial_started_at INTEGER,
+              decided_at INTEGER,
+              decision_note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sh_candidates ON sh_candidates(state, base_version, id);
             "#,
         )?;
         let db = Self { conn };
@@ -779,6 +819,291 @@ impl Db {
             .optional()
             .map_err(Into::into)
     }
+
+    // -----------------------------------------------------------------------
+    // Self-Harness — 에피소드·증거 클러스터·후보 (self_harness.rs 전용)
+    // -----------------------------------------------------------------------
+
+    pub fn sh_add_episode(
+        &self,
+        harness_version: i64,
+        trial_id: Option<i64>,
+        success: bool,
+        signature: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sh_episodes (created_at, harness_version, trial_id, success, signature) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![now_secs(), harness_version, trial_id, success as i64, signature],
+        )?;
+        Ok(())
+    }
+
+    /// 시그니처 정확 일치 클러스터링 — 같은 φ=(c,q,m) 은 support 만 올린다.
+    pub fn sh_upsert_evidence(
+        &self,
+        signature: &str,
+        cause: &str,
+        causal: &str,
+        mechanism: &str,
+        sample_task: &str,
+        sample_detail: &str,
+    ) -> Result<()> {
+        let now = now_secs();
+        let task: String = sample_task.chars().take(300).collect();
+        let detail: String = sample_detail.chars().take(300).collect();
+        self.conn.execute(
+            "INSERT INTO sh_evidence (created_at, updated_at, signature, cause, causal, mechanism, support, sample_task, sample_detail)
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)
+             ON CONFLICT(signature) DO UPDATE SET
+               support = support + 1,
+               updated_at = ?1,
+               sample_task = excluded.sample_task,
+               sample_detail = excluded.sample_detail",
+            rusqlite::params![now, signature, cause, causal, mechanism, task, detail],
+        )?;
+        Ok(())
+    }
+
+    /// 아직 다뤄지지 않은 클러스터 중 지지도 최상위 — 논문 3.2 의 정렬(지지도 순).
+    pub fn sh_top_unaddressed(&self, min_support: i64) -> Result<Option<ShEvidenceRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, signature, cause, causal, mechanism, support, sample_task, sample_detail
+                 FROM sh_evidence WHERE addressed = 0 AND support >= ?1
+                 ORDER BY support DESC, updated_at DESC LIMIT 1",
+                [min_support],
+                |r| {
+                    Ok(ShEvidenceRow {
+                        id: r.get(0)?,
+                        signature: r.get(1)?,
+                        cause: r.get(2)?,
+                        causal: r.get(3)?,
+                        mechanism: r.get(4)?,
+                        support: r.get(5)?,
+                        sample_task: r.get(6)?,
+                        sample_detail: r.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// 이 증거에 대해 이번 하네스 세대에서 이미 후보를 만들었는지.
+    pub fn sh_has_candidates_for(&self, evidence_id: i64, base_version: i64) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sh_candidates WHERE evidence_id = ?1 AND base_version = ?2",
+            rusqlite::params![evidence_id, base_version],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 현재 버전의 기준선 — trial 이 아닌 최근 window 개 에피소드의
+    /// (성공률, 타깃 시그니처 발생 수, 표본 수).
+    pub fn sh_baseline(
+        &self,
+        harness_version: i64,
+        target_signature: &str,
+        window: i64,
+    ) -> Result<(f64, i64, u32)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT success, signature FROM sh_episodes
+             WHERE harness_version = ?1 AND trial_id IS NULL
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![harness_version, window.max(1)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut n = 0i64;
+        let mut ok = 0i64;
+        let mut target = 0i64;
+        for row in rows {
+            let (s, sig) = row?;
+            n += 1;
+            ok += s;
+            if sig == target_signature {
+                target += 1;
+            }
+        }
+        if n == 0 {
+            return Ok((0.0, 0, 0));
+        }
+        Ok((ok as f64 / n as f64, target, n as u32))
+    }
+
+    /// 과거 시도 요약 — proposer 컨텍스트의 "이전에 시도한 수정" (논문 3.3).
+    pub fn sh_attempts_summary(&self, evidence_id: i64, limit: usize) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT surface, state, COALESCE(decision_note, '') FROM sh_candidates
+             WHERE evidence_id = ?1 AND state IN ('accepted','rejected','stale')
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![evidence_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (surface, state, note) = row?;
+            out.push(format!("- {surface}: {state} {note}"));
+        }
+        Ok(out.join("\n"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sh_add_candidate(
+        &self,
+        evidence_id: i64,
+        surface: &str,
+        new_value: &str,
+        audit_json: &str,
+        base_version: i64,
+        target_signature: &str,
+        baseline_success: f64,
+        baseline_target: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO sh_candidates (created_at, evidence_id, surface, new_value, audit_json, state, base_version, target_signature, baseline_success, baseline_target)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'proposed', ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                now_secs(),
+                evidence_id,
+                surface,
+                new_value,
+                audit_json,
+                base_version,
+                target_signature,
+                baseline_success,
+                baseline_target
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn sh_candidate(&self, id: i64) -> Result<Option<ShCandidateRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, evidence_id, surface, new_value, audit_json, state, base_version, target_signature, baseline_success, baseline_target
+                 FROM sh_candidates WHERE id = ?1",
+                [id],
+                Self::map_sh_candidate,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn map_sh_candidate(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShCandidateRow> {
+        Ok(ShCandidateRow {
+            id: r.get(0)?,
+            evidence_id: r.get(1)?,
+            surface: r.get(2)?,
+            new_value: r.get(3)?,
+            audit_json: r.get(4)?,
+            state: r.get(5)?,
+            base_version: r.get(6)?,
+            target_signature: r.get(7)?,
+            baseline_success: r.get(8)?,
+            baseline_target: r.get(9)?,
+        })
+    }
+
+    pub fn sh_start_trial(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sh_candidates SET state = 'trial', trial_started_at = ?1 WHERE id = ?2",
+            rusqlite::params![now_secs(), id],
+        )?;
+        Ok(())
+    }
+
+    /// trial 에 배정된 에피소드 통계 — (에피소드 수, 성공 수, 타깃 시그니처 재발 수).
+    pub fn sh_trial_stats(
+        &self,
+        candidate_id: i64,
+        target_signature: &str,
+    ) -> Result<ShTrialStats> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(success),0),
+                        COALESCE(SUM(CASE WHEN signature = ?2 THEN 1 ELSE 0 END),0)
+                 FROM sh_episodes WHERE trial_id = ?1",
+                rusqlite::params![candidate_id, target_signature],
+                |r| {
+                    Ok(ShTrialStats {
+                        episodes: r.get(0)?,
+                        successes: r.get(1)?,
+                        target_recurrences: r.get(2)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn sh_decide_candidate(&self, id: i64, state: &str, note: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sh_candidates SET state = ?1, decided_at = ?2, decision_note = ?3 WHERE id = ?4",
+            rusqlite::params![state, now_secs(), note.chars().take(300).collect::<String>(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn sh_mark_addressed(&self, evidence_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sh_evidence SET addressed = 1, updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now_secs(), evidence_id],
+        )?;
+        Ok(())
+    }
+
+    /// 같은 세대(base_version)에서 아직 시도하지 않은 다음 후보.
+    pub fn sh_next_proposed(&self, base_version: i64) -> Result<Option<ShCandidateRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, evidence_id, surface, new_value, audit_json, state, base_version, target_signature, baseline_success, baseline_target
+                 FROM sh_candidates WHERE state = 'proposed' AND base_version = ?1
+                 ORDER BY id ASC LIMIT 1",
+                [base_version],
+                Self::map_sh_candidate,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// 하네스 승격으로 세대가 지난 후보 폐기 — 병렬 후보 평가의 순차 번역.
+    pub fn sh_stale_proposed(&self, current_version: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sh_candidates SET state = 'stale', decided_at = ?1,
+             decision_note = 'base_version 경과 (하네스 승격)'
+             WHERE state = 'proposed' AND base_version < ?2",
+            rusqlite::params![now_secs(), current_version],
+        )?;
+        Ok(())
+    }
+
+    /// /engine 상태 표시용 — 이번 버전의 (에피소드 수, 실패 수).
+    pub fn sh_episode_counts(&self, harness_version: i64) -> Result<(i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END),0)
+                 FROM sh_episodes WHERE harness_version = ?1",
+                [harness_version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn sh_open_cluster_count(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM sh_evidence WHERE addressed = 0",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -863,6 +1188,44 @@ pub enum LessonWrite {
     Bumped { id: i64 },
 }
 
+/// Self-Harness 실패 클러스터 — 시그니처 φ=(cause, causal, mechanism) 단위.
+#[derive(Debug, Clone)]
+pub struct ShEvidenceRow {
+    pub id: i64,
+    pub signature: String,
+    pub cause: String,
+    pub causal: String,
+    pub mechanism: String,
+    pub support: i64,
+    pub sample_task: String,
+    pub sample_detail: String,
+}
+
+/// Self-Harness 후보 수정 Δ_j — audit 기록과 기준선을 함께 보관한다.
+#[derive(Debug, Clone)]
+pub struct ShCandidateRow {
+    pub id: i64,
+    pub evidence_id: i64,
+    pub surface: String,
+    pub new_value: String,
+    pub audit_json: String,
+    #[allow(dead_code)]
+    pub state: String,
+    #[allow(dead_code)]
+    pub base_version: i64,
+    pub target_signature: String,
+    pub baseline_success: f64,
+    #[allow(dead_code)]
+    pub baseline_target: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShTrialStats {
+    pub episodes: i64,
+    pub successes: i64,
+    pub target_recurrences: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NoteHit {
     pub path: String,
@@ -938,6 +1301,75 @@ mod tests {
         assert!(matches!(w2, LessonWrite::Bumped { .. }));
         let rows = db.lessons_for_inject("edit_file 원문", 5, 2).unwrap();
         assert!(!rows.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn self_harness_mining_baseline_and_trial_flow() {
+        let dir = std::env::temp_dir().join(format!(
+            "rafikx-sh-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("data.db")).unwrap();
+        let sig = "verify_fail|direct|missing_artifact";
+
+        // 시그니처 정확 일치 클러스터링 — 같은 φ 는 support 만 오른다.
+        db.sh_upsert_evidence(sig, "verify_fail", "direct", "missing_artifact", "작업 A", "노트")
+            .unwrap();
+        db.sh_upsert_evidence(sig, "verify_fail", "direct", "missing_artifact", "작업 B", "노트2")
+            .unwrap();
+        assert!(db.sh_top_unaddressed(3).unwrap().is_none()); // 임계 미달
+        let ev = db.sh_top_unaddressed(2).unwrap().expect("클러스터");
+        assert_eq!(ev.support, 2);
+        assert_eq!(ev.signature, sig);
+
+        // 기준선: 성공 2 · 타깃 실패 2 → 성공률 0.5, 타깃 2건.
+        db.sh_add_episode(0, None, true, "").unwrap();
+        db.sh_add_episode(0, None, false, sig).unwrap();
+        db.sh_add_episode(0, None, true, "").unwrap();
+        db.sh_add_episode(0, None, false, sig).unwrap();
+        let (rate, target, n) = db.sh_baseline(0, sig, 20).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(target, 2);
+        assert!((rate - 0.5).abs() < 1e-9);
+
+        // 후보 등록 → trial → trial 에피소드 통계 → 판정 기록.
+        let cid = db
+            .sh_add_candidate(ev.id, "verification_instruction", "새 검증 지시", "{}", 0, sig, rate, target)
+            .unwrap();
+        assert!(!db.sh_has_candidates_for(ev.id, 1).unwrap());
+        assert!(db.sh_has_candidates_for(ev.id, 0).unwrap());
+        db.sh_start_trial(cid).unwrap();
+        db.sh_add_episode(0, Some(cid), true, "").unwrap();
+        db.sh_add_episode(0, Some(cid), true, "").unwrap();
+        let other_sig = "tool_loop|direct|blind_retry";
+        db.sh_upsert_evidence(other_sig, "tool_loop", "direct", "blind_retry", "작업 C", "")
+            .unwrap();
+        db.sh_add_episode(0, Some(cid), false, other_sig).unwrap();
+        let stats = db.sh_trial_stats(cid, sig).unwrap();
+        assert_eq!(stats.episodes, 3);
+        assert_eq!(stats.successes, 2);
+        assert_eq!(stats.target_recurrences, 0); // 타깃 시그니처는 재발하지 않았다
+
+        db.sh_decide_candidate(cid, "accepted", "재발 0").unwrap();
+        db.sh_mark_addressed(ev.id).unwrap();
+        assert!(db.sh_top_unaddressed(1).unwrap().map(|e| e.signature) != Some(sig.into()));
+        assert_eq!(db.sh_open_cluster_count().unwrap(), 1); // tool_loop 클러스터만 미해결로 남는다
+
+        // 세대가 지난 proposed 후보는 stale 처리된다.
+        let old = db
+            .sh_add_candidate(ev.id, "execution_instruction", "다른 지시", "{}", 0, sig, rate, target)
+            .unwrap();
+        db.sh_stale_proposed(1).unwrap();
+        assert!(db.sh_next_proposed(0).unwrap().is_none());
+        assert_eq!(db.sh_candidate(old).unwrap().unwrap().state, "stale");
+
+        let (episodes, failures) = db.sh_episode_counts(0).unwrap();
+        assert_eq!((episodes, failures), (7, 3));
         let _ = std::fs::remove_dir_all(dir);
     }
 

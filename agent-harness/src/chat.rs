@@ -139,7 +139,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/login", "연결 마법사"),
     ("/provider", "기본 연결 변경"),
     ("/model", "모델 선택"),
-    ("/engine", "하네스 엔진 rafikx|deepseek|dk|pi"),
+    ("/engine", "하네스 엔진 rafikx|deepseek|dk|pi|self"),
     ("/harness", "Harness strategy single|multi"),
     ("/mode", "plan(읽기전용)/build 전환"),
     ("/class", "분류 고정 simple|medium|advanced|dev"),
@@ -400,7 +400,7 @@ pub enum Slash {
 
 /// /engine 에서 선택 가능한 엔진인지 판정한다.
 pub fn is_valid_engine(e: &str) -> bool {
-    matches!(e, "rafikx" | "deepseek" | "dk" | "pi")
+    matches!(e, "rafikx" | "deepseek" | "dk" | "pi" | "self")
 }
 
 pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Result<Slash> {
@@ -445,21 +445,32 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
         }
         "/engine" => {
             let e = rest.trim().to_ascii_lowercase();
-            const ENGINES: &str = "rafikx|deepseek|dk|pi";
+            const ENGINES: &str = "rafikx|deepseek|dk|pi|self";
             if e.is_empty() {
                 let cur = session.cfg.file.general.engine.clone();
-                Ok(Slash::Continue(vec![format!(
+                let mut notes = vec![format!(
                     "현재 하네스 엔진: {cur}   ·   변경: /engine {ENGINES}"
-                )]))
+                )];
+                if cur.eq_ignore_ascii_case("self") {
+                    notes.extend(crate::self_harness::status_lines(&db));
+                }
+                Ok(Slash::Continue(notes))
             } else if is_valid_engine(&e) {
                 let label = match e.as_str() {
                     "dk" => "dk-harness (DeepSeek DSH 호환 모드)".into(),
                     "pi" => "pi-harness (oh-my-pi 스타일)".into(),
+                    "self" => "self-harness (자기개선 루프 · arXiv:2606.09498)".into(),
                     other => other.to_string(),
                 };
                 session.cfg.file.general.engine = e.clone();
                 match crate::api::set_engine(&e) {
-                    Ok(msg) => Ok(Slash::Continue(vec![format!("하네스 엔진: {label}\n{msg}")])),
+                    Ok(msg) => {
+                        let mut notes = vec![format!("하네스 엔진: {label}\n{msg}")];
+                        if e == "self" {
+                            notes.extend(crate::self_harness::status_lines(&db));
+                        }
+                        Ok(Slash::Continue(notes))
+                    }
                     Err(err) => Ok(Slash::Continue(vec![format!("저장 실패: {err}")])),
                 }
             } else {
@@ -1493,11 +1504,22 @@ mod tests {
         assert!(matches!(out, Slash::Continue(_)));
         assert_eq!(s.cfg.file.general.engine, "dk");
 
+        // self 엔진 — 저장되고 Self-Harness 상태 요약이 함께 나와야 한다.
+        let out = handle_slash(&mut s, "/engine self", false).expect("ok");
+        match out {
+            Slash::Continue(notes) => {
+                assert!(notes.iter().any(|n| n.contains("self-harness")));
+                assert!(notes.iter().any(|n| n.contains("Self-Harness v")));
+            }
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(s.cfg.file.general.engine, "self");
+
         // 미지원 값 — 거부 안내를 반환한다.
         let out = handle_slash(&mut s, "/engine nope", false).expect("ok");
         match out {
             Slash::Continue(notes) => {
-                assert!(notes.iter().any(|n| n.contains("rafikx|deepseek|dk|pi")));
+                assert!(notes.iter().any(|n| n.contains("rafikx|deepseek|dk|pi|self")));
             }
             _ => panic!("expected Continue"),
         }
@@ -1508,13 +1530,15 @@ mod tests {
     }
 
     #[test]
-    fn engine_slash_accepts_dk_and_pi_only() {
+    fn engine_slash_accepts_known_engines_only() {
         assert!(is_valid_engine("rafikx"));
         assert!(is_valid_engine("deepseek"));
         assert!(is_valid_engine("dk"));
         assert!(is_valid_engine("pi"));
+        assert!(is_valid_engine("self"));
         // 오타·미지원 값은 거부해야 한다.
         assert!(!is_valid_engine("dkharness"));
+        assert!(!is_valid_engine("selfharness"));
         assert!(!is_valid_engine(""));
         assert!(!is_valid_engine("gpt"));
     }

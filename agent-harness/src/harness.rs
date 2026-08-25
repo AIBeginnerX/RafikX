@@ -1160,6 +1160,7 @@ pub async fn run_pipeline(
     let engine_deep = engine == "deepseek" || engine == "dk";
     let engine_dk = engine == "dk";
     let engine_pi = engine == "pi";
+    let engine_self = engine == "self";
     let staged = !binding.tools.is_empty()
         && (engine_deep || binding.class != crate::harness::TaskClass::Simple);
     let mut system = system;
@@ -1205,6 +1206,30 @@ pub async fn run_pipeline(
              작업 중에는 지금 수행하는 단계와 도구 결과를 짧고 사실적으로 알리고, \
              최종 답변과 분리하라. 공개 응답에 포함된 추론·진행 텍스트는 숨기지 않는다.",
         );
+    }
+    // Self-Harness 엔진 (arXiv:2606.09498) — 자기개선 루프가 유지하는 하네스 상태를
+    // 시스템 프롬프트와 런타임 제어에 반영한다. 상태는 에피소드 관찰이 갱신한다.
+    let mut effective_max_iter = binding.max_iterations;
+    if engine_self {
+        let sh = crate::self_harness::SelfHarnessState::load();
+        crate::ui::live_line(&format!(
+            "[하네스] self-harness v{} — 자기개선 루프 활성{}",
+            sh.version,
+            sh.trial
+                .as_ref()
+                .map(|t| format!(" · trial #{} 검증 중", t.candidate_id))
+                .unwrap_or_default()
+        ));
+        crate::graph::node(
+            "pre_step",
+            "self_harness",
+            &format!("v{}", sh.version),
+            Some("bind"),
+        );
+        sh.decorate_system(&mut system);
+        if let Some(cap) = sh.effective_iter_cap() {
+            effective_max_iter = effective_max_iter.min(cap).max(1);
+        }
     }
 
     if binding.plan_first {
@@ -1325,7 +1350,7 @@ pub async fn run_pipeline(
             model: &binding.model,
             task,
             yes,
-            max_iterations: binding.max_iterations,
+            max_iterations: effective_max_iter,
             system: system.clone(),
             registry,
             resume: next_resume.take(),
@@ -1468,6 +1493,11 @@ pub async fn run_pipeline(
         crate::spinner::set_label("검증 중…");
         outcome = run_verify(cfg, binding, task, yes, system, outcome, remote, local_ask).await?;
         crate::graph::node("verify", &outcome.status, "", Some("verify"));
+    }
+    // Self-Harness 에피소드 관찰 — TUI/CLI/텔레그램 세 진입 경로가 모두 여기를
+    // 지나므로 이 지점 하나로 전 경로의 실행 증거가 수집된다. 백그라운드 실행.
+    if engine_self {
+        crate::self_harness::maybe_observe(cfg, task, &outcome);
     }
     Ok(outcome)
 }

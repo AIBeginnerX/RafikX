@@ -256,6 +256,14 @@ enabled = true
 max_lessons = 500
 inject_limit_chars = 2000
 
+# Self-Harness 엔진(/engine self) — 하네스가 자기 실행 실패를 채굴해 스스로 개선 (arXiv:2606.09498)
+[self_harness]
+enabled = true
+proposal_threshold = 2     # 같은 실패 시그니처 누적 시 하네스 수정 제안
+trial_min_episodes = 3     # trial 판정에 필요한 최소 에피소드
+baseline_window = 20       # 기준선 성공률 계산 구간
+proposal_width = 3         # 한 번에 생성하는 후보 수 (논문의 K)
+
 [inspector]
 subagent = "thinker"
 auto_interval_hours = 24
@@ -286,6 +294,9 @@ pub struct ConfigFile {
     pub harness: HarnessConfig,
     pub subagents: HashMap<String, SubAgentConfig>,
     pub memory: MemoryConfig,
+    /// 옛 설정에 없으면 기본값 (Self-Harness 루프 on, 임계 2/3/20/K=3).
+    #[serde(default)]
+    pub self_harness: SelfHarnessConfig,
     pub inspector: InspectorConfig,
     pub obsidian: ObsidianConfig,
     pub telegram: TelegramConfig,
@@ -306,7 +317,8 @@ pub struct GeneralConfig {
     /// 첫 실행 마법사를 이미 지났으면 true. 옛 설정에는 없음 → false.
     #[serde(default)]
     pub setup_done: bool,
-    /// 하네스 엔진: rafikx (기본) | deepseek (dsh 영향 단계별 실행 강화). 옛 설정엔 없음 → rafikx.
+    /// 하네스 엔진: rafikx (기본) | deepseek/dk (단계별 실행) | pi | self (Self-Harness
+    /// 자기개선 루프, arXiv:2606.09498). 옛 설정엔 없음 → rafikx.
     #[serde(default)]
     pub engine: String,
     /// 마지막으로 성공/선택한 연결 — 재시작 후에도 같은 모델로 이어지게 하는 영속 선택.
@@ -401,6 +413,55 @@ pub struct MemoryConfig {
     pub enabled: bool,
     pub max_lessons: u32,
     pub inject_limit_chars: u32,
+}
+
+/// Self-Harness 엔진(/engine self) 개선 루프 설정 — arXiv:2606.09498.
+/// 옛 config 에 섹션이 없으면 전부 기본값.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SelfHarnessConfig {
+    /// engine=self 일 때 약점 채굴→제안→검증 루프 동작 여부.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 같은 실패 시그니처가 이만큼 쌓이면 하네스 수정을 제안한다.
+    #[serde(default = "default_sh_threshold")]
+    pub proposal_threshold: u32,
+    /// trial 판정에 필요한 최소 에피소드 수.
+    #[serde(default = "default_sh_trial_min")]
+    pub trial_min_episodes: u32,
+    /// 기준선 계산에 쓰는 최근 에피소드 수.
+    #[serde(default = "default_sh_baseline")]
+    pub baseline_window: u32,
+    /// 한 번에 생성하는 후보 수 (논문의 K).
+    #[serde(default = "default_sh_width")]
+    pub proposal_width: u32,
+}
+
+fn default_sh_threshold() -> u32 {
+    2
+}
+
+fn default_sh_trial_min() -> u32 {
+    3
+}
+
+fn default_sh_baseline() -> u32 {
+    20
+}
+
+fn default_sh_width() -> u32 {
+    3
+}
+
+impl Default for SelfHarnessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            proposal_threshold: default_sh_threshold(),
+            trial_min_episodes: default_sh_trial_min(),
+            baseline_window: default_sh_baseline(),
+            proposal_width: default_sh_width(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
