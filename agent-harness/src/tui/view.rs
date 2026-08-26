@@ -341,15 +341,89 @@ fn draw_transcript_frame(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
 }
 
 fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
-    let mut lines: Vec<Line> = Vec::new();
+    let width = area.width.max(1);
+    let theme_name = app.session.cfg.file.ui.theme.clone();
+    // 엔트리 단위 렌더 캐시 — 마크다운 파싱·syntect 하이라이트·줄바꿈까지
+    // 끝난 비주얼 행을 (kind, text, width, theme) 해시로 재사용한다.
+    // 확정된 과거 턴은 다시 파싱하지 않으므로 프레임 비용이 O(보이는 행)이다.
+    let mut cache = app.render_cache.borrow_mut();
+    let mut visual: Vec<Line> = Vec::new();
+    let mut count = 0usize;
     for e in &app.transcript {
+        let h = entry_render_hash(e, width, &theme_name);
+        if count < cache.len() && cache[count].0 == h {
+            visual.extend(cache[count].1.iter().cloned());
+        } else {
+            let rows = render_entry(e, width, th);
+            let slot = (h, rows.clone());
+            if count < cache.len() {
+                cache[count] = slot;
+            } else {
+                cache.push(slot);
+            }
+            visual.extend(rows);
+        }
+        count += 1;
+    }
+    cache.truncate(count);
+    drop(cache);
+
+    if visual.is_empty() {
+        visual.push(Line::from(Span::styled(
+            "  할 일을 말하면 실행합니다.  ?  키 도움말",
+            Style::default().fg(th.mute),
+        )));
+    }
+
+    let total = visual.len() as u16;
+    let vis = area.height;
+    let max_scroll = total.saturating_sub(vis);
+    // app.scroll 은 「바닥에서 몇 줄 위」 — ↑(휠 업)으로 늘려 과거를 보고,
+    // 0 이 되면 자동 follow 로 복귀한다.
+    let off = if app.follow {
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.scroll.min(max_scroll))
+    };
+    let start = off as usize;
+    let end = (start + vis as usize).min(visual.len());
+    let visible: Vec<Line> = visual[start..end]
+        .iter()
+        .cloned()
+        .map(|line| pad_line_to_width(line, width as usize, th.bg))
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .style(Style::default().bg(th.bg));
+    f.render_widget(
+        Paragraph::new(visible).block(block),
+        area,
+    );
+}
+
+/// 렌더 캐시 키 — 내용·폭·테마가 같으면 렌더 결과도 같다.
+fn entry_render_hash(e: &super::Entry, width: u16, theme: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (e.kind as u8).hash(&mut h);
+    e.text.hash(&mut h);
+    width.hash(&mut h);
+    theme.hash(&mut h);
+    h.finish()
+}
+
+/// 엔트리 하나를 래핑 완료된 비주얼 행으로 렌더한다 (순수 함수 — 캐시 대상).
+fn render_entry(e: &super::Entry, width: u16, th: &Pal) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+
         let text = match e.kind {
             EntryKind::Assistant => compact_blank(&display_model_work(&e.text)),
             EntryKind::User | EntryKind::Queued => super::collapsed_input(&e.text),
             _ => e.text.clone(),
         };
         if text.trim().is_empty() && e.kind == EntryKind::Assistant {
-            continue;
+            return Vec::new();
         }
         let role = coding_role(&text);
         let (tag, style) = match e.kind {
@@ -396,7 +470,7 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         };
 
         if e.kind == EntryKind::Assistant {
-            let content_width = area.width.saturating_sub(8).max(1) as usize;
+            let content_width = width.saturating_sub(8).max(1) as usize;
             for (is_work, section) in split_model_work(&text) {
                 if is_work {
                     let work_style = Style::default()
@@ -509,53 +583,20 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         if matches!(e.kind, EntryKind::Tool | EntryKind::Warn) {
             lines.push(Line::from(""));
         }
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  할 일을 말하면 실행합니다.  ?  키 도움말",
-            Style::default().fg(th.mute),
-        )));
-    }
-
-    // ratatui 의 Wrap+scroll 은 논리 줄 기준이라 자동 줄바꿈된 긴 답변에서
-    // 내용이 건너뛰어져(검은 영역·윗줄만 표시) 보이는 문제가 있다.
-    // 모든 논리 줄을 그리기 전에 비주얼 행으로 직접 자르고 Wrap 없이 윈도잉한다.
-    let width = area.width.max(1) as usize;
-    let mut visual: Vec<Line> = Vec::with_capacity(lines.len());
+    
+    // 논리 줄을 터미널 폭 기준 비주얼 행으로 잘라 반환한다.
+    let w = width.max(1) as usize;
+    let mut visual: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     for l in &lines {
-        if wrapped_rows(l, area.width) <= 1 {
+        if wrapped_rows(l, width) <= 1 {
             visual.push(l.clone());
         } else {
-            for row in wrap_spans(&l.spans, width) {
+            for row in wrap_spans(&l.spans, w) {
                 visual.push(Line::from(row));
             }
         }
     }
-    let total = visual.len() as u16;
-    let vis = area.height;
-    let max_scroll = total.saturating_sub(vis);
-    // app.scroll 은 「바닥에서 몇 줄 위」 — ↑(휠 업)으로 늘려 과거를 보고,
-    // 0 이 되면 자동 follow 로 복귀한다.
-    let off = if app.follow {
-        max_scroll
-    } else {
-        max_scroll.saturating_sub(app.scroll.min(max_scroll))
-    };
-    let start = off as usize;
-    let end = (start + vis as usize).min(visual.len());
-    let visible: Vec<Line> = visual[start..end]
-        .iter()
-        .cloned()
-        .map(|line| pad_line_to_width(line, width, th.bg))
-        .collect();
-
-    let block = Block::default()
-        .borders(Borders::NONE)
-        .style(Style::default().bg(th.bg));
-    f.render_widget(
-        Paragraph::new(visible).block(block),
-        area,
-    );
+    visual
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1042,19 +1083,45 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let mut line_spans = vec![Span::styled(badge_text, badge_style)];
     let mut used = super::md::display_width(badge_text);
 
+    // 권한무시(YOLO) 상시 표시 — 자동 승인 중임을 항상 인지하게 한다.
+    if app.session.yes {
+        let yolo = " YOLO ";
+        line_spans.push(Span::styled(
+            yolo,
+            Style::default().fg(th.bg).bg(th.err).add_modifier(Modifier::BOLD),
+        ));
+        used += super::md::display_width(yolo);
+    }
+
     // 상태 — 승인 대기가 최우선, 그다음 실행 스피너, 마지막 idle 결과.
-    if app.approval.is_some() {
-        for (label, color) in [
-            (super::APPROVAL_YES, Color::Green),
-            (super::APPROVAL_NO, th.err),
-            (super::APPROVAL_ALWAYS, th.warn),
-        ] {
-            line_spans.push(Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
-            used += super::md::display_width(label);
+    if let Some(ap) = &app.approval {
+        for (i, (label, color)) in [
+            ("Yes", Color::Green),
+            ("No", th.err),
+            ("Always", th.warn),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let picked = i == ap.selected;
+            let text = if picked {
+                format!(" ▸[{label}]")
+            } else {
+                format!("  {label} ")
+            };
+            let style = if picked {
+                Style::default()
+                    .fg(*color)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(th.mute)
+            };
+            used += super::md::display_width(&text);
+            line_spans.push(Span::styled(text, style));
         }
+        let hint = " ←→ 이동 · Enter 확정 · y/n/a";
+        used += super::md::display_width(hint);
+        line_spans.push(Span::styled(hint, Style::default().fg(th.mute)));
     } else if app.busy {
         let state = format!(" {} {}", braille_spin(), active_status_label(&app.status));
         used += super::md::display_width(&state);

@@ -27,9 +27,6 @@ use crate::db::Db;
 use crate::provider::{ContentBlock, Message, Role};
 use crate::ui::{self, Live};
 
-pub(super) const APPROVAL_YES: &str = " [Yes]";
-pub(super) const APPROVAL_NO: &str = " [No]";
-pub(super) const APPROVAL_ALWAYS: &str = " [Always]";
 
 pub struct App {
     session: Session,
@@ -58,6 +55,8 @@ pub struct App {
     quit_after: bool,
     /// 이번 턴이 시작된 트랜스크립트 위치 — 종료 시 이후 노이즈만 접는다.
     turn_start: usize,
+    /// 트랜스크립트 렌더 캐시 — 엔트리별 (해시, 래핑 완료 행). view 가 채운다.
+    pub render_cache: std::cell::RefCell<Vec<(u64, Vec<ratatui::text::Line<'static>>)>>,
     /// 실행 중 접수한 대기 프롬프트 큐 — 턴이 끝나면 순차 실행
     pub queue: Vec<String>,
     /// 현재 실행의 Todo 목록 — 하단 진행 패널에 즉시 반영된다.
@@ -76,6 +75,8 @@ pub struct App {
 
 pub struct ApprovalPrompt {
     pub preview: String,
+    /// 방향키로 고른 현재 선택 — 0 Yes · 1 No · 2 Always.
+    pub selected: usize,
     tx: oneshot::Sender<ApprovalChoice>,
 }
 
@@ -222,6 +223,7 @@ pub async fn run(
         quit: false,
         quit_after: false,
         turn_start: 0,
+        render_cache: std::cell::RefCell::new(Vec::new()),
         queue: Vec::new(),
         todos: crate::tools_more::current_todos(),
         agents: Vec::new(),
@@ -396,7 +398,7 @@ pub async fn run(
             ask = ask_rx.recv(), if ask_open => {
                 match ask {
                     Some((preview, tx)) => {
-                        app.approval = Some(ApprovalPrompt { preview, tx });
+                        app.approval = Some(ApprovalPrompt { preview, selected: 0, tx });
                         app.help = false;
                         dirty = true;
                     }
@@ -434,24 +436,46 @@ fn handle_key(
     local_ask: &LocalAsk,
     done_tx: &mpsc::UnboundedSender<TurnDone>,
 ) {
-    if let Some(prompt) = app.approval.take() {
-        match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let _ = prompt.tx.send(ApprovalChoice::Yes);
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                let _ = prompt.tx.send(ApprovalChoice::No);
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                // Always 는 이번 턴이 아니라 세션 전체에 적용한다 — 같은 도구를
-                // 다음 턴에 또 물어보지 않는다.
+    if let Some(mut prompt) = app.approval.take() {
+        // 방향키(←/→)로 선택을 옮기고 Enter 로 확정한다 — 현재 선택은 푸터에
+        // ▸ 하이라이트로 보인다. y/n/a 단축키와 Esc(=No)도 그대로 동작한다.
+        let confirm = |app: &mut App, choice: ApprovalChoice, tx: oneshot::Sender<ApprovalChoice>| {
+            if choice == ApprovalChoice::Always {
+                // Always 는 이번 턴이 아니라 세션 전체에 적용한다.
                 app.session.yes = true;
                 push(
                     app,
                     EntryKind::System,
                     "이 세션의 도구 실행을 모두 자동 승인합니다. (/new 로 해제)",
                 );
-                let _ = prompt.tx.send(ApprovalChoice::Always);
+            }
+            let _ = tx.send(choice);
+        };
+        match k.code {
+            KeyCode::Left => {
+                prompt.selected = prompt.selected.saturating_sub(1);
+                app.approval = Some(prompt);
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                prompt.selected = (prompt.selected + 1).min(2);
+                app.approval = Some(prompt);
+            }
+            KeyCode::Enter => {
+                let choice = match prompt.selected {
+                    0 => ApprovalChoice::Yes,
+                    1 => ApprovalChoice::No,
+                    _ => ApprovalChoice::Always,
+                };
+                confirm(app, choice, prompt.tx);
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                confirm(app, ApprovalChoice::Yes, prompt.tx);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                confirm(app, ApprovalChoice::No, prompt.tx);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                confirm(app, ApprovalChoice::Always, prompt.tx);
             }
             _ => {
                 app.approval = Some(prompt);
@@ -966,8 +990,6 @@ fn finish_turn(
                 app.follow = false;
                 app.final_summary = true;
             }
-            // 세션 자동 저장 (pi 스타일) — 크래시·강제 종료에도 대화가 남는다.
-            let _ = chat::save_if_dirty(&mut app.session);
         }
         Err(e) => {
             push(app, EntryKind::Warn, format!("오류: {e:#}"));

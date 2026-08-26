@@ -311,7 +311,7 @@ pub struct GeneralConfig {
     pub workspace: String,
     pub max_tokens: u32,
     pub max_context_chars: u32,
-    #[allow(dead_code)]
+    /// ask (기본) | yolo — yolo 면 시작부터 도구 자동 승인 (/yolo 로 토글).
     pub approval: String,
     pub classifier: String,
     /// 첫 실행 마법사를 이미 지났으면 true. 옛 설정에는 없음 → false.

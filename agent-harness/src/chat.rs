@@ -129,6 +129,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/engine", "하네스 엔진 rafikx|deepseek|pi|self · provider mode single|multi"),
     ("/harness", "Harness strategy single|multi"),
     ("/mode", "plan(읽기전용)/build 전환"),
+    ("/yolo", "권한무시 on|off — 도구 자동 승인 (영속)"),
     ("/class", "분류 고정 simple|medium|advanced|dev"),
     ("/agent", "코딩 실행"),
     ("/file", "파일 첨부 (@경로 멘션 가능)"),
@@ -274,6 +275,8 @@ pub fn open_session(
             }
         }
     }
+    // 권한무시(YOLO)가 config 에 켜져 있으면 처음부터 자동 승인으로 시작한다.
+    let yes = yes || cfg.file.general.approval.eq_ignore_ascii_case("yolo");
     let db = Db::open(&Db::db_path()?)?;
     if let Some(id) = resume {
         let Some(row) = db.load_session(&id)? else {
@@ -552,6 +555,29 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                     "Harness strategy 저장 실패: {error:#}"
                 )])),
             }
+        }
+        "/yolo" => {
+            // 권한무시 — 도구 승인을 전부 자동으로. config 에 영속되어
+            // 다음 실행도 처음부터 자동 승인으로 시작한다 (/yolo 로 다시 끔).
+            let on = match rest {
+                "on" => true,
+                "off" => false,
+                _ => !session.yes,
+            };
+            session.yes = on;
+            let value = if on { "yolo" } else { "ask" };
+            session.cfg.file.general.approval = value.into();
+            let _ = crate::config::write_toml_key(
+                &session.cfg.path,
+                "[general]",
+                "approval",
+                &crate::config::toml_string(value),
+            );
+            Ok(Slash::Continue(vec![if on {
+                "권한무시(YOLO) 켜짐 — 모든 도구를 자동 승인합니다. 끄기: /yolo off".into()
+            } else {
+                "권한무시(YOLO) 꺼짐 — 도구 실행 전에 다시 물어봅니다.".into()
+            }]))
         }
         "/mode" => {
             let m = rest.to_ascii_lowercase();
@@ -1427,6 +1453,9 @@ pub async fn run_turn(
                 &binding.provider_name,
                 &binding.model,
             );
+            // 세션 자동 저장 (pi 스타일) — 턴 태스크(백그라운드)에서 실행되므로
+            // 큰 세션 직렬화가 TUI 메인 루프를 멈추지 않는다.
+            let _ = save_if_dirty(session);
             Ok(TurnInfo {
                 run_id,
                 label: info_label,
