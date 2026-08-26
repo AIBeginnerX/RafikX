@@ -3,6 +3,8 @@
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
+mod install;
+
 pub const REPO_API: &str = "https://api.github.com/repos/AIBeginnerX/RafikX/releases/latest";
 const GIT_URL: &str = "https://github.com/AIBeginnerX/RafikX.git";
 
@@ -55,11 +57,7 @@ pub fn latest_release() -> Result<Release> {
     let best = text
         .lines()
         .filter_map(|l| l.rsplit('/').next())
-        .filter_map(|t| {
-            t.parse::<SemverKey>()
-                .ok()
-                .map(|k| (t.to_string(), k))
-        })
+        .filter_map(|t| t.parse::<SemverKey>().ok().map(|k| (t.to_string(), k)))
         .max_by(|a, b| a.1.cmp(&b.1));
     let Some((tag, _)) = best else {
         return Err(anyhow!("태그가 없습니다"));
@@ -84,7 +82,11 @@ impl std::str::FromStr for SemverKey {
             .trim_start_matches(|c: char| !c.is_ascii_digit())
             .split('.')
             .take(3)
-            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
             .filter(|p| !p.is_empty())
             .map(|p| p.parse::<u64>())
             .collect::<Result<_, _>>()?;
@@ -98,7 +100,11 @@ pub fn is_newer(latest_tag: &str, current: &str) -> bool {
         s.trim()
             .trim_start_matches(|c: char| !c.is_ascii_digit())
             .split('.')
-            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
             .filter_map(|p| p.parse::<u64>().ok())
             .collect()
     };
@@ -131,7 +137,6 @@ pub fn summarize_notes(notes: &str, max_lines: usize) -> Vec<String> {
         .collect()
 }
 
-/// 표준 설치 경로(~/.rafikx-src)에서 최신 소스를 받아 설치하는 명령.
 static LAST_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// TUI 에서 U 키로 요청하면 기록하고, 에이전트 종료 후 main 이 소비한다.
 static UPDATE_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -174,12 +179,14 @@ pub fn upgrade_notice(release: &Release, current: &str) -> Option<String> {
         out.push(release.url.clone());
     }
     out.push("업그레이드 명령어: RafikX update (터미널 입력: rafikx update)".into());
-    out.push("지금 업그레이드하려면 U 키를 누르세요 (에이전트가 종료되며 업데이트가 실행됩니다).".into());
+    out.push(
+        "지금 업그레이드하려면 U 키를 누르세요 (에이전트가 종료되며 업데이트가 실행됩니다).".into(),
+    );
     Some(out.join("\n"))
 }
 
 /// rafikx update 서브커맨드 본체 — 에이전트 밖에서 단독 실행된다.
-/// GitHub 확인 → 요약 출력 → ~/.rafikx-src 갱신 후 cargo install (진행 출력 그대로 스트리밍).
+/// GitHub 확인 → 요약 출력 → 정확한 릴리스 태그를 임시 체크아웃한 뒤 cargo install.
 pub fn run_update_flow() -> anyhow::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("현재 버전 v{current} — GitHub 확인 중…");
@@ -206,36 +213,7 @@ pub fn run_update_flow() -> anyhow::Result<()> {
         println!("취소했습니다. 나중에 `rafikx update` 로 다시 진행하세요.");
         return Ok(());
     }
-    perform_install()
-}
-
-fn perform_install() -> anyhow::Result<()> {
-    use std::process::Command;
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(install_script())
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("업그레이드 실패 (exit {})", status.code().unwrap_or(-1));
-    }
-    println!();
-    println!("업그레이드 완료 — `rafikx` 를 다시 실행하세요.");
-    Ok(())
-}
-
-fn install_script() -> &'static str {
-    r#"
-set -e
-SRC="$HOME/.rafikx-src"
-if [ -d "$SRC/.git" ]; then
-  git -C "$SRC" fetch --depth 1 origin master
-  git -C "$SRC" checkout -q master
-  git -C "$SRC" reset -q --hard origin/master
-else
-  git clone --depth 1 --branch master https://github.com/AIBeginnerX/RafikX.git "$SRC"
-fi
-cargo install --path "$SRC/agent-harness" --locked --force
-"#
+    install::perform_install(&rel.tag)
 }
 
 #[cfg(test)]
@@ -258,12 +236,5 @@ mod tests {
             summarize_notes(notes, 5),
             vec!["web_search 추가", "apply_patch 지원", "일반 문단"]
         );
-    }
-
-    #[test]
-    fn updater_bootstraps_missing_source_clone() {
-        let script = install_script();
-        assert!(script.contains("git clone --depth 1"));
-        assert!(script.contains("cargo install --path"));
     }
 }
