@@ -31,15 +31,16 @@ fn answer_started() -> bool {
 }
 
 /// 스피너 구동 중 라벨 갱신 (agent 루프의 반복·도구 정보 등).
-fn label_slot() -> &'static Mutex<Option<String>> {
-    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// 라벨과 그 라벨이 걸린 시각 — 단계별 경과를 세기 위해 함께 보관한다.
+fn label_slot() -> &'static Mutex<Option<(String, Instant)>> {
+    static SLOT: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
 pub fn set_label(msg: &str) {
     if let Ok(mut g) = label_slot().lock() {
         let trimmed: String = msg.chars().take(56).collect();
-        *g = Some(trimmed);
+        *g = Some((trimmed, Instant::now()));
     }
 }
 
@@ -49,7 +50,40 @@ pub fn set_label_in(run: &RunContext, msg: &str) {
 
 /// 현재 라벨 — TUI 진행바가 단계 상태를 표시할 때 읽는다.
 pub fn current_label() -> Option<String> {
-    label_slot().lock().ok().and_then(|g| g.clone())
+    label_slot()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(label, _)| label.clone()))
+}
+
+/// 단계 경과 표기 — 60초 미만은 "42s", 그 이상은 "1m24s".
+pub(crate) fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// 스피너 한 줄에 실리는 라벨 — 지금 단계가 얼마나 이어졌는지를 함께 보인다.
+/// 같은 라벨이 오래 머무르면 그 자체로 "무엇을 하는 중인지"의 답이 된다.
+pub(crate) fn label_with_elapsed(label: &str, secs: u64) -> String {
+    if label.is_empty() {
+        return String::new();
+    }
+    format!("{label} · {}", format_elapsed(secs))
+}
+
+/// 전역 스피너가 그리는 라벨 (경과 포함).
+fn label_display() -> String {
+    label_slot()
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .map(|(label, at)| label_with_elapsed(label, at.elapsed().as_secs()))
+        })
+        .unwrap_or_default()
 }
 
 pub fn current_label_in(run: &RunContext) -> Option<String> {
@@ -176,11 +210,7 @@ impl Spinner {
                     break;
                 }
                 let elapsed = started.elapsed().as_secs();
-                let label = label_slot()
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .unwrap_or_default();
+                let label = label_display();
                 let _ = write!(
                     err,
                     "\r\x1b[36m{}\x1b[0m {} {:>3}초 {} ",
@@ -231,7 +261,7 @@ impl Spinner {
                     break;
                 }
                 let elapsed = started.elapsed().as_secs();
-                let label = run_t.progress().label().unwrap_or_default();
+                let label = run_t.progress().label_display();
                 let _ = write!(
                     err,
                     "\r\x1b[36m{}\x1b[0m {} {:>3}초 {} ",
@@ -335,7 +365,31 @@ mod tests {
     #[test]
     fn label_roundtrip() {
         set_label("반복 2/25");
-        assert_eq!(label_slot().lock().unwrap().as_deref(), Some("반복 2/25"));
+        assert_eq!(current_label().as_deref(), Some("반복 2/25"));
+        // 라벨을 걸자마자는 0초 — 경과가 라벨 뒤에 붙는다.
+        assert!(label_display().starts_with("반복 2/25 · "));
         *label_slot().lock().unwrap() = None;
+        assert!(label_display().is_empty());
+    }
+
+    #[test]
+    fn elapsed_switches_to_minutes_after_a_minute() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(42), "42s");
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(60), "1m00s");
+        assert_eq!(format_elapsed(84), "1m24s");
+        assert_eq!(format_elapsed(3_600), "60m00s");
+    }
+
+    #[test]
+    fn label_gets_elapsed_suffix_unless_empty() {
+        assert_eq!(
+            label_with_elapsed("반복 3/25 · 모델 호출", 84),
+            "반복 3/25 · 모델 호출 · 1m24s"
+        );
+        assert_eq!(label_with_elapsed("검증 중…", 42), "검증 중… · 42s");
+        // 라벨이 없으면 경과만 떠 있는 줄을 만들지 않는다.
+        assert!(label_with_elapsed("", 42).is_empty());
     }
 }

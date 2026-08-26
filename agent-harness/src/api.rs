@@ -592,6 +592,30 @@ pub(crate) fn set_discipline_for(cfg: &Config, name: &str) -> Result<String> {
     Ok(format!("실행 분야: {} — {}", d.as_str(), d.summary()))
 }
 
+/// 팀 모드 저장 (single | multi). 미지원 값은 거부한다.
+pub fn set_team(name: &str) -> Result<String> {
+    let cfg = Config::load(None)?;
+    set_team_for(&cfg, name)
+}
+
+pub(crate) fn set_team_for(cfg: &Config, name: &str) -> Result<String> {
+    let raw = name.trim().to_ascii_lowercase();
+    let t = crate::engine::normalize_team(&raw);
+    if t.as_str() != raw {
+        anyhow::bail!(
+            "팀 모드는 {} 중 하나여야 합니다",
+            crate::engine::team_names_joined()
+        );
+    }
+    crate::config::write_toml_key(
+        &cfg.path,
+        "[harness]",
+        "team",
+        &crate::config::toml_string(t.as_str()),
+    )?;
+    Ok(format!("팀 모드: {} — {}", t.as_str(), t.summary()))
+}
+
 /// Self-Harness 메타 레이어 토글 저장 — 어떤 엔진 위에도 자기개선 루프를 겹친다.
 pub fn set_self_meta(on: bool) -> Result<String> {
     let cfg = Config::load(None)?;

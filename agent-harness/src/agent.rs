@@ -12,12 +12,28 @@ use crate::applog;
 use crate::config::Config;
 use crate::db::Db;
 use crate::lifecycle::{ApprovalDecision, LifecycleEventData, LifecycleState};
-use crate::provider::{ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason};
+use crate::provider::{
+    ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason, StreamEvent,
+};
 use crate::run::{RunContext, RunId};
 use crate::tools::{self, ToolCtx, ToolRegistry};
 
 pub const HARD_CAP: u32 = 50;
 pub const AGENT_MAX_ITER: u32 = 25;
+
+/// 한 응답의 도구 호출 목록 앞부분에서 병렬로 묶을 수 있는 연속 `task` 구간의 길이.
+/// 2 미만이면 0 — 호출부는 기존 순차 경로를 그대로 탄다.
+///
+/// 병렬화 대상을 task 하나로 한정하는 이유: task 는 자식 RunContext·자식 승인 범위를
+/// 이미 갖고 워크스페이스를 직접 만지지 않는다. 파일·셸 도구는 서로의 결과에 의존하므로
+/// 순서를 보존해야 한다.
+pub fn leading_task_span(names: &[&str]) -> usize {
+    let n = names
+        .iter()
+        .take_while(|name| **name == tools::TaskTool::NAME)
+        .count();
+    if n >= 2 { n } else { 0 }
+}
 
 pub struct AgentOutcome {
     pub status: String,
@@ -34,7 +50,11 @@ pub struct AgentOutcome {
     pub changed_files: Vec<String>,
     pub tool_errors: Vec<String>,
     pub deny_reasons: Vec<String>,
+    /// 검증 명령의 **최종** 실패. 재시도로 통과했으면 None 이다 (설계 §15.4).
     pub verify_fail: Option<String>,
+    /// 검증이 한 번 실패했다가 재시도로 통과한 경우의 첫 실패 사유.
+    /// 성공 판정을 흐리지 않으면서 "실패 후 회복" 교훈 수집 경로를 유지한다.
+    pub verify_recovered: Option<String>,
 }
 
 impl Default for AgentOutcome {
@@ -53,6 +73,7 @@ impl Default for AgentOutcome {
             tool_errors: Vec::new(),
             deny_reasons: Vec::new(),
             verify_fail: None,
+            verify_recovered: None,
         }
     }
 }
@@ -92,6 +113,12 @@ enum Approval {
     Yes,
     No,
     Always,
+}
+
+/// working 패널의 이 실행 줄에 "지금 하는 일"만 갱신한다.
+/// 역할·모델은 파이프라인(또는 task.rs)이 이미 채웠으므로 빈 값으로 두어 유지시킨다.
+fn worker_activity(run: &RunContext, activity: &str) {
+    crate::ui::live_worker_in(run, &crate::ui::worker_id(run), "", "", activity, false);
 }
 
 pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
@@ -189,6 +216,7 @@ pub async fn run_agent_with_context(
                 tool_errors,
                 deny_reasons,
                 verify_fail: None,
+                verify_recovered: None,
             });
         }
         if iterations >= max_iter {
@@ -207,6 +235,7 @@ pub async fn run_agent_with_context(
                 tool_errors,
                 deny_reasons,
                 verify_fail: None,
+                verify_recovered: None,
             });
         }
         iterations += 1;
@@ -218,6 +247,7 @@ pub async fn run_agent_with_context(
             &run_context,
             &format!("반복 {iterations}/{max_iter} · 모델 호출"),
         );
+        worker_activity(&run_context, &format!("반복 {iterations}/{max_iter}"));
         let specs = registry.specs();
         messages = crate::packer::pack_messages(
             &messages,
@@ -250,9 +280,17 @@ pub async fn run_agent_with_context(
         let mut streamed = false;
         let (_used, resp) = {
             let response =
-                crate::harness::stream_with_fallback(cfg, &order, "main", req, |piece| {
-                    streamed = true;
-                    crate::ui::live_chunk_in(&run_context, piece);
+                crate::harness::stream_with_fallback(cfg, &order, "main", req, |ev| match ev {
+                    StreamEvent::Text(piece) => {
+                        streamed = true;
+                        crate::ui::live_chunk_in(&run_context, piece);
+                    }
+                    // 대형 tool call 인자를 쓰는 동안은 텍스트가 없다 — 진행만 갱신한다.
+                    StreamEvent::ToolArgs { name, total_bytes } => {
+                        let label = crate::harness::tool_args_label(name, total_bytes);
+                        crate::ui::live_status_in(&run_context, &label);
+                        worker_activity(&run_context, &label);
+                    }
                 });
             tokio::pin!(response);
             tokio::select! {
@@ -272,6 +310,7 @@ pub async fn run_agent_with_context(
                         tool_errors,
                         deny_reasons,
                         verify_fail: None,
+                        verify_recovered: None,
                     });
                 }
             }
@@ -380,6 +419,7 @@ pub async fn run_agent_with_context(
                 tool_errors,
                 deny_reasons,
                 verify_fail: None,
+                verify_recovered: None,
             });
         }
 
@@ -402,6 +442,7 @@ pub async fn run_agent_with_context(
                 tool_errors,
                 deny_reasons,
                 verify_fail: None,
+                verify_recovered: None,
             });
         }
 
@@ -411,7 +452,149 @@ pub async fn run_agent_with_context(
         });
 
         let mut results: Vec<ContentBlock> = Vec::new();
-        for (id, name, input) in tool_uses {
+        let mut pending: std::collections::VecDeque<(String, String, serde_json::Value)> =
+            tool_uses.into_iter().collect();
+        while !pending.is_empty() {
+            // 팀 모드가 노리는 병렬 위임: 승인이 필요 없는 상태에서만 연속 task 호출을 한
+            // 묶음으로 동시에 돌린다. 승인이 필요하면(allow_all=false) 프리뷰 순서를 지켜야
+            // 하므로 기존 순차 경로를 그대로 탄다.
+            // 결과는 tool_use 순서대로 되돌려 API 규격(id 짝)을 지킨다.
+            let span = if allow_all && registry.get(tools::TaskTool::NAME).is_some() {
+                let names: Vec<&str> = pending.iter().map(|(_, name, _)| name.as_str()).collect();
+                leading_task_span(&names)
+            } else {
+                0
+            };
+            if span >= 2 {
+                if run_context.is_cancelled() {
+                    return Ok(AgentOutcome {
+                        status: "cancelled".into(),
+                        iterations,
+                        input_tokens,
+                        output_tokens,
+                        context_tokens,
+                        cached_tokens,
+                        cache_reported,
+                        error: Some("실행이 취소되었습니다.".into()),
+                        messages,
+                        changed_files: committed_files(&run_context),
+                        tool_errors,
+                        deny_reasons,
+                        verify_fail: None,
+                        verify_recovered: None,
+                    });
+                }
+                let batch: Vec<(String, String, serde_json::Value)> =
+                    pending.drain(..span).collect();
+                // 동일 도구·입력 3회 반복 차단은 병렬 구간에서도 그대로 적용한다.
+                let mut repeated = false;
+                for (_, name, input) in &batch {
+                    let count = call_counts.entry(format!("{name}:{input}")).or_insert(0);
+                    *count += 1;
+                    repeated |= *count >= 3;
+                }
+                if repeated {
+                    crate::ui::live_line_in(
+                        &run_context,
+                        "동일 도구·입력이 3회 반복되어 중단합니다.",
+                    );
+                    return Ok(AgentOutcome {
+                        status: "limit".into(),
+                        iterations,
+                        input_tokens,
+                        output_tokens,
+                        context_tokens,
+                        cached_tokens,
+                        cache_reported,
+                        error: Some("동일 도구 3회 반복".into()),
+                        messages,
+                        changed_files: committed_files(&run_context),
+                        tool_errors,
+                        deny_reasons,
+                        verify_fail: None,
+                        verify_recovered: None,
+                    });
+                }
+                crate::ui::live_line_in(&run_context, &format!("[병렬] task {span}건 동시 위임"));
+                crate::spinner::set_label_in(
+                    &run_context,
+                    &format!("도구 실행: task ×{span} (병렬)"),
+                );
+                let prepared: Vec<_> = batch
+                    .iter()
+                    .map(|(_, name, input)| {
+                        let _ = run_context.transition_lifecycle(LifecycleEventData::ToolStarted {
+                            name: name.clone(),
+                        });
+                        crate::graph::node_in(
+                            &run_context,
+                            "tool_pre",
+                            name,
+                            "parallel",
+                            Some("request"),
+                        );
+                        tools::TaskTool::parse_args(input, &ctx)
+                    })
+                    .collect();
+                // 인자 파싱이 실패한 호출만 오류 결과가 되고 나머지는 그대로 병렬 실행된다.
+                let outs =
+                    futures_util::future::join_all(prepared.into_iter().map(|args| async move {
+                        match args {
+                            Ok(args) => tools::TaskTool::run_async(args).await,
+                            Err(e) => Err(e),
+                        }
+                    }))
+                    .await;
+                for ((id, name, _), out) in batch.into_iter().zip(outs) {
+                    match out {
+                        Ok(text) => {
+                            crate::graph::node_in(
+                                &run_context,
+                                "tool_post",
+                                &name,
+                                "ok",
+                                Some("tool_pre"),
+                            );
+                            crate::ui::live_line_in(
+                                &run_context,
+                                &tool_output_summary(&name, &text),
+                            );
+                            results.push(ContentBlock::ToolResult {
+                                tool_use_id: id,
+                                content: text,
+                                is_error: false,
+                            });
+                            let _ = run_context.transition_lifecycle(
+                                LifecycleEventData::ToolFinished { name, ok: true },
+                            );
+                        }
+                        Err(e) => {
+                            crate::graph::node_in(
+                                &run_context,
+                                "tool_post",
+                                &name,
+                                "error",
+                                Some("tool_pre"),
+                            );
+                            applog::error(&format!("tool {name}: {e}"));
+                            crate::ui::live_line_in(&run_context, &format!("도구 오류: {e}"));
+                            tool_errors.push(format!("{name}: {e}"));
+                            results.push(ContentBlock::ToolResult {
+                                tool_use_id: id,
+                                content: e.to_string(),
+                                is_error: true,
+                            });
+                            let _ = run_context.transition_lifecycle(
+                                LifecycleEventData::ToolFinished { name, ok: false },
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some((id, name, input)) = pending.pop_front() else {
+                break;
+            };
             if run_context.is_cancelled() {
                 return Ok(AgentOutcome {
                     status: "cancelled".into(),
@@ -427,6 +610,7 @@ pub async fn run_agent_with_context(
                     tool_errors,
                     deny_reasons,
                     verify_fail: None,
+                    verify_recovered: None,
                 });
             }
             let key = format!("{name}:{}", input);
@@ -448,10 +632,12 @@ pub async fn run_agent_with_context(
                     tool_errors,
                     deny_reasons,
                     verify_fail: None,
+                    verify_recovered: None,
                 });
             }
 
             crate::ui::live_line_in(&run_context, &format!("[도구] {name}"));
+            worker_activity(&run_context, &format!("[도구] {name}"));
             let _ = run_context
                 .transition_lifecycle(LifecycleEventData::ToolStarted { name: name.clone() });
             crate::spinner::set_label_in(&run_context, &format!("도구 실행: {name}"));
@@ -502,6 +688,7 @@ pub async fn run_agent_with_context(
                                 tool_errors,
                                 deny_reasons,
                                 verify_fail: None,
+                                verify_recovered: None,
                             });
                         };
                         let decision = match &choice {
@@ -807,6 +994,23 @@ pub fn assistant_text(messages: &[Message]) -> String {
     parts.join("\n")
 }
 
+/// 마지막 assistant 메시지의 텍스트만 이어붙인다.
+/// 판정을 읽어야 하는 곳(검증자 게이트)은 전체 발화가 아니라 이 결론만 본다 —
+/// 1회차의 "…판정하겠다" 같은 중간 발화가 결론으로 오인되면 안 된다.
+pub fn last_assistant_text(messages: &[Message]) -> String {
+    let Some(last) = messages.iter().rev().find(|m| m.role == Role::Assistant) else {
+        return String::new();
+    };
+    last.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn record_finish(db: &Db, run_id: &str, outcome: &AgentOutcome) -> Result<()> {
     db.finish_run(
         run_id,
@@ -822,6 +1026,46 @@ pub fn record_finish(db: &Db, run_id: &str, outcome: &AgentOutcome) -> Result<()
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn last_assistant_text_takes_only_the_final_turn() {
+        let msgs = vec![
+            Message::user_text("판정하라"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "[판정] 은 파일을 읽고 내리겠다".into(),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "계속".into(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "확인 완료.".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "[판정] pass".into(),
+                    },
+                ],
+            },
+        ];
+        let last = last_assistant_text(&msgs);
+        // 마지막 assistant 턴만 — 1회차의 "판정하겠다" 발화가 섞이면 안 된다.
+        assert!(last.contains("[판정] pass"));
+        assert!(!last.contains("내리겠다"));
+        // 같은 턴의 텍스트 블록은 모두 이어붙인다.
+        assert!(last.contains("확인 완료."));
+        // 전체 이어붙이기(assistant_text)는 두 발화를 모두 담는다 — 대비.
+        assert!(assistant_text(&msgs).contains("내리겠다"));
+        assert_eq!(last_assistant_text(&[]), "");
+        assert_eq!(last_assistant_text(&[Message::user_text("x")]), "");
+    }
 
     #[test]
     fn drops_unpaired_tool_use() {
@@ -864,6 +1108,21 @@ mod tests {
         ];
         sanitize_tool_pairs(&mut msgs);
         assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn groups_only_leading_runs_of_two_or_more_task_calls() {
+        // 병렬 대상은 "선두의 연속 task 2개 이상"뿐이다.
+        assert_eq!(leading_task_span(&["task", "task"]), 2);
+        assert_eq!(leading_task_span(&["task", "task", "task"]), 3);
+        assert_eq!(leading_task_span(&["task", "task", "read_file"]), 2);
+        // 1개짜리는 병렬화하지 않는다 — 기존 순차 경로가 그대로 처리한다.
+        assert_eq!(leading_task_span(&["task"]), 0);
+        assert_eq!(leading_task_span(&["task", "read_file", "task"]), 0);
+        // 선두가 task 가 아니면 0 — 앞선 도구의 부수효과 순서를 먼저 지킨다.
+        assert_eq!(leading_task_span(&["read_file", "task", "task"]), 0);
+        assert_eq!(leading_task_span(&[]), 0);
+        assert_eq!(leading_task_span(&["write_file"]), 0);
     }
 
     #[test]

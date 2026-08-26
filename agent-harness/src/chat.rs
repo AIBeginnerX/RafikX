@@ -138,6 +138,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/discipline",
         "실행 분야 harness|loop|graph — 루프 강화 · 노드 DAG 실행",
     ),
+    (
+        "/team",
+        "팀 모드 single|multi — 독립 단계를 역할 서브에이전트로 위임(병렬)",
+    ),
     ("/harness", "Harness strategy single|multi"),
     (
         "/selfharness",
@@ -568,6 +572,29 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             match crate::api::set_discipline_for(&session.cfg, &arg) {
                 Ok(msg) => {
                     session.cfg.file.general.discipline = arg;
+                    Ok(Slash::Continue(vec![msg]))
+                }
+                Err(err) => Ok(Slash::Continue(vec![format!("{err}")])),
+            }
+        }
+        "/team" => {
+            // 팀 모드 — 엔진·분야와 직교하는 축. 위임 지침과 병렬 실행만 바꾼다.
+            let arg = rest.trim().to_ascii_lowercase();
+            let names = crate::engine::team_names_joined();
+            if arg.is_empty() {
+                let cur = crate::harness::team_mode(&session.cfg);
+                let mut notes = vec![format!(
+                    "현재 팀 모드: {}   ·   변경: /team {names}",
+                    cur.as_str()
+                )];
+                for t in crate::engine::TEAM_MODES {
+                    notes.push(format!("  {:<8} {}", t.as_str(), t.summary()));
+                }
+                return Ok(Slash::Continue(notes));
+            }
+            match crate::api::set_team_for(&session.cfg, &arg) {
+                Ok(msg) => {
+                    session.cfg.file.harness.team = arg;
                     Ok(Slash::Continue(vec![msg]))
                 }
                 Err(err) => Ok(Slash::Continue(vec![format!("{err}")])),
@@ -1499,6 +1526,8 @@ pub async fn run_turn_observed(
         }
     }
     crate::ui::live_status("Working");
+    // 이번 턴의 실행 축 — working 패널 마지막 줄로 진행 내내 남는다 (§16.2).
+    crate::ui::live_mode(&crate::harness::mode_line(&session.cfg));
 
     let db = Db::open(&Db::db_path()?)?;
     let run_id = db.start_run(
@@ -1510,11 +1539,10 @@ pub async fn run_turn_observed(
         Some(&binding.model),
     )?;
     let _g = crate::graph::scope(&run_id);
-    let live_sink = if observer.is_some() {
-        Some(Arc::new(|_| {}) as crate::run::RunLiveSink)
-    } else {
-        crate::ui::current_live_sink()
-    };
+    // 라이브 sink 는 observer 유무와 무관하게 전역 sink 다. TUI 일 때 no-op 을 끼우면
+    // `ui::emit_in` 의 단락 평가(`run.emit_live(e) || emit(e)`)가 no-op 에서 true 를
+    // 돌려 전역 TUI sink 에 아무 이벤트도 도달하지 못했다 (§16.1).
+    let live_sink = crate::ui::current_live_sink();
     let run_context =
         RunContext::for_config(RunId::new(run_id.clone()), Arc::new(session.cfg.clone()))
             .with_live_sink(live_sink);
@@ -1686,6 +1714,7 @@ pub async fn run_turn_observed(
                 tool_errors: vec![],
                 deny_reasons: vec![],
                 verify_fail: None,
+                verify_recovered: None,
             };
             crate::lessons::maybe_spawn(&session.cfg, prompt, &fail);
             crate::ui::print_footer();
@@ -1964,6 +1993,83 @@ mod tests {
 
         // 팔레트에 등록되어 있어야 TUI 자동완성에 뜬다.
         assert!(SLASH_COMMANDS.iter().any(|(c, _)| *c == "/discipline"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn team_slash_switches_and_persists() {
+        let dir = std::env::temp_dir().join(format!("rafikx-team-{}", Db::new_id()));
+        let config_path = dir.join("config.toml");
+        let cfg = Config::load(Some(&config_path)).expect("config");
+        // 새 config 기본값은 single.
+        assert_eq!(
+            crate::harness::team_mode(&cfg),
+            crate::engine::TeamMode::Single
+        );
+        let mut s = Session {
+            cfg,
+            yes: true,
+            provider: None,
+            model: None,
+            class: None,
+            mode: "build".into(),
+            session_id: None,
+            messages: vec![],
+            last_context_tokens: 0,
+            obsidian_on: false,
+            attachments: vec![],
+            dirty: false,
+            sticky: None,
+        };
+
+        // 인자 없음 — 현재 값과 2종 설명만 보여주고 아무것도 바꾸지 않는다.
+        match handle_slash(&mut s, "/team", false).expect("ok") {
+            Slash::Continue(notes) => {
+                assert!(notes.iter().any(|n| n.contains("현재 팀 모드: single")));
+                for name in ["single", "multi"] {
+                    assert!(
+                        notes.iter().any(|n| n.trim_start().starts_with(name)),
+                        "{name} 설명 없음"
+                    );
+                }
+            }
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(s.cfg.file.harness.team, "single");
+
+        // 값 지정 — 세션과 config 양쪽에 반영된다.
+        handle_slash(&mut s, "/team MULTI", false).expect("ok");
+        assert_eq!(s.cfg.file.harness.team, "multi");
+        assert_eq!(
+            Config::load(Some(&config_path))
+                .expect("reload multi")
+                .file
+                .harness
+                .team,
+            "multi"
+        );
+
+        handle_slash(&mut s, "/team single", false).expect("ok");
+        assert_eq!(s.cfg.file.harness.team, "single");
+        assert_eq!(
+            Config::load(Some(&config_path))
+                .expect("reload single")
+                .file
+                .harness
+                .team,
+            "single"
+        );
+
+        // 미지원 값은 저장하지 않고 사용법만 안내한다.
+        match handle_slash(&mut s, "/team duo", false).expect("ok") {
+            Slash::Continue(notes) => assert!(notes.iter().any(|n| n.contains("single|multi"))),
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(s.cfg.file.harness.team, "single");
+
+        // 팔레트에 등록되어 있어야 TUI 자동완성에 뜬다.
+        assert!(SLASH_COMMANDS.iter().any(|(c, _)| *c == "/team"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

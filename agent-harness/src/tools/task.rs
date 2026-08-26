@@ -23,6 +23,19 @@ pub struct TaskResult {
     pub output_tokens: u32,
 }
 
+/// 위임 한 건의 실행 인자 — 도구 입력과 ToolCtx 에서 미리 뽑아 소유한다.
+/// 전부 소유 값이므로 이 묶음으로 만든 future 는 병렬로 묶어도 안전하다.
+pub struct TaskArgs {
+    cfg: crate::config::Config,
+    prompt: String,
+    class: Option<String>,
+    role: Option<String>,
+    model: Option<String>,
+    parent: Option<RunContext>,
+    remote: Option<crate::agent::RemoteApproval>,
+    local_ask: Option<crate::agent::LocalAsk>,
+}
+
 impl TaskTool {
     pub const NAME: &'static str = "task";
 
@@ -32,16 +45,54 @@ impl TaskTool {
             .unwrap_or_else(|| crate::harness::classify_rules(prompt, false))
     }
 
-    async fn delegate(
-        cfg: crate::config::Config,
-        prompt: String,
-        class: Option<String>,
-        role: Option<String>,
-        model: Option<String>,
-        parent: Option<RunContext>,
-        remote: Option<crate::agent::RemoteApproval>,
-        local_ask: Option<crate::agent::LocalAsk>,
-    ) -> Result<String> {
+    /// 도구 입력을 소유 인자로 옮긴다. 동기 run() 과 병렬 경로가 같은 파싱을 쓴다.
+    pub fn parse_args(input: &Value, ctx: &ToolCtx) -> Result<TaskArgs> {
+        let prompt = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("prompt 인자가 필요합니다"))?
+            .trim()
+            .to_string();
+        if prompt.is_empty() {
+            return Err(anyhow!("prompt 가 비어 있습니다"));
+        }
+        let string = |key| input.get(key).and_then(Value::as_str).map(str::to_string);
+        let cfg = ctx
+            .run
+            .as_ref()
+            .and_then(RunContext::config)
+            .map(|config| config.as_ref().clone())
+            .map(Ok)
+            .unwrap_or_else(|| crate::config::Config::load(None))?;
+        Ok(TaskArgs {
+            cfg,
+            prompt,
+            class: string("class"),
+            role: string("role"),
+            model: string("model"),
+            parent: ctx.run.clone(),
+            remote: ctx.remote.clone(),
+            local_ask: ctx.local_ask.clone(),
+        })
+    }
+
+    /// 병렬 구간이 쓰는 async 진입점 — 동기 run() 이 block_on 으로 감싸는 바로 그 실행이다.
+    /// 다른 도구의 실행 방식(&self 동기 run)은 건드리지 않는다.
+    pub async fn run_async(args: TaskArgs) -> Result<String> {
+        Self::delegate(args).await
+    }
+
+    async fn delegate(args: TaskArgs) -> Result<String> {
+        let TaskArgs {
+            cfg,
+            prompt,
+            class,
+            role,
+            model,
+            parent,
+            remote,
+            local_ask,
+        } = args;
         let task_class = Self::resolve_class(&prompt, class.as_deref());
         // role 이 유효한 프로파일 이름(config 정의 또는 내장 전문가 프리셋)이면 그 프로파일로
         // 바인딩한다. 아니면 예전처럼 화면 표시용 라벨로만 쓴다.
@@ -74,19 +125,31 @@ impl TaskTool {
                 agent_id: agent_id.clone(),
             });
         }
-        crate::ui::live_agent_in(
+        // 팀 모드에서는 자식들의 라이브 출력이 섞이므로 시작·종료 줄에 역할 프리픽스를 붙인다.
+        let team_tag = if crate::harness::team_mode(&cfg) == crate::engine::TeamMode::Multi {
+            format!("[팀:{role}] ")
+        } else {
+            String::new()
+        };
+        // working 패널에서도 팀 모드면 역할이 팀 소속임을 드러낸다.
+        let worker_role = if team_tag.is_empty() {
+            role.clone()
+        } else {
+            format!("팀:{role}")
+        };
+        let worker_model = format!("{}/{}", binding.provider_name, binding.model);
+        crate::ui::live_worker_in(
             &child,
-            crate::ui::AgentProgress {
-                id: agent_id.to_string(),
-                role: role.clone(),
-                model: binding.model.clone(),
-                status: "running".into(),
-            },
+            &agent_id.to_string(),
+            &worker_role,
+            &worker_model,
+            "시작",
+            false,
         );
         crate::ui::live_line_in(
             &child,
             &format!(
-                "[task] {} · {} → {} ({})",
+                "{team_tag}[task] {} · {} → {} ({})",
                 agent_id,
                 binding.class.as_str(),
                 role,
@@ -119,14 +182,16 @@ impl TaskTool {
             Ok(outcome) => outcome,
             Err(error) => {
                 finish_parent(&parent, &child, 0, 0);
-                crate::ui::live_agent_in(
+                if !team_tag.is_empty() {
+                    crate::ui::live_line_in(&child, &format!("{team_tag}[task] 실패 · {error}"));
+                }
+                crate::ui::live_worker_in(
                     &child,
-                    crate::ui::AgentProgress {
-                        id: agent_id.to_string(),
-                        role,
-                        model: binding.model.clone(),
-                        status: "failed".into(),
-                    },
+                    &agent_id.to_string(),
+                    &worker_role,
+                    &worker_model,
+                    "실패",
+                    true,
                 );
                 return Err(error);
             }
@@ -135,14 +200,19 @@ impl TaskTool {
             parent.record_committed_paths(child.committed_paths());
         }
         finish_parent(&parent, &child, outcome.input_tokens, outcome.output_tokens);
-        crate::ui::live_agent_in(
+        if !team_tag.is_empty() {
+            crate::ui::live_line_in(
+                &child,
+                &format!("{team_tag}[task] 종료 · status={}", outcome.status),
+            );
+        }
+        crate::ui::live_worker_in(
             &child,
-            crate::ui::AgentProgress {
-                id: agent_id.to_string(),
-                role,
-                model: binding.model.clone(),
-                status: outcome.status.clone(),
-            },
+            &agent_id.to_string(),
+            &worker_role,
+            &worker_model,
+            &outcome.status,
+            true,
         );
         let state = child.lifecycle_state().unwrap_or(LifecycleState::Failed);
         let metadata = TaskResult {
@@ -207,33 +277,9 @@ impl Tool for TaskTool {
     }
 
     fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
-        let prompt = input
-            .get("prompt")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("prompt 인자가 필요합니다"))?
-            .trim()
-            .to_string();
-        if prompt.is_empty() {
-            return Err(anyhow!("prompt 가 비어 있습니다"));
-        }
-        let string = |key| input.get(key).and_then(Value::as_str).map(str::to_string);
-        let cfg = ctx
-            .run
-            .as_ref()
-            .and_then(RunContext::config)
-            .map(|config| config.as_ref().clone())
-            .map(Ok)
-            .unwrap_or_else(|| crate::config::Config::load(None))?;
-        let parent = ctx.run.clone();
-        let remote = ctx.remote.clone();
-        let local_ask = ctx.local_ask.clone();
-        let class = string("class");
-        let role = string("role");
-        let model = string("model");
+        let args = Self::parse_args(&input, ctx)?;
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                Self::delegate(cfg, prompt, class, role, model, parent, remote, local_ask).await
-            })
+            tokio::runtime::Handle::current().block_on(Self::delegate(args))
         })
     }
 }

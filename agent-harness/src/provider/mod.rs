@@ -123,6 +123,25 @@ pub fn map_stop_reason(raw: Option<&str>) -> StopReason {
     }
 }
 
+/// 스트림 진행 이벤트. 텍스트가 한 조각도 없는 구간(대형 tool call 인자 생성)에서도
+/// "모델이 무엇을 하는 중인가"를 소비자에게 알리기 위한 통로다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEvent<'a> {
+    /// 화면으로 흘러나가는 응답 조각 (본문·추론 텍스트).
+    Text(&'a str),
+    /// 도구 호출 인자를 누적 중이라는 진행 신호. 화면 출력이 아니라 상태 표시용이다.
+    ToolArgs { name: &'a str, total_bytes: usize },
+}
+
+/// 이 이벤트가 화면으로 내보낸 문자 수. ToolArgs 는 진행 표시일 뿐 출력이 아니므로 0이다
+/// — 이 구분이 없으면 "이미 출력이 나갔다"는 판정이 오염돼 폴백이 막힌다.
+pub fn emitted_chars(event: &StreamEvent) -> usize {
+    match event {
+        StreamEvent::Text(s) => s.chars().count(),
+        StreamEvent::ToolArgs { .. } => 0,
+    }
+}
+
 pub enum DynProvider {
     Anthropic(AnthropicProvider),
     OpenAi(OpenAiCompatProvider),
@@ -136,13 +155,13 @@ impl DynProvider {
         }
     }
 
-    pub async fn chat_stream<F>(&self, req: &ChatRequest, on_text: F) -> Result<ChatResponse>
+    pub async fn chat_stream<F>(&self, req: &ChatRequest, on_event: F) -> Result<ChatResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(StreamEvent),
     {
         match self {
-            DynProvider::Anthropic(p) => p.chat_stream(req, on_text).await,
-            DynProvider::OpenAi(p) => p.chat_stream(req, on_text).await,
+            DynProvider::Anthropic(p) => p.chat_stream(req, on_event).await,
+            DynProvider::OpenAi(p) => p.chat_stream(req, on_event).await,
         }
     }
 }
@@ -209,4 +228,23 @@ pub fn rate_limit_error(status: u16, body: &str, hint: &LimitHint) -> anyhow::Er
     let snippet: String = body.chars().take(200).collect();
     let wait = hint.retry_after_secs.unwrap_or(45);
     anyhow!("HTTP {status} rate_limited retry_after={wait} {snippet}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_text_events_count_as_screen_output() {
+        assert_eq!(emitted_chars(&StreamEvent::Text("가나다")), 3);
+        assert_eq!(emitted_chars(&StreamEvent::Text("")), 0);
+        // 진행 신호는 화면에 답을 흘린 것이 아니다 — 재시도·폴백 판정을 막으면 안 된다.
+        assert_eq!(
+            emitted_chars(&StreamEvent::ToolArgs {
+                name: "write_file",
+                total_bytes: 16384,
+            }),
+            0
+        );
+    }
 }

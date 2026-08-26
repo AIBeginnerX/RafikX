@@ -9,7 +9,7 @@ use crate::config::{Config, ProviderConfig};
 use crate::db::Db;
 use crate::provider::{
     AnthropicProvider, ChatRequest, ChatResponse, ContentBlock, DynProvider, Message,
-    OpenAiCompatProvider, StopReason, is_rate_limited, is_retryable,
+    OpenAiCompatProvider, StopReason, StreamEvent, emitted_chars, is_rate_limited, is_retryable,
 };
 use crate::run::{RunContext, RunId, TerminalState};
 use crate::tools::{self, ToolCtx, ToolRegistry};
@@ -252,9 +252,26 @@ pub fn bind_profile(
     let strategy =
         HarnessStrategy::parse(&cfg.file.harness.strategy).unwrap_or(HarnessStrategy::Single);
 
-    let (provider_name, model, verify_model) = if let (Some(p), Some(m)) =
-        (provider_override, model_override)
-    {
+    // 프로파일별 모델(`[subagents.<name>] model`) — 팀 모드의 역할 분업 자리다.
+    // 사용자가 모델을 직접 지정했으면(model_override) 그 의지가 이긴다.
+    // 프로바이더 오버라이드(엔진 고정 재바인딩·CLI 지정)는 provider 부분만 이기고
+    // 모델 ID 는 그대로 존중한다 — 그래서 pin 재바인딩이 profile.model 을 지우지 않는다.
+    let profile_pick = if model_override.is_some() {
+        None
+    } else {
+        decide_profile_model(
+            sub.model.as_deref(),
+            &sub.provider,
+            provider_override,
+            |m| provider_for_model(cfg, m),
+        )
+        .filter(|(p, _)| profile_model_usable(cfg, p, needs_tools))
+    };
+
+    let (provider_name, model, verify_model) = if let Some((p, m)) = profile_pick {
+        crate::applog::debug(&format!("bind: profile model {profile_name} → {p}/{m}"));
+        (p, m, None)
+    } else if let (Some(p), Some(m)) = (provider_override, model_override) {
         // 직접 지정 조합도 도구 지원 여부를 검사한다 — 미지원 모델로 코딩 프로필을
         // 돌리면 답변이 비정상(도구 호출 불가·빈 응답)으로 나온다.
         ensure_connected(cfg, p)?;
@@ -330,6 +347,51 @@ pub fn bind_profile(
         context_window: window,
         verify_model,
     })
+}
+
+/// 프로파일별 모델 해석 (순수 함수 — 배선 없이 우선순위만 정한다).
+///
+/// - `profile_model` 이 비면 None → 기존 선택 규칙(manual·single·auto)을 그대로 쓴다.
+/// - `"provider:model"` 이면 그 프로바이더, 모델 ID 단독이면 `lookup`(등록 모델) →
+///   프로파일 provider 순으로 프로바이더를 정한다.
+/// - `provider_override`(엔진 고정 재바인딩·CLI `--provider`)가 있으면 프로바이더는 그것이
+///   이기고 **모델 ID 만** 존중한다. 그 모델이 고정 프로바이더에 실재하는지는 카탈로그
+///   API 가 없어 확인할 수 없으므로 그대로 시도한다.
+pub fn decide_profile_model(
+    profile_model: Option<&str>,
+    profile_provider: &str,
+    provider_override: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<(String, String)> {
+    let spec = profile_model.map(str::trim).filter(|s| !s.is_empty())?;
+    let (spec_provider, model) = parse_manual_spec(spec);
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return None;
+    }
+    let provider = provider_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(spec_provider)
+        .or_else(|| lookup(&model))
+        .unwrap_or_else(|| profile_provider.to_string());
+    if provider.trim().is_empty() {
+        return None;
+    }
+    Some((provider, model))
+}
+
+/// 프로파일별 모델이 가리키는 프로바이더를 실제로 쓸 수 있는지.
+/// 쓸 수 없으면 지정을 버리고 기존 선택 규칙으로 되돌린다 (설정 오타가 실행을 막지 않게).
+fn profile_model_usable(cfg: &Config, provider: &str, needs_tools: bool) -> bool {
+    let Ok(p) = cfg.provider(provider) else {
+        return false;
+    };
+    if !crate::auth::is_usable(cfg, provider) {
+        return false;
+    }
+    !needs_tools || p.supports_tools
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,8 +1163,10 @@ pub fn fallback_order(cfg: &Config, primary: &str, cli_provider: Option<&str>) -
 }
 
 /// 실행 경로(에이전트 루프·검증·검증자 게이트)용 폴백 순서.
-/// 엔진 고정이 있으면 그 프로바이더 하나로 제한한다 — 계정 다중 순회는 안쪽
-/// (chat_with_fallback)이 담당하므로 리밋 시 같은 프로바이더의 다른 계정으로만 넘어간다.
+/// 엔진 고정이 있으면 그 프로바이더를 **선두**로 올린다 — 계정 다중 순회는 안쪽
+/// (chat_with_fallback)이 담당하므로 리밋 시 같은 프로바이더의 다른 계정으로 먼저 넘어가고,
+/// 그 프로바이더가 전면 장애일 때만 나머지 폴백으로 내려간다(설계 §15.2: 고정은 선호이지
+/// 가용성 희생이 아니다). `pin_strict = true` 면 예전처럼 고정 하나로 제한한다.
 /// 백그라운드 보조 호출(교훈 반성·LLM 분류·self-harness 제안)은 고정 대상이 아니므로
 /// 기존 `fallback_order` 를 그대로 쓴다 (설계 §11.2).
 pub fn fallback_order_pinned(
@@ -1111,7 +1175,9 @@ pub fn fallback_order_pinned(
     cli_provider: Option<&str>,
 ) -> Vec<String> {
     let order = fallback_order(cfg, primary, cli_provider);
-    limit_order_to_pin(engine_pin(cfg).as_deref(), cli_provider, order)
+    let (engine, _) = crate::engine::normalize(&cfg.file.general.engine);
+    let spec = crate::engine::resolve_with(&cfg.file.engines, &engine);
+    limit_order_to_pin(spec.pin(), spec.pin_strict, cli_provider, order)
 }
 
 /// 고정이 걸린 실행의 폴백 순서 계산 (순수 함수).
@@ -1119,6 +1185,7 @@ pub fn fallback_order_pinned(
 /// 아예 없으면(연결 없음) 원래 순서를 지킨다 — 가용성 우선.
 fn limit_order_to_pin(
     pin: Option<&str>,
+    pin_strict: bool,
     cli_provider: Option<&str>,
     order: Vec<String>,
 ) -> Vec<String> {
@@ -1128,10 +1195,22 @@ fn limit_order_to_pin(
     if cli_provider.map(str::trim).is_some_and(|p| !p.is_empty()) {
         return order;
     }
-    if order.iter().any(|p| p.eq_ignore_ascii_case(pin)) {
+    if !order.iter().any(|p| p.eq_ignore_ascii_case(pin)) {
+        return order;
+    }
+    if pin_strict {
         return vec![pin.to_string()];
     }
-    order
+    // 고정을 선두로, 나머지는 후순위로 남긴다. 실제 폴백이 일어나면 stream/chat 의
+    // 기존 폴백 경고가 "다른 프로바이더로 넘어갔다"를 그대로 알린다.
+    let mut out = vec![pin.to_string()];
+    out.extend(
+        order
+            .into_iter()
+            .filter(|p| !p.eq_ignore_ascii_case(pin))
+            .collect::<Vec<_>>(),
+    );
+    out
 }
 
 fn model_for_fallback(
@@ -1217,6 +1296,11 @@ pub async fn chat_with_fallback(
         .unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
 }
 
+/// 도구 인자 생성 구간의 진행 표시 문구 — 스트림 소비자 세 곳이 함께 쓴다.
+pub fn tool_args_label(name: &str, total_bytes: usize) -> String {
+    format!("도구 호출 작성 중: {name} · {}KB", total_bytes / 1024)
+}
+
 fn short_err(e: &anyhow::Error) -> String {
     let s = format!("{e:#}");
     s.chars().take(120).collect()
@@ -1227,10 +1311,10 @@ pub async fn stream_with_fallback<F>(
     order: &[String],
     model_role: &str,
     mut req: ChatRequest,
-    mut on_text: F,
+    mut on_event: F,
 ) -> Result<(String, ChatResponse)>
 where
-    F: FnMut(&str),
+    F: FnMut(StreamEvent),
 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let original_model = req.model.clone();
@@ -1265,9 +1349,10 @@ where
             // 화면에 이미 텍스트가 흘러나간 뒤의 재시도·폴백은 중복 출력을 만드므로 금지한다.
             let mut attempt = 0u32;
             loop {
-                let mut track = |piece: &str| {
-                    emitted.fetch_add(piece.chars().count(), Ordering::Relaxed);
-                    on_text(piece);
+                let mut track = |ev: StreamEvent| {
+                    // 진행 신호(ToolArgs)는 화면 출력이 아니므로 재시도 판정에서 제외된다.
+                    emitted.fetch_add(emitted_chars(&ev), Ordering::Relaxed);
+                    on_event(ev);
                 };
                 match client.chat_stream(&req, &mut track).await {
                     Ok(resp) => {
@@ -1290,7 +1375,7 @@ where
                             if emitted.load(Ordering::Relaxed) > 0 {
                                 // 출력이 이미 나간 뒤의 절단 — 같은 연결로만 다시 시도하고,
                                 // 재출력이 중복으로 보이지 않게 경계 표시를 남긴다.
-                                on_text("\n[연결 끊김 — 같은 연결로 재시도]\n");
+                                on_event(StreamEvent::Text("\n[연결 끊김 — 같은 연결로 재시도]\n"));
                             }
                             tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt)))
                                 .await;
@@ -1380,7 +1465,12 @@ pub fn print_binding(cfg: &Config, b: &Binding) {
     ));
 }
 
-/// 기본값이 아닐 때만 붙는 실행 축 표시 — ` · engine=claude · graph`.
+/// 현재 팀 모드 — `[harness] team`. 미설정·오타는 single 로 떨어진다.
+pub fn team_mode(cfg: &Config) -> crate::engine::TeamMode {
+    crate::engine::normalize_team(&cfg.file.harness.team)
+}
+
+/// 기본값이 아닐 때만 붙는 실행 축 표시 — ` · engine=claude · graph · team`.
 pub fn engine_suffix(cfg: &Config) -> String {
     let mut s = String::new();
     let (engine, _) = crate::engine::normalize(&cfg.file.general.engine);
@@ -1391,7 +1481,38 @@ pub fn engine_suffix(cfg: &Config) -> String {
     if discipline != crate::engine::Discipline::Harness {
         s.push_str(&format!("  ·  {}", discipline.as_str()));
     }
+    if team_mode(cfg) == crate::engine::TeamMode::Multi {
+        s.push_str("  ·  team");
+    }
     s
+}
+
+/// working 패널 마지막 줄에 상시 표시하는 실행 축 요약 (§16.2).
+/// 기본값도 생략하지 않는다 — "지금 무엇으로 도는가"를 매 턴 한 줄로 못 박는 자리다.
+pub fn mode_line(cfg: &Config) -> String {
+    let (engine, _) = crate::engine::normalize(&cfg.file.general.engine);
+    let spec = crate::engine::resolve_with(&cfg.file.engines, &engine);
+    let pin = if spec.pin().is_some() { "(고정)" } else { "" };
+    let self_layer = if crate::self_harness::meta_active(cfg) {
+        format!(
+            "self v{}",
+            crate::self_harness::SelfHarnessState::load().version
+        )
+    } else {
+        "self off".to_string()
+    };
+    let gate = if spec.verify_policy == crate::engine::VerifyPolicy::Strict
+        && cfg.file.harness.strict_gate
+    {
+        "gate on"
+    } else {
+        "gate off"
+    };
+    format!(
+        "engine={engine}{pin} · team={} · discipline={} · {self_layer} · {gate}",
+        team_mode(cfg).as_str(),
+        crate::engine::normalize_discipline(&cfg.file.general.discipline).as_str(),
+    )
 }
 
 pub fn print_binding_table(cfg: &Config) {
@@ -1499,6 +1620,7 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          - 취향을 적용한다: 무게 없는 코드는 지우고, 불필요한 추상화는 거부하고, 지루한(boring) 해법을 선호한다. 설계는 철저하고 우아하게.\n\
          - 예상 밖의 저장소 변경은 사용자의 작업이다. 적응한다.\n\
          - 사용자의 말이 최우선이다: 사용자가 보고한 상태(오류·실패·관찰)는 ground truth 다. 그대로 근거로 행동하고, 이미 보고된 사실을 재확인하려고 검사를 다시 돌리지 않는다(NEVER).\n\
+         - 같은 파일에서 edit_file/apply_patch 가 2회 연속 실패하면 부분 패치를 멈추고 그 파일을 읽어 전체를 write_file 로 재작성하라.\n\
          \n\
          [말투 — 증거 우선 간결 엔지니어]\n\
          - 모든 문장은 사실·결정·리스크 중 하나다. 의례·헤징·자기요약·필러·과장은 금지(NEVER).\n\
@@ -1603,6 +1725,22 @@ pub async fn run_pipeline_with_context(
         }
     };
     let _ = run_context.transition_lifecycle(start_event);
+    // working 패널의 메인 줄 — 위임 자식(agent_id 보유)은 task.rs 가 자기 역할명으로
+    // 발신하므로 여기서는 루트 실행만 연다 (§16.2).
+    let worker = run_context
+        .agent_id()
+        .is_none()
+        .then(|| crate::ui::worker_id(&run_context));
+    if let Some(id) = &worker {
+        crate::ui::live_worker_in(
+            &run_context,
+            id,
+            &binding.profile_name,
+            &format!("{}/{}", binding.provider_name, binding.model),
+            "시작",
+            false,
+        );
+    }
     let result = run_pipeline_inner(
         cfg,
         binding,
@@ -1629,6 +1767,9 @@ pub async fn run_pipeline_with_context(
             run_context.finish_with_error(TerminalState::Failed, Some(error.to_string()));
         }
     }
+    if let Some(id) = &worker {
+        crate::ui::live_worker_in(&run_context, id, "", "", "", true);
+    }
     result
 }
 
@@ -1645,7 +1786,32 @@ const PLAN_CONTRACT_INSTRUCTION: &str = "\
     [해석] 요구사항을 한 문단으로 재진술하고, 모호한 점과 그중 채택한 해석을 밝힌다.\n\
     [완료 기준] 검증 가능한 체크리스트 3~10항목. 각 항목은 '무엇이 충족되어야 하는가'와 \
     '어떻게 확인하는가(명령·파일·관찰 대상)'를 함께 적는다.\n\
-    [작업 분해] 실행 순서 3~9단계. 각 단계는 한 줄로 적고 결과물을 명시한다.";
+    [작업 분해] 실행 순서 3~9단계. 각 단계는 한 줄로 적고 결과물을 명시한다.\n\
+    [반박] 이 계획을 실패시킬 가장 유력한 위험 1개와 그것을 조기 확인할 최소 테스트 1개.";
+
+/// team = multi — 계획이 확정된 뒤 독립 단계를 역할 서브에이전트에게 넘기게 하는 지침.
+/// graph 분야와는 상호 배타다 (그래프가 이미 분해 실행을 담당한다).
+const TEAM_MULTI_BLOCK: &str = "\n\n[팀 모드]\n\
+     계획이 확정되면 [작업 분해]에서 서로 독립적인 단계들을 task 도구로 위임하라 — \
+     role 은 planner|frontend|backend|reviewer 중 작업 성격에 맞는 것.\n\
+     서로 독립적인 갈래는 한 응답에서 task 를 여러 개 함께 호출하면 병렬로 실행된다.\n\
+     위임 프롬프트에는 해당 단계의 목표·대상 파일·완료 기준을 자체 완결로 담아라 \
+     (수신자는 이 대화를 보지 못한다).\n\
+     순차 의존이 있는 단계는 스스로 수행하거나 순서대로 위임하라.";
+
+/// 팀 지침 주입 조건 (순수 함수). multi 이고, 도구를 쓰는 설계·개발 작업이며,
+/// graph 분야가 아닐 때만 켠다 — graph 는 이미 노드 DAG 로 분해 실행을 담당한다.
+pub fn team_block_active(
+    team: crate::engine::TeamMode,
+    class: TaskClass,
+    has_tools: bool,
+    graph_mode: bool,
+) -> bool {
+    team == crate::engine::TeamMode::Multi
+        && matches!(class, TaskClass::Dev | TaskClass::Advanced)
+        && has_tools
+        && !graph_mode
+}
 
 /// discipline = loop — 종료 조건을 시스템 프롬프트에 못 박는다.
 const LOOP_DISCIPLINE_RULE: &str =
@@ -1695,6 +1861,49 @@ fn plan_system_prompt_with(system: &str, instruction: &str, plan_extra: &str) ->
         s.push_str(extra);
     }
     s
+}
+
+/// 단계별 처리 지시 (순수 함수). 계약형 계획이면 단계 수를 계획의 [작업 분해]가
+/// 지배하므로 "2~6개" 같은 경쟁 지시를 내지 않는다 (설계 §15.3).
+fn staged_block(contract_plan: bool) -> &'static str {
+    if contract_plan {
+        "\n\n[실행 방식 — 단계별 처리]\n\
+         이 작업은 여러 단계가 필요하다. 다른 도구를 쓰기 전에 먼저 todo_write 로 계획의 [작업 분해] 단계들을 등록하고, \
+         한 단계를 마칠 때마다 todo_write 로 상태를 갱신하라. \
+         모든 단계가 끝나면 단계별 핵심 결과를 짧게 요약해 답을 마친다."
+    } else {
+        "\n\n[실행 방식 — 단계별 처리]\n\
+         이 작업은 여러 단계가 필요하다. 다른 도구를 쓰기 전에 먼저 todo_write 로 2~6개의 실행 단계를 등록하고, \
+         한 단계를 마칠 때마다 todo_write 로 상태를 갱신하라. \
+         모든 단계가 끝나면 단계별 핵심 결과를 짧게 요약해 답을 마친다."
+    }
+}
+
+/// 첫 사용자 메시지 조립 (순수 함수) — 계약형 계획의 [작업 분해] 본문을 그대로 싣는다.
+/// system 안 [실행 계획]을 가리키는 원거리 참조는 실측에서 시드가 통째로 누락되는
+/// 원인이었다 (설계 §15.3).
+fn contract_seed_task(task: &str, plan_steps: &str) -> String {
+    let steps = plan_steps.trim();
+    if steps.is_empty() {
+        return task.to_string();
+    }
+    format!(
+        "{task}\n\n[착수 지시] 아래 [작업 분해]의 단계들을 먼저 todo_write 로 등록한 뒤 \
+         첫 항목부터 실행하라. 항목을 마칠 때마다 상태를 갱신한다.\n\n[작업 분해]\n{steps}"
+    )
+}
+
+/// `[작업 분해]` 절의 단계 수 추정 (순수 함수) — "1." 처럼 숫자로 시작하는 줄을 센다.
+/// 계획 단계 수와 실제 등록된 todo 수가 어긋났는지 관측하는 데만 쓴다(강제 없음).
+fn plan_step_count(steps: &str) -> usize {
+    steps
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            let digits = t.chars().take_while(char::is_ascii_digit).count();
+            digits > 0 && t[digits..].starts_with(['.', ')'])
+        })
+        .count()
 }
 
 /// 계획 텍스트에서 `[머리표]` 절만 잘라낸다 — 다음 `[`로 시작하는 줄 직전까지.
@@ -1798,6 +2007,18 @@ async fn run_pipeline_inner(
     let staged = !binding.tools.is_empty()
         && (spec.force_staged || binding.class != crate::harness::TaskClass::Simple)
         && !graph_mode;
+    // 계획 깊이는 staged 블록 문구보다 먼저 정해져야 한다 — 계약형 계획이면 단계 수를
+    // 계획의 [작업 분해]가 지배하므로 여기서 "2~6개" 같은 경쟁 지시를 내지 않는다(§15.3).
+    // Contract 깊이는 dev/advanced 클래스에서만 활성하고 그 밖은 Brief 로 낮춘다.
+    let plan_depth = match spec.plan_depth {
+        crate::engine::PlanDepth::Contract
+            if !matches!(binding.class, TaskClass::Dev | TaskClass::Advanced) =>
+        {
+            crate::engine::PlanDepth::Brief
+        }
+        other => other,
+    };
+    let contract_plan = plan_depth == crate::engine::PlanDepth::Contract;
     let mut system = system;
     if staged {
         // 배너 없이 조용히 — 단계 진행은 Todo 패널이 보여준다 (pi 저소음).
@@ -1813,12 +2034,7 @@ async fn run_pipeline_inner(
             },
             Some("bind"),
         );
-        system.push_str(
-            "\n\n[실행 방식 — 단계별 처리]\n\
-             이 작업은 여러 단계가 필요하다. 다른 도구를 쓰기 전에 먼저 todo_write 로 2~6개의 실행 단계를 등록하고, \
-             한 단계를 마칠 때마다 todo_write 로 상태를 갱신하라. \
-             모든 단계가 끝나면 단계별 핵심 결과를 짧게 요약해 답을 마친다.",
-        );
+        system.push_str(staged_block(contract_plan));
     }
     // 엔진 프롬프트 블록 — 각 하네스의 품질 장치를 한 지점에서 주입한다.
     if !spec.prompt_block.is_empty() {
@@ -1827,6 +2043,18 @@ async fn run_pipeline_inner(
     // loop 분야 — 종료 조건을 명시해 조기 완료 선언을 막는다 (Ralph 루프 계열).
     if discipline == crate::engine::Discipline::Loop {
         system.push_str(LOOP_DISCIPLINE_RULE);
+    }
+    // 팀 모드 — 독립 단계를 역할 서브에이전트로 위임하게 한다 (graph 와 상호 배타).
+    let team = team_mode(cfg);
+    if team_block_active(team, binding.class, !binding.tools.is_empty(), graph_mode) {
+        system.push_str(TEAM_MULTI_BLOCK);
+        crate::graph::node_in(
+            &run_context,
+            "pre_step",
+            "team",
+            team.as_str(),
+            Some("bind"),
+        );
     }
     // Self-Harness (arXiv:2606.09498) — 자기개선 루프가 유지하는 하네스 상태를
     // 시스템 프롬프트와 런타임 제어에 반영한다. 상태는 에피소드 관찰이 갱신한다.
@@ -1863,20 +2091,13 @@ async fn run_pipeline_inner(
 
     // 계획 단계 — 메인 system 을 그대로 이어받아 lessons·system_extra·프로젝트 규칙·
     // 엔진 지시가 계획에도 반영되게 한다 (system 을 통째로 교체하던 결함 수정).
-    // Contract 깊이는 dev/advanced 클래스에서만 활성하고 그 밖은 Brief 로 낮춘다.
-    let plan_depth = match spec.plan_depth {
-        crate::engine::PlanDepth::Contract
-            if !matches!(binding.class, TaskClass::Dev | TaskClass::Advanced) =>
-        {
-            crate::engine::PlanDepth::Brief
-        }
-        other => other,
-    };
-    let contract_plan = plan_depth == crate::engine::PlanDepth::Contract;
     // 계획이 산출한 DoD 체크리스트 — 독립 검증자 게이트(§5)의 입력.
     let mut dod_checklist = String::new();
-    // Contract 계획이 실제로 나왔을 때만 첫 사용자 메시지에 todo 시드 지시를 붙인다.
-    let mut seed_todo_from_plan = false;
+    // 계획을 죽일 가장 유력한 위험(paperthin hate) — DoD 와 함께 게이트로 넘어간다.
+    let mut rebuttal = String::new();
+    // Contract 계획의 [작업 분해] 본문 — 비어 있지 않으면 첫 사용자 메시지에 그대로
+    // 복사해 넣는다 (system 안 [실행 계획]을 가리키는 원거리 참조 제거, §15.3).
+    let mut plan_steps = String::new();
     // graph 분야가 실행할 노드 DAG — 계획이 형식을 지켰을 때만 채워진다.
     let mut dag: Option<(Vec<DagNode>, Vec<usize>)> = None;
     // 그래프는 계획 산출물(DAG) 없이는 성립하지 않으므로 계획 호출을 반드시 지난다.
@@ -1896,18 +2117,37 @@ async fn run_pipeline_inner(
             messages: vec![Message::user_text(task)],
             tools: vec![],
             max_tokens: plan_budget,
-            stream: false,
+            // 계획은 수십 초가 걸린다 — 비스트리밍이면 그 구간이 통째로 침묵한다.
+            stream: true,
         };
-        match chat_with_fallback(cfg, &order, role, req).await {
+        crate::ui::live_line_in(&run_context, &format!("[계획 수립 중 · {}]", binding.model));
+        let mut plan_streamed = false;
+        let plan_call = stream_with_fallback(cfg, &order, role, req, |ev| match ev {
+            StreamEvent::Text(piece) => {
+                plan_streamed = true;
+                crate::ui::live_chunk_in(&run_context, piece);
+            }
+            StreamEvent::ToolArgs { name, total_bytes } => {
+                crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
+            }
+        })
+        .await;
+        match plan_call {
             Ok((_n, resp)) => {
                 crate::graph::node_in(&run_context, "plan", "plan_first", "", Some("pre_step"));
-                crate::ui::live_line_in(&run_context, "[계획]");
-                for b in &resp.content {
-                    if let ContentBlock::Text { text } = b {
-                        crate::ui::live_assistant_in(
-                            &run_context,
-                            &format!("[모델 작업]\n{text}\n[/모델 작업]"),
-                        );
+                if plan_streamed {
+                    // 이미 흘러나간 계획을 다시 찍지 않는다 — 줄바꿈으로만 끊는다.
+                    crate::ui::live_chunk_in(&run_context, "\n");
+                    crate::ui::live_line_in(&run_context, "[계획] 수립 완료");
+                } else {
+                    crate::ui::live_line_in(&run_context, "[계획]");
+                    for b in &resp.content {
+                        if let ContentBlock::Text { text } = b {
+                            crate::ui::live_assistant_in(
+                                &run_context,
+                                &format!("[모델 작업]\n{text}\n[/모델 작업]"),
+                            );
+                        }
                     }
                 }
                 let plan = resp
@@ -1933,6 +2173,13 @@ async fn run_pipeline_inner(
                     if graph_mode {
                         // DAG JSON 과 별개로 [완료 기준] 절도 요구한다 — 게이트의 입력.
                         dod_checklist = extract_plan_section(plan_prose(&plan), "[완료 기준]");
+                        if dod_checklist.trim().is_empty() {
+                            // 조용한 약화 방지(§15.5): 게이트가 원 작업만으로 판정하게 된다.
+                            crate::ui::live_warn_in(
+                                &run_context,
+                                "그래프 계획에서 [완료 기준]을 읽지 못했습니다 — 검증자는 원 작업만으로 대조합니다.",
+                            );
+                        }
                         dag = match parse_dag(&plan) {
                             Some(nodes) => match topo_order(&nodes) {
                                 Ok(order) => Some((nodes, order)),
@@ -1956,8 +2203,8 @@ async fn run_pipeline_inner(
                         };
                     } else if contract_plan {
                         dod_checklist = extract_plan_section(&plan, "[완료 기준]");
-                        seed_todo_from_plan =
-                            !extract_plan_section(&plan, "[작업 분해]").is_empty();
+                        rebuttal = extract_plan_section(&plan, "[반박]");
+                        plan_steps = extract_plan_section(&plan, "[작업 분해]");
                     }
                 }
             }
@@ -1990,8 +2237,11 @@ async fn run_pipeline_inner(
             max_tokens: cfg.file.general.max_tokens,
             stream: true,
         };
-        let response = stream_with_fallback(cfg, &order, role, req, |piece| {
-            crate::ui::live_chunk_in(&run_context, piece);
+        let response = stream_with_fallback(cfg, &order, role, req, |ev| match ev {
+            StreamEvent::Text(piece) => crate::ui::live_chunk_in(&run_context, piece),
+            StreamEvent::ToolArgs { name, total_bytes } => {
+                crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
+            }
         });
         tokio::pin!(response);
         let (_name, resp) = tokio::select! {
@@ -2043,6 +2293,7 @@ async fn run_pipeline_inner(
             tool_errors: vec![],
             deny_reasons: vec![],
             verify_fail: None,
+            verify_recovered: None,
         });
     }
 
@@ -2059,14 +2310,7 @@ async fn run_pipeline_inner(
 
     // Contract 계획의 [작업 분해]를 todo 로 옮겨 staged goal continuation 과 결합한다.
     // 첫 사용자 메시지에만 붙는다 (이어하기에는 resume 이 우선).
-    let agent_task = if seed_todo_from_plan {
-        format!(
-            "{task}\n\n[착수 지시] 위 [작업 분해]의 단계들을 먼저 todo_write 로 등록한 뒤 \
-             첫 항목부터 실행하라. 항목을 마칠 때마다 상태를 갱신한다."
-        )
-    } else {
-        task.to_string()
-    };
+    let agent_task = contract_seed_task(task, &plan_steps);
 
     // 그래프 분야 — 위상순 노드 실행이 전역 goal continuation 루프를 대체한다.
     // 검증·게이트는 그래프 전체가 끝난 뒤 합산 outcome 위에서 1회만 돈다.
@@ -2097,6 +2341,7 @@ async fn run_pipeline_inner(
             &spec,
             task,
             &dod_checklist,
+            &rebuttal,
             yes,
             &system,
             outcome,
@@ -2114,6 +2359,8 @@ async fn run_pipeline_inner(
     // loop 분야는 계속 실행 한도를 엔진 값 +4(상한 12)로 늘린다.
     let max_continuations =
         crate::engine::max_continuations_for(discipline, spec.max_continuations);
+    // 계획이 제시한 단계 수 — 첫 goal 판정에서 todo 총계와 대조만 한다(§15.3 관측).
+    let plan_step_total = plan_step_count(&plan_steps);
     let mut next_resume = resume;
     let mut continuations = 0u8;
     let mut stale_rounds = 0u8;
@@ -2205,6 +2452,22 @@ async fn run_pipeline_inner(
             &format!("continuations={continuations} stale={stale_rounds}"),
             Some("request"),
         );
+        // 계획 단계 수와 실제 등록된 todo 수가 어긋나면 첫 판정에서 한 줄만 남긴다.
+        // 관측 전용 — 강제하지 않는다 (모델이 단계를 합치거나 쪼갤 여지는 남긴다).
+        if staged
+            && continuations == 0
+            && plan_step_total > 0
+            && progress.total > 0
+            && progress.total != plan_step_total
+        {
+            crate::ui::live_warn_in(
+                &run_context,
+                &format!(
+                    "[관측] 계획 단계 {plan_step_total}개 · 등록된 Todo {}개 — 사슬이 어긋났습니다.",
+                    progress.total
+                ),
+            );
+        }
         if staged
             && progress.total > 0
             && progress.completed == progress.total
@@ -2309,6 +2572,7 @@ async fn run_pipeline_inner(
         &spec,
         task,
         &dod_checklist,
+        &rebuttal,
         yes,
         &system,
         outcome,
@@ -2364,6 +2628,7 @@ async fn finish_verification(
     spec: &crate::engine::EngineSpec,
     task: &str,
     dod: &str,
+    rebuttal: &str,
     yes: bool,
     system: &str,
     mut outcome: AgentOutcome,
@@ -2402,21 +2667,31 @@ async fn finish_verification(
         && outcome.status == "ok"
         && !run_context.is_cancelled()
     {
+        let review_worker = review_worker_id(&run_context);
         outcome = run_review_gate(
             cfg,
             binding,
+            spec,
             task,
             dod,
+            rebuttal,
             yes,
             system,
             outcome,
             remote,
             local_ask,
-            run_context,
+            run_context.clone(),
         )
         .await;
+        // 게이트는 중간에 여러 경로로 빠져나간다 — 워커 줄은 호출부에서 한 번에 닫는다.
+        crate::ui::live_worker_in(&run_context, &review_worker, "", "", "", true);
     }
     Ok(outcome)
+}
+
+/// 검증자는 실행 모델과 같은 RunContext 로 돌지만 working 패널에서는 별도 줄이다.
+fn review_worker_id(run: &RunContext) -> String {
+    format!("{}:reviewer", crate::ui::worker_id(run))
 }
 
 fn cancelled_outcome() -> AgentOutcome {
@@ -2473,6 +2748,67 @@ fn goal_should_continue(
     total > 0 && completed < total && stale_rounds < 2 && continuations < max_continuations
 }
 
+/// 검증이 재시도 끝에 통과했을 때의 정리 — 최종 실패가 아니므로 verify_fail 을 비우고,
+/// 첫 실패는 회복 증거로 옮긴다. 성공을 실패로 오표시하지 않으면서(§15.4)
+/// "실패 후 회복" 교훈 수집 경로는 살려 둔다.
+fn mark_verify_recovered(outcome: &mut AgentOutcome) {
+    if let Some(first) = outcome.verify_fail.take() {
+        outcome.verify_recovered = Some(first);
+    }
+}
+
+/// bash 검증 명령 1회에 대한 승인 결과.
+enum BashApproval {
+    Allowed,
+    Denied,
+    /// 미리보기조차 만들 수 없어 실행을 포기한다 (사유 포함).
+    Blocked(String),
+}
+
+/// 검증용 bash 호출의 승인 흐름 — 종료 검증과 그래프 노드 경계 검증이 함께 쓴다.
+/// 승인이 필요 없거나 이미 허용된 실행이면 곧바로 Allowed.
+async fn approve_bash_command(
+    input: &serde_json::Value,
+    tool: &(dyn tools::Tool + Send + Sync),
+    ctx: &ToolCtx,
+    yes: bool,
+    remote: &Option<agent::RemoteApproval>,
+    local_ask: &Option<agent::LocalAsk>,
+    run_context: &RunContext,
+) -> Result<BashApproval> {
+    if !tool.needs_approval(input) || yes {
+        return Ok(BashApproval::Allowed);
+    }
+    let preview = match tools::approval_preview("bash", input, ctx) {
+        Ok(p) => p,
+        Err(e) => return Ok(BashApproval::Blocked(e.to_string())),
+    };
+    crate::ui::live_line_in(run_context, &preview);
+    let denied = if let Some(ask) = local_ask {
+        !matches!(
+            ask(preview.clone()).await,
+            crate::agent::ApprovalChoice::Yes | crate::agent::ApprovalChoice::Always
+        )
+    } else if let Some(r) = remote {
+        let ask = r.ask.clone();
+        !tokio::time::timeout(r.timeout, (ask)(preview.clone()))
+            .await
+            .unwrap_or(false)
+    } else {
+        print!("[y] 이번만  / [n] 거부  / [a] 이번 실행 모두 허용 : ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let t = line.trim().to_lowercase();
+        t == "n" || t == "no"
+    };
+    Ok(if denied {
+        BashApproval::Denied
+    } else {
+        BashApproval::Allowed
+    })
+}
+
 async fn run_verify(
     cfg: &Config,
     binding: &Binding,
@@ -2510,42 +2846,21 @@ async fn run_verify(
         crate::ui::live_line_in(&run_context, &format!("[검증] {cmd}"));
         crate::spinner::set_label_in(&run_context, &format!("검증 실행: {cmd}"));
         let input = serde_json::json!({"command": cmd});
-        if tool.needs_approval(&input) && !yes {
-            match tools::approval_preview("bash", &input, &ctx) {
-                Ok(p) => {
-                    crate::ui::live_line_in(&run_context, &p);
-                    let denied = if let Some(ask) = &local_ask {
-                        !matches!(
-                            ask(p.clone()).await,
-                            crate::agent::ApprovalChoice::Yes
-                                | crate::agent::ApprovalChoice::Always
-                        )
-                    } else if let Some(r) = &remote {
-                        let ask = r.ask.clone();
-                        !tokio::time::timeout(r.timeout, (ask)(p.clone()))
-                            .await
-                            .unwrap_or(false)
-                    } else {
-                        print!("[y] 이번만  / [n] 거부  / [a] 이번 실행 모두 허용 : ");
-                        let _ = io::stdout().flush();
-                        let mut line = String::new();
-                        io::stdin().read_line(&mut line)?;
-                        let t = line.trim().to_lowercase();
-                        t == "n" || t == "no"
-                    };
-                    if denied {
-                        crate::ui::live_line_in(&run_context, "검증이 거부되었습니다.");
-                        outcome.status = "denied".into();
-                        return Ok(outcome);
-                    }
-                }
-                Err(e) => {
-                    crate::ui::live_line_in(
-                        &run_context,
-                        &format!("검증 명령을 실행할 수 없습니다: {e}"),
-                    );
-                    return Ok(outcome);
-                }
+        match approve_bash_command(&input, tool, &ctx, yes, &remote, &local_ask, &run_context)
+            .await?
+        {
+            BashApproval::Allowed => {}
+            BashApproval::Denied => {
+                crate::ui::live_line_in(&run_context, "검증이 거부되었습니다.");
+                outcome.status = "denied".into();
+                return Ok(outcome);
+            }
+            BashApproval::Blocked(e) => {
+                crate::ui::live_line_in(
+                    &run_context,
+                    &format!("검증 명령을 실행할 수 없습니다: {e}"),
+                );
+                return Ok(outcome);
             }
         }
         match tool.run(serde_json::json!({"command": cmd}), &ctx) {
@@ -2553,6 +2868,7 @@ async fn run_verify(
                 // 성공 시 원문 대신 요약 한 줄 — 실패했을 때만 상세가 필요하다.
                 let lines = out.trim().lines().count();
                 crate::ui::live_line_in(&run_context, &format!("검증 성공 ({lines}줄 출력)"));
+                mark_verify_recovered(&mut outcome);
                 return Ok(outcome);
             }
             other => {
@@ -2613,18 +2929,55 @@ async fn run_verify(
 // ---------------------------------------------------------------------------
 
 /// 게이트 미니 루프 상한 — 리뷰어는 읽고 판정만 한다.
-const REVIEW_GATE_MAX_ITER: u32 = 6;
+/// 재질의(판정 불능 1회 되물음)까지 같은 루프 안에서 소화하므로 여유를 둔다.
+const REVIEW_GATE_MAX_ITER: u32 = 8;
 /// 리뷰 피드백 보존 상한 (재개 메시지에 그대로 실린다).
 const REVIEW_SUMMARY_CAP: usize = 2000;
+
+/// 판정 불능일 때 리뷰어에게 한 번만 되묻는 문장.
+const REVIEW_REQUERY: &str =
+    "[판정] pass 또는 fail 한 줄로만 결론을 내라. 이미 읽은 근거로 판정하라.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReviewVerdict {
     Pass,
-    Fail { summary: String },
+    Fail {
+        summary: String,
+    },
+    /// 판정 줄이 없거나 리뷰어 미니 루프가 정상 종료하지 못했다.
+    /// "신호 없음 = 통과"가 아니라 별도 상태로 남긴다(설계 §15 공통 원칙).
+    Indeterminate,
 }
 
 /// 리뷰어 출력에서 판정을 뽑는 순수 함수.
-/// `[판정]` 줄이 없으면 통과로 본다 — 게이트가 가용성을 해치면 안 된다.
+/// `[판정]` 줄이 여러 개면 **마지막** 것이 결론이다. 줄이 아예 없으면 판정 불능.
+/// 판정 줄에서 가장 먼저 나온 판정어를 채택한다. 단어 포함 검사만 하면
+/// "pass — 실패 요인 없음" 같은 부연의 부정어가 fail 로 오탐된다 (실측 2026-08-26).
+fn verdict_token(line: &str) -> Option<bool> {
+    // (표지, 실패 여부). '미통과/불합격'이 '통과/합격'을 포함하므로 긴 표지를 먼저 매칭.
+    const TOKENS: &[(&str, bool)] = &[
+        ("미통과", true),
+        ("불합격", true),
+        ("fail", true),
+        ("실패", true),
+        ("pass", false),
+        ("통과", false),
+        ("합격", false),
+        ("충족", false),
+    ];
+    let mut best: Option<(usize, bool)> = None;
+    for (tok, failed) in TOKENS {
+        if let Some(pos) = line.find(tok) {
+            // 같은 위치에서 긴 표지가 이미 잡혔으면 유지 ('미통과' 안의 '통과' 무시).
+            let covered = best.is_some_and(|(p, _)| p <= pos && pos < p + 9);
+            if !covered && best.is_none_or(|(p, _)| pos < p) {
+                best = Some((pos, *failed));
+            }
+        }
+    }
+    best.map(|(_, failed)| failed)
+}
+
 fn parse_review_verdict(text: &str) -> ReviewVerdict {
     let mut failed = None;
     for line in text.lines() {
@@ -2632,17 +2985,14 @@ fn parse_review_verdict(text: &str) -> ReviewVerdict {
             continue;
         };
         let v = rest.trim().to_ascii_lowercase();
-        // '미통과'가 '통과'를 포함하므로 실패 표지를 먼저 본다.
-        failed = Some(
-            v.contains("fail")
-                || v.contains("미통과")
-                || v.contains("불합격")
-                || v.contains("실패"),
-        );
-        break;
+        if let Some(f) = verdict_token(&v) {
+            failed = Some(f);
+        }
     }
-    if failed != Some(true) {
-        return ReviewVerdict::Pass;
+    match failed {
+        None => return ReviewVerdict::Indeterminate,
+        Some(false) => return ReviewVerdict::Pass,
+        Some(true) => {}
     }
     let mut summary = String::new();
     for header in ["[미충족 항목]", "[결함]"] {
@@ -2672,16 +3022,23 @@ fn parse_review_verdict(text: &str) -> ReviewVerdict {
 enum GateAction {
     /// 통과 — outcome 그대로 완료.
     Accept,
+    /// 판정 불능 — 리뷰어에게 결론만 한 줄 다시 묻는다 (실행당 1회).
+    Requery,
+    /// 재질의 후에도 판정 불능 — 통과로 진행하되 "판정 불능"으로 남긴다.
+    AcceptUnknown,
     /// 지적을 되먹여 본 작업을 1회 재개한다.
     Resume(String),
     /// 재개 후에도 미통과 — status 는 유지하고 error 에만 사유를 남긴다.
     Report(String),
 }
 
-/// 게이트 상태 전이 (순수 함수). `attempt` 는 0-based 검증 회차.
-fn gate_action(verdict: ReviewVerdict, attempt: u8) -> GateAction {
+/// 게이트 상태 전이 (순수 함수). `attempt` 는 0-based 검증 회차,
+/// `requeried` 는 이번 실행에서 판정 불능 재질의를 이미 썼는지.
+fn gate_action(verdict: ReviewVerdict, attempt: u8, requeried: bool) -> GateAction {
     match verdict {
         ReviewVerdict::Pass => GateAction::Accept,
+        ReviewVerdict::Indeterminate if !requeried => GateAction::Requery,
+        ReviewVerdict::Indeterminate => GateAction::AcceptUnknown,
         ReviewVerdict::Fail { summary } if attempt == 0 => GateAction::Resume(summary),
         ReviewVerdict::Fail { summary } => GateAction::Report(summary),
     }
@@ -2699,15 +3056,21 @@ fn verdict_headline(summary: &str) -> String {
         .collect()
 }
 
-/// 검증자 입력 — 원 작업 + 완료 기준 + 변경 파일 목록.
+/// 검증자 입력 — 원 작업 + 완료 기준 + 계획의 반박 + 변경 파일 목록.
 /// diff 전문은 넣지 않는다: 리뷰어가 도구로 직접 읽어야 신선한 시각이 유지된다.
-fn review_prompt(task: &str, dod: &str, changed: &[String]) -> String {
+fn review_prompt(task: &str, dod: &str, rebuttal: &str, changed: &[String]) -> String {
     let mut s = String::from("아래 작업의 산출물을 완료 기준과 대조해 판정하라.\n\n[원 작업]\n");
     s.extend(task.trim().chars().take(4000));
     let dod = dod.trim();
     if !dod.is_empty() {
         s.push_str("\n\n[완료 기준]\n");
         s.extend(dod.chars().take(4000));
+    }
+    let rebuttal = rebuttal.trim();
+    if !rebuttal.is_empty() {
+        // 계획 단계가 스스로 지목한 최대 위험 — 리뷰어가 이 지점을 먼저 확인한다.
+        s.push_str("\n\n[계획이 지목한 최대 위험]\n");
+        s.extend(rebuttal.chars().take(2000));
     }
     s.push_str("\n\n[변경된 파일]\n");
     if changed.is_empty() {
@@ -2721,21 +3084,31 @@ fn review_prompt(task: &str, dod: &str, changed: &[String]) -> String {
     }
     s.push_str(
         "\n변경 내용은 첨부하지 않았다. read_file·grep 으로 직접 읽어 확인하고, 필요하면 \
-         bash 로 빌드·테스트를 실행하라. 확인하지 않은 파일에 대해서는 판정하지 않는다(NEVER).",
+         bash 로 빌드·테스트를 실행하라. 확인하지 않은 파일에 대해서는 판정하지 않는다(NEVER).\n\
+         완료 기준은 실행 모델이 세운 것이다 — 원 작업 요구와 어긋나면 원 작업이 우선한다.",
     );
     s
 }
 
 /// 리뷰어 미니 루프 1회. 게이트 자체의 오류는 호출자가 통과로 처리한다.
+/// `engine_block` 은 실행 엔진의 prompt_block — 리뷰어도 같은 품질 기준으로 보게 한다
+/// (약점 보정 지시 없이 판정만 시키던 교차 누수 제거, 설계 §15.2).
+/// `resume` 이 있으면 그 대화를 이어 재질의한다.
+#[allow(clippy::too_many_arguments)]
 async fn run_review_once(
     cfg: &Config,
     reviewer: &Binding,
     prompt: &str,
+    engine_block: &str,
+    resume: Option<Vec<Message>>,
     yes: bool,
     remote: Option<agent::RemoteApproval>,
     local_ask: Option<agent::LocalAsk>,
     run_context: RunContext,
 ) -> Result<AgentOutcome> {
+    // 신선한 컨텍스트: 본 작업의 대화·lessons 를 물려받지 않는다.
+    let mut system = system_prompt(cfg, &reviewer.system_extra, "");
+    system.push_str(engine_block);
     agent::run_agent_with_context(
         AgentRun {
             cfg,
@@ -2744,10 +3117,9 @@ async fn run_review_once(
             task: prompt,
             yes,
             max_iterations: reviewer.max_iterations.min(REVIEW_GATE_MAX_ITER).max(1),
-            // 신선한 컨텍스트: 본 작업의 대화·lessons 를 물려받지 않는다.
-            system: system_prompt(cfg, &reviewer.system_extra, ""),
+            system,
             registry: ToolRegistry::with_names(&reviewer.tools),
-            resume: None,
+            resume,
             remote,
             local_ask,
             context_window: reviewer.context_window,
@@ -2763,8 +3135,10 @@ async fn run_review_once(
 async fn run_review_gate(
     cfg: &Config,
     binding: &Binding,
+    spec: &crate::engine::EngineSpec,
     task: &str,
     dod: &str,
+    rebuttal: &str,
     yes: bool,
     system: &str,
     mut outcome: AgentOutcome,
@@ -2805,6 +3179,8 @@ async fn run_review_gate(
         }
     };
 
+    // 판정 불능 재질의는 실행당 1회만 쓴다 (되묻기 무한 반복 금지).
+    let mut requeried = false;
     for attempt in 0..2u8 {
         crate::graph::node_in(
             &run_context,
@@ -2816,44 +3192,96 @@ async fn run_review_gate(
         crate::spinner::set_label_in(&run_context, "독립 검증자 대조 중…");
         crate::ui::live_line_in(
             &run_context,
-            &format!("[검증자] {} — 완료 기준 대조", reviewer.model),
+            &format!(
+                "[검증자 리뷰 {}회차 · {}] 완료 기준 대조",
+                attempt + 1,
+                reviewer.model
+            ),
         );
-        let prompt = review_prompt(task, dod, &outcome.changed_files);
-        let review = match run_review_once(
-            cfg,
-            &reviewer,
-            &prompt,
-            yes,
-            remote.clone(),
-            local_ask.clone(),
-            run_context.clone(),
-        )
-        .await
-        {
-            Ok(review) => review,
-            Err(e) => {
-                crate::ui::live_warn_in(
-                    &run_context,
-                    &format!("검증자 게이트 실패(통과 처리): {e}"),
-                );
-                crate::graph::node_in(
-                    &run_context,
-                    "critic",
-                    "error",
-                    &e.to_string(),
-                    Some("verify"),
-                );
-                return outcome;
+        crate::ui::live_worker_in(
+            &run_context,
+            &review_worker_id(&run_context),
+            "reviewer",
+            &format!("{}/{}", reviewer.provider_name, reviewer.model),
+            &format!("완료 기준 대조 · {}회차", attempt + 1),
+            false,
+        );
+        let prompt = review_prompt(task, dod, rebuttal, &outcome.changed_files);
+        // 안쪽 루프는 "판정 불능 → 결론만 재질의" 1회를 흡수한다.
+        let mut resume: Option<Vec<Message>> = None;
+        let action = loop {
+            let review = match run_review_once(
+                cfg,
+                &reviewer,
+                &prompt,
+                &spec.prompt_block,
+                resume.take(),
+                yes,
+                remote.clone(),
+                local_ask.clone(),
+                run_context.clone(),
+            )
+            .await
+            {
+                Ok(review) => review,
+                Err(e) => {
+                    crate::ui::live_warn_in(
+                        &run_context,
+                        &format!("검증자 게이트 실패(통과 처리): {e}"),
+                    );
+                    crate::graph::node_in(
+                        &run_context,
+                        "critic",
+                        "error",
+                        &e.to_string(),
+                        Some("verify"),
+                    );
+                    return outcome;
+                }
+            };
+            outcome.input_tokens = outcome.input_tokens.saturating_add(review.input_tokens);
+            outcome.output_tokens = outcome.output_tokens.saturating_add(review.output_tokens);
+
+            // 리뷰어가 정상 종료하지 못했으면 그 출력은 결론이 아니다 — 판정 불능으로 본다.
+            let verdict = if review.status == "ok" {
+                parse_review_verdict(&agent::last_assistant_text(&review.messages))
+            } else {
+                ReviewVerdict::Indeterminate
+            };
+            match gate_action(verdict, attempt, requeried) {
+                GateAction::Requery => {
+                    requeried = true;
+                    crate::ui::live_line_in(
+                        &run_context,
+                        "[검증자] 결론 줄이 없어 판정만 한 줄 다시 요청합니다.",
+                    );
+                    let mut msgs = review.messages.clone();
+                    if msgs.is_empty() {
+                        msgs.push(Message::user_text(prompt.as_str()));
+                    }
+                    msgs.push(Message::user_text(REVIEW_REQUERY));
+                    resume = Some(msgs);
+                }
+                other => break other,
             }
         };
-        outcome.input_tokens = outcome.input_tokens.saturating_add(review.input_tokens);
-        outcome.output_tokens = outcome.output_tokens.saturating_add(review.output_tokens);
-
-        let verdict = parse_review_verdict(&agent::assistant_text(&review.messages));
-        let summary = match gate_action(verdict, attempt) {
+        let summary = match action {
             GateAction::Accept => {
                 crate::graph::node_in(&run_context, "critic", "pass", "", Some("verify"));
                 crate::ui::live_line_in(&run_context, "[검증자] 완료 기준 충족 — 통과");
+                return outcome;
+            }
+            // 판정 불능은 통과와 구분해 기록한다: 가용성은 지키되 "안 돈 것"이 조용히
+            // 통과로 묻히지 않게 라이브 라인과 graph 에 남긴다 (설계 §15.1).
+            GateAction::AcceptUnknown | GateAction::Requery => {
+                crate::graph::node_in(
+                    &run_context,
+                    "critic",
+                    "indeterminate",
+                    "판정 줄 없음",
+                    Some("verify"),
+                );
+                crate::ui::live_warn_in(&run_context, "[검증자] 판정 불능 — 통과로 간주");
                 return outcome;
             }
             GateAction::Report(summary) => {
@@ -3185,7 +3613,8 @@ fn graph_node_system(
     }
     s.push_str(
         "\n이 노드의 목표만 수행한다. 다른 노드가 맡은 범위는 건드리지 않는다(NEVER). \
-         끝내면 무엇을 만들었는지 한 문단으로 보고한다.",
+         선행 노드가 바꾼 파일은 읽고 그 위에서 작업한다 — 이미 있는 구현을 지우고 \
+         새로 쓰지 않는다(NEVER). 끝내면 무엇을 만들었는지 한 문단으로 보고한다.",
     );
     s
 }
@@ -3196,6 +3625,82 @@ fn graph_node_prompt(task: &str, node: &DagNode) -> String {
         "{task}\n\n[이번 노드] {}\n이 노드의 목표만 수행하라. 나머지는 다른 노드가 처리한다.",
         node.goal.trim()
     )
+}
+
+/// 노드 재시도 프롬프트 (순수 함수) — 실패 사유 + 첫 시도가 이미 바꾼 파일.
+/// 노드 재시도는 resume 없이 신선한 컨텍스트로 도는데, 첫 시도의 편집을 모르면
+/// 같은 파일을 처음부터 다시 써서 이중 편집이 난다 (설계 §15.5).
+fn graph_retry_prompt(prompt: &str, reason: &str, changed: &[String]) -> String {
+    let mut s = format!(
+        "{prompt}\n\n[직전 시도 실패] {reason}\n같은 접근을 반복하지 마라. \
+         막힌 지점을 먼저 확인하고 다른 경로로 이 노드의 목표를 완수하라."
+    );
+    if !changed.is_empty() {
+        s.push_str("\n[첫 시도가 이미 바꾼 파일]\n");
+        for path in changed.iter().take(40) {
+            s.push_str("- ");
+            s.push_str(path);
+            s.push('\n');
+        }
+        s.push_str("현재 상태를 읽고 이어가라. 처음부터 다시 쓰지 마라(NEVER).");
+    }
+    s
+}
+
+/// 노드 경계 검증 — 노드가 끝날 때마다 자동 감지된 검증 명령을 한 번 돌린다.
+/// 실패 출력을 돌려주면 호출자가 그 노드의 재시도 사유로 합류시킨다.
+/// 명령이 없거나 승인되지 않으면 None (검증 생략은 실패가 아니다).
+#[allow(clippy::too_many_arguments)]
+async fn graph_node_boundary_check(
+    cfg: &Config,
+    changed: &[String],
+    yes: bool,
+    remote: &Option<agent::RemoteApproval>,
+    local_ask: &Option<agent::LocalAsk>,
+    run_context: &RunContext,
+) -> Option<String> {
+    let cmd = auto_verify_command(cfg, changed);
+    if cmd.is_empty() {
+        return None;
+    }
+    let registry = ToolRegistry::all();
+    let tool = registry.get("bash")?;
+    let mut ctx = ToolCtx::new(cfg.workspace.clone());
+    ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
+    ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
+    ctx.local_ask = local_ask.clone();
+    ctx.remote = remote.clone();
+    ctx.run = Some(run_context.clone());
+    let input = serde_json::json!({ "command": cmd });
+    // 노드마다 승인을 되묻지 않는다 — 이미 허용된 실행에서만 돌린다.
+    let allowed = agent::effective_yes(yes, remote) || run_context.run_tree_approved();
+    if !matches!(
+        approve_bash_command(&input, tool, &ctx, allowed, remote, local_ask, run_context).await,
+        Ok(BashApproval::Allowed)
+    ) {
+        return None;
+    }
+    crate::spinner::set_label_in(run_context, &format!("노드 경계 검증: {cmd}"));
+    match tool.run(input, &ctx) {
+        Ok(out) if !out.contains("[exit") => {
+            crate::ui::live_line_in(run_context, &format!("[노드 검증] {cmd} — 통과"));
+            None
+        }
+        other => {
+            let err = match other {
+                Ok(o) => o,
+                Err(e) => e.to_string(),
+            };
+            crate::ui::live_warn_in(
+                run_context,
+                &format!("[노드 검증] {cmd} 실패 — 이 노드에서 바로잡습니다."),
+            );
+            Some(format!(
+                "노드 경계 검증 실패 ({cmd}):\n{}",
+                err.chars().take(1500).collect::<String>()
+            ))
+        }
+    }
 }
 
 /// 노드 하나의 실행 결과를 그래프 합산본에 누적한다 (실패한 시도도 보존).
@@ -3215,6 +3720,9 @@ fn merge_node_outcome(agg: &mut AgentOutcome, node: &AgentOutcome) {
     agg.deny_reasons.extend(node.deny_reasons.clone());
     if node.verify_fail.is_some() {
         agg.verify_fail = node.verify_fail.clone();
+    }
+    if node.verify_recovered.is_some() {
+        agg.verify_recovered = node.verify_recovered.clone();
     }
     agg.messages = node.messages.clone();
 }
@@ -3287,8 +3795,8 @@ async fn run_graph_discipline(
             let progress = crate::tools_more::todo_progress(&crate::tools_more::current_todos_in(
                 &run_context,
             ));
-            let ok = graph_node_ok(&outcome.status, progress.completed, progress.total);
-            let reason = outcome
+            let mut ok = graph_node_ok(&outcome.status, progress.completed, progress.total);
+            let mut reason = outcome
                 .error
                 .clone()
                 .unwrap_or_else(|| format!("status={}", outcome.status));
@@ -3296,6 +3804,24 @@ async fn run_graph_discipline(
             // 취소는 실패가 아니다 — 재시도하지 않고 그대로 끝낸다.
             if outcome.status == "cancelled" || run_context.is_cancelled() {
                 return Ok(cancelled_outcome());
+            }
+            // 노드 경계 검증 — 깨진 상태가 다음 노드로 전파되지 않게 한다(§15.5).
+            // 재시도 여지가 있는 첫 시도에서만 돌린다(검증은 무겁고, 마지막 시도 뒤에는
+            // 어차피 그래프 종료 후 종료 검증이 같은 명령을 다시 돌린다).
+            if ok
+                && attempt == 0
+                && let Some(fail) = graph_node_boundary_check(
+                    cfg,
+                    &agg.changed_files,
+                    yes,
+                    &remote,
+                    &local_ask,
+                    &run_context,
+                )
+                .await
+            {
+                ok = false;
+                reason = fail;
             }
             if ok {
                 produced.push((id.to_string(), graph_node_summary(&outcome)));
@@ -3305,12 +3831,12 @@ async fn run_graph_discipline(
             if attempt == 0 {
                 crate::ui::live_warn_in(
                     &run_context,
-                    &format!("[그래프] 노드 {id} 실패 — 1회 재시도합니다: {reason}"),
+                    &format!(
+                        "[그래프] 노드 {id} 실패 — 1회 재시도합니다: {}",
+                        reason.lines().next().unwrap_or(&reason)
+                    ),
                 );
-                prompt = format!(
-                    "{prompt}\n\n[직전 시도 실패] {reason}\n같은 접근을 반복하지 마라. \
-                     막힌 지점을 먼저 확인하고 다른 경로로 이 노드의 목표를 완수하라."
-                );
+                prompt = graph_retry_prompt(&prompt, &reason, &outcome.changed_files);
                 continue;
             }
             crate::graph::node_in(&run_context, "graph_node", id, "fail", Some("plan_first"));
@@ -3560,7 +4086,166 @@ mod tests {
         cfg.file.general.discipline = "loop".into();
         assert_eq!(engine_suffix(&cfg), "  ·  loop");
 
+        // 팀 모드는 multi 일 때만 붙는다.
+        assert_eq!(team_mode(&cfg), crate::engine::TeamMode::Single);
+        cfg.file.harness.team = "multi".into();
+        assert_eq!(engine_suffix(&cfg), "  ·  loop  ·  team");
+        cfg.file.general.discipline = "harness".into();
+        cfg.file.general.engine = "rafikx".into();
+        assert_eq!(engine_suffix(&cfg), "  ·  team");
+        // 오타는 single 로 흡수되어 표시가 늘지 않는다.
+        cfg.file.harness.team = "멀티".into();
+        assert!(engine_suffix(&cfg).is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// auth 를 타지 않는(auth="none") 합성 프로바이더 — 테스트가 실제 로그인 상태에
+    /// 의존하지 않게 한다.
+    fn fake_provider(model: &str, small: &str) -> ProviderConfig {
+        ProviderConfig {
+            kind: "openai_compat".into(),
+            auth: "none".into(),
+            api_key_env: String::new(),
+            model: model.into(),
+            small_model: Some(small.into()),
+            base_url: Some("http://localhost:9/v1".into()),
+            supports_tools: true,
+            model_auto: false,
+            context_window: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn profile_model_resolves_provider_and_yields_only_to_explicit_model() {
+        // 등록 모델 조회는 주입 — 실제 계정 상태에 기대지 않는다.
+        let lookup = |m: &str| (m == "등록된모델").then(|| "찾은프로바이더".to_string());
+
+        // 값이 없으면 기존 선택 규칙(manual·single·auto)을 그대로 쓴다.
+        assert_eq!(decide_profile_model(None, "anthropic", None, lookup), None);
+        assert_eq!(
+            decide_profile_model(Some("   "), "anthropic", None, lookup),
+            None
+        );
+
+        // "provider:model" — 앞부분이 프로바이더.
+        assert_eq!(
+            decide_profile_model(Some("minimax:MiniMax-M2"), "anthropic", None, lookup),
+            Some(("minimax".into(), "MiniMax-M2".into()))
+        );
+
+        // 모델 ID 단독 — 등록 모델 조회가 성공하면 그 프로바이더.
+        assert_eq!(
+            decide_profile_model(Some("등록된모델"), "anthropic", None, lookup),
+            Some(("찾은프로바이더".into(), "등록된모델".into()))
+        );
+        // 조회에 실패하면 프로파일의 provider 로 떨어진다.
+        assert_eq!(
+            decide_profile_model(Some("  낯선모델  "), "anthropic", None, lookup),
+            Some(("anthropic".into(), "낯선모델".into()))
+        );
+
+        // pin 재바인딩(apply_engine_pin 이 provider_override 로 pin 을 넘긴다):
+        // 프로바이더는 pin 이 이기고 모델 ID 만 존중한다.
+        assert_eq!(
+            decide_profile_model(Some("minimax:MiniMax-M2"), "anthropic", Some("glm"), lookup),
+            Some(("glm".into(), "MiniMax-M2".into()))
+        );
+        assert_eq!(
+            decide_profile_model(Some("등록된모델"), "anthropic", Some("glm"), lookup),
+            Some(("glm".into(), "등록된모델".into()))
+        );
+        // 공백뿐인 오버라이드는 지정이 아니다.
+        assert_eq!(
+            decide_profile_model(Some("minimax:MiniMax-M2"), "anthropic", Some(" "), lookup),
+            Some(("minimax".into(), "MiniMax-M2".into()))
+        );
+    }
+
+    #[test]
+    fn profile_model_survives_engine_pin_rebinding() {
+        let dir =
+            std::env::temp_dir().join(format!("rafikx-teammodel-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = Config::load(Some(&dir.join("config.toml"))).expect("config");
+        cfg.file
+            .providers
+            .insert("fake_a".into(), fake_provider("a-main", "a-small"));
+        cfg.file
+            .providers
+            .insert("fake_b".into(), fake_provider("b-main", "b-small"));
+
+        // 역할에 모델을 배정한 프로파일 (팀 모드의 분업).
+        let mut role = crate::config::builtin_profile("backend").expect("preset");
+        role.provider = "fake_a".into();
+        role.tools = vec!["read_file".into()];
+        role.model = Some("role-only-model".into());
+        cfg.file.subagents.insert("backend".into(), role.clone());
+
+        // 엔진 고정을 fake_b 로 건다 — 실행 경로 프로바이더는 고정이 이겨야 한다.
+        cfg.file.general.engine = "claude".into();
+        cfg.file.engines.insert(
+            "claude".into(),
+            crate::engine::EngineOverride {
+                pin_provider: Some("fake_b".into()),
+                ..Default::default()
+            },
+        );
+
+        let mut binding = bind_profile(&cfg, TaskClass::Dev, Some("backend"), None, None)
+            .expect("프로파일 모델 바인딩");
+        assert_eq!(binding.provider_name, "fake_a");
+        assert_eq!(binding.model, "role-only-model");
+
+        // pin 재바인딩이 프로파일 모델을 지우지 않는다: provider 만 고정으로 바뀐다.
+        assert_eq!(apply_engine_pin(&cfg, &mut binding, None, None), None);
+        assert_eq!(binding.provider_name, "fake_b");
+        assert_eq!(binding.model, "role-only-model");
+
+        // 모델 ID 가 비면 고정 프로바이더의 model_role 규칙으로 되돌아간다.
+        let mut plain = role.clone();
+        plain.model = None;
+        cfg.file.subagents.insert("backend".into(), plain);
+        let mut binding = bind_profile(&cfg, TaskClass::Dev, Some("backend"), Some("fake_b"), None)
+            .expect("model_role 바인딩");
+        assert_eq!(binding.model, "b-main");
+
+        // 사용자가 모델을 직접 지정하면 프로파일 모델을 이긴다.
+        cfg.file.subagents.insert("backend".into(), role);
+        binding = bind_profile(
+            &cfg,
+            TaskClass::Dev,
+            Some("backend"),
+            Some("fake_b"),
+            Some("user-picked"),
+        )
+        .expect("명시 모델 바인딩");
+        assert_eq!(binding.model, "user-picked");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn team_block_only_for_multi_dev_advanced_outside_graph() {
+        use crate::engine::TeamMode;
+        for class in [TaskClass::Dev, TaskClass::Advanced] {
+            assert!(team_block_active(TeamMode::Multi, class, true, false));
+            // graph 분야와 상호 배타 — 그래프가 이미 분해 실행을 담당한다.
+            assert!(!team_block_active(TeamMode::Multi, class, true, true));
+            // 도구가 없으면 위임 자체가 불가능하다.
+            assert!(!team_block_active(TeamMode::Multi, class, false, false));
+            // single 은 현행 그대로.
+            assert!(!team_block_active(TeamMode::Single, class, true, false));
+        }
+        for class in [TaskClass::Simple, TaskClass::Medium] {
+            assert!(!team_block_active(TeamMode::Multi, class, true, false));
+        }
+        // 지침 본문은 role 목록과 병렬 호출 방법을 함께 알려야 한다.
+        for key in ["planner", "frontend", "backend", "reviewer", "병렬"] {
+            assert!(TEAM_MULTI_BLOCK.contains(key), "{key} 지시 없음");
+        }
+        assert!(TEAM_MULTI_BLOCK.contains("자체 완결"));
     }
 
     #[test]
@@ -3618,12 +4303,21 @@ mod tests {
             ReviewVerdict::Pass
         );
         assert_eq!(parse_review_verdict("[판정] 통과"), ReviewVerdict::Pass);
-        // 판정 줄이 없으면 통과로 본다 — 게이트가 가용성을 해치면 안 된다.
+        // 판정 줄이 없으면 통과가 아니라 판정 불능이다 ("신호 없음 = 통과" 금지).
         assert_eq!(
             parse_review_verdict("리뷰 도중 파일을 열지 못했습니다."),
+            ReviewVerdict::Indeterminate
+        );
+        assert_eq!(parse_review_verdict(""), ReviewVerdict::Indeterminate);
+        // 판정이 여러 개면 마지막이 결론이다 — 1회차의 "판정하겠다" 류 오탐 제거.
+        assert_eq!(
+            parse_review_verdict("[판정] 은 마지막에 fail 여부로 내겠다\n…확인 완료\n[판정] pass"),
             ReviewVerdict::Pass
         );
-        assert_eq!(parse_review_verdict(""), ReviewVerdict::Pass);
+        assert!(matches!(
+            parse_review_verdict("[판정] pass 로 보인다\n추가 확인 결과\n[판정] fail\n[결함] 누락"),
+            ReviewVerdict::Fail { .. }
+        ));
 
         // 미통과 — 미충족 항목과 결함이 사유로 모인다.
         let text = "[판정] fail\n\
@@ -3642,6 +4336,20 @@ mod tests {
             parse_review_verdict("[판정] 미통과\n[결함] 테스트 없음"),
             ReviewVerdict::Fail { .. }
         ));
+        // 부연의 부정어 오탐 방지 (실측 2026-08-26): 먼저 나온 판정어가 결론이다.
+        assert_eq!(
+            parse_review_verdict("[판정] pass — 실패 요인 없음, 모두 충족"),
+            ReviewVerdict::Pass
+        );
+        assert_eq!(
+            parse_review_verdict("[판정] 통과 (미충족 항목 없음)"),
+            ReviewVerdict::Pass
+        );
+        // 판정어가 없는 판정 줄은 결론이 아니다 — 단독이면 판정 불능.
+        assert_eq!(
+            parse_review_verdict("[판정] 아직 근거가 부족하다"),
+            ReviewVerdict::Indeterminate
+        );
         // 구조를 지키지 않은 fail 출력은 본문 전체를 사유로 쓴다.
         let ReviewVerdict::Fail { summary } = parse_review_verdict("[판정] fail\n그냥 부족합니다")
         else {
@@ -3653,15 +4361,34 @@ mod tests {
         let fail = || ReviewVerdict::Fail {
             summary: "[결함] 테스트 없음".into(),
         };
-        assert_eq!(gate_action(ReviewVerdict::Pass, 0), GateAction::Accept);
-        assert_eq!(gate_action(ReviewVerdict::Pass, 1), GateAction::Accept);
         assert_eq!(
-            gate_action(fail(), 0),
+            gate_action(ReviewVerdict::Pass, 0, false),
+            GateAction::Accept
+        );
+        assert_eq!(
+            gate_action(ReviewVerdict::Pass, 1, true),
+            GateAction::Accept
+        );
+        assert_eq!(
+            gate_action(fail(), 0, false),
             GateAction::Resume("[결함] 테스트 없음".into())
         );
         assert_eq!(
-            gate_action(fail(), 1),
+            gate_action(fail(), 1, false),
             GateAction::Report("[결함] 테스트 없음".into())
+        );
+        // 판정 불능: 재질의는 실행당 1회, 그 뒤에도 불능이면 통과로 진행하되 구분해 남긴다.
+        assert_eq!(
+            gate_action(ReviewVerdict::Indeterminate, 0, false),
+            GateAction::Requery
+        );
+        assert_eq!(
+            gate_action(ReviewVerdict::Indeterminate, 0, true),
+            GateAction::AcceptUnknown
+        );
+        assert_eq!(
+            gate_action(ReviewVerdict::Indeterminate, 1, true),
+            GateAction::AcceptUnknown
         );
         assert_eq!(
             verdict_headline("[결함] 테스트 없음\n둘째 줄"),
@@ -3673,7 +4400,7 @@ mod tests {
     #[test]
     fn review_prompt_sends_dod_and_files_but_not_diffs() {
         let changed = vec!["src/cache.rs".to_string(), "src/main.rs".to_string()];
-        let p = review_prompt("캐시를 추가하라", "1. cargo test 통과", &changed);
+        let p = review_prompt("캐시를 추가하라", "1. cargo test 통과", "", &changed);
         assert!(p.contains("캐시를 추가하라"));
         assert!(p.contains("[완료 기준]\n1. cargo test 통과"));
         assert!(p.contains("- src/cache.rs"));
@@ -3682,9 +4409,32 @@ mod tests {
         assert!(p.contains("read_file"));
 
         // DoD 가 없으면 그 절은 통째로 빠진다.
-        let p = review_prompt("캐시를 추가하라", "   ", &[]);
+        let p = review_prompt("캐시를 추가하라", "   ", "  ", &[]);
         assert!(!p.contains("[완료 기준]"));
+        assert!(!p.contains("[계획이 지목한 최대 위험]"));
         assert!(p.contains("변경 파일 없음"));
+    }
+
+    #[test]
+    fn rebuttal_reaches_the_verifier_gate_prompt() {
+        let plan = "[해석] 캐시 계층을 추가한다.\n\
+                    [완료 기준]\n\
+                    1. cargo test 통과 — `cargo test` 실행\n\
+                    [작업 분해]\n\
+                    1. 인터페이스 정의\n\
+                    [반박] 위험: 동시 쓰기에서 캐시가 낡는다.\n\
+                    최소 테스트: 두 스레드로 같은 키를 갱신하고 값을 재조회한다.";
+        let rebuttal = extract_plan_section(plan, "[반박]");
+        assert!(rebuttal.starts_with("위험: 동시 쓰기에서"));
+        assert!(rebuttal.contains("최소 테스트: 두 스레드로"));
+        // [반박] 이 뒤에 붙어도 앞 절들은 그대로 잘린다.
+        assert!(!extract_plan_section(plan, "[작업 분해]").contains("반박"));
+
+        let p = review_prompt("캐시를 추가하라", "1. cargo test 통과", &rebuttal, &[]);
+        assert!(p.contains("[계획이 지목한 최대 위험]"));
+        assert!(p.contains("동시 쓰기에서 캐시가 낡는다"));
+        // 계획 지시 자체가 [반박] 절을 요구해야 이 경로가 채워진다.
+        assert!(PLAN_CONTRACT_INSTRUCTION.contains("[반박]"));
     }
 
     #[test]
@@ -3938,7 +4688,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_fallback_order_keeps_one_provider() {
+    fn pinned_fallback_order_prefers_pin_then_keeps_rest() {
         let order = || {
             vec![
                 "anthropic".to_string(),
@@ -3946,21 +4696,117 @@ mod tests {
                 "glm".to_string(),
             ]
         };
-        // 고정이면 그 프로바이더 하나만 남는다 (계정 순회는 안쪽이 담당).
+        // 기본(pin_strict=false): 고정이 선두, 나머지는 후순위로 살아남는다.
+        // 고정 프로바이더 전면 장애에도 실행이 이어져야 한다 (§15.2).
         assert_eq!(
-            limit_order_to_pin(Some("minimax"), None, order()),
+            limit_order_to_pin(Some("minimax"), false, None, order()),
+            vec![
+                "minimax".to_string(),
+                "anthropic".to_string(),
+                "glm".to_string()
+            ]
+        );
+        // pin_strict = true 면 예전처럼 고정 하나로 제한한다 (계정 순회는 안쪽이 담당).
+        assert_eq!(
+            limit_order_to_pin(Some("minimax"), true, None, order()),
             vec!["minimax".to_string()]
         );
         // 고정이 없으면 원래 순서 그대로.
-        assert_eq!(limit_order_to_pin(None, None, order()), order());
-        assert_eq!(limit_order_to_pin(Some(""), None, order()), order());
+        assert_eq!(limit_order_to_pin(None, false, None, order()), order());
+        assert_eq!(limit_order_to_pin(Some(""), false, None, order()), order());
         // 명시 --provider 가 있으면 고정을 양보한다.
         assert_eq!(
-            limit_order_to_pin(Some("minimax"), Some("anthropic"), order()),
+            limit_order_to_pin(Some("minimax"), false, Some("anthropic"), order()),
+            order()
+        );
+        assert_eq!(
+            limit_order_to_pin(Some("minimax"), true, Some("anthropic"), order()),
             order()
         );
         // 고정 프로바이더가 순서에 없으면(미연결) 가용성을 우선해 원래 순서를 지킨다.
-        assert_eq!(limit_order_to_pin(Some("moonshot"), None, order()), order());
+        assert_eq!(
+            limit_order_to_pin(Some("moonshot"), false, None, order()),
+            order()
+        );
+        assert_eq!(
+            limit_order_to_pin(Some("moonshot"), true, None, order()),
+            order()
+        );
+    }
+
+    #[test]
+    fn contract_plan_seeds_todo_with_the_step_body() {
+        let steps = "1. 인터페이스 정의 — src/cache.rs\n2. 저장소 연결\n3. 테스트 추가";
+        let seeded = contract_seed_task("캐시를 추가하라", steps);
+        // 착수 지시가 단계 본문을 그대로 실어야 한다 (원거리 참조 금지, §15.3).
+        assert!(seeded.contains("[착수 지시]"));
+        assert!(seeded.contains("[작업 분해]"));
+        assert!(seeded.contains("1. 인터페이스 정의 — src/cache.rs"));
+        assert!(seeded.contains("3. 테스트 추가"));
+        assert!(seeded.starts_with("캐시를 추가하라"));
+        // 계획이 없으면 원 작업 그대로 — 빈 지시를 붙이지 않는다.
+        assert_eq!(
+            contract_seed_task("캐시를 추가하라", "  \n "),
+            "캐시를 추가하라"
+        );
+
+        // staged 블록과 시드 지시는 단계 수를 두고 경쟁하지 않는다.
+        assert!(!staged_block(true).contains("2~6개"));
+        assert!(staged_block(true).contains("[작업 분해]"));
+        assert!(staged_block(false).contains("2~6개"));
+        assert!(!staged_block(false).contains("[작업 분해]"));
+
+        // 계획 단계 수 추정 — 관측 경고의 입력.
+        assert_eq!(plan_step_count(steps), 3);
+        assert_eq!(plan_step_count("1) 첫째\n2) 둘째\n- 메모"), 2);
+        assert_eq!(plan_step_count("단계 없음"), 0);
+    }
+
+    #[test]
+    fn graph_retry_prompt_carries_first_attempt_changes() {
+        let changed = vec!["src/board.rs".to_string(), "src/main.rs".to_string()];
+        let p = graph_retry_prompt("노드 프롬프트", "status=limit", &changed);
+        assert!(p.contains("노드 프롬프트"));
+        assert!(p.contains("[직전 시도 실패] status=limit"));
+        // resume 없는 재시도의 이중 편집 방지 (§15.5).
+        assert!(p.contains("- src/board.rs"));
+        assert!(p.contains("- src/main.rs"));
+        assert!(p.contains("현재 상태를 읽고 이어가라"));
+        // 바뀐 파일이 없으면 그 절은 통째로 빠진다.
+        let p = graph_retry_prompt("노드 프롬프트", "status=fail", &[]);
+        assert!(!p.contains("[첫 시도가 이미 바꾼 파일]"));
+
+        // 노드 시스템 프롬프트도 선행 노드의 산출물 위에서 일하라고 못 박는다.
+        let node = DagNode {
+            id: "n2".into(),
+            goal: "렌더링".into(),
+            deps: vec![],
+            produces: "화면".into(),
+        };
+        let sys = graph_node_system("BASE", 2, 3, &node, &[]);
+        assert!(sys.contains("선행 노드가 바꾼 파일은 읽고"));
+    }
+
+    #[test]
+    fn verify_retry_success_clears_final_failure_but_keeps_evidence() {
+        let mut outcome = AgentOutcome {
+            verify_fail: Some("cargo check 실패".into()),
+            ..AgentOutcome::default()
+        };
+        mark_verify_recovered(&mut outcome);
+        // 재시도로 통과한 실행은 최종 실패가 아니다 — Self-Harness 가 실패로 세면 안 된다.
+        assert_eq!(outcome.verify_fail, None);
+        // 그래도 회복 증거는 남아 교훈 수집 경로를 지킨다.
+        assert_eq!(
+            outcome.verify_recovered.as_deref(),
+            Some("cargo check 실패")
+        );
+
+        // 애초에 실패가 없었으면 아무것도 만들지 않는다.
+        let mut clean = AgentOutcome::default();
+        mark_verify_recovered(&mut clean);
+        assert_eq!(clean.verify_fail, None);
+        assert_eq!(clean.verify_recovered, None);
     }
 
     #[test]

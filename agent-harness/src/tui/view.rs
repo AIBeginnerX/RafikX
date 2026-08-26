@@ -33,14 +33,15 @@ fn rgb(c: (u8, u8, u8)) -> Color {
 }
 
 pub fn theme_of(app: &App) -> Pal {
-    let t: &Theme = {
-        let name = app.session.cfg.file.ui.theme.as_str();
-        if name.is_empty() {
-            &palette::RAFIKX
-        } else {
-            palette::by_name(name)
-        }
-    };
+    let name = app.session.cfg.file.ui.theme.as_str();
+    pal_of(if name.is_empty() {
+        &palette::RAFIKX
+    } else {
+        palette::by_name(name)
+    })
+}
+
+fn pal_of(t: &Theme) -> Pal {
     Pal {
         bg: rgb(t.bg),
         accent: rgb(t.accent),
@@ -74,12 +75,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         slash_palette_height(slash_hits.len())
     };
+    let working = render_working_rows(&app.workers, &app.mode_line, area.width, &th);
     let rows = responsive_rows(
         area.width,
         area.height,
         todo_panel_height(app, area.width),
         wanted_pal_h,
         input_height(app, area.width),
+        working_panel_height(working.len()),
     );
 
     let chunks = Layout::default()
@@ -103,6 +106,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_input(f, app, chunks[3], &th);
     if rows[4] > 0 {
         draw_slash_palette(f, chunks[4], &slash_hits, &th);
+    }
+    if rows[5] > 0 {
+        draw_working_panel(f, chunks[5], working, &th);
     }
     draw_footer(f, app, chunks[6], &th);
 
@@ -182,21 +188,27 @@ fn responsive_rows(
     wanted_todo: u16,
     wanted_palette: u16,
     wanted_input: u16,
+    wanted_status: u16,
 ) -> [u16; 7] {
     let header = u16::from(height >= 5);
-    // 상태 스트립은 푸터에 통합됐다 (pi 스타일 단일 푸터) — 화면 1행 절약.
-    let status = 0u16;
     let footer = u16::from(height >= 3);
-    let fixed = header + status + footer;
+    let fixed = header + footer;
     let remaining = height.saturating_sub(fixed);
     let input = wanted_input.max(1).min(remaining);
     let after_input = remaining.saturating_sub(input);
-    let todo = if height >= 8 {
-        wanted_todo.min(after_input.saturating_sub(3))
+    // 상태 슬롯은 working 패널이 쓴다 — 입력창과 푸터 사이 (§16.2).
+    let status = if height >= 8 {
+        wanted_status.min(after_input.saturating_sub(3))
     } else {
         0
     };
-    let after_todo = after_input.saturating_sub(todo);
+    let after_status = after_input.saturating_sub(status);
+    let todo = if height >= 8 {
+        wanted_todo.min(after_status.saturating_sub(3))
+    } else {
+        0
+    };
+    let after_todo = after_status.saturating_sub(todo);
     let palette = if height >= 8 {
         wanted_palette.min(after_todo.saturating_sub(3))
     } else {
@@ -207,7 +219,7 @@ fn responsive_rows(
 }
 
 fn todo_panel_height(app: &App, width: u16) -> u16 {
-    if app.todos.is_empty() && app.agents.is_empty() {
+    if app.todos.is_empty() {
         0
     } else {
         let content_width = width.saturating_sub(4).max(1) as usize;
@@ -220,16 +232,98 @@ fn todo_panel_height(app: &App, width: u16) -> u16 {
                     .max(1)
             })
             .sum();
-        progress_panel_height(todo_rows, app.agents.len(), width)
+        progress_panel_height(todo_rows, width)
     }
 }
 
-fn progress_panel_height(todo_count: usize, agent_count: usize, _width: u16) -> u16 {
-    (todo_count + agent_count + 2).min(u16::MAX as usize) as u16
+fn progress_panel_height(todo_count: usize, _width: u16) -> u16 {
+    (todo_count + 2).min(u16::MAX as usize) as u16
+}
+
+/// working 패널에 한 번에 보일 워커 줄 수 상한 — 넘치면 오래된 워커를 생략한다.
+const WORKING_MAX_ROWS: usize = 6;
+
+/// working 패널이 요구하는 높이 — 본문 행 + 위쪽 구분선 1행. 본문이 없으면 0행.
+fn working_panel_height(row_count: usize) -> u16 {
+    if row_count == 0 {
+        0
+    } else {
+        (row_count + 1).min(u16::MAX as usize) as u16
+    }
+}
+
+/// working 패널 본문 — 에이전트별 한 줄 + 마지막 mode 줄. 순수 함수라 단위 테스트한다.
+/// 워커도 mode 줄도 없으면 빈 목록(패널 0행)이다.
+pub fn render_working_rows(
+    workers: &[crate::ui::AgentProgress],
+    mode_line: &str,
+    width: u16,
+    th: &Pal,
+) -> Vec<Line<'static>> {
+    let mode_rows = usize::from(!mode_line.trim().is_empty());
+    if workers.is_empty() && mode_rows == 0 {
+        return Vec::new();
+    }
+    // 상한을 넘으면 최근 워커를 남긴다 — 지금 일하는 쪽이 뒤에 있다.
+    let cap = WORKING_MAX_ROWS.saturating_sub(mode_rows);
+    let shown = &workers[workers.len().saturating_sub(cap)..];
+    // 접두("working"/"mode") 2칸 들여쓰기 + 라벨 7칸 + 공백 2칸을 뺀 나머지가 본문 폭.
+    let body_width = (width as usize).saturating_sub(11).max(8);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for worker in shown {
+        let mut body = String::new();
+        for part in [
+            worker.role.as_str(),
+            worker.model.as_str(),
+            worker.activity.as_str(),
+        ] {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if !body.is_empty() {
+                body.push_str("  ");
+            }
+            body.push_str(part);
+        }
+        rows.push(Line::from(vec![
+            Span::styled(
+                " working  ".to_string(),
+                Style::default()
+                    .fg(th.secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_display(&body, body_width),
+                Style::default().fg(th.body),
+            ),
+        ]));
+    }
+    if mode_rows == 1 {
+        rows.push(Line::from(vec![
+            Span::styled(" mode     ".to_string(), Style::default().fg(th.mute)),
+            Span::styled(
+                truncate_display(mode_line.trim(), body_width),
+                Style::default().fg(th.mute),
+            ),
+        ]));
+    }
+    rows
+}
+
+fn draw_working_panel(f: &mut Frame, area: Rect, rows: Vec<Line<'static>>, th: &Pal) {
+    if area.height == 0 || rows.is_empty() {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    f.render_widget(Paragraph::new(rows).block(block), area);
 }
 
 fn draw_todo_panel(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
-    if area.height == 0 || (app.todos.is_empty() && app.agents.is_empty()) {
+    if area.height == 0 || app.todos.is_empty() {
         return;
     }
     let progress = crate::tools_more::todo_progress(&app.todos);
@@ -270,20 +364,6 @@ fn draw_todo_panel(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         rows.push(Line::from(vec![
             Span::styled(format!(" {mark} "), style),
             Span::styled(item.content.clone(), style),
-        ]));
-    }
-    for agent in &app.agents {
-        let (mark, color) = match agent.status.as_str() {
-            "running" => ("●", th.code),
-            "failed" | "denied" => ("!", th.err),
-            _ => ("o", th.mute),
-        };
-        rows.push(Line::from(vec![
-            Span::styled(format!(" {mark} "), Style::default().fg(color)),
-            Span::styled(
-                format!("{} · {} · {}", agent.role, agent.model, agent.status),
-                Style::default().fg(color),
-            ),
         ]));
     }
     let block = Block::default()
@@ -1724,13 +1804,128 @@ mod tests {
     #[test]
     fn narrow_layout_never_allocates_more_rows_than_available() {
         for height in 1..16 {
-            let rows = responsive_rows(18, height, 4, 9, 3);
+            let rows = responsive_rows(18, height, 4, 9, 3, 3);
             assert!(rows.iter().copied().sum::<u16>() <= height);
             if height < 8 {
                 assert_eq!(rows[4], 0, "좁은 높이에서는 명령 팔레트를 접어야 한다");
                 assert_eq!(rows[2], 0, "좁은 높이에서는 Todo 패널을 접어야 한다");
+                assert_eq!(rows[5], 0, "좁은 높이에서는 working 패널을 접어야 한다");
             }
         }
+    }
+
+    #[test]
+    fn working_panel_takes_the_status_slot_without_stealing_the_transcript() {
+        // 넉넉한 높이에서는 요청한 만큼 status 슬롯(chunks[5])을 받는다.
+        let rows = responsive_rows(80, 30, 4, 0, 3, 3);
+        assert_eq!(rows[5], 3);
+        assert!(rows.iter().copied().sum::<u16>() <= 30);
+        // 요청이 없으면 0행 — 이전과 같은 레이아웃.
+        let none = responsive_rows(80, 30, 4, 0, 3, 0);
+        assert_eq!(none[5], 0);
+        assert_eq!(none[1], rows[1] + 3, "패널이 접히면 그 행은 트랜스크립트로");
+    }
+
+    #[test]
+    fn working_panel_height_adds_one_divider_row_only_when_used() {
+        assert_eq!(working_panel_height(0), 0);
+        assert_eq!(working_panel_height(1), 2);
+        assert_eq!(working_panel_height(6), 7);
+    }
+
+    fn worker(id: &str, role: &str, model: &str, activity: &str) -> crate::ui::AgentProgress {
+        crate::ui::AgentProgress {
+            id: id.into(),
+            role: role.into(),
+            model: model.into(),
+            activity: activity.into(),
+            done: false,
+        }
+    }
+
+    fn row_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn working_rows_show_role_model_and_activity_after_the_working_prefix() {
+        let th = pal_of(&palette::RAFIKX);
+        let rows = render_working_rows(
+            &[worker("run-1", "dev", "minimax/MiniMax-M3", "반복 3/25")],
+            "engine=minimax(고정) · team=single",
+            120,
+            &th,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_text(&rows[0]),
+            " working  dev  minimax/MiniMax-M3  반복 3/25"
+        );
+        assert!(row_text(&rows[1]).starts_with(" mode     engine=minimax(고정)"));
+        // 접두는 영문 소문자 그대로여야 한다 (§16.2).
+        assert!(rows[0].spans[0].content.contains("working"));
+    }
+
+    #[test]
+    fn working_rows_are_empty_without_workers_or_mode() {
+        let th = pal_of(&palette::RAFIKX);
+        assert!(render_working_rows(&[], "", 120, &th).is_empty());
+        assert!(render_working_rows(&[], "   ", 120, &th).is_empty());
+        // mode 줄만 있어도 패널은 열린다.
+        assert_eq!(render_working_rows(&[], "engine=rafikx", 120, &th).len(), 1);
+    }
+
+    #[test]
+    fn working_rows_cap_at_six_and_drop_the_oldest_workers() {
+        let th = pal_of(&palette::RAFIKX);
+        let many: Vec<_> = (0..8)
+            .map(|i| worker(&format!("w{i}"), &format!("role{i}"), "p/m", "일하는 중"))
+            .collect();
+        let rows = render_working_rows(&many, "engine=rafikx", 120, &th);
+        assert_eq!(rows.len(), WORKING_MAX_ROWS);
+        // 최근 5명 + mode 줄 — 가장 오래된 w0..w2 는 생략된다.
+        assert!(row_text(&rows[0]).contains("role3"));
+        assert!(row_text(&rows[4]).contains("role7"));
+        assert!(rows.iter().all(|r| !row_text(r).contains("role0")));
+
+        // mode 줄이 없으면 워커가 상한을 다 쓴다.
+        let rows = render_working_rows(&many, "", 120, &th);
+        assert_eq!(rows.len(), WORKING_MAX_ROWS);
+        assert!(row_text(&rows[0]).contains("role2"));
+        assert!(row_text(&rows[5]).contains("role7"));
+    }
+
+    #[test]
+    fn working_rows_stay_inside_the_terminal_width_with_korean_text() {
+        let th = pal_of(&palette::RAFIKX);
+        let rows = render_working_rows(
+            &[worker(
+                "run-1",
+                "backend",
+                "minimax/MiniMax-M3",
+                "도구 호출 작성 중: write_file · 48KB",
+            )],
+            "engine=minimax(고정) · team=multi · discipline=graph · self v3 · gate on",
+            40,
+            &th,
+        );
+        for row in &rows {
+            assert!(
+                super::super::md::display_width(&row_text(row)) <= 40,
+                "행이 터미널 폭을 넘었다: {}",
+                row_text(row)
+            );
+        }
+    }
+
+    #[test]
+    fn working_rows_skip_empty_fields_instead_of_printing_separators() {
+        let th = pal_of(&palette::RAFIKX);
+        let rows = render_working_rows(&[worker("run-1", "", "", "시작")], "", 120, &th);
+        assert_eq!(row_text(&rows[0]), " working  시작");
     }
 
     #[test]
@@ -1757,7 +1952,7 @@ mod tests {
 
     #[test]
     fn todo_panel_requests_every_item_row() {
-        assert_eq!(progress_panel_height(8, 0, 100), 10);
+        assert_eq!(progress_panel_height(8, 100), 10);
     }
 
     #[test]

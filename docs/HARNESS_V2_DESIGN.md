@@ -37,17 +37,22 @@ pub enum VerifyPolicy { Inherit, Auto, Strict }
 // Inherit = 프로파일의 verify 설정 그대로. Auto = verify 강제 on(자동 감지).
 // Strict = Auto + 독립 검증자 게이트(§5).
 
+// 구현 반영: 문자열 필드는 Cow 다. 내장 카탈로그는 정적 문자열(Cow::Borrowed)을
+// 그대로 쓰고, config `[engines.*]` 오버라이드가 적용된 사본만 소유 문자열
+// (Cow::Owned)을 담는다 — 오버라이드 때문에 카탈로그 전체를 복제하지 않기 위해서다.
 pub struct EngineSpec {
-    pub name: &'static str,
-    pub summary: &'static str,        // /engine 목록 한 줄 설명 (한국어)
-    pub prompt_block: &'static str,   // 시스템 프롬프트 증강 블록 (한국어)
+    pub name: Cow<'static, str>,
+    pub summary: Cow<'static, str>,       // /engine 목록 한 줄 설명 (한국어)
+    pub prompt_block: Cow<'static, str>,  // 시스템 프롬프트 증강 블록 (한국어)
     pub force_staged: bool,           // 모든 도구 작업에 todo 단계 강제
     pub plan_depth: PlanDepth,        // dev/advanced 클래스에 적용
     pub verify_policy: VerifyPolicy,
     pub max_continuations: u8,        // goal continuation 한도 (기존 8)
+    pub pin_provider: Option<Cow<'static, str>>, // §11.1
+    pub pin_strict: bool,             // §15.2 — true 면 고정 장애에도 폴백 금지
 }
 
-pub fn catalog() -> &'static [EngineSpec];      // 내장 6종
+pub fn catalog() -> &'static [EngineSpec];      // 내장 6종 (Phase 4 에서 minimax 추가 → 7종)
 pub fn resolve(name: &str) -> Option<&'static EngineSpec>;
 /// config 값 정규화: "dk"→"deepseek", "self"→("rafikx", self_meta=true), 빈 값→"rafikx"
 pub fn normalize(raw: &str) -> (String, bool);  // (engine_name, legacy_self_flag)
@@ -64,7 +69,7 @@ pub fn normalize(raw: &str) -> (String, bool);  // (engine_name, legacy_self_fla
 | `kimi` | **Contract** | **Strict** | 기존 판정 | interleaved thinking+루브릭: "작업 시작 시 성공 루브릭(기준·예상 도구 패턴·체크포인트)을 명시하고, 도구 호출을 끊지 말고 연쇄 유지. 관찰마다 루브릭 대비 위치를 확인" (K2 기술 리포트) |
 | `pi` | Brief | Inherit | 기존 판정 | 기존 저소음 블록 유지 |
 
-- `catalog()`는 config `[engines.<name>]` 테이블로 **필드 단위 오버라이드** 가능해야 한다 (문구·플래그를 코드 수정 없이 튜닝). 오버라이드 구조체: `EngineOverride { prompt_block, force_staged, plan_depth, verify_policy, max_continuations }` 전 필드 Option.
+- `catalog()`는 config `[engines.<name>]` 테이블로 **필드 단위 오버라이드** 가능해야 한다 (문구·플래그를 코드 수정 없이 튜닝). 오버라이드 구조체: `EngineOverride { prompt_block, force_staged, plan_depth, verify_policy, max_continuations, pin_provider, pin_strict }` 전 필드 Option.
 - `is_valid_engine`(chat.rs:418)과 `ENGINES` 상수를 카탈로그 기반으로 교체. `self`는 유효 입력으로 유지하되 normalize가 처리.
 
 ### 1.1 run_pipeline_inner 분기 교체
@@ -133,11 +138,11 @@ let self_meta_on = cfg.file.self_harness.enabled && (legacy_self || cfg.file.sel
 run_verify 성공 **후** (또는 검증 생략 시 그 자리에서), spec.verify_policy==Strict && class∈{Dev,Advanced}이면:
 
 1. reviewer 프로파일 + `[harness] manual_verify` 모델(현재 fable-5 배정)로 **신선한 컨텍스트** 1회 호출 (agent 루프 아님, read-only 도구 포함 미니 루프 max 6 iter — task.rs 재활용 가능하면 재활용).
-2. 입력: 원 task + DoD 체크리스트(§2, 없으면 원 task만) + 변경 파일 목록 + 각 변경 파일 diff 요약(전문 아님 — 크기 상한 8KB).
+2. 입력: 원 task + DoD 체크리스트(§2, 없으면 원 task만) + 계획의 [반박] + **변경 파일 목록만**. diff는 첨부하지 않는다 — 리뷰어가 read_file·grep 으로 직접 읽고 필요하면 bash 로 빌드·테스트를 돌린다(구현된 정책). 첨부된 요약만 보고 판정하면 "신선한 시각"이 성립하지 않기 때문이다.
 3. 출력 파싱: `[판정] pass` → 완료. `[판정] fail` → [미충족 항목]+[결함]을 사용자 메시지로 만들어 **agent 루프 1회 재개** (기존 verify 재시도 패턴과 동일한 resume 방식). 재개 후 재검증은 1회만 — 2번째 fail이면 상태 보고 후 종료 (무한루프 방지). outcome.error에 "검증자 미통과: <요약>" 기록.
 4. 게이트 자체 실패(모델 오류 등)는 경고 1줄 후 통과 취급 (게이트가 가용성을 해치면 안 됨).
 5. graph 노드: `critic` kind로 기록.
-6. config `[harness] strict_gate = true`(기본 true)로 전역 차단 가능.
+6. config `[harness] strict_gate = true`(기본)가 게이트를 **활성**한다 — `false` 로 끈다.
 
 근거: K2 검증자 선택 +5.8%p, graph engineering의 fresh-context 리뷰어 노드, 자기평가 편향 방지.
 
@@ -190,6 +195,10 @@ run_verify 성공 **후** (또는 검증 생략 시 그 자리에서), spec.veri
 - **Phase 1**: engine.rs + 분기 교체 + 계획 강화(Contract·컨텍스트 수정) + normalize/dk + /engine 갱신 + config 스키마(EngineOverride, discipline 필드만 선언) + 테스트 1,2,3
 - **Phase 2**: 전문가 프로파일 프리셋 + bind 폴백 + task role 경로 + 독립 검증자 게이트 + /selfharness + self-harness meta 승격 + plan_instruction surface + 테스트 4,5
 - **Phase 3**: discipline 구현(loop·graph) + /discipline + status/doctor 표시 + DEFAULT_CONFIG 갱신 + 테스트 6,7 + 문서(README 한 단락)
+- **Phase 4**: minimax 엔진 + pin_provider(bind·fallback_order·검증자 게이트 배선) + EngineOverride.pin_provider + 테스트(§11.4)
+- **Phase 5**: 진행 가시성(§12) — 계획 스트리밍 + StreamEvent 확장 + 스피너 경과 시간 + 단계 전환 라이브 라인 + paperthin 패턴 흡수(§14)
+- **Phase 6**: 팀 모드(§13) — team = single|multi + /team + 프로파일별 모델 + task 병렬 실행
+- **Phase 7**: 하드닝(§15) — 게이트 판정 견고화 + pin 교차 완화 + Contract→todo 결합 + 수락 통계 강화 + graph 노드 경계 검증 + 문서 정합
 
 각 Phase 종료 조건: `cargo test` 전체 통과 + `cargo build --release` 성공.
 
@@ -237,10 +246,98 @@ prompt_block (한국어, 관찰된 실제 약점의 정면 보정):
 
 summary: "MiniMax 전용 — 프로바이더 고정 + 약점 보정 + 계약형 계획·검증"
 
-### 11.4 테스트 계약
+### 11.4 테스트 계약 (Phase 4 — 구현 완료)
 
 1. 카탈로그에 minimax 포함(7종), pin_provider="minimax", is_selectable 통과.
+   - `is_selectable(name)` = `/engine <name>` 입력으로 받아들일지 판정한다: `resolve(name).is_some() || name == "self"`(대소문자 무시). legacy `self` 를 유효 입력으로 남기되 normalize 가 `(rafikx, legacy_self=true)` 로 해석한다.
 2. pin 우선순위: 자동 선택·manual_*를 이기고, 명시 오버라이드에는 진다 (순수 함수로 분리해 검증).
 3. fallback_order 제한: pin이면 결과가 pin 프로바이더 하나.
 4. EngineOverride.pin_provider 병합 (설정·해제).
 5. 기존 전체 테스트 통과 유지.
+
+## 12. 진행 가시성 (Phase 5) — "모델이 뭘 하는지 항상 한 줄은 보인다"
+
+실측 근거(2026-08-26 21:25 run): 계획 40초 비스트리밍 침묵, MiniMax-M3의 대형 tool call 인자 생성 88~124초 구간(reasoning도 텍스트도 없음)이 완전 침묵 — 사용자는 "모델이 일하지 않는다"고 느꼈다.
+
+1. **계획 스트리밍**: plan 호출을 `chat_with_fallback` → `stream_with_fallback`로 전환, 시작 시 `[계획 수립 중 · {model}]` 라이브 라인, 텍스트는 기존 `[모델 작업]` 래핑으로 흘린다.
+2. **스트림 이벤트 확장**: provider `chat_stream`의 `on_text: FnMut(&str)`를 `FnMut(StreamEvent)`로 확장 — `Text(&str)` | `ToolArgs { name: &str, total_bytes: usize }`. openai_compat이 tool_calls delta를 누적할 때 8KB 단위로 ToolArgs를 발행. 소비자(agent.rs 등)는 Text→기존 출력, ToolArgs→스피너 라벨 "도구 호출 작성 중: {name} · {KB}KB". 호출부 영향이 크면 어댑터(기존 &str 클로저 래핑)로 침습 최소화.
+3. **스피너 경과 시간**: 모델 호출 대기 중 스피너 라벨에 경과 시간 자동 표기 ("반복 3/25 · 모델 호출 · 1m24s"). spinner 틱에서 시작 시각 기준 계산.
+4. **단계 전환 라이브 라인 표준화**: verify 시작·critic 시작(모델·회차)·goal_continue(사유)·graph 노드 시작이 각각 한 줄씩 화면에 남는지 점검하고 빠진 곳을 보강. CLI(비 TUI) 경로도 동일.
+
+## 13. 팀 모드 (Phase 6) — single | multi 에이전트 선택
+
+`[harness] team = "single"`(기본) | `"multi"` + `/team` 슬래시 + status 표시.
+
+- **single**: 현행 그대로 — 한 바인딩 모델이 전 과정 수행.
+- **multi** (dev|advanced 클래스): 시스템 프롬프트에 팀 지침 주입 — "계획 확정 후 [작업 분해]에서 독립적인 단계들을 task 도구(role=planner|frontend|backend|reviewer)로 위임하라. 독립적인 갈래는 한 턴에 task 를 여러 개 함께 호출하면 병렬 실행된다."
+- **프로파일별 모델**: `SubAgentConfig.model: Option<String>` ("provider:model" 또는 모델 ID) — 역할마다 다른 모델 배정. pin 활성 시 provider 부분은 pin이 이기고 모델 ID만 존중하되, pin 프로바이더에 없는 모델이면 경고 후 model_role 기본으로. 이로써 pin=minimax + team=multi = "MiniMax 안에서 M2(경량 역할)/M3(구현·리뷰) 분업", pin 없음 + team=multi = 기존 ranks/manual 역할 배정과 프로파일 모델의 조합.
+- **task 병렬 실행**: agent.rs 도구 실행 루프에서 같은 응답의 연속 task 호출들을 묶어 동시 실행(join_all). 조건: 승인 불필요 상태(allow_all)일 때만, 아니면 기존 순차. 자식 라이브 출력에는 `[팀:{role}]` 프리픽스로 구분. task 자식은 이미 독립 RunContext·graph 기록을 가진다.
+
+## 14. paperthin 패턴 흡수 (Phase 5에 포함)
+
+LilMGenius/paperthin(MIT)의 저수준 에이전트 패턴 중 실측 실패와 맞물리는 것만 하네스에 반사신경으로 내장:
+
+1. **re0 (패치 대신 재작성)**: 공통 시스템 프롬프트 [엔지니어링] 절에 추가 — "같은 파일에서 edit_file/apply_patch 가 2회 연속 실패하면 부분 패치를 멈추고 그 파일을 읽어 전체를 write_file 로 재작성하라." (2026-08-26 21:33 edit_file old_str 불일치 3연속 실측 대응)
+2. **hate (계획을 죽일 유일한 이의)**: Contract 계획 산출물에 `[반박]` 절 추가 — "이 계획을 실패시킬 가장 유력한 위험 1개와 그것을 조기 확인할 최소 테스트 1개." DoD와 함께 검증자 게이트 입력에 포함.
+3. **mandela/shower (자체 확인 편향 감시)**: reviewer 프리셋 system_extra 에 추가 — "직접 읽고 실행해 얻은 외부 근거 없이 pass 를 주지 마라. 작성 맥락을 모르는 낯선 눈으로 본다."
+4. 도입하지 않는 것: 나머지 스킬들은 대화형 슬래시 워크플로라 RafikX 하네스 자동 반사에 부적합 — 필요 시 사용자가 paperthin 을 Claude Code 쪽에서 직접 쓴다.
+
+## 15. 하드닝 (Phase 7) — paperthin 점검(2026-08-26) 발견 반영
+
+mandela·hate·prism·shower 렌즈 점검의 확인된 발견만 반영한다. 공통 원칙: **"신호 없음 = 통과" 금지 — 판정 불능은 통과와 구분해 기록한다.**
+
+### 15.1 검증자 게이트 판정 견고화 [high×2]
+- `parse_review_verdict`: 이어붙인 전체가 아니라 **마지막 assistant 메시지**에서, `[판정]`이 여러 개면 **마지막 것**을 채택 (1회차 발화의 "[판정] …하겠다" 오탐 제거).
+- 판정 줄 부재 또는 리뷰어 미니루프 status≠ok → Pass가 아니라 **Indeterminate**: "[판정] pass 또는 fail 한 줄로만 결론을 내라" 재질의 1회 → 그래도 불능이면 통과 처리하되 `outcome.error`가 아닌 별도 표기로 "검증자 판정 불능"을 라이브 라인+graph(critic indeterminate)로 남긴다 (가용성 유지 + 관측 가능, "안 돈 것"과 "통과" 구분).
+- `REVIEW_GATE_MAX_ITER` 6→8.
+
+### 15.2 pin 게이트 교차 완화 [med×2 + 장애 대응]
+- 리뷰어 system에 **엔진 prompt_block을 함께 주입** (약점 보정 없이 판정만 시키는 모순 제거).
+- `review_prompt`에 1줄: "완료 기준은 실행 모델이 세운 것이다 — 원 작업 요구와 어긋나면 원 작업이 우선한다."
+- pin 런타임 전면 장애: 주 실행에서 pin 프로바이더가 재시도 소진 후에도 실패하면 **이번 실행에 한해** 경고 1줄과 함께 `[harness] fallback` 순서로 폴백 (pin은 선호이지 가용성 희생이 아니다). `[engines.*]`에 `pin_strict = true` 오버라이드로 폴백 금지 선택 가능.
+
+### 15.3 Contract→todo 사슬 결합 [hate root]
+- Contract 활성 시 첫 사용자 메시지의 착수 지시에 **[작업 분해] 본문을 그대로 복사**해 넣는다 (system 안 [실행 계획]을 가리키는 원거리 참조 제거).
+- Contract 활성 시 staged 블록의 "2~6개" 문구를 생략 (지시 충돌 제거 — 시드 지시가 단계 수를 지배).
+- 관측: goal 첫 판정 시 계획 단계 수 N과 todo total이 다르면 경고 라이브 라인 1줄 (강제 없음).
+
+### 15.4 Self-Harness 수락 통계 강화 [high×3]
+- 재발 판정을 signature 완전일치 → **cause(결정적 추출) 일치**로 완화. causal|mechanism은 표시·클러스터용으로 유지.
+- baseline을 **버전 경계와 무관하게** 최근 window개로 계산. `baseline_n < 5`면 판정 보류(트라이얼 연장).
+- `trial_min_episodes` 기본 3→5. (엄밀한 이항검정은 도입하지 않는다 — 문서에 한계 명시: 이 게이트는 통계 검정이 아니라 보수적 휴리스틱이다.)
+- verify 재시도로 최종 통과한 실행: `AgentOutcome.verify_fail`은 **최종 실패만** 담는다 (재시도 성공 시 None). 단 "실패 후 회복" lesson 수집 경로는 유지 (소비자 확인 후 최소 수정).
+
+### 15.5 graph 노드 경계 검증 [prism fail×2]
+- 노드 종료마다 `auto_verify_command` 1회 (명령이 있을 때만). 실패 시 해당 노드 재시도 프롬프트에 검증 출력 포함.
+- 노드 재시도에 **첫 시도의 변경 파일 목록** 포함: "첫 시도가 아래 파일을 이미 바꿨다 — 현재 상태를 읽고 이어가라." (resume 없는 재시도의 이중 편집 방지)
+- 노드 system의 범위 제한 문구에 "선행 노드가 바꾼 파일은 읽고 그 위에서 작업하라" 추가.
+- graph 계획에서 DoD가 추출되지 않으면 경고 라이브 라인 1줄 (조용한 약화 방지).
+
+### 15.6 문서 정합 (shower)
+- §5.6 문구 교정: "strict_gate = true(기본)가 게이트 활성 — false로 끈다".
+- §1 타입을 Cow 반영, §11.4의 is_selectable 정의 추가, §5.2 diff 정책을 구현(목록만 전달, 리뷰어가 직접 읽음)으로 갱신, §10 Phase 목록에 4~7 추가.
+
+### 15.7 점검이 확인한 "누수 없음" (기록)
+- 리뷰어 컨텍스트 격리(본 대화·lessons 미상속, 도구로 외부 근거 접근)는 건전.
+- 게이트 오류=통과(가용성 우선)는 15.1의 관측 표기와 결합하면 수용 가능.
+
+## 16. TUI 라이브 배선 수리 + working 패널 (Phase 8)
+
+근본 원인(정찰 확정): TUI 턴 실행 시 `chat.rs:1540-1547`이 run sink를 no-op으로 설치하고, `ui::emit_in`의 단락 평가(`run.emit_live(e) || emit(e)`)가 no-op에서 true를 돌려 전역 TUI sink에 아무 라이브 이벤트도 도달하지 않는다. 수신 측(`apply_live`, `render_streaming_tail`)은 완비 — 송신 배선만 끊김.
+
+### 16.1 라이브 배선 수리
+- observer 유무와 무관하게 `let live_sink = crate::ui::current_live_sink();` — no-op 분기 제거. 이것만으로 스트리밍 텍스트·[도구] 로그·todo 패널·[팀:role] 라인·서브에이전트 진행(Live::Agent)이 TUI에 살아난다.
+- 자식 lifecycle이 부모 스테이지 스트립을 덮어쓰는 버그(`tui.rs:946-949`, run_id 무필터) 수정: 루트 run의 state만 반영.
+
+### 16.2 working 패널 (chunks[5] — 비어 있는 status 슬롯)
+- 목적: **에이전트별 한 줄** — `working  {역할}  {provider/model}  {지금 하는 일}` + 마지막에 `mode` 줄 1개. 팔레트와 푸터 사이(최하단 푸터 위).
+- 데이터: 기존 `Live::Agent`(현재 task.rs만 발신)를 확장 — 필드에 model(provider/model 문자열)·activity·done 추가(하위호환 serde default). 발신 지점:
+  (a) 메인 에이전트: 턴 시작 직후(바인딩 확정 지점)에 1줄 시작 발신, agent.rs 반복 시작마다 activity="반복 n/m", StreamEvent::ToolArgs 소비 지점에서 activity="도구 호출 작성 중: {name} · {KB}KB", 도구 실행 시 activity="[도구] {name}", 턴 종료 시 done.
+  (b) task 자식: 기존 발신 지점(task.rs 시작/실패/종료)에 role·model 채워 확장 — done이면 줄 제거.
+  (c) 검증자 게이트: 시작 시 role="reviewer", activity="완료 기준 대조 · {n}회차", 종료 시 done.
+- mode 줄: `mode  engine={name}{(고정)} · team={mode} · discipline={d} · self v{N}|off · gate on|off` — 턴 시작 시 조립해 App에 저장(새 Live variant 또는 Agent 확장으로 전달), 턴 진행 동안 상시 표시.
+- 렌더: `render_working_rows(&[WorkerLine], mode_line, width) -> Vec<Line>` 순수 함수. "working" 리터럴은 영문 소문자, 강조색. 행 수 = workers+1, 상한 6(초과 시 오래된 worker 생략), 좁은 높이에서 0으로 접힘 — `responsive_rows`에 wanted_status 인자 추가, 기존 `narrow_layout_never_allocates_more_rows_than_available` 계약 유지.
+- App 상태: `workers: Vec<WorkerLine>{id, role, model, activity}` — apply_live에서 upsert/remove.
+
+### 16.3 테스트 (기존 관행: 순수 함수 단위)
+- `render_working_rows` 행 조립(working 접두·역할·모델·활동, 한국어 폭), 높이 함수, responsive_rows 확장 회귀, Live::Agent 직렬화 하위호환(구 필드만 있는 JSON 역직렬화), 루트 run 필터.

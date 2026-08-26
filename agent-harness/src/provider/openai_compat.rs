@@ -3,8 +3,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use super::{
-    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, limit_hint,
-    map_stop_reason, rate_limit_error,
+    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, StreamEvent,
+    limit_hint, map_stop_reason, rate_limit_error,
 };
 
 const CODEX_RESPONSES: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -127,12 +127,12 @@ impl OpenAiCompatProvider {
         Ok(parsed)
     }
 
-    pub async fn chat_stream<F>(&self, req: &ChatRequest, mut on_text: F) -> Result<ChatResponse>
+    pub async fn chat_stream<F>(&self, req: &ChatRequest, mut on_event: F) -> Result<ChatResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(StreamEvent),
     {
         if matches!(self.mode, CompatMode::CodexResponses) {
-            return self.chat_codex_stream(req, on_text).await;
+            return self.chat_codex_stream(req, on_event).await;
         }
         let body = build_body(req, true);
         let builder = self.apply_auth(
@@ -161,6 +161,8 @@ impl OpenAiCompatProvider {
         let mut cache_reported = false;
         let mut finish = None::<String>;
         let mut tool_acc: Vec<(String, String, String)> = Vec::new();
+        // tool call 인덱스별로 마지막 진행 발행 시점의 누적 바이트 수.
+        let mut args_marks: Vec<usize> = Vec::new();
         let mut reasoning_started = false;
 
         while let Some(chunk) = stream.next().await {
@@ -178,7 +180,7 @@ impl OpenAiCompatProvider {
                 let data = data.trim();
                 if data == "[DONE]" {
                     if reasoning_started {
-                        on_text("\n[/모델 작업]\n");
+                        on_event(StreamEvent::Text("\n[/모델 작업]\n"));
                     }
                     return Ok(finish_stream(
                         full_text,
@@ -217,10 +219,10 @@ impl OpenAiCompatProvider {
                     if let Some(piece) = delta.get("content").and_then(|x| x.as_str()) {
                         if !piece.is_empty() {
                             if reasoning_started {
-                                on_text("\n[/모델 작업]\n");
+                                on_event(StreamEvent::Text("\n[/모델 작업]\n"));
                                 reasoning_started = false;
                             }
-                            on_text(piece);
+                            on_event(StreamEvent::Text(piece));
                             full_text.push_str(piece);
                         }
                     }
@@ -231,10 +233,10 @@ impl OpenAiCompatProvider {
                     {
                         if !piece.is_empty() {
                             if !reasoning_started {
-                                on_text("\n[모델 작업]\n");
+                                on_event(StreamEvent::Text("\n[모델 작업]\n"));
                                 reasoning_started = true;
                             }
-                            on_text(piece);
+                            on_event(StreamEvent::Text(piece));
                         }
                     }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
@@ -256,6 +258,20 @@ impl OpenAiCompatProvider {
                                 tc.pointer("/function/arguments").and_then(|x| x.as_str())
                             {
                                 tool_acc[idx].2.push_str(args);
+                                // 대형 인자(수 KB~수십 KB) 생성 구간은 텍스트가 한 조각도
+                                // 흐르지 않는다 — 누적량을 진행 신호로 내보내 침묵을 없앤다.
+                                let total = tool_acc[idx].2.len();
+                                if tool_args_due(&mut args_marks, idx, total) {
+                                    let name = if tool_acc[idx].1.is_empty() {
+                                        "tool"
+                                    } else {
+                                        tool_acc[idx].1.as_str()
+                                    };
+                                    on_event(StreamEvent::ToolArgs {
+                                        name,
+                                        total_bytes: total,
+                                    });
+                                }
                             }
                         }
                     }
@@ -274,7 +290,7 @@ impl OpenAiCompatProvider {
             );
         }
         if reasoning_started {
-            on_text("\n[/모델 작업]\n");
+            on_event(StreamEvent::Text("\n[/모델 작업]\n"));
         }
 
         Ok(finish_stream(
@@ -289,9 +305,9 @@ impl OpenAiCompatProvider {
         ))
     }
 
-    async fn chat_codex_stream<F>(&self, req: &ChatRequest, mut on_text: F) -> Result<ChatResponse>
+    async fn chat_codex_stream<F>(&self, req: &ChatRequest, mut on_event: F) -> Result<ChatResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(StreamEvent),
     {
         let body = build_codex_body(req, true);
         let builder = self.apply_auth(
@@ -354,7 +370,7 @@ impl OpenAiCompatProvider {
                     &mut cached_tokens,
                     &mut cache_reported,
                     &mut finish,
-                    Some(&mut on_text),
+                    Some(&mut on_event),
                 );
                 if finish.is_some() {
                     finished = true;
@@ -383,6 +399,23 @@ impl OpenAiCompatProvider {
             hint,
         ))
     }
+}
+
+/// 도구 인자 진행 신호의 발행 간격 (바이트). 너무 촘촘하면 화면이 시끄럽고,
+/// 너무 성기면 침묵 구간이 다시 생긴다.
+const TOOL_ARGS_STEP: usize = 8192;
+
+/// 인덱스별로 마지막 발행 이후 `TOOL_ARGS_STEP` 을 넘겼을 때만 true 를 돌려주고
+/// 그 시점을 기록한다. 인덱스마다 독립적으로 센다 (한 응답에 도구 여러 개).
+fn tool_args_due(marks: &mut Vec<usize>, idx: usize, total: usize) -> bool {
+    while marks.len() <= idx {
+        marks.push(0);
+    }
+    if total >= marks[idx] + TOOL_ARGS_STEP {
+        marks[idx] = total;
+        return true;
+    }
+    false
 }
 
 /// tool call 인자 문자열을 해석한다. 빈 문자열은 인자 없는 호출이므로 `{}`,
@@ -772,17 +805,17 @@ fn apply_codex_event<F>(
     cached_tokens: &mut u32,
     cache_reported: &mut bool,
     finish: &mut Option<String>,
-    mut on_text: Option<&mut F>,
+    mut on_event: Option<&mut F>,
 ) where
-    F: FnMut(&str),
+    F: FnMut(StreamEvent),
 {
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     if kind.ends_with("output_text.delta") || kind == "response.output_text.delta" {
         if let Some(delta) = v.get("delta").and_then(|x| x.as_str()) {
             if !delta.is_empty() {
                 full_text.push_str(delta);
-                if let Some(cb) = on_text.as_mut() {
-                    cb(delta);
+                if let Some(cb) = on_event.as_mut() {
+                    cb(StreamEvent::Text(delta));
                 }
             }
         }
@@ -904,6 +937,23 @@ fn take_stream_usage(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn tool_args_progress_fires_every_step_per_tool() {
+        let mut marks: Vec<usize> = Vec::new();
+        // 임계 미만은 조용하다.
+        assert!(!tool_args_due(&mut marks, 0, 1));
+        assert!(!tool_args_due(&mut marks, 0, TOOL_ARGS_STEP - 1));
+        // 임계를 넘긴 첫 순간에 한 번.
+        assert!(tool_args_due(&mut marks, 0, TOOL_ARGS_STEP));
+        // 발행 직후에는 다시 조용해지고, 다음 8KB 에서 또 한 번.
+        assert!(!tool_args_due(&mut marks, 0, TOOL_ARGS_STEP + 10));
+        assert!(tool_args_due(&mut marks, 0, TOOL_ARGS_STEP * 2));
+        // 도구마다 독립적으로 센다 — 0번의 누적이 1번의 발행을 삼키지 않는다.
+        assert!(!tool_args_due(&mut marks, 1, 100));
+        assert!(tool_args_due(&mut marks, 1, TOOL_ARGS_STEP));
+        assert_eq!(marks.len(), 2);
+    }
 
     fn stream(tool_acc: Vec<(String, String, String)>, finish: Option<&str>) -> ChatResponse {
         finish_stream(

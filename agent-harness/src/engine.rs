@@ -90,6 +90,10 @@ pub struct EngineSpec {
     /// 오버라이드(--provider/--model)에만 진다. 일반 메커니즘이므로 config `[engines.*]`
     /// 로 어떤 엔진에든 다른 프로바이더를 고정할 수 있다.
     pub pin_provider: Option<Cow<'static, str>>,
+    /// true 면 고정 프로바이더가 전면 장애일 때도 다른 프로바이더로 넘어가지 않는다.
+    /// 기본은 false — 고정은 선호이지 가용성 희생이 아니다(설계 §15.2). 폴백이 일어나면
+    /// 기존 폴백 경고가 그대로 알린다.
+    pub pin_strict: bool,
 }
 
 impl EngineSpec {
@@ -122,6 +126,9 @@ pub struct EngineOverride {
     /// 프로바이더 고정. 빈 문자열이면 내장 고정을 해제한다.
     #[serde(default)]
     pub pin_provider: Option<String>,
+    /// true 면 고정 프로바이더 전면 장애에도 폴백을 금지한다 (기본 false).
+    #[serde(default)]
+    pub pin_strict: Option<bool>,
 }
 
 impl EngineOverride {
@@ -150,6 +157,9 @@ impl EngineOverride {
                 Some(Cow::Owned(t.to_string()))
             };
         }
+        if let Some(v) = self.pin_strict {
+            spec.pin_strict = v;
+        }
     }
 }
 
@@ -166,6 +176,7 @@ static CATALOG: &[EngineSpec] = &[
         verify_policy: VerifyPolicy::Inherit,
         max_continuations: 8,
         pin_provider: None,
+        pin_strict: false,
     },
     EngineSpec {
         name: Cow::Borrowed("claude"),
@@ -183,6 +194,7 @@ static CATALOG: &[EngineSpec] = &[
         verify_policy: VerifyPolicy::Strict,
         max_continuations: 8,
         pin_provider: None,
+        pin_strict: false,
     },
     EngineSpec {
         name: Cow::Borrowed("deepseek"),
@@ -199,6 +211,7 @@ static CATALOG: &[EngineSpec] = &[
         verify_policy: VerifyPolicy::Inherit,
         max_continuations: 8,
         pin_provider: None,
+        pin_strict: false,
     },
     EngineSpec {
         name: Cow::Borrowed("qwen"),
@@ -215,6 +228,7 @@ static CATALOG: &[EngineSpec] = &[
         verify_policy: VerifyPolicy::Auto,
         max_continuations: 8,
         pin_provider: None,
+        pin_strict: false,
     },
     EngineSpec {
         name: Cow::Borrowed("kimi"),
@@ -233,6 +247,7 @@ static CATALOG: &[EngineSpec] = &[
         verify_policy: VerifyPolicy::Strict,
         max_continuations: 8,
         pin_provider: None,
+        pin_strict: false,
     },
     EngineSpec {
         name: Cow::Borrowed("pi"),
@@ -247,6 +262,7 @@ static CATALOG: &[EngineSpec] = &[
         verify_policy: VerifyPolicy::Inherit,
         max_continuations: 8,
         pin_provider: None,
+        pin_strict: false,
     },
     EngineSpec {
         name: Cow::Borrowed("minimax"),
@@ -263,6 +279,7 @@ static CATALOG: &[EngineSpec] = &[
         verify_policy: VerifyPolicy::Strict,
         max_continuations: 10,
         pin_provider: Some(Cow::Borrowed("minimax")),
+        pin_strict: false,
     },
 ];
 
@@ -355,6 +372,53 @@ pub fn max_continuations_for(discipline: Discipline, spec_value: u8) -> u8 {
             .min(LOOP_MAX_CONTINUATIONS),
         _ => spec_value,
     }
+}
+
+/// 팀 모드 — 엔진·분야와 직교하는 축. 한 바인딩이 전 과정을 수행할지(single),
+/// 계획이 확정된 뒤 독립 단계를 역할 서브에이전트에게 위임할지(multi)를 정한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamMode {
+    /// 현행 — 한 바인딩 모델이 전 과정을 수행한다.
+    Single,
+    /// 계획 확정 후 독립 단계를 task 도구(role 프로파일)로 위임한다. 독립 갈래는 병렬 실행.
+    Multi,
+}
+
+impl TeamMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Multi => "multi",
+        }
+    }
+
+    /// /team 목록 한 줄 설명.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Single => "기본 — 한 모델이 전 과정을 수행",
+            Self::Multi => "팀 — 독립 단계를 역할별 서브에이전트로 위임(연속 위임은 병렬)",
+        }
+    }
+}
+
+/// 선택 가능한 팀 모드 2종 (표시 순서).
+pub const TEAM_MODES: &[TeamMode] = &[TeamMode::Single, TeamMode::Multi];
+
+/// config 값 정규화 — 미설정·오타는 single 로 떨어진다.
+pub fn normalize_team(raw: &str) -> TeamMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "multi" => TeamMode::Multi,
+        _ => TeamMode::Single,
+    }
+}
+
+/// /team 표시용 — `single|multi`.
+pub fn team_names_joined() -> String {
+    TEAM_MODES
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// config 값 정규화 → (엔진 이름, legacy self 플래그).
@@ -501,6 +565,20 @@ mod tests {
         // 지정하지 않으면 내장 고정 유지.
         let untouched = resolve_with(&HashMap::new(), "minimax");
         assert_eq!(untouched.pin(), Some("minimax"));
+        // 고정은 기본적으로 가용성에 양보한다 — 폴백 금지는 명시해야 켜진다 (§15.2).
+        assert!(!untouched.pin_strict);
+
+        let mut strict: HashMap<String, EngineOverride> = HashMap::new();
+        strict.insert(
+            "minimax".into(),
+            EngineOverride {
+                pin_strict: Some(true),
+                ..EngineOverride::default()
+            },
+        );
+        let spec = resolve_with(&strict, "minimax");
+        assert!(spec.pin_strict);
+        assert_eq!(spec.pin(), Some("minimax"));
     }
 
     #[test]
@@ -585,6 +663,22 @@ mod tests {
         assert_eq!(max_continuations_for(Discipline::Loop, 250), 12);
         // harness 는 오버라이드 값을 그대로 쓴다.
         assert_eq!(max_continuations_for(Discipline::Harness, 250), 250);
+    }
+
+    #[test]
+    fn team_normalizes_to_single_unless_multi() {
+        assert_eq!(normalize_team(""), TeamMode::Single);
+        assert_eq!(normalize_team("   "), TeamMode::Single);
+        assert_eq!(normalize_team("single"), TeamMode::Single);
+        assert_eq!(normalize_team("MULTI"), TeamMode::Multi);
+        assert_eq!(normalize_team("  multi  "), TeamMode::Multi);
+        // 오타·미지원 값은 조용히 single — 설정 오류로 실행이 막히지 않게.
+        assert_eq!(normalize_team("team"), TeamMode::Single);
+        assert_eq!(normalize_team("multi-agent"), TeamMode::Single);
+        assert_eq!(team_names_joined(), "single|multi");
+        for t in TEAM_MODES {
+            assert!(!t.summary().is_empty());
+        }
     }
 
     #[test]

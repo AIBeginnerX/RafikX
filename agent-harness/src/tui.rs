@@ -62,8 +62,10 @@ pub struct App {
     pub queue: Vec<String>,
     /// 현재 실행의 Todo 목록 — 하단 진행 패널에 즉시 반영된다.
     pub todos: Vec<crate::tools_more::TodoItem>,
-    /// 실행 중이거나 끝난 서브에이전트 역할·모델·상태.
-    pub agents: Vec<crate::ui::AgentProgress>,
+    /// 지금 일하는 에이전트들 — working 패널의 줄들. done 이 오면 지운다.
+    pub workers: Vec<crate::ui::AgentProgress>,
+    /// 이번 턴의 실행 축 한 줄 — working 패널 마지막 줄.
+    pub mode_line: String,
     /// 완료 요약 화면이 활성화되면 직전 실행의 늦은 진행 이벤트를 버린다.
     final_summary: bool,
     /// 현재 실행 중인 턴의 핸들 — Esc 인터럽트용
@@ -234,7 +236,8 @@ pub async fn run(
         render_cache: std::cell::RefCell::new(Vec::new()),
         queue: Vec::new(),
         todos: crate::tools_more::current_todos(),
-        agents: Vec::new(),
+        workers: Vec::new(),
+        mode_line: String::new(),
         final_summary: false,
         turn_handle: None,
         active_run: Arc::new(Mutex::new(None)),
@@ -942,8 +945,14 @@ fn start_turn(
         if let Ok(mut current) = state.lock() {
             *current = run.lifecycle_state();
         }
+        // 위임 자식은 부모의 lifecycle 버스를 그대로 쓴다 — 필터가 없으면 자식의
+        // 상태가 부모 스테이지 표시를 덮어쓰고, 자식 종료가 부모 구독까지 끊는다 (§16.1).
+        let root_id = run.run_id().clone();
         tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
+                if !is_root_lifecycle(&event, &root_id) {
+                    continue;
+                }
                 if let Ok(mut current) = state.lock() {
                     *current = Some(event.state);
                 }
@@ -968,6 +977,11 @@ fn start_turn(
     app.turn_handle = Some(handle);
 }
 
+/// 스테이지 표시에 반영할 lifecycle 이벤트인가 — 루트 run 의 것만 받는다.
+fn is_root_lifecycle(event: &crate::lifecycle::LifecycleEvent, root: &crate::run::RunId) -> bool {
+    event.run_id == *root
+}
+
 /// 큐잉된 프롬프트를 정식 User 엔트리로 바꾼다. 없으면 새로 push.
 fn promote_queued(app: &mut App, prompt: &str) {
     if let Some(e) = app
@@ -990,6 +1004,9 @@ fn finish_turn(
     app.busy = false;
     app.streaming = false;
     app.turn_handle = None;
+    // working 패널은 턴이 살아 있는 동안만 존재한다 — 성공·실패 어느 쪽으로 끝나도 닫는다.
+    app.workers.clear();
+    app.mode_line.clear();
     if let Ok(mut active) = app.active_run.lock() {
         *active = None;
     }
@@ -1033,7 +1050,6 @@ fn finish_turn(
                 let summary = completion_report(&info);
                 collapse_turn_noise(&mut app.transcript, app.turn_start, info.answer, summary);
                 app.todos.clear();
-                app.agents.clear();
                 // 최신 결과(맨 아래)를 따라간다 — 예전 scroll=MAX·follow=false 는
                 // 화면에 답변만 남던 시절의 잔재로, 누적 스크롤백에서는 완료
                 // 순간 화면을 과거 대화 꼭대기로 점프시켰다 ("결과가 사라짐").
@@ -1274,9 +1290,10 @@ fn apply_live(app: &mut App, ev: Live) {
             app.follow = true;
         }
         Live::Agent(progress) => {
-            update_agent_progress(&mut app.agents, progress);
+            update_worker(&mut app.workers, progress);
             app.follow = true;
         }
+        Live::Mode(s) => app.mode_line = s,
     }
 }
 
@@ -1284,17 +1301,29 @@ fn apply_live(app: &mut App, ev: Live) {
 /// 실제 알림(예: /connect 후 백그라운드 모델 조회 결과)은 통과시킨다 —
 /// 예전에는 전 이벤트를 무음 처리해 알림이 통째로 사라졌다.
 fn ignore_after_final_summary(event: &Live) -> bool {
-    matches!(event, Live::Chunk(_) | Live::Assistant(_) | Live::Status(_))
+    matches!(
+        event,
+        Live::Chunk(_) | Live::Assistant(_) | Live::Status(_) | Live::Agent(_) | Live::Mode(_)
+    )
 }
 
-fn update_agent_progress(
-    agents: &mut Vec<crate::ui::AgentProgress>,
-    progress: crate::ui::AgentProgress,
-) {
-    if let Some(existing) = agents.iter_mut().find(|item| item.id == progress.id) {
-        *existing = progress;
+/// working 패널 줄 갱신 — id 로 upsert 하고 done 이면 지운다.
+/// 빈 role·model 은 "이 값은 안 건드린다"는 뜻이라 기존 값을 유지한다 (§16.2).
+fn update_worker(workers: &mut Vec<crate::ui::AgentProgress>, progress: crate::ui::AgentProgress) {
+    if progress.done {
+        workers.retain(|item| item.id != progress.id);
+        return;
+    }
+    if let Some(existing) = workers.iter_mut().find(|item| item.id == progress.id) {
+        if !progress.role.is_empty() {
+            existing.role = progress.role;
+        }
+        if !progress.model.is_empty() {
+            existing.model = progress.model;
+        }
+        existing.activity = progress.activity;
     } else {
-        agents.push(progress);
+        workers.push(progress);
     }
 }
 
@@ -2336,29 +2365,64 @@ mod upgrade_tests {
         );
     }
 
+    fn worker(id: &str, role: &str, model: &str, activity: &str, done: bool) -> ui::AgentProgress {
+        ui::AgentProgress {
+            id: id.into(),
+            role: role.into(),
+            model: model.into(),
+            activity: activity.into(),
+            done,
+        }
+    }
+
     #[test]
-    fn agent_progress_updates_role_model_and_status_in_place() {
-        let mut agents = Vec::new();
-        update_agent_progress(
-            &mut agents,
-            crate::ui::AgentProgress {
-                id: "agent-1".into(),
-                role: "reviewer".into(),
-                model: "minimax-m3".into(),
-                status: "running".into(),
-            },
+    fn worker_updates_in_place_and_disappears_when_done() {
+        let mut workers = Vec::new();
+        update_worker(
+            &mut workers,
+            worker("agent-1", "reviewer", "minimax/M3", "시작", false),
         );
-        update_agent_progress(
-            &mut agents,
-            crate::ui::AgentProgress {
-                id: "agent-1".into(),
-                role: "reviewer".into(),
-                model: "minimax-m3".into(),
-                status: "ok".into(),
-            },
+        // 갱신 발신은 역할·모델을 모르므로 빈 값으로 온다 — 기존 값을 지우면 안 된다.
+        update_worker(
+            &mut workers,
+            worker("agent-1", "", "", "[도구] read_file", false),
         );
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].status, "ok");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].role, "reviewer");
+        assert_eq!(workers[0].model, "minimax/M3");
+        assert_eq!(workers[0].activity, "[도구] read_file");
+
+        update_worker(
+            &mut workers,
+            worker("agent-2", "backend", "openai/gpt", "시작", false),
+        );
+        assert_eq!(workers.len(), 2);
+
+        update_worker(&mut workers, worker("agent-1", "", "", "", true));
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "agent-2");
+    }
+
+    #[test]
+    fn child_lifecycle_events_share_the_parent_bus_so_the_root_filter_is_required() {
+        use crate::lifecycle::LifecycleEventData;
+        use crate::run::{AgentId, RunContext, RunId};
+
+        let root = RunContext::isolated(RunId::new("run-root"), std::env::temp_dir());
+        let child = root.child(RunId::new("run-root:child-1"), AgentId::new("agent-1"));
+        let _ = child.transition_lifecycle(LifecycleEventData::RunStarted { model: None });
+
+        let all = root.lifecycle_events();
+        assert!(
+            all.iter().any(|e| e.run_id != *root.run_id()),
+            "자식 이벤트가 부모 버스에 실제로 섞여 온다"
+        );
+        assert!(
+            all.iter()
+                .filter(|e| is_root_lifecycle(e, root.run_id()))
+                .all(|e| e.run_id == *root.run_id()),
+            "루트 필터는 자식 이벤트를 남기지 않는다"
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use super::{
-    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, limit_hint,
-    map_stop_reason, rate_limit_error,
+    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, StreamEvent,
+    limit_hint, map_stop_reason, rate_limit_error,
 };
 
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -86,9 +86,9 @@ impl AnthropicProvider {
         Ok(parsed)
     }
 
-    pub async fn chat_stream<F>(&self, req: &ChatRequest, mut on_text: F) -> Result<ChatResponse>
+    pub async fn chat_stream<F>(&self, req: &ChatRequest, mut on_event: F) -> Result<ChatResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(StreamEvent),
     {
         let body = build_body(req);
         let resp = self
@@ -150,10 +150,10 @@ impl AnthropicProvider {
                                 {
                                     if !piece.is_empty() {
                                         if thinking_started {
-                                            on_text("\n[/모델 작업]\n");
+                                            on_event(StreamEvent::Text("\n[/모델 작업]\n"));
                                             thinking_started = false;
                                         }
-                                        on_text(piece);
+                                        on_event(StreamEvent::Text(piece));
                                         full_text.push_str(piece);
                                     }
                                 }
@@ -165,10 +165,10 @@ impl AnthropicProvider {
                                 {
                                     if !piece.is_empty() {
                                         if !thinking_started {
-                                            on_text("\n[모델 작업]\n");
+                                            on_event(StreamEvent::Text("\n[모델 작업]\n"));
                                             thinking_started = true;
                                         }
-                                        on_text(piece);
+                                        on_event(StreamEvent::Text(piece));
                                     }
                                 }
                             }
@@ -185,7 +185,7 @@ impl AnthropicProvider {
                         }
                         Some("message_stop") => {
                             if thinking_started {
-                                on_text("\n[/모델 작업]\n");
+                                on_event(StreamEvent::Text("\n[/모델 작업]\n"));
                             }
                             if let Some(stopped_cache) = crate::provider::cached_tokens_entry(&v) {
                                 cached_tokens = stopped_cache;

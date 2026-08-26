@@ -215,10 +215,14 @@ strategy = "single"            # single | multi  (한 모델 고정 | 역할별 
 # manual_debug = ""            # 디버깅 (dev)
 # manual_model = ""            # 전역 수동 모델 (provider:model)
 # strict_gate = true           # 독립 검증자 게이트 (claude/kimi 엔진 · dev|advanced 에서 동작)
+# team = "single"              # single | multi  (/team 으로 변경)
+                               # multi 는 계획 확정 후 독립 단계를 역할 서브에이전트로 위임합니다 (연속 위임은 병렬 실행).
 
 
 # 프로파일은 config 정의가 내장 프리셋을 이깁니다.
 # planner/frontend/backend/reviewer 는 내장 — [subagents.<이름>] 으로 덮어쓸 수 있습니다.
+# 역할마다 다른 모델을 쓰려면 model 을 적습니다: model = "minimax:MiniMax-M2" (또는 모델 ID 단독).
+# 엔진 고정(pin)이 걸려 있으면 프로바이더는 고정이 이기고 모델 ID 만 존중합니다.
 [subagents.quick]
 provider = "local"
 model_role = "small"
@@ -270,6 +274,7 @@ inject_limit_chars = 2000
 # force_staged = true
 # max_continuations = 10
 # pin_provider = "minimax"         # 실행 경로를 이 연결로 고정 (빈 문자열이면 고정 해제)
+# pin_strict = false               # true 면 고정 연결이 전면 장애여도 폴백하지 않는다
 
 # Self-Harness — 하네스가 자기 실행 실패를 채굴해 스스로 개선 (arXiv:2606.09498).
 # meta = true 면 엔진과 무관하게 모든 실행 위에 자기개선 루프를 겹칩니다 (/selfharness on|off).
@@ -278,8 +283,8 @@ inject_limit_chars = 2000
 enabled = true             # 자기개선 루프 전체 스위치
 # meta = false             # 모든 엔진 위에 겹치기 (legacy engine = "self" 는 자동으로 on)
 proposal_threshold = 2     # 같은 실패 시그니처 누적 시 하네스 수정 제안
-trial_min_episodes = 3     # trial 판정에 필요한 최소 에피소드
-baseline_window = 20       # 기준선 성공률 계산 구간
+trial_min_episodes = 5     # trial 판정에 필요한 최소 에피소드
+baseline_window = 20       # 기준선 성공률 계산 구간 (버전 경계 없이 최근 N개)
 proposal_width = 3         # 한 번에 생성하는 후보 수 (논문의 K)
 
 [inspector]
@@ -316,7 +321,7 @@ pub struct ConfigFile {
     /// `[engines.<name>]` 엔진 사양 오버라이드 — 없으면 내장 카탈로그 그대로.
     #[serde(default)]
     pub engines: HashMap<String, crate::engine::EngineOverride>,
-    /// 옛 설정에 없으면 기본값 (Self-Harness 루프 on, 임계 2/3/20/K=3).
+    /// 옛 설정에 없으면 기본값 (Self-Harness 루프 on, 임계 2/5/20/K=3).
     #[serde(default)]
     pub self_harness: SelfHarnessConfig,
     pub inspector: InspectorConfig,
@@ -395,6 +400,10 @@ fn default_discipline() -> String {
     "harness".into()
 }
 
+fn default_team() -> String {
+    "single".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct HarnessConfig {
     pub simple: String,
@@ -423,12 +432,19 @@ pub struct HarnessConfig {
     /// 옛 설정에 없으면 켜짐.
     #[serde(default = "default_true")]
     pub strict_gate: bool,
+    /// 팀 모드: single (기본) | multi. 그 밖의 값은 engine::normalize_team 이 single 로 흡수한다.
+    #[serde(default = "default_team")]
+    pub team: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubAgentConfig {
     pub provider: String,
     pub model_role: String,
+    /// 이 역할이 쓸 모델 ("provider:model" 또는 모델 ID 단독). 없으면 model_role 규칙.
+    /// 팀 모드에서 역할마다 다른 모델을 배정하는 자리다 (예: 구현=M3, 경량 역할=M2).
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
     pub max_iterations: u32,
@@ -498,7 +514,8 @@ pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
         ),
         "reviewer" => (
             &["read_file", "list_dir", "grep", "bash"],
-            6,
+            // 판정 불능 재질의(§15.1)까지 같은 미니 루프에서 소화하도록 여유를 둔다.
+            8,
             false,
             false,
             "20년 경력 수석 리뷰어다. 신선한 시각으로 산출물을 완료 기준과 대조하고 결함을 찾는다. \
@@ -508,13 +525,16 @@ pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
                  출력은 반드시 아래 구조로만 낸다. 머리표는 대괄호 그대로 쓴다.\n\
                  [판정] pass 또는 fail 한 단어.\n\
                  [미충족 항목] 완료 기준 중 충족되지 않은 항목을 그대로 인용하고 왜 미충족인지 한 줄씩. 없으면 '없음'.\n\
-                 [결함] 파일:줄 — 문제 — 근거 형식으로 한 줄씩. 없으면 '없음'.",
+                 [결함] 파일:줄 — 문제 — 근거 형식으로 한 줄씩. 없으면 '없음'.\n\
+                 직접 읽고 실행해 얻은 외부 근거 없이 pass 를 주지 마라. 작성 맥락을 모르는 낯선 눈으로 본다.",
         ),
         _ => return None,
     };
     Some(SubAgentConfig {
         provider: "anthropic".into(),
         model_role: "main".into(),
+        // 프리셋은 모델을 고정하지 않는다 — 사용자가 [subagents.<이름>] model 로 지정한다.
+        model: None,
         tools: tools.iter().map(|t| (*t).to_string()).collect(),
         max_iterations,
         plan_first,
@@ -560,7 +580,8 @@ fn default_sh_threshold() -> u32 {
 }
 
 fn default_sh_trial_min() -> u32 {
-    3
+    // 3회는 우연 하나로 판정이 뒤집힌다 — 하드닝에서 5로 올렸다 (설계 §15.4).
+    5
 }
 
 fn default_sh_baseline() -> u32 {
@@ -1004,6 +1025,32 @@ mod tests {
         let raw = DEFAULT_CONFIG.replace("[harness]\n", "[harness]\nstrict_gate = false\n");
         let file: ConfigFile = toml::from_str(&raw).expect("parse");
         assert!(!file.harness.strict_gate);
+    }
+
+    #[test]
+    fn old_config_without_team_defaults_single_and_profile_model_is_optional() {
+        // 키가 없는 옛 설정에서도 팀 모드는 single, 프로파일 모델은 미지정이다.
+        let file: ConfigFile = toml::from_str(DEFAULT_CONFIG).expect("parse");
+        assert_eq!(file.harness.team, "single");
+        assert!(file.subagents.values().all(|s| s.model.is_none()));
+        assert!(
+            BUILTIN_PROFILES
+                .iter()
+                .all(|n| builtin_profile(n).and_then(|s| s.model).is_none())
+        );
+
+        // 역할별 모델은 [subagents.<이름>] model 로 지정한다.
+        let raw = DEFAULT_CONFIG.replace("[harness]\n", "[harness]\nteam = \"multi\"\n")
+            + "\n[subagents.frontend]\nprovider = \"minimax\"\nmodel_role = \"main\"\n\
+             model = \"MiniMax-M2.5\"\ntools = [\"*\"]\nmax_iterations = 20\n";
+        let file: ConfigFile = toml::from_str(&raw).expect("parse");
+        assert_eq!(file.harness.team, "multi");
+        assert_eq!(
+            file.subagents
+                .get("frontend")
+                .and_then(|s| s.model.as_deref()),
+            Some("MiniMax-M2.5")
+        );
     }
 
     #[test]

@@ -964,22 +964,21 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// 현재 버전의 기준선 — trial 이 아닌 최근 window 개 에피소드의
-    /// (성공률, 타깃 시그니처 발생 수, 표본 수).
-    pub fn sh_baseline(
-        &self,
-        harness_version: i64,
-        target_signature: &str,
-        window: i64,
-    ) -> Result<(f64, i64, u32)> {
+    /// 기준선 — trial 이 아닌 최근 window 개 에피소드의
+    /// (성공률, 타깃 원인 발생 수, 표본 수).
+    /// 버전 경계로 자르지 않는다: 하네스가 한 번 승격될 때마다 기준선이 0에서 다시
+    /// 시작하면 표본이 늘 부족해 수락 판정이 신뢰를 잃는다(설계 §15.4).
+    pub fn sh_baseline(&self, target_signature: &str, window: i64) -> Result<(f64, i64, u32)> {
         let mut stmt = self.conn.prepare(
             "SELECT success, signature FROM sh_episodes
-             WHERE harness_version = ?1 AND trial_id IS NULL
-             ORDER BY id DESC LIMIT ?2",
+             WHERE trial_id IS NULL
+             ORDER BY id DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(rusqlite::params![harness_version, window.max(1)], |r| {
+        let rows = stmt.query_map(rusqlite::params![window.max(1)], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?;
+        // 재발은 (q, m) 클러스터가 달라도 같은 원인이면 재발이다 — cause 프리픽스로 센다.
+        let prefix = cause_prefix(target_signature);
         let mut n = 0i64;
         let mut ok = 0i64;
         let mut target = 0i64;
@@ -987,7 +986,7 @@ impl Db {
             let (s, sig) = row?;
             n += 1;
             ok += s;
-            if sig == target_signature {
+            if sig.starts_with(&prefix) {
                 target += 1;
             }
         }
@@ -1090,12 +1089,15 @@ impl Db {
         candidate_id: i64,
         target_signature: &str,
     ) -> Result<ShTrialStats> {
+        // 재발 판정은 시그니처 완전일치가 아니라 cause 프리픽스 일치다(설계 §15.4):
+        // 같은 원인이 다른 (q, m) 클러스터로 기록되면 완전일치는 재발을 놓친다.
+        let prefix = cause_prefix(target_signature);
         self.conn
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(success),0),
-                        COALESCE(SUM(CASE WHEN signature = ?2 THEN 1 ELSE 0 END),0)
+                        COALESCE(SUM(CASE WHEN substr(signature, 1, length(?2)) = ?2 THEN 1 ELSE 0 END),0)
                  FROM sh_episodes WHERE trial_id = ?1",
-                rusqlite::params![candidate_id, target_signature],
+                rusqlite::params![candidate_id, prefix],
                 |r| {
                     Ok(ShTrialStats {
                         episodes: r.get(0)?,
@@ -1289,6 +1291,15 @@ pub struct ShTrialStats {
     pub episodes: i64,
     pub successes: i64,
     pub target_recurrences: i64,
+}
+
+/// 시그니처(`cause|q|m`)의 원인 프리픽스 — `cause|` 까지. 구분자가 없으면 전체.
+/// 재발 판정과 기준선 집계가 같은 기준을 쓴다 (설계 §15.4).
+pub fn cause_prefix(signature: &str) -> String {
+    match signature.find('|') {
+        Some(i) => signature[..=i].to_string(),
+        None => signature.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1532,10 +1543,19 @@ mod tests {
         db.sh_add_episode(0, None, false, sig).unwrap();
         db.sh_add_episode(0, None, true, "").unwrap();
         db.sh_add_episode(0, None, false, sig).unwrap();
-        let (rate, target, n) = db.sh_baseline(0, sig, 20).unwrap();
+        let (rate, target, n) = db.sh_baseline(sig, 20).unwrap();
         assert_eq!(n, 4);
         assert_eq!(target, 2);
         assert!((rate - 0.5).abs() < 1e-9);
+        // 기준선은 하네스 버전 경계로 잘리지 않는다 (§15.4) — 다른 버전 에피소드도 표본이다.
+        db.sh_add_episode(3, None, false, sig).unwrap();
+        let (_, target_v3, n_v3) = db.sh_baseline(sig, 20).unwrap();
+        assert_eq!((n_v3, target_v3), (5, 3));
+        // 원인이 같으면 (q, m) 클러스터가 달라도 같은 타깃으로 센다.
+        db.sh_add_episode(0, None, false, "verify_fail|indirect|other")
+            .unwrap();
+        let (_, target_cause, _) = db.sh_baseline(sig, 20).unwrap();
+        assert_eq!(target_cause, 4);
 
         // 후보 등록 → trial → trial 에피소드 통계 → 판정 기록.
         let cid = db
@@ -1569,7 +1589,14 @@ mod tests {
         let stats = db.sh_trial_stats(cid, sig).unwrap();
         assert_eq!(stats.episodes, 3);
         assert_eq!(stats.successes, 2);
-        assert_eq!(stats.target_recurrences, 0); // 타깃 시그니처는 재발하지 않았다
+        assert_eq!(stats.target_recurrences, 0); // 다른 원인의 실패는 재발이 아니다
+        // 재발 판정은 cause 프리픽스 일치다 (§15.4) — 같은 원인이 다른 (q, m) 클러스터로
+        // 기록돼도 재발로 센다. 완전일치였다면 이 실패를 놓쳤다.
+        db.sh_add_episode(0, Some(cid), false, "verify_fail|indirect|other")
+            .unwrap();
+        let stats = db.sh_trial_stats(cid, sig).unwrap();
+        assert_eq!(stats.episodes, 4);
+        assert_eq!(stats.target_recurrences, 1);
 
         db.sh_decide_candidate(cid, "accepted", "재발 0").unwrap();
         db.sh_mark_addressed(ev.id).unwrap();
@@ -1594,7 +1621,7 @@ mod tests {
         assert_eq!(db.sh_candidate(old).unwrap().unwrap().state, "stale");
 
         let (episodes, failures) = db.sh_episode_counts(0).unwrap();
-        assert_eq!((episodes, failures), (7, 3));
+        assert_eq!((episodes, failures), (9, 5));
         let _ = std::fs::remove_dir_all(dir);
     }
 

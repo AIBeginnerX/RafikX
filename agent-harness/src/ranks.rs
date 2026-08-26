@@ -106,25 +106,26 @@ pub fn normalize_id(id: &str) -> String {
         .trim_end_matches("-latest")
         .trim_end_matches(":latest")
         .to_string();
-    // strip trailing YYYYMMDD or YYYY-MM-DD conservatively
+    // strip trailing YYYYMMDD or YYYY-MM-DD conservatively.
+    // 한글 등 멀티바이트 ID 는 바이트 경계가 문자 경계와 어긋난다 — 직접 슬라이스하면
+    // 패닉하므로 경계에서만 잘리는 get() 으로 꺼낸다(None 이면 날짜 접미가 아니다).
     let nlen = s.len();
-    if nlen >= 9 {
-        let tail = s[nlen - 9..].to_string();
-        if tail.starts_with('-') && tail[1..].chars().all(|c| c.is_ascii_digit()) {
-            s.truncate(nlen - 9);
-        }
+    if nlen >= 9
+        && let Some(tail) = s.get(nlen - 9..)
+        && tail.starts_with('-')
+        && tail[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        s.truncate(nlen - 9);
     }
     let nlen = s.len();
-    if nlen >= 11 {
-        let tail = s[nlen - 11..].to_string();
-        if tail.len() == 11
-            && tail.as_bytes()[0] == b'-'
-            && tail.as_bytes()[5] == b'-'
-            && tail.as_bytes()[8] == b'-'
-            && tail[1..].chars().all(|c| c.is_ascii_digit() || c == '-')
-        {
-            s.truncate(nlen - 11);
-        }
+    if nlen >= 11
+        && let Some(tail) = s.get(nlen - 11..)
+        && tail.as_bytes()[0] == b'-'
+        && tail.as_bytes()[5] == b'-'
+        && tail.as_bytes()[8] == b'-'
+        && tail[1..].chars().all(|c| c.is_ascii_digit() || c == '-')
+    {
+        s.truncate(nlen - 11);
     }
     s
 }
@@ -523,6 +524,20 @@ mod tests {
             tier: "other".into(),
             sources_count: 0,
         }
+    }
+
+    #[test]
+    fn normalize_id_survives_non_ascii_ids() {
+        // 실측 크래시: 한글이 섞인 모델 ID 를 바이트 인덱스로 자르다 패닉했다.
+        // 문자 경계를 벗어난 절단은 일어나지 않아야 하고, 결과도 온전해야 한다.
+        assert_eq!(normalize_id("한국어모델"), "한국어모델");
+        assert_eq!(normalize_id("provider/모델-테스트"), "모델-테스트");
+        assert_eq!(normalize_id("모델_v1"), "모델-v1");
+        assert_eq!(normalize_id("가나다-20260826"), "가나다");
+        assert_eq!(normalize_id("가나다-2026-08-26"), "가나다");
+        // ASCII 경로는 그대로다.
+        assert_eq!(normalize_id("claude-opus-5-20260801"), "claude-opus-5");
+        assert_eq!(normalize_id("claude-opus-5-2026-08-01"), "claude-opus-5");
     }
 
     #[test]

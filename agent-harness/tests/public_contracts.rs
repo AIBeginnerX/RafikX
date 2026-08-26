@@ -131,6 +131,7 @@ fn legacy_live_variants_and_task_schema_remain_available() {
             Live::Status(_) => "status",
             Live::Todo(_) => "todo",
             Live::Agent(_) => "agent",
+            Live::Mode(_) => "mode",
         }
     }
 
@@ -140,7 +141,8 @@ fn legacy_live_variants_and_task_schema_remain_available() {
             id: "agent-1".into(),
             role: "reviewer".into(),
             model: "model-1".into(),
-            status: "running".into(),
+            activity: "완료 기준 대조".into(),
+            done: false,
         })),
         "agent"
     );

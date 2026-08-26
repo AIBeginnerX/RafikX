@@ -179,14 +179,24 @@ pub enum Live {
     Status(String),
     Todo(Vec<crate::tools_more::TodoItem>),
     Agent(AgentProgress),
+    /// 이번 턴의 실행 축 한 줄 (engine·team·discipline·self·gate) — working 패널 마지막 줄.
+    Mode(String),
 }
 
+/// working 패널의 한 줄 — 실행 중인 에이전트 하나.
+/// `role`·`model` 이 빈 문자열이면 **갱신만** 하겠다는 뜻이라 수신 측이 기존 값을 유지한다
+/// (agent.rs 는 프로파일 이름을 모르므로 activity 만 갱신한다).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentProgress {
     pub id: String,
     pub role: String,
     pub model: String,
-    pub status: String,
+    /// 지금 하는 일 한 조각 — "반복 3/25", "[도구] read_file" 등.
+    #[serde(default)]
+    pub activity: String,
+    /// true 면 이 줄을 지운다.
+    #[serde(default)]
+    pub done: bool,
 }
 
 pub type LiveFn = Arc<dyn Fn(Live) + Send + Sync>;
@@ -288,6 +298,40 @@ pub fn live_todo_in(run: &RunContext, items: &[crate::tools_more::TodoItem]) {
 
 pub fn live_agent_in(run: &RunContext, progress: AgentProgress) {
     let _ = emit_in(run, Live::Agent(progress));
+}
+
+/// working 패널의 워커 줄 id — 위임 자식은 agent_id, 루트 실행은 run_id.
+/// task.rs 와 파이프라인이 같은 규칙을 쓰므로 같은 실행은 항상 한 줄로 합쳐진다.
+pub fn worker_id(run: &RunContext) -> String {
+    run.agent_id()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| run.run_id().to_string())
+}
+
+/// working 패널 한 줄을 보내는 단일 진입점. `role`·`model` 이 비면 기존 값을 유지한다.
+pub fn live_worker_in(
+    run: &RunContext,
+    id: &str,
+    role: &str,
+    model: &str,
+    activity: &str,
+    done: bool,
+) {
+    live_agent_in(
+        run,
+        AgentProgress {
+            id: id.to_string(),
+            role: role.to_string(),
+            model: model.to_string(),
+            activity: activity.to_string(),
+            done,
+        },
+    );
+}
+
+/// 이번 턴의 실행 축 한 줄. TUI 가 없으면 조용히 버려진다 (CLI 는 print_binding 이 이미 알린다).
+pub fn live_mode(s: &str) {
+    let _ = emit(Live::Mode(s.to_string()));
 }
 
 pub fn live_chunk(s: &str) {
@@ -428,3 +472,32 @@ fn enable_windows_vt() {
 
 #[cfg(not(windows))]
 fn enable_windows_vt() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_progress_reads_records_written_before_the_working_panel() {
+        // 구 형식: activity·done 이 없고 지금은 안 쓰는 status 가 들어 있다.
+        let old = r#"{"type":"agent","payload":{"id":"agent-1","role":"reviewer","model":"minimax-m3","status":"running"}}"#;
+        let Live::Agent(progress) = serde_json::from_str::<Live>(old).expect("구 JSON 역직렬화")
+        else {
+            panic!("Live::Agent 여야 한다");
+        };
+        assert_eq!(progress.id, "agent-1");
+        assert_eq!(progress.role, "reviewer");
+        assert_eq!(progress.model, "minimax-m3");
+        assert_eq!(progress.activity, "");
+        assert!(!progress.done, "구 기록은 살아 있는 줄로 읽혀야 한다");
+    }
+
+    #[test]
+    fn mode_line_survives_a_round_trip() {
+        let json = serde_json::to_string(&Live::Mode("engine=minimax(고정)".into())).unwrap();
+        let Live::Mode(s) = serde_json::from_str::<Live>(&json).unwrap() else {
+            panic!("Live::Mode 여야 한다");
+        };
+        assert_eq!(s, "engine=minimax(고정)");
+    }
+}

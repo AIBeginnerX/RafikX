@@ -1,10 +1,12 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 pub(crate) struct ProgressState {
     answer_started: AtomicBool,
     running: AtomicBool,
-    label: Mutex<Option<String>>,
+    /// 라벨과 그 라벨이 걸린 시각 — 스피너가 단계 경과를 함께 그린다.
+    label: Mutex<Option<(String, Instant)>>,
     notes: Mutex<Vec<String>>,
 }
 
@@ -36,12 +38,28 @@ impl ProgressState {
 
     pub(crate) fn set_label(&self, label: &str) {
         if let Ok(mut current) = self.label.lock() {
-            *current = Some(label.chars().take(56).collect());
+            *current = Some((label.chars().take(56).collect(), Instant::now()));
         }
     }
 
     pub(crate) fn label(&self) -> Option<String> {
-        self.label.lock().ok().and_then(|label| label.clone())
+        self.label
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|(label, _)| label.clone()))
+    }
+
+    /// 스피너가 그리는 라벨 — 현재 단계의 경과 시간이 붙는다.
+    pub(crate) fn label_display(&self) -> String {
+        self.label
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref().map(|(label, at)| {
+                    crate::spinner::label_with_elapsed(label, at.elapsed().as_secs())
+                })
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn push_note(&self, note: &str) {

@@ -26,7 +26,7 @@ pub mod mutation;
 mod task;
 
 use lsp_tools::{LspDefinition, LspDiagnostics};
-pub use task::{TaskResult, TaskTool};
+pub use task::{TaskArgs, TaskResult, TaskTool};
 
 pub const MAX_LIST_ITEMS: usize = 500;
 pub const MAX_GREP_LINES: usize = 200;

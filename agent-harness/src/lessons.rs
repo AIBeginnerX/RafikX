@@ -168,6 +168,12 @@ fn detect_trigger(outcome: &crate::agent::AgentOutcome) -> Option<(String, Strin
     if let Some(v) = &outcome.verify_fail {
         return Some(("verify_fail".into(), v.clone()));
     }
+    // 검증이 한 번 깨졌다가 재시도로 통과한 실행 — 결과는 성공이지만 그 실패에서
+    // 배울 것은 남아 있다. verify_fail 이 최종 실패만 담게 된 뒤에도(§15.4)
+    // 회복 교훈 수집이 끊기지 않도록 여기서 이어받는다.
+    if let Some(v) = &outcome.verify_recovered {
+        return Some(("verify_recovered".into(), v.clone()));
+    }
     if outcome.status == "fail" || outcome.status == "limit" {
         let d = outcome
             .error
@@ -223,6 +229,29 @@ async fn reflect_and_save(cfg: &Config, task: &str, trigger: &str, detail: &str)
 mod tests {
     use super::*;
     use crate::db::LessonRow;
+
+    #[test]
+    fn verify_recovery_still_triggers_a_lesson() {
+        // verify_fail 이 최종 실패만 담게 된 뒤에도(§15.4) 회복 사례의 교훈은 남아야 한다.
+        let recovered = crate::agent::AgentOutcome {
+            verify_recovered: Some("cargo check 실패".into()),
+            ..Default::default()
+        };
+        let (trigger, detail) = detect_trigger(&recovered).expect("회복 트리거");
+        assert_eq!(trigger, "verify_recovered");
+        assert_eq!(detail, "cargo check 실패");
+
+        // 최종 실패가 있으면 그쪽이 우선한다 (더 구체적인 원인).
+        let failed = crate::agent::AgentOutcome {
+            verify_fail: Some("cargo test 실패".into()),
+            verify_recovered: Some("cargo check 실패".into()),
+            ..Default::default()
+        };
+        assert_eq!(detect_trigger(&failed).unwrap().0, "verify_fail");
+
+        // 아무 흔적도 없는 성공은 트리거가 없다.
+        assert!(detect_trigger(&crate::agent::AgentOutcome::default()).is_none());
+    }
 
     #[test]
     fn parse_json_object() {

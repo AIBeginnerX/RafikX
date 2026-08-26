@@ -499,8 +499,9 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     let discipline = rafikx::engine::normalize_discipline(&cfg.file.general.discipline);
     println!("  엔진: {engine_name} ({})", engine_spec.summary);
     println!(
-        "  분야: {}  ·  self 메타: {}  ·  독립 검증자 게이트: {}",
+        "  분야: {}  ·  팀: {}  ·  self 메타: {}  ·  독립 검증자 게이트: {}",
         discipline.as_str(),
+        harness::team_mode(&cfg).as_str(),
         if rafikx::self_harness::meta_active(&cfg) {
             "on"
         } else {

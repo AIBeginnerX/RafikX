@@ -703,8 +703,19 @@ async fn observe_async(
     store_proposals(cfg, &db, &mut state, &prep, proposals)
 }
 
+/// 판정에 필요한 최소 기준선 표본. 이보다 얇으면 성공률 비교가 잡음이다.
+/// 주의: 이 게이트는 통계 검정이 아니라 보수적 휴리스틱이다 (설계 §15.4).
+const MIN_BASELINE_N: i64 = 5;
+
+/// 기준선 표본이 얇을 때 판정을 미룰지 (순수 함수).
+/// trial 중에는 비-trial 에피소드가 늘지 않으므로 무기한 보류는 교착이다 —
+/// trial 관측이 최소치의 3배까지 쌓이면 얇은 기준선 그대로 판정한다.
+fn defer_for_thin_baseline(baseline_n: u32, episodes: i64, min: i64) -> bool {
+    (baseline_n as i64) < MIN_BASELINE_N && episodes < min.saturating_mul(3)
+}
+
 /// 논문 3.4 수락 규칙의 온라인 번역:
-/// Δ_in ≥ 0 ← trial 중 타깃 시그니처 재발 0 (기준선에서 반복되던 패턴 소멸)
+/// Δ_in ≥ 0 ← trial 중 타깃 원인(cause) 재발 0 (기준선에서 반복되던 패턴 소멸)
 /// Δ_ho ≥ 0 ← trial 성공률이 기준선 성공률 이상 (다른 행동의 회귀 없음)
 fn run_validation(
     cfg: &Config,
@@ -715,6 +726,18 @@ fn run_validation(
     let stats = db.sh_trial_stats(trial.candidate_id, &trial.target_signature)?;
     let min = cfg.file.self_harness.trial_min_episodes.max(1) as i64;
     if stats.episodes < min {
+        return Ok(());
+    }
+    // 기준선 표본이 너무 얇으면 승격도 기각도 근거가 없다 — 판정을 미루고 trial 을 이어간다.
+    let (_, _, baseline_n) = db.sh_baseline(
+        &trial.target_signature,
+        cfg.file.self_harness.baseline_window as i64,
+    )?;
+    if defer_for_thin_baseline(baseline_n, stats.episodes, min) {
+        applog::info(&format!(
+            "self-harness 판정 보류: 기준선 표본 {baseline_n}건 (필요 {MIN_BASELINE_N}건), trial {}회",
+            stats.episodes
+        ));
         return Ok(());
     }
     let Some(cand) = db.sh_candidate(trial.candidate_id)? else {
@@ -798,11 +821,8 @@ fn prepare_proposal(
         // 이 패턴은 이번 세대에서 이미 시도했다 — 같은 증거로 재제안하지 않는다.
         return Ok(None);
     }
-    let (baseline_success, baseline_target, baseline_n) = db.sh_baseline(
-        state.version as i64,
-        &ev.signature,
-        sh_cfg.baseline_window as i64,
-    )?;
+    let (baseline_success, baseline_target, baseline_n) =
+        db.sh_baseline(&ev.signature, sh_cfg.baseline_window as i64)?;
     let attempts = db.sh_attempts_summary(ev.id, 5)?;
     Ok(Some(ProposalPrep {
         evidence: ev,
@@ -974,6 +994,28 @@ mod tests {
             error: error.map(String::from),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn thin_baseline_defers_until_trial_evidence_piles_up() {
+        // 기준선이 얇으면 판정을 미룬다 (설계 §15.4).
+        assert!(defer_for_thin_baseline(0, 5, 5));
+        assert!(defer_for_thin_baseline(4, 5, 5));
+        // 표본이 충분하면 곧바로 판정한다.
+        assert!(!defer_for_thin_baseline(5, 5, 5));
+        assert!(!defer_for_thin_baseline(20, 5, 5));
+        // trial 중에는 비-trial 에피소드가 늘지 않는다 — 관측이 3배 쌓이면 교착을 푼다.
+        assert!(!defer_for_thin_baseline(0, 15, 5));
+        assert!(defer_for_thin_baseline(0, 14, 5));
+    }
+
+    #[test]
+    fn verify_recovery_is_not_counted_as_failure() {
+        // 재시도로 통과한 실행은 성공이다 — verify_fail 이 비어 있으면 원인도 없다.
+        let mut recovered = failed_outcome("ok", None);
+        recovered.verify_recovered = Some("cargo check 실패".into());
+        assert_eq!(terminal_cause(&recovered), None);
+        assert!(is_success(&recovered));
     }
 
     #[test]
