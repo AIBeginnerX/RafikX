@@ -875,6 +875,13 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
                 }
                 app.binding = binding_label(&app.session);
             }
+            Ok(Slash::New(notes)) => {
+                reset_screen_for_new_session(app);
+                for n in notes {
+                    push(app, EntryKind::System, n);
+                }
+                app.binding = binding_label(&app.session);
+            }
             Ok(Slash::Quit) => {
                 if app.busy {
                     app.quit_after = true;
@@ -1436,6 +1443,21 @@ fn parse_token_metrics(status: &str) -> Option<TokenMetrics> {
         context: value("context=")?,
         cache: value("cache="),
     })
+}
+
+/// /new — 새 세션과 함께 화면을 처음 상태로 되돌린다: 트랜스크립트·Todo·working
+/// 패널·상태줄을 비운다. (세션 데이터는 chat::handle_slash 의 "/new" 가 이미 비웠다.)
+fn reset_screen_for_new_session(app: &mut App) {
+    app.transcript.clear();
+    app.scroll = 0;
+    app.follow = true;
+    app.todos.clear();
+    app.workers.clear();
+    app.mode_line.clear();
+    app.status = "준비".into();
+    if let Ok(mut st) = app.lifecycle_state.lock() {
+        *st = None;
+    }
 }
 
 fn push(app: &mut App, kind: EntryKind, text: impl Into<String>) {

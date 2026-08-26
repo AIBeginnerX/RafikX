@@ -373,7 +373,7 @@ pub async fn run_turn_observed(
 
 pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
     match chat::handle_slash(session, line, false)? {
-        Slash::Continue(notes) => Ok(SlashResult {
+        Slash::Continue(notes) | Slash::New(notes) => Ok(SlashResult {
             notes: notes.join("\n"),
             quit: false,
             agent_task: None,

@@ -222,6 +222,13 @@ pub async fn cmd_chat(
                         println!("{n}");
                     }
                 }
+                Slash::New(notes) => {
+                    // 화면을 지우고 커서를 원점으로 — 새 세션은 빈 화면에서 시작한다.
+                    print!("\x1b[2J\x1b[H");
+                    for n in notes {
+                        println!("{n}");
+                    }
+                }
                 Slash::Quit => break,
                 Slash::Agent(task) => {
                     run_turn(&mut session, &task, Some("dev"), false, None).await?;
@@ -416,8 +423,11 @@ pub fn save_if_dirty(session: &mut Session) -> Result<Option<String>> {
     Ok(Some(id))
 }
 
+#[derive(Debug)]
 pub enum Slash {
     Continue(Vec<String>),
+    /// /new — 세션을 비우고 새로 시작. TUI 는 화면(트랜스크립트·패널)도 함께 지운다.
+    New(Vec<String>),
     Quit,
     Agent(String),
     /// /compact — 대화 요약으로 압축 (비동기)
@@ -456,7 +466,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 session.provider = Some(provider);
                 session.model = Some(model);
             }
-            Ok(Slash::Continue(vec![format!(
+            Ok(Slash::New(vec![format!(
                 "새 세션을 시작합니다. 기본 모델: {}",
                 session.model.as_deref().unwrap_or("auto")
             )]))
@@ -1995,6 +2005,40 @@ mod tests {
         assert!(SLASH_COMMANDS.iter().any(|(c, _)| *c == "/discipline"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_slash_clears_session_and_signals_screen_reset() {
+        let dir = std::env::temp_dir().join(format!("rafikx-new-{}", Db::new_id()));
+        let config_path = dir.join("config.toml");
+        let cfg = Config::load(Some(&config_path)).expect("config");
+        let mut s = Session {
+            cfg,
+            yes: true,
+            provider: None,
+            model: None,
+            class: None,
+            mode: "build".into(),
+            session_id: Some("old".into()),
+            messages: vec![crate::provider::Message::user_text("이전 대화")],
+            last_context_tokens: 0,
+            obsidian_on: false,
+            attachments: vec![],
+            dirty: true,
+            sticky: Some(("p".into(), "m".into())),
+        };
+        // /new 는 Continue 가 아니라 New 를 돌려줘야 TUI 가 화면을 지운다.
+        match handle_slash(&mut s, "/new", false).expect("ok") {
+            Slash::New(notes) => {
+                assert!(notes.iter().any(|n| n.contains("새 세션")));
+            }
+            other => panic!("Slash::New 여야 한다: {other:?}"),
+        }
+        assert!(s.messages.is_empty());
+        assert!(s.session_id.is_none());
+        assert!(s.sticky.is_none());
+        assert!(!s.dirty);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
