@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
@@ -33,6 +32,19 @@ pub fn leading_task_span(names: &[&str]) -> usize {
         .take_while(|name| **name == tools::TaskTool::NAME)
         .count();
     if n >= 2 { n } else { 0 }
+}
+
+/// 직전과 같은 (도구, 입력) 호출의 연속 횟수를 갱신하고, 3회 연속이면 true.
+/// 사이에 다른 호출이 끼면 스트릭이 리셋된다 — "고치고 같은 검증 재실행" 허용,
+/// 같은 호출만 제자리 반복하는 진짜 루프만 차단한다.
+pub fn same_call_repeated(last: &mut Option<String>, streak: &mut u32, key: String) -> bool {
+    if last.as_deref() == Some(key.as_str()) {
+        *streak += 1;
+    } else {
+        *last = Some(key);
+        *streak = 1;
+    }
+    *streak >= 3
 }
 
 pub struct AgentOutcome {
@@ -194,7 +206,11 @@ pub async fn run_agent_with_context(
     let mut cache_reported = false;
     let mut context_tokens = 0u32;
     let mut denied_any = false;
-    let mut call_counts: HashMap<String, u32> = HashMap::new();
+    // 직전과 같은 (도구, 입력) 호출이 몇 번 연속됐는지. 사이에 다른 호출이 끼면
+    // 리셋한다 — "고치고 같은 검증을 재실행" 같은 정상 루프를 막지 않기 위해서다.
+    // (누적 카운트는 20회 반복 작업에서 정당한 재실행 3회째를 오차단했다: 2026-08-27 실측)
+    let mut last_call_key: Option<String> = None;
+    let mut same_call_streak: u32 = 0;
     let mut tool_errors: Vec<String> = Vec::new();
     let mut deny_reasons: Vec<String> = Vec::new();
     let mut truncation_retries = 0u8;
@@ -486,17 +502,19 @@ pub async fn run_agent_with_context(
                 }
                 let batch: Vec<(String, String, serde_json::Value)> =
                     pending.drain(..span).collect();
-                // 동일 도구·입력 3회 반복 차단은 병렬 구간에서도 그대로 적용한다.
+                // 동일 도구·입력 연속 3회 차단은 병렬 구간에서도 그대로 적용한다.
                 let mut repeated = false;
                 for (_, name, input) in &batch {
-                    let count = call_counts.entry(format!("{name}:{input}")).or_insert(0);
-                    *count += 1;
-                    repeated |= *count >= 3;
+                    repeated |= same_call_repeated(
+                        &mut last_call_key,
+                        &mut same_call_streak,
+                        format!("{name}:{input}"),
+                    );
                 }
                 if repeated {
                     crate::ui::live_line_in(
                         &run_context,
-                        "동일 도구·입력이 3회 반복되어 중단합니다.",
+                        "동일 도구·입력이 3회 연속 반복되어 중단합니다.",
                     );
                     return Ok(AgentOutcome {
                         status: "limit".into(),
@@ -506,7 +524,7 @@ pub async fn run_agent_with_context(
                         context_tokens,
                         cached_tokens,
                         cache_reported,
-                        error: Some("동일 도구 3회 반복".into()),
+                        error: Some("동일 도구 3회 연속 반복".into()),
                         messages,
                         changed_files: committed_files(&run_context),
                         tool_errors,
@@ -614,10 +632,11 @@ pub async fn run_agent_with_context(
                 });
             }
             let key = format!("{name}:{}", input);
-            let count = call_counts.entry(key).or_insert(0);
-            *count += 1;
-            if *count >= 3 {
-                crate::ui::live_line_in(&run_context, "동일 도구·입력이 3회 반복되어 중단합니다.");
+            if same_call_repeated(&mut last_call_key, &mut same_call_streak, key) {
+                crate::ui::live_line_in(
+                    &run_context,
+                    "동일 도구·입력이 3회 연속 반복되어 중단합니다.",
+                );
                 return Ok(AgentOutcome {
                     status: "limit".into(),
                     iterations,
@@ -626,7 +645,7 @@ pub async fn run_agent_with_context(
                     context_tokens,
                     cached_tokens,
                     cache_reported,
-                    error: Some("동일 도구 3회 반복".into()),
+                    error: Some("동일 도구 3회 연속 반복".into()),
                     messages,
                     changed_files: committed_files(&run_context),
                     tool_errors,
@@ -1024,6 +1043,23 @@ pub fn record_finish(db: &Db, run_id: &str, outcome: &AgentOutcome) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_call_streak_resets_when_another_call_intervenes() {
+        let mut last = None;
+        let mut streak = 0u32;
+        let mut hit = |k: &str| super::same_call_repeated(&mut last, &mut streak, k.to_string());
+        // 고치고 재실행하는 정상 루프 — 사이에 edit 가 끼면 무한정 허용.
+        assert!(!hit("bash:test"));
+        assert!(!hit("edit:a"));
+        assert!(!hit("bash:test"));
+        assert!(!hit("edit:b"));
+        assert!(!hit("bash:test"));
+        // 제자리 반복 — 같은 호출 3회 연속이면 차단.
+        assert!(!hit("bash:loop"));
+        assert!(!hit("bash:loop"));
+        assert!(hit("bash:loop"));
+    }
+
     use super::*;
     use serde_json::json;
 

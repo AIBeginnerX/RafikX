@@ -320,7 +320,11 @@ fn terminal_cause(outcome: &AgentOutcome) -> Option<&'static str> {
     }
     match outcome.status.as_str() {
         "limit" => {
-            if outcome.error.as_deref() == Some("동일 도구 3회 반복") {
+            if outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("동일 도구"))
+            {
                 Some("tool_loop")
             } else {
                 Some("iteration_limit")
@@ -1026,7 +1030,7 @@ mod tests {
             Some("iteration_limit")
         );
         assert_eq!(
-            terminal_cause(&failed_outcome("limit", Some("동일 도구 3회 반복"))),
+            terminal_cause(&failed_outcome("limit", Some("동일 도구 3회 연속 반복"))),
             Some("tool_loop")
         );
         assert_eq!(
