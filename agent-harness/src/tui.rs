@@ -986,8 +986,11 @@ fn finish_turn(
                 );
                 app.todos.clear();
                 app.agents.clear();
-                app.scroll = u16::MAX;
-                app.follow = false;
+                // 최신 결과(맨 아래)를 따라간다 — 예전 scroll=MAX·follow=false 는
+                // 화면에 답변만 남던 시절의 잔재로, 누적 스크롤백에서는 완료
+                // 순간 화면을 과거 대화 꼭대기로 점프시켰다 ("결과가 사라짐").
+                app.scroll = 0;
+                app.follow = true;
                 app.final_summary = true;
             }
         }

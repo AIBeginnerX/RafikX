@@ -349,7 +349,15 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let mut cache = app.render_cache.borrow_mut();
     let mut visual: Vec<Line> = Vec::new();
     let mut count = 0usize;
-    for e in &app.transcript {
+    let last = app.transcript.len();
+    for (idx, e) in app.transcript.iter().enumerate() {
+        // 스트리밍 중인 마지막 답변은 경량 렌더 — 청크가 올 때마다 전체
+        // 마크다운 파싱과 syntect 하이라이팅을 다시 돌리면 긴 코딩 답변에서
+        // CPU 가 폭증한다. 턴이 끝나면 풀 렌더로 확정되어 캐시에 들어간다.
+        if app.busy && idx + 1 == last && e.kind == EntryKind::Assistant {
+            visual.extend(render_streaming_tail(&e.text, width, th));
+            continue;
+        }
         let h = entry_render_hash(e, width, &theme_name);
         if count < cache.len() && cache[count].0 == h {
             visual.extend(cache[count].1.iter().cloned());
@@ -400,6 +408,40 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         Paragraph::new(visible).block(block),
         area,
     );
+}
+
+/// 스트리밍 중 답변의 경량 렌더 — 마크다운 파싱·코드 하이라이팅 없이
+/// 태그와 줄바꿈만. 완료되면 render_entry 의 풀 렌더로 교체된다.
+fn render_streaming_tail(text: &str, width: u16, th: &Pal) -> Vec<Line<'static>> {
+    let shown = compact_blank(&display_model_work(text));
+    let content_width = width.saturating_sub(8).max(1) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for row in shown.lines() {
+        let pieces = super::md::wrap_text(row, content_width);
+        let pieces = if pieces.is_empty() { vec![String::new()] } else { pieces };
+        for piece in pieces {
+            if first {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {:<6}", "rafikx"),
+                        Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {piece}"), Style::default().fg(th.text)),
+                ]));
+                first = false;
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        CONTINUATION_PREFIX.to_string(),
+                        Style::default().fg(th.mute),
+                    ),
+                    Span::styled(format!(" {piece}"), Style::default().fg(th.text)),
+                ]));
+            }
+        }
+    }
+    lines
 }
 
 /// 렌더 캐시 키 — 내용·폭·테마가 같으면 렌더 결과도 같다.
