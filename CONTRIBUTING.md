@@ -7,7 +7,7 @@
 필요: [Rust](https://rustup.rs) stable (에디션 2024, rustc 1.85+), Git.
 
 ```bash
-git clone https://github.com/AIBeginnerX/rafikx.git
+git clone https://github.com/AIBeginnerX/RafikX.git
 cd rafikx
 cargo test --manifest-path agent-harness/Cargo.toml
 cargo test --manifest-path agent-harness/Cargo.toml --no-default-features

@@ -2,7 +2,7 @@
 
 명령 이름은 **`rafikx`** 입니다. Windows, macOS, Linux에서 같은 소스를 씁니다.
 
-저장소 주소는 공개 시 `https://github.com/AIBeginnerX/rafikx` 를 기준으로 적었습니다. 주소가 바뀌면 스크립트의 `RAFIKX_REPO` 만 바꾸면 됩니다.
+기본 저장소는 `https://github.com/AIBeginnerX/RafikX` 입니다. 포크를 쓰려면 `RAFIKX_REPO` 로 바꿀 수 있습니다.
 
 ## 한 줄 설치
 
@@ -11,7 +11,7 @@
 터미널:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AIBeginnerX/RafikX/master/install.sh | bash
 ```
 
 끝나면:
@@ -27,7 +27,7 @@ rafikx
 PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/AIBeginnerX/RafikX/master/install.ps1 | iex
 ```
 
 끝나면 **새 PowerShell**을 열거나:
@@ -73,7 +73,7 @@ irm https://raw.githubusercontent.com/내계정/rafikx/master/install.ps1 | iex
 ## Rust가 이미 있을 때
 
 ```bash
-git clone https://github.com/AIBeginnerX/rafikx.git
+git clone https://github.com/AIBeginnerX/RafikX.git
 cd rafikx
 cargo install --path agent-harness --locked --force
 rafikx --version
@@ -197,7 +197,7 @@ Windows에서는 호스트가 지원하는 번들만 실제로 만들어집니�
 ## 확인
 
 ```text
-rafikx --version    →  RafikX 0.1.0
+rafikx --version    →  rafikx 1.0.0
 rafikx              →  대화 화면 (TTY). 처음이면 짧은 연결 마법사
 rafikx login        →  Zen / Go / Claude 등 연결
 rafikx settings     →  설정

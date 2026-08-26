@@ -1,7 +1,7 @@
 # RafikX one-line install for Windows PowerShell.
-#   irm https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/AIBeginnerX/RafikX/master/install.ps1 | iex
 $ErrorActionPreference = "Stop"
-$Repo = if ($env:RAFIKX_REPO) { $env:RAFIKX_REPO } else { "AIBeginnerX/rafikx" }
+$Repo = if ($env:RAFIKX_REPO) { $env:RAFIKX_REPO } else { "AIBeginnerX/RafikX" }
 $Branch = if ($env:RAFIKX_BRANCH) { $env:RAFIKX_BRANCH } else { "master" }
 $Src = if ($env:RAFIKX_SRC) { $env:RAFIKX_SRC } else { Join-Path $HOME ".rafikx-src" }
 
@@ -31,8 +31,9 @@ if (Test-Path (Join-Path $Src ".git")) {
     git -C $Src fetch --depth 1 origin $Branch
     git -C $Src checkout -q $Branch
     git -C $Src pull --ff-only origin $Branch
+} elseif (Test-Path $Src) {
+    throw "$Src 가 Git 저장소가 아니어서 덮어쓰지 않았습니다. 경로를 옮기거나 RAFIKX_SRC를 지정하세요."
 } else {
-    if (Test-Path $Src) { Remove-Item -Recurse -Force $Src }
     git clone --depth 1 --branch $Branch "https://github.com/$Repo.git" $Src
 }
 

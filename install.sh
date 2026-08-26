@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # RafikX one-line install for macOS and Linux.
-#   curl -fsSL https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/AIBeginnerX/RafikX/master/install.sh | bash
 set -euo pipefail
 
-REPO="${RAFIKX_REPO:-AIBeginnerX/rafikx}"
+REPO="${RAFIKX_REPO:-AIBeginnerX/RafikX}"
 BRANCH="${RAFIKX_BRANCH:-master}"
 SRC="${RAFIKX_SRC:-$HOME/.rafikx-src}"
 
@@ -36,9 +36,10 @@ if [[ -d "$SRC/.git" ]]; then
   git -C "$SRC" fetch --depth 1 origin "$BRANCH"
   git -C "$SRC" checkout -q "$BRANCH"
   git -C "$SRC" pull --ff-only origin "$BRANCH"
+elif [[ -e "$SRC" ]]; then
+  die "$SRC 가 Git 저장소가 아니어서 덮어쓰지 않았습니다. 경로를 옮기거나 RAFIKX_SRC를 지정하세요."
 else
   need_cmd git || die "git 이 필요합니다. (macOS: xcode-select --install)"
-  rm -rf "$SRC"
   git clone --depth 1 --branch "$BRANCH" "https://github.com/${REPO}.git" "$SRC"
 fi
 
