@@ -139,7 +139,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/undo", "마지막 질문 되돌리기"),
     ("/tools", "도구 목록"),
     ("/todo", "작업 목록 보기"),
-    ("/goal", "장기 목표 상태"),
+    ("/goal", "장기 목표 상태 · resume 이어가기 · clear 해제"),
     ("/status", "연결·사용량 요약"),
     ("/theme", "테마 변경"),
     ("/obsidian", "볼트 사용 on|off"),
@@ -251,8 +251,12 @@ pub fn open_session(
     announce: bool,
 ) -> Result<Session> {
     // 공식 CLI 로컬 로그인이 있으면 자동으로 가져와 연결한다 (프로세스당 1회).
+    // TUI(announce=false)에서는 조용히 — AlternateScreen 전환으로 stdout 이
+    // 유실되어 어차피 보이지 않고, 내부 동작이라 알릴 필요도 없다.
     for note in crate::auth::auto_import_cli_logins(&cfg) {
-        crate::ui::note(&note);
+        if announce {
+            crate::ui::note(&note);
+        }
     }
     // 새 릴리스 확인 (비동기 화면용과 별개로, 일반 채팅 시작 시 짧게 확인해서 안내만).
     if announce {
@@ -318,15 +322,15 @@ pub fn open_session(
     }))
 }
 
+/// /new 는 사용자가 마지막으로 쓰던 (provider, model) 을 유지한다 —
+/// 특정 모델(minimax-m3)로 강제 리셋하던 하드코딩을 제거했다.
 fn default_new_session_pair(cfg: &Config) -> Option<(String, String)> {
-    cfg.file
-        .providers
-        .get("minimax")
-        .filter(|provider| {
-            provider.enabled
-                && crate::ranks::normalize_id(&provider.model) == "minimax-m3"
-        })
-        .map(|provider| ("minimax".into(), provider.model.clone()))
+    let lp = cfg.file.general.last_provider.trim();
+    let lm = cfg.file.general.last_model.trim();
+    if !lp.is_empty() && !lm.is_empty() && cfg.file.providers.contains_key(lp) {
+        return Some((lp.to_string(), lm.to_string()));
+    }
+    None
 }
 
 fn seed_default_choice(mut session: Session) -> Session {
@@ -688,10 +692,16 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             &crate::tools_more::current_todos(),
         )])),
         "/goal" => {
+            if rest == "clear" {
+                return Ok(Slash::Continue(vec![match db.clear_active_goal()? {
+                    true => "활성 목표를 해제했습니다.".into(),
+                    false => "활성 목표가 없습니다.".into(),
+                }]));
+            }
             let active = db.active_goal()?;
             Ok(Slash::Continue(vec![match active {
                 Some(goal) => format!(
-                    "진행 중 목표: {} · Todo {}/{} · 연속 실행 {}/8",
+                    "진행 중 목표: {} · Todo {}/{} · 연속 실행 {}/8 · 이어가기 /goal resume · 지우기 /goal clear",
                     goal.objective, goal.completed, goal.total, goal.continuations
                 ),
                 None => "진행 중인 장기 목표가 없습니다.".into(),
@@ -1527,13 +1537,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_session_prefers_minimax_provider_minimax_m3() {
+    fn new_session_keeps_last_choice_instead_of_hardcoded_model() {
         let cfg = Config::load(None).expect("config");
         let pair = default_new_session_pair(&cfg);
-        assert_eq!(
-            pair.map(|(provider, model)| (provider, crate::ranks::normalize_id(&model))),
-            Some(("minimax".into(), "minimax-m3".into()))
-        );
+        // last_provider/last_model 이 있으면 그 조합, 없으면 None (하네스 자동).
+        let lp = cfg.file.general.last_provider.trim();
+        if lp.is_empty() || !cfg.file.providers.contains_key(lp) {
+            assert!(pair.is_none());
+        } else {
+            assert_eq!(pair.map(|(p, _)| p), Some(lp.to_string()));
+        }
     }
 
     #[test]

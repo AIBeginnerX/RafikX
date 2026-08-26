@@ -10,7 +10,8 @@ pub async fn maybe_first_run(cfg: Config, interactive: bool) -> Result<Config> {
         return Ok(cfg);
     }
     if cfg.file.general.setup_done || auth::has_cloud_credential(&cfg) {
-        ranks::maybe_refresh_quiet().await;
+        // 순위표 갱신은 main 의 spawn_weekly_refresh 가 백그라운드로 처리한다 —
+        // 시작 경로에서 최대 30초 동기 네트워크 대기를 하지 않는다.
         return Ok(cfg);
     }
     crate::ui::banner("처음 설정");

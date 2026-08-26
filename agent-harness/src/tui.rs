@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -17,7 +17,6 @@ use crossterm::terminal::{
 use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::{mpsc, oneshot};
 
@@ -28,9 +27,6 @@ use crate::db::Db;
 use crate::provider::{ContentBlock, Message, Role};
 use crate::ui::{self, Live};
 
-pub(super) const STATUS_MARK: &str = " N·A·I ";
-pub(super) const STATUS_NAME: &str = "RAFIKX";
-pub(super) const STATUS_DIVIDER: &str = " │";
 pub(super) const APPROVAL_YES: &str = " [Yes]";
 pub(super) const APPROVAL_NO: &str = " [No]";
 pub(super) const APPROVAL_ALWAYS: &str = " [Always]";
@@ -60,8 +56,8 @@ pub struct App {
     streaming: bool,
     quit: bool,
     quit_after: bool,
-    /// 슬래시 명령 Enter 2회 확인용
-    pub slash_armed: bool,
+    /// 이번 턴이 시작된 트랜스크립트 위치 — 종료 시 이후 노이즈만 접는다.
+    turn_start: usize,
     /// 실행 중 접수한 대기 프롬프트 큐 — 턴이 끝나면 순차 실행
     pub queue: Vec<String>,
     /// 현재 실행의 Todo 목록 — 하단 진행 패널에 즉시 반영된다.
@@ -81,13 +77,6 @@ pub struct App {
 pub struct ApprovalPrompt {
     pub preview: String,
     tx: oneshot::Sender<ApprovalChoice>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ApprovalButton {
-    pub rect: Rect,
-    pub choice: ApprovalChoice,
-    pub label: &'static str,
 }
 
 pub struct Picker {
@@ -118,6 +107,8 @@ pub enum PickerKind {
     Model,
     Manage,
     Action,
+    /// 지난 세션 선택 — /resume·/sessions 에서 연다 (pi 의 /resume picker).
+    Session,
 }
 
 pub struct SecretPrompt {
@@ -230,7 +221,7 @@ pub async fn run(
         streaming: false,
         quit: false,
         quit_after: false,
-        slash_armed: false,
+        turn_start: 0,
         queue: Vec::new(),
         todos: crate::tools_more::current_todos(),
         agents: Vec::new(),
@@ -239,29 +230,26 @@ pub async fn run(
         upgrade: None,
         upgrading: false,
     };
-    if app.transcript.is_empty() {
+    // 연결이 하나도 없을 때만 시작 안내 — 이미 쓰던 사용자에게는 빈 화면
+    // 기본 문구("할 일을 말하면 실행합니다")로 충분하다.
+    if app.transcript.is_empty() && crate::auth::usable_names(&app.session.cfg).is_empty() {
         app.transcript.push(Entry {
             kind: EntryKind::System,
-            text: "RafikX 대화. /connect 로 키를 붙입니다. Ctrl+V 붙여넣기.".into(),
+            text: "/connect 로 서비스 키를 붙이면 대화가 열립니다.".into(),
         });
     }
 
     // 새 릴리스 확인 — 네트워크 조회가 시작을 막지 않도록 백그라운드로 돌린다.
     let (upd_tx, mut upd_rx) = mpsc::unbounded_channel::<String>();
     // 동기 조회(git/gh)라 별도 스레드에서 — 시작을 막지 않는다.
-    std::thread::spawn(move || match crate::update::latest_release() {
-        Ok(rel) => {
+    // 새 버전이 있을 때만 알린다 — 최신이거나 확인 실패면 침묵 (매 실행
+    // 붉은 경고 줄로 화면을 어지럽히지 않는다).
+    std::thread::spawn(move || {
+        if let Ok(rel) = crate::update::latest_release() {
             let current = env!("CARGO_PKG_VERSION");
             if let Some(notice) = crate::update::upgrade_notice(&rel, current) {
                 let _ = upd_tx.send(notice);
-            } else {
-                let _ = upd_tx.send(format!(
-                    "버전 확인: 최신입니다 (v{current})"
-                ));
             }
-        }
-        Err(e) => {
-            let _ = upd_tx.send(format!("버전 확인 실패: {e:#}"));
         }
     });
 
@@ -325,29 +313,21 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<TurnDone>();
+    // 중단된 목표는 자동 재개하지 않는다 — 앱을 켜자마자 확인 없이 토큰을
+    // 쓰고 --resume 세션을 덮어쓰던 동작을 제거. 안내만 하고 사용자가
+    // /goal resume 으로 명시적으로 이어간다.
     if let Ok(path) = Db::db_path()
         && let Ok(db) = Db::open(&path)
         && let Ok(Some(goal)) = db.active_goal()
         && goal.continuations < 8
     {
-        if let Ok(messages) = serde_json::from_str::<Vec<Message>>(&goal.messages_json) {
-            app.session.messages = messages;
-        }
         push(
             &mut app,
             EntryKind::System,
             format!(
-                "중단된 목표를 자동 재개합니다: {} (Todo {}/{})",
+                "중단된 목표가 있습니다: {} (Todo {}/{}) · 이어가기 /goal resume · 지우기 /goal clear",
                 goal.objective, goal.completed, goal.total
             ),
-        );
-        start_turn(
-            &mut app,
-            goal.objective,
-            Some("dev".into()),
-            false,
-            &local_ask,
-            &done_tx,
         );
     }
     let mut dirty = true;
@@ -369,7 +349,11 @@ pub async fn run(
 
         tokio::select! {
             _ = tick.tick() => {
-                dirty = true;
+                // 스피너가 돌 때만 주기 리드로우 — 유휴 상태에서는 이벤트가
+                // 있을 때만 그린다 (초당 12.5회 무조건 리드로우 제거).
+                if app.busy || app.upgrading {
+                    dirty = true;
+                }
             }
             ev = events.next() => {
                 match ev {
@@ -382,11 +366,6 @@ pub async fn run(
                     }
                     Some(Ok(Event::Paste(text))) => {
                         handle_paste(&mut app, &text);
-                        dirty = true;
-                    }
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        let size = terminal.size().unwrap_or_default();
-                        handle_mouse(&mut app, mouse, size.width, size.height);
                         dirty = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => dirty = true,
@@ -417,7 +396,6 @@ pub async fn run(
             ask = ask_rx.recv(), if ask_open => {
                 match ask {
                     Some((preview, tx)) => {
-                        set_mouse_capture(true);
                         app.approval = Some(ApprovalPrompt { preview, tx });
                         app.help = false;
                         dirty = true;
@@ -459,15 +437,20 @@ fn handle_key(
     if let Some(prompt) = app.approval.take() {
         match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                set_mouse_capture(false);
                 let _ = prompt.tx.send(ApprovalChoice::Yes);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                set_mouse_capture(false);
                 let _ = prompt.tx.send(ApprovalChoice::No);
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                set_mouse_capture(false);
+                // Always 는 이번 턴이 아니라 세션 전체에 적용한다 — 같은 도구를
+                // 다음 턴에 또 물어보지 않는다.
+                app.session.yes = true;
+                push(
+                    app,
+                    EntryKind::System,
+                    "이 세션의 도구 실행을 모두 자동 승인합니다. (/new 로 해제)",
+                );
                 let _ = prompt.tx.send(ApprovalChoice::Always);
             }
             _ => {
@@ -507,7 +490,6 @@ fn handle_key(
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Esc => {
-                set_mouse_capture(true);
                 app.status = "연결을 취소했습니다".into();
             }
             KeyCode::Enter => {
@@ -544,7 +526,6 @@ fn handle_key(
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Esc => {
-                set_mouse_capture(true);
                 app.status = "입력을 취소했습니다".into();
             }
             KeyCode::Enter => finish_text(app, text),
@@ -720,13 +701,7 @@ fn handle_key(
         KeyCode::Enter if shift || ctrl => insert_char(app, '\n'),
         KeyCode::Char('j') if ctrl => insert_char(app, '\n'),
         KeyCode::Enter => {
-            // 슬래시 명령은 Enter 두 번으로 실행 (첫 번째는 확인)
-            if app.input.trim().starts_with('/') && !app.slash_armed {
-                app.slash_armed = true;
-                app.status = "슬래시 명령 — 다시 Enter 로 실행".into();
-                return;
-            }
-            app.slash_armed = false;
+            // 슬래시 명령도 Enter 한 번에 실행한다 (확인 단계 없음 — pi 스타일).
             submit(app, local_ask, done_tx);
         }
         KeyCode::Backspace => backspace(app),
@@ -767,132 +742,9 @@ fn handle_key(
     }
 }
 
-fn handle_mouse(app: &mut App, mouse: MouseEvent, width: u16, height: u16) {
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return;
-    }
-    let model = view::selected_model_label(app);
-    let Some(choice) = approval_popup_click(mouse.column, mouse.row, width, height)
-        .or_else(|| approval_click(mouse.column, mouse.row, height, &model))
-    else {
-        return;
-    };
-    if let Some(prompt) = app.approval.take() {
-        set_mouse_capture(false);
-        let _ = prompt.tx.send(choice);
-    }
-}
 
-pub(super) fn approval_popup_layout(area: Rect) -> (Rect, [ApprovalButton; 3]) {
-    let popup = view::overlay_rect(area, 72, 22);
-    let inner_x = popup.x.saturating_add(1);
-    let inner_width = popup.width.saturating_sub(2);
-    if inner_width < 23 {
-        let first_y = popup
-            .y
-            .saturating_add(popup.height.saturating_sub(5));
-        return (
-            popup,
-            [
-                ApprovalButton {
-                    rect: Rect::new(inner_x, first_y, 5.min(inner_width), 1),
-                    choice: ApprovalChoice::Yes,
-                    label: "[Yes]",
-                },
-                ApprovalButton {
-                    rect: Rect::new(
-                        inner_x,
-                        first_y.saturating_add(1),
-                        4.min(inner_width),
-                        1,
-                    ),
-                    choice: ApprovalChoice::No,
-                    label: "[No]",
-                },
-                ApprovalButton {
-                    rect: Rect::new(
-                        inner_x,
-                        first_y.saturating_add(2),
-                        8.min(inner_width),
-                        1,
-                    ),
-                    choice: ApprovalChoice::Always,
-                    label: "[Always]",
-                },
-            ],
-        );
-    }
-    let button_y = popup
-        .y
-        .saturating_add(popup.height.saturating_sub(3));
-    let group_width = 23u16;
-    let start = inner_x.saturating_add(inner_width.saturating_sub(group_width) / 2);
-    (
-        popup,
-        [
-            ApprovalButton {
-                rect: Rect::new(start, button_y, 5, 1),
-                choice: ApprovalChoice::Yes,
-                label: "[Yes]",
-            },
-            ApprovalButton {
-                rect: Rect::new(start.saturating_add(8), button_y, 4, 1),
-                choice: ApprovalChoice::No,
-                label: "[No]",
-            },
-            ApprovalButton {
-                rect: Rect::new(start.saturating_add(15), button_y, 8, 1),
-                choice: ApprovalChoice::Always,
-                label: "[Always]",
-            },
-        ],
-    )
-}
 
-fn approval_popup_click(
-    column: u16,
-    row: u16,
-    width: u16,
-    height: u16,
-) -> Option<ApprovalChoice> {
-    let area = Rect::new(0, 0, width, height);
-    let (_, buttons) = approval_popup_layout(area);
-    buttons
-        .into_iter()
-        .find(|button| {
-            button.rect.contains(ratatui::layout::Position::new(column, row))
-        })
-        .map(|button| button.choice)
-}
 
-fn approval_click(
-    column: u16,
-    row: u16,
-    height: u16,
-    model: &str,
-) -> Option<ApprovalChoice> {
-    if height < 2 || row != height.saturating_sub(2) {
-        return None;
-    }
-    let prefix = format!(
-        "{STATUS_MARK}{STATUS_NAME}{STATUS_DIVIDER} MODEL {model} ·"
-    );
-    let yes_start = crate::tui::md::display_width(&prefix) as u16;
-    let no_start = yes_start + crate::tui::md::display_width(APPROVAL_YES) as u16;
-    let always_start = no_start + crate::tui::md::display_width(APPROVAL_NO) as u16;
-    if (yes_start..no_start).contains(&column) {
-        Some(ApprovalChoice::Yes)
-    } else if (no_start..always_start).contains(&column) {
-        Some(ApprovalChoice::No)
-    } else if (always_start
-        ..always_start + crate::tui::md::display_width(APPROVAL_ALWAYS) as u16)
-        .contains(&column)
-    {
-        Some(ApprovalChoice::Always)
-    } else {
-        None
-    }
-}
 
 fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<TurnDone>) {
     let line = app.input.trim().to_string();
@@ -903,11 +755,9 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
         // 명령 없이 "/" 만 — 하단 팔레트가 이미 보고 있으므로 아무것도 실행하지 않는다.
         app.input.clear();
         app.cursor = 0;
-        app.slash_armed = false;
         app.status = "명령을 입력하세요".into();
         return;
     }
-    app.slash_armed = false;
     if app.busy && !line.starts_with('/') {
         // 실행 중 입력은 큐에 적립 — 현재 턴이 끝나면 순차 실행된다.
         app.queue.push(line.clone());
@@ -952,6 +802,24 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
                     start_connect(app, rest);
                 }
                 return;
+            }
+            "/resume" | "/sessions" if rest.is_empty() => {
+                open_session_picker(app);
+                return;
+            }
+            "/goal" => {
+                match rest {
+                    "resume" => {
+                        resume_goal(app, local_ask, done_tx);
+                    }
+                    "clear" => {
+                        clear_goal(app);
+                    }
+                    _ => {}
+                }
+                if matches!(rest, "resume" | "clear") {
+                    return;
+                }
             }
             _ => {}
         }
@@ -999,6 +867,8 @@ fn start_turn(
 ) {
     app.final_summary = false;
     promote_queued(app, &prompt);
+    // 이번 턴의 시작 지점 — 종료 시 이 이후의 작업 노이즈만 접는다.
+    app.turn_start = app.transcript.len();
     app.busy = true;
     app.streaming = false;
     app.status = "실행 중…".into();
@@ -1084,13 +954,20 @@ fn finish_turn(
             }
             if !info.run_id.is_empty() {
                 let summary = completion_report(&info);
-                replace_with_final_response(&mut app.transcript, info.answer, summary);
+                collapse_turn_noise(
+                    &mut app.transcript,
+                    app.turn_start,
+                    info.answer,
+                    summary,
+                );
                 app.todos.clear();
                 app.agents.clear();
                 app.scroll = u16::MAX;
                 app.follow = false;
                 app.final_summary = true;
             }
+            // 세션 자동 저장 (pi 스타일) — 크래시·강제 종료에도 대화가 남는다.
+            let _ = chat::save_if_dirty(&mut app.session);
         }
         Err(e) => {
             push(app, EntryKind::Warn, format!("오류: {e:#}"));
@@ -1106,12 +983,17 @@ fn finish_turn(
     }
 }
 
-fn replace_with_final_response(
+/// 턴 종료 정리 (pi 스타일 스크롤백) — 이전 대화는 그대로 두고, 이번 턴의
+/// 작업 노이즈(도구 로그·진행 줄·스트리밍 중간본)만 걷어낸 뒤 최종 답변과
+/// 요약을 남긴다. 화면의 대화 기록이 턴마다 사라지던 동작을 대체한다.
+fn collapse_turn_noise(
     transcript: &mut Vec<Entry>,
+    turn_start: usize,
     answer: String,
     summary: String,
 ) {
-    transcript.clear();
+    let keep = turn_start.min(transcript.len());
+    transcript.truncate(keep);
     if !answer.trim().is_empty() {
         transcript.push(Entry {
             kind: EntryKind::Assistant,
@@ -1321,17 +1203,11 @@ fn apply_live(app: &mut App, ev: Live) {
     }
 }
 
+/// 완료 요약 뒤에 도착한 늦은 스트리밍 조각만 무시한다. System/Warn 등
+/// 실제 알림(예: /connect 후 백그라운드 모델 조회 결과)은 통과시킨다 —
+/// 예전에는 전 이벤트를 무음 처리해 알림이 통째로 사라졌다.
 fn ignore_after_final_summary(event: &Live) -> bool {
-    matches!(
-        event,
-        Live::Chunk(_)
-            | Live::Assistant(_)
-            | Live::System(_)
-            | Live::Warn(_)
-            | Live::Status(_)
-            | Live::Todo(_)
-            | Live::Agent(_)
-    )
+    matches!(event, Live::Chunk(_) | Live::Assistant(_) | Live::Status(_))
 }
 
 fn update_agent_progress(
@@ -1552,7 +1428,6 @@ fn insert_char(app: &mut App, c: char) {
     app.input.insert(app.cursor, c);
     app.cursor += c.len_utf8();
     app.history_idx = None;
-    app.slash_armed = false;
 }
 
 fn backspace(app: &mut App) {
@@ -1562,7 +1437,6 @@ fn backspace(app: &mut App) {
     let prev = prev_idx(&app.input, app.cursor);
     app.input.replace_range(prev..app.cursor, "");
     app.cursor = prev;
-    app.slash_armed = false;
 }
 
 fn delete(app: &mut App) {
@@ -1658,6 +1532,72 @@ fn open_model_picker(app: &mut App) {
 }
 
 const CUSTOM_ID: &str = "__custom__";
+
+/// 지난 세션을 picker 로 고른다 — id 를 눈으로 읽고 다시 타이핑하던 흐름 대체.
+fn open_session_picker(app: &mut App) {
+    let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
+        return;
+    };
+    let rows = db.list_sessions(50).unwrap_or_default();
+    if rows.is_empty() {
+        push(app, EntryKind::System, "저장된 세션이 없습니다.");
+        return;
+    }
+    let mut items = Vec::new();
+    let mut ids = Vec::new();
+    for r in rows {
+        items.push(format!(
+            "{}  ·  {}",
+            r.title.clone().unwrap_or_else(|| "(제목 없음)".into()),
+            r.id
+        ));
+        ids.push(r.id);
+    }
+    app.picker = Some(Picker {
+        title: "세션".into(),
+        items,
+        ids,
+        selected: 0,
+        kind: PickerKind::Session,
+        target: None,
+        query: String::new(),
+    });
+}
+
+/// /goal resume — 중단된 목표를 명시적으로 이어간다 (시작 시 자동 재개 대체).
+fn resume_goal(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<TurnDone>) {
+    if app.busy {
+        return;
+    }
+    let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
+        return;
+    };
+    let Ok(Some(goal)) = db.active_goal() else {
+        push(app, EntryKind::System, "이어갈 목표가 없습니다.");
+        return;
+    };
+    if let Ok(messages) = serde_json::from_str::<Vec<Message>>(&goal.messages_json) {
+        app.session.messages = messages;
+    }
+    push(
+        app,
+        EntryKind::System,
+        format!("목표 재개: {} (Todo {}/{})", goal.objective, goal.completed, goal.total),
+    );
+    start_turn(app, goal.objective, Some("dev".into()), false, local_ask, done_tx);
+}
+
+/// /goal clear — 활성 목표 해제 (Esc 중단으로 active 가 고착된 경우 포함).
+fn clear_goal(app: &mut App) {
+    let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
+        return;
+    };
+    match db.clear_active_goal() {
+        Ok(true) => push(app, EntryKind::System, "활성 목표를 해제했습니다."),
+        Ok(false) => push(app, EntryKind::System, "활성 목표가 없습니다."),
+        Err(e) => push(app, EntryKind::Warn, format!("목표 해제 실패: {e:#}")),
+    }
+}
 
 fn open_manage_picker(app: &mut App) {
     let names = crate::auth::menu_provider_names(&app.session.cfg);
@@ -1788,6 +1728,37 @@ fn apply_picker(app: &mut App, picker: Picker) {
                 pick_managed(app, &id);
             }
         }
+        PickerKind::Session => {
+            let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
+                return;
+            };
+            match db.load_session(&id) {
+                Ok(Some(row)) => {
+                    match serde_json::from_str::<Vec<Message>>(&row.messages_json) {
+                        Ok(mut messages) => {
+                            crate::agent::sanitize_tool_pairs(&mut messages);
+                            app.session.messages = messages;
+                            app.session.session_id = Some(row.id.clone());
+                            app.session.dirty = false;
+                            app.session.attachments.clear();
+                            app.transcript.clear();
+                            app.turn_start = 0;
+                            push(
+                                app,
+                                EntryKind::System,
+                                format!(
+                                    "세션 재개: {}  ({})",
+                                    row.id,
+                                    row.title.unwrap_or_else(|| "(제목 없음)".into())
+                                ),
+                            );
+                        }
+                        Err(_) => push(app, EntryKind::Warn, "세션 메시지를 읽지 못했습니다."),
+                    }
+                }
+                _ => push(app, EntryKind::Warn, format!("세션 '{id}' 를 찾지 못했습니다.")),
+            }
+        }
         PickerKind::Action => {
             let Some(name) = picker.target else { return };
             apply_action(app, &name, &id);
@@ -1879,7 +1850,6 @@ fn use_provider(app: &mut App, name: &str) {
 }
 
 fn open_secret(app: &mut App, name: &str) {
-    set_mouse_capture(false);
     app.secret = Some(SecretPrompt {
         provider: name.to_string(),
         buf: String::new(),
@@ -1891,7 +1861,6 @@ fn open_secret(app: &mut App, name: &str) {
 }
 
 fn open_text(app: &mut App, title: &str, hint: &str, buf: String, kind: TextKind) {
-    set_mouse_capture(false);
     app.text = Some(TextPrompt {
         title: title.into(),
         hint: hint.into(),
@@ -1940,7 +1909,6 @@ fn confirm_yes(app: &mut App, c: ConfirmPrompt) {
 }
 
 fn finish_secret(app: &mut App, secret: SecretPrompt) {
-    set_mouse_capture(true);
     match crate::auth::replace_or_save_key(&secret.provider, &secret.buf) {
         Ok(_) => {
             reload_cfg(app);
@@ -2006,7 +1974,6 @@ fn finish_secret(app: &mut App, secret: SecretPrompt) {
 }
 
 fn finish_text(app: &mut App, text: TextPrompt) {
-    set_mouse_capture(true);
     let val = crate::accounts_ui::sanitize_pasted_key(&text.buf);
     match text.kind {
         TextKind::BaseUrl { provider } => {
@@ -2103,14 +2070,6 @@ fn handle_paste(app: &mut App, raw: &str) {
     }
 }
 
-fn set_mouse_capture(on: bool) {
-    let mut out = stdout();
-    if on {
-        let _ = execute!(out, EnableMouseCapture);
-    } else {
-        let _ = execute!(out, DisableMouseCapture);
-    }
-}
 
 fn read_clipboard() -> Option<String> {
     #[cfg(windows)]
@@ -2207,61 +2166,22 @@ mod upgrade_tests {
         assert_eq!(cache_usage_label(0, 0, false), "cache --");
     }
 
-    #[test]
-    fn approval_status_clicks_map_to_english_options() {
-        let model = "minimax-m3";
-        let prefix = format!(
-            "{STATUS_MARK}{STATUS_NAME}{STATUS_DIVIDER} MODEL {model} ·"
-        );
-        let yes = crate::tui::md::display_width(&prefix) as u16;
-        let no = yes + crate::tui::md::display_width(APPROVAL_YES) as u16;
-        let always = no + crate::tui::md::display_width(APPROVAL_NO) as u16;
-        assert_eq!(
-            approval_click(yes + 1, 8, 10, model),
-            Some(ApprovalChoice::Yes)
-        );
-        assert_eq!(
-            approval_click(no + 1, 8, 10, model),
-            Some(ApprovalChoice::No)
-        );
-        assert_eq!(
-            approval_click(always + 1, 8, 10, model),
-            Some(ApprovalChoice::Always)
-        );
-        assert_eq!(approval_click(2, 8, 10, model), None);
-    }
+
 
     #[test]
-    fn approval_popup_buttons_are_directly_mouse_selectable() {
-        assert_eq!(
-            approval_popup_click(40, 23, 100, 30),
-            Some(ApprovalChoice::Yes)
-        );
-        assert_eq!(
-            approval_popup_click(48, 23, 100, 30),
-            Some(ApprovalChoice::No)
-        );
-        assert_eq!(
-            approval_popup_click(56, 23, 100, 30),
-            Some(ApprovalChoice::Always)
-        );
-        assert_eq!(approval_popup_click(40, 22, 100, 30), None);
-    }
-
-    #[test]
-    fn approval_popup_stacks_buttons_on_narrow_terminals() {
-        assert_eq!(
-            approval_popup_click(2, 5, 18, 10),
-            Some(ApprovalChoice::Yes)
-        );
-        assert_eq!(
-            approval_popup_click(2, 6, 18, 10),
-            Some(ApprovalChoice::No)
-        );
-        assert_eq!(
-            approval_popup_click(2, 7, 18, 10),
-            Some(ApprovalChoice::Always)
-        );
+    fn collapse_turn_noise_preserves_previous_conversation() {
+        // pi 스타일 스크롤백: 이전 턴의 대화는 남고, 이번 턴 노이즈만 접힌다.
+        let mut transcript = vec![
+            Entry { kind: EntryKind::User, text: "첫 질문".into() },
+            Entry { kind: EntryKind::Assistant, text: "첫 답변".into() },
+            Entry { kind: EntryKind::User, text: "둘째 질문".into() },
+            Entry { kind: EntryKind::Tool, text: "[도구] read_file".into() },
+            Entry { kind: EntryKind::System, text: "진행 중…".into() },
+        ];
+        // 둘째 질문(인덱스 2) 직후가 턴 시작 → 노이즈(3,4)만 접힌다.
+        collapse_turn_noise(&mut transcript, 3, "둘째 답변".into(), "Run summary".into());
+        let texts: Vec<&str> = transcript.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["첫 질문", "첫 답변", "둘째 질문", "둘째 답변", "Run summary"]);
     }
 
     #[test]
@@ -2338,7 +2258,7 @@ mod upgrade_tests {
             },
         ];
         let answer = "| model |\n|---|\n| minimax-m3 |";
-        replace_with_final_response(&mut transcript, answer.into(), "Run summary".into());
+        collapse_turn_noise(&mut transcript, 0, answer.into(), "Run summary".into());
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].kind, EntryKind::Assistant);
         assert_eq!(transcript[0].text, answer);
@@ -2347,10 +2267,12 @@ mod upgrade_tests {
     }
 
     #[test]
-    fn final_summary_ignores_late_work_events() {
+    fn final_summary_ignores_only_late_stream_chunks() {
+        // 늦은 스트리밍 조각은 무시, System/Warn 같은 실제 알림은 통과.
         assert!(ignore_after_final_summary(&Live::Chunk("late".into())));
         assert!(ignore_after_final_summary(&Live::Assistant("late".into())));
-        assert!(ignore_after_final_summary(&Live::System("[도구] late".into())));
+        assert!(!ignore_after_final_summary(&Live::System("모델 12개 등록".into())));
+        assert!(!ignore_after_final_summary(&Live::Warn("경고".into())));
         assert!(ignore_after_final_summary(&Live::Status(
             "[tokens] total_in=1 total_out=1 context=1".into()
         )));

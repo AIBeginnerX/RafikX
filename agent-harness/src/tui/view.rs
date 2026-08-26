@@ -104,7 +104,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     if rows[4] > 0 {
         draw_slash_palette(f, chunks[4], &slash_hits, &th);
     }
-    draw_status_strip(f, app, chunks[5], &th);
     draw_footer(f, app, chunks[6], &th);
 
     if app.help {
@@ -164,9 +163,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(c) = &app.confirm {
         draw_overlay(f, area, &c.title, &c.body, &th);
     }
-    if let Some(p) = &app.approval {
-        draw_approval_popup(f, area, &p.preview, &th);
-    }
+    // 승인은 팝업 없이 인라인으로 — 미리보기는 트랜스크립트에, 선택은 푸터에서
+    // Y/N/A 키로 (pi 스타일: 화면을 덮는 permission popup 을 두지 않는다).
 }
 
 fn slash_palette_height(hit_count: usize) -> u16 {
@@ -186,8 +184,9 @@ fn responsive_rows(
     wanted_input: u16,
 ) -> [u16; 7] {
     let header = u16::from(height >= 5);
-    let status = u16::from(height >= 3);
-    let footer = u16::from(height >= 4);
+    // 상태 스트립은 푸터에 통합됐다 (pi 스타일 단일 푸터) — 화면 1행 절약.
+    let status = 0u16;
+    let footer = u16::from(height >= 3);
     let fixed = header + status + footer;
     let remaining = height.saturating_sub(fixed);
     let input = wanted_input.max(1).min(remaining);
@@ -1015,71 +1014,9 @@ fn cursor_xy(text: &str, cursor: usize, width: u16) -> (u16, u16) {
     (x, y)
 }
 
-/// 채팅창 아래 스트립 — [로고] RAFIKX │ [디지털바+Working] 실행 중 │ 작업 폴더
-fn draw_status_strip(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
-    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let mut spans: Vec<Span> = Vec::new();
-    // 이미지 프로토콜 없이 모든 터미널에서 보이는 NAI 선형 마크.
-    spans.push(Span::styled(
-        super::STATUS_MARK,
-        Style::default()
-            .fg(if app.busy { th.code } else { th.secondary })
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        super::STATUS_NAME,
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        super::STATUS_DIVIDER,
-        Style::default().fg(th.mute),
-    ));
-    spans.push(Span::styled(
-        status_model_label(&selected_model_label(app)),
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(" ·", Style::default().fg(th.mute)));
 
-    if app.approval.is_some() {
-        spans.push(Span::styled(
-            super::APPROVAL_YES,
-            Style::default().fg(Color::Green),
-        ));
-        spans.push(Span::styled(
-            super::APPROVAL_NO,
-            Style::default().fg(th.err),
-        ));
-        spans.push(Span::styled(
-            super::APPROVAL_ALWAYS,
-            Style::default().fg(th.warn),
-        ));
-    } else if app.busy {
-        let frame = SPINNER[spin_frame_index(120, SPINNER.len())];
-        spans.push(Span::styled(
-            format!(" {frame}"),
-            Style::default().fg(th.code).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!(" {}", active_status_label(&app.status)),
-            Style::default()
-                .fg(th.mute)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    } else {
-        let idle = footer_state_label(&app.status);
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("{} {idle}", idle_status_mark(&app.status)),
-            Style::default().fg(idle_status_color(&app.status, th)),
-        ));
-    }
-
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
-        area,
-    );
-}
-
+/// 단일 푸터 (pi 스타일) — 모드 배지 · 상태(스피너/승인/완료) · 모델 · 통계를
+/// 한 줄에 담는다. 옛 상태 스트립의 역할(스피너·승인 버튼)을 흡수했다.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let badge_text = if app.session.is_plan_mode() {
         " PLAN "
@@ -1100,23 +1037,48 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     } else {
         app.ctx.clone()
     };
-    let state = if app.busy {
-        format!("{} {}", braille_spin(), active_status_label(&app.status))
+
+    let width = area.width as usize;
+    let mut line_spans = vec![Span::styled(badge_text, badge_style)];
+    let mut used = super::md::display_width(badge_text);
+
+    // 상태 — 승인 대기가 최우선, 그다음 실행 스피너, 마지막 idle 결과.
+    if app.approval.is_some() {
+        for (label, color) in [
+            (super::APPROVAL_YES, Color::Green),
+            (super::APPROVAL_NO, th.err),
+            (super::APPROVAL_ALWAYS, th.warn),
+        ] {
+            line_spans.push(Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            used += super::md::display_width(label);
+        }
+    } else if app.busy {
+        let state = format!(" {} {}", braille_spin(), active_status_label(&app.status));
+        used += super::md::display_width(&state);
+        line_spans.push(Span::styled(
+            state,
+            Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+        ));
     } else {
-        footer_state_label(&app.status).into()
-    };
-    let mut secondary = Vec::new();
+        let state = format!(
+            " {} {}",
+            idle_status_mark(&app.status),
+            footer_state_label(&app.status)
+        );
+        used += super::md::display_width(&state);
+        line_spans.push(Span::styled(
+            state,
+            Style::default().fg(idle_status_color(&app.status, th)),
+        ));
+    }
+
+    let mut secondary = vec![(model, Style::default().fg(th.accent).add_modifier(Modifier::BOLD))];
     if !app.tokens.is_empty() {
         secondary.push((app.tokens.clone(), Style::default().fg(th.mute)));
     }
-    secondary.push((
-        state,
-        Style::default().fg(if app.busy {
-            th.code
-        } else {
-            idle_status_color(&app.status, th)
-        }),
-    ));
     if !app.todos.is_empty() {
         let progress = crate::tools_more::todo_progress(&app.todos);
         secondary.push((
@@ -1131,22 +1093,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         ));
     }
 
-    let width = area.width as usize;
-    let left_width = super::md::display_width(badge_text)
-        + 1
-        + super::md::display_width(&model);
-    let right_budget = width.saturating_sub(left_width + 1);
+    let right_budget = width.saturating_sub(used + 1);
     let shown_context = truncate_display(&context, right_budget);
     let right_width = super::md::display_width(&shown_context);
-    let mut line_spans = vec![
-        Span::styled(badge_text, badge_style),
-        Span::raw(" "),
-        Span::styled(
-            model,
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    let mut used = left_width + right_width;
+    used += right_width;
     for (text, style) in secondary {
         let needed = 3 + super::md::display_width(&text);
         if used + needed + 1 > width {
@@ -1258,9 +1208,6 @@ fn active_status_label(status: &str) -> &'static str {
     }
 }
 
-fn status_model_label(model: &str) -> String {
-    format!(" MODEL {model}")
-}
 
 fn selected_context_label(app: &App) -> String {
     let cfg = &app.session.cfg;
@@ -1361,10 +1308,8 @@ fn slash_hits_for(input: &str) -> Vec<&'static (&'static str, &'static str)> {
         .collect();
     // 정확히 일치하는 명령은 맨 앞으로
     hits.sort_by_key(|(name, _)| name[1..].to_lowercase() != tok);
-    if hits.is_empty() && !tok.is_empty() {
-        // 검색 불일치 시에도 목록이 사라지지 않게 전체를 보여준다 (헤더에 불일치 표기)
-        return crate::chat::SLASH_COMMANDS.iter().collect();
-    }
+    // 검색 불일치면 팔레트를 숨긴다 — 오타 한 글자에 전체 목록으로 화면
+    // 하단을 채우지 않는다 (pi 스타일 저소음).
     hits
 }
 
@@ -1601,57 +1546,6 @@ pub(super) fn overlay_rect(area: Rect, max_w: u16, max_h: u16) -> Rect {
     }
 }
 
-fn draw_approval_popup(f: &mut Frame, area: Rect, preview: &str, th: &Pal) {
-    let (rect, buttons) = super::approval_popup_layout(area);
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " Tool approval ",
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(th.accent))
-        .style(Style::default().bg(th.bg).fg(th.text));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let preview_height = inner.height.saturating_sub(4);
-    f.render_widget(
-        Paragraph::new(preview)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(th.text)),
-        Rect::new(inner.x, inner.y, inner.width, preview_height),
-    );
-    if inner.height >= 3 && inner.width >= 23 {
-        f.render_widget(
-            Paragraph::new("Select with mouse or press Y / N / A")
-                .style(Style::default().fg(th.mute)),
-            Rect::new(
-                inner.x,
-                rect.y.saturating_add(rect.height.saturating_sub(5)),
-                inner.width,
-                1,
-            ),
-        );
-    }
-    for button in buttons {
-        let color = match button.choice {
-            crate::agent::ApprovalChoice::Yes => Color::Green,
-            crate::agent::ApprovalChoice::No => th.err,
-            crate::agent::ApprovalChoice::Always => th.warn,
-        };
-        f.render_widget(
-            Paragraph::new(button.label).style(
-                Style::default()
-                    .fg(color)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            ),
-            button.rect,
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1752,11 +1646,6 @@ mod tests {
         assert_eq!(coding_role("[코드 변경] 수정 src/a.rs:1-2"), CodeRole::Edit);
         assert_eq!(coding_role("[코드 변경] 삭제 src/a.rs:1-2"), CodeRole::Delete);
         assert_eq!(coding_role("[검증] cargo test"), CodeRole::Verify);
-    }
-
-    #[test]
-    fn initial_status_bar_names_the_selected_model() {
-        assert_eq!(status_model_label("minimax-m3"), " MODEL minimax-m3");
     }
 
     #[test]

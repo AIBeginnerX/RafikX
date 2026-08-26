@@ -1,3 +1,52 @@
+# pi 미니멀 UI/UX 대개편 (2026-08-26 오전)
+
+earendil-works/pi 와 code-yeongyu/oh-my-openagent 분석 후, pi 의 핵심 장점
+(마찰 없는 흐름: 팝업 없음·노이즈 없음·항상 저장·인라인 UI)을 이식.
+사전에 Explore 에이전트로 RafikX UX 전수 조사(마찰 상위 10개, 파일:라인)를 떠서
+전부 해소.
+
+## 화면·스크롤백
+- [x] 턴 종료 시 transcript.clear() 로 대화 전체가 사라지던 것 →
+      collapse_turn_noise: 이전 대화 보존, 이번 턴 작업 노이즈만 접음
+- [x] 상태 스트립+푸터 2줄 → 단일 푸터 통합 (모드·상태·모델·토큰·Todo·ctx)
+      — 중복 표시(모델 2회·상태 2회·Todo 2회·스피너 2개 위상 어긋남) 해소
+- [x] 도구 출력 원문 전량 투척 → 요약 한 줄 (원문은 모델에게만)
+- [x] "[모델 작업] 반복 N" 매 반복 배너, "[하네스] …" 매 턴 배너, 검증 성공
+      원문 출력 제거 · 슬래시 팔레트 오타 시 26개 전체 재표시 → 숨김
+- [x] 버전 확인: 새 버전 있을 때만 표시 (최신/실패 시 매번 붉은 경고 제거)
+- [x] 80ms 무조건 전체 리드로우 → busy 일 때만 (유휴 CPU 0.0% 실측)
+
+## 팝업 제거 (pi: no permission popups)
+- [x] 도구 승인 전체화면 팝업 삭제 → 푸터 인라인 [Yes][No][Always] + y/n/a 키
+- [x] 마우스 캡처 인프라 전부 제거 — /connect 후 드래그·복사·휠이 죽던
+      캡처 누수, 보이지 않는 클릭 타깃 오승인 버그 동시 해소
+- [x] Always 가 턴 한정이던 것 → 세션 전체 지속 (session.yes 승격)
+- [x] 슬래시 명령 Enter 2회 확인 → 1회 즉시 실행 (slash_armed 제거)
+
+## 시작 시퀀스
+- [x] 시작 경로의 ranks 동기 네트워크 대기(최대 30초) 제거 — 백그라운드
+      spawn_weekly_refresh 만 유지 (중복 요청도 해소)
+- [x] goal 무확인 자동 재개(켜자마자 토큰 소모·세션 덮어쓰기) → 안내 한 줄
+      + /goal resume(명시 재개) · /goal clear(해제; Esc 고착 탈출구, DB
+      clear_active_goal 추가)
+- [x] CLI 로그인 자동 임포트 println 이 AlternateScreen 전환으로 유실 →
+      TUI 에서는 침묵 · 시작 안내문은 연결 없을 때만
+
+## 세션 (pi: auto-save · picker · -c)
+- [x] 턴마다 자동 저장 (이전: 종료 시 1회 → 크래시 시 전량 유실)
+- [x] /resume·/sessions 인자 없으면 세션 picker (id 손 타이핑 제거)
+- [x] rafikx -c — 최근 세션 이어서 시작
+- [x] /new 의 minimax-m3 하드코딩 리셋 → 마지막 사용 조합 유지
+
+검증: cargo test 127 통과(마우스 승인 테스트 3개 제거·신규 2개), minimax
+실전 태스크 ok(저소음 확인), pty TUI 유휴 CPU 0.0%, 설치본 갱신.
+참고: 오늘 아침 사용자가 target 을 외장 RAID 심링크로 오프로드 →
+Claude 셸은 TCC 로 외장 볼륨 차단이라 CARGO_TARGET_DIR 로 로컬 우회 빌드.
+미채용(과설계 방지): OmO 구조화 메모리(facts/journal)는 기존
+lessons+obsidian 과 중복이라 도입하지 않음.
+
+---
+
 # TUI 멈춤(CPU 96% 스핀) 원인 분석·수정 (2026-08-26 새벽)
 
 증상: 벤치마크 작업 중 TUI 멈춤. PID 6987 이 52분 경과에 CPU 시간 51분(96%).

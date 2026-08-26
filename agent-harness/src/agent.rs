@@ -192,7 +192,6 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         // 프로바이더 폴백: 주 연결 실패(4xx·5xx·리밋) 시 fallback_order 의 다음 연결로.
         // 주 연결은 원래 모델을 그대로 쓰고, 이후 연결은 role(main) 기준 모델을 쓴다.
         let order = crate::harness::fallback_order(cfg, provider_name, None);
-        crate::ui::live_line(&format!("[모델 작업] 반복 {iterations} · 응답 스트리밍 중"));
         let mut streamed = false;
         let (_used, resp) = crate::harness::stream_with_fallback(
             cfg,
@@ -385,7 +384,8 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 Ok(out) => {
                     crate::graph::node("tool_post", &name, "ok", Some("tool_pre"));
                     if name != "todo_write" {
-                        crate::ui::live_line(&out);
+                        // 도구 출력 원문 전량 투척 대신 요약 한 줄 (pi 저소음).
+                        crate::ui::live_line(&tool_output_summary(&name, &out));
                     }
                     for path in changed_paths(&name, &input) {
                         if !changed_files.contains(&path) {
@@ -417,6 +417,19 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             content: results,
         });
     }
+}
+
+/// 도구 결과를 트랜스크립트용 한 줄로 압축한다 — 짧으면 그대로, 길면
+/// 첫 줄 + 규모만. 원문은 모델에게 전달되는 ToolResult 에 온전히 남는다.
+fn tool_output_summary(name: &str, out: &str) -> String {
+    let trimmed = out.trim_end();
+    let lines = trimmed.lines().count();
+    if lines <= 2 && trimmed.chars().count() <= 160 {
+        return trimmed.to_string();
+    }
+    let first = trimmed.lines().next().unwrap_or("");
+    let first: String = first.chars().take(120).collect();
+    format!("{first}  … ({name} 결과 {lines}줄)")
 }
 
 fn changed_paths(name: &str, input: &serde_json::Value) -> Vec<String> {

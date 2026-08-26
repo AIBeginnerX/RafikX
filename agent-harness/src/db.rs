@@ -577,6 +577,15 @@ impl Db {
         Ok(())
     }
 
+    /// 활성 목표 해제 — /goal clear. Esc 중단으로 active 가 고착된 경우의 탈출구.
+    pub fn clear_active_goal(&self) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE goals SET status = 'cleared', updated_at = ?1 WHERE status = 'active'",
+            [now_secs()],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn active_goal(&self) -> Result<Option<GoalRow>> {
         self.conn
             .query_row(

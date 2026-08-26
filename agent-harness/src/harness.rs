@@ -1371,16 +1371,8 @@ pub async fn run_pipeline(
         && (engine_deep || binding.class != crate::harness::TaskClass::Simple);
     let mut system = system;
     if staged {
+        // 배너 없이 조용히 — 단계 진행은 Todo 패널이 보여준다 (pi 저소음).
         crate::tools_more::clear_todos();
-        crate::ui::live_line(&format!(
-            "[하네스] {} 난이도{} — 단계별 실행(todo) 활성",
-            binding.class.as_str(),
-            if engine_deep {
-                " · deepseek 엔진"
-            } else {
-                ""
-            }
-        ));
         crate::graph::node(
             "pre_step",
             "staging",
@@ -1400,9 +1392,6 @@ pub async fn run_pipeline(
         system.push_str(&directive);
     }
     if engine_pi {
-        crate::ui::live_line(
-            "[하네스] pi/oh-my-pi 엔진 — 모델 응답·도구 실행·사용량을 실시간 표시",
-        );
         system.push_str(
             "\n\n[pi harness]\n\
              작업 중에는 지금 수행하는 단계와 도구 결과를 짧고 사실적으로 알리고, \
@@ -1812,8 +1801,9 @@ async fn run_verify(
         }
         match tool.run(serde_json::json!({"command": cmd}), &ctx) {
             Ok(out) if !out.contains("[exit") => {
-                crate::ui::live_line("검증 성공");
-                crate::ui::live_line(&out);
+                // 성공 시 원문 대신 요약 한 줄 — 실패했을 때만 상세가 필요하다.
+                let lines = out.trim().lines().count();
+                crate::ui::live_line(&format!("검증 성공 ({lines}줄 출력)"));
                 return Ok(outcome);
             }
             other => {

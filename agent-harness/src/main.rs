@@ -49,6 +49,9 @@ struct Cli {
     class: Option<String>,
     #[arg(long, global = true)]
     yes: bool,
+    /// 최근 세션을 이어서 시작 (pi 의 -c)
+    #[arg(short = 'c', long = "continue")]
+    continue_last: bool,
     #[command(subcommand)]
     cmd: Option<Commands>,
 }
@@ -902,7 +905,17 @@ async fn cmd_default(cli: &Cli) -> Result<()> {
         println!();
         return Ok(());
     }
-    cmd_chat_entry(cli, false, None).await
+    // rafikx -c — 최근 세션을 바로 이어서 시작한다.
+    let resume = if cli.continue_last {
+        Db::open(&Db::db_path()?)
+            .ok()
+            .and_then(|db| db.list_sessions(1).ok())
+            .and_then(|rows| rows.into_iter().next())
+            .map(|row| row.id)
+    } else {
+        None
+    };
+    cmd_chat_entry(cli, false, resume).await
 }
 
 async fn cmd_chat_entry(cli: &Cli, list: bool, resume: Option<String>) -> Result<()> {
