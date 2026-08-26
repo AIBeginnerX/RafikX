@@ -1,0 +1,15 @@
+{
+  "name": "rafikx-visual-qa",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "node ensure-pty-helper.mjs",
+    "desktop": "node desktop-ui.mjs",
+    "tui": "node tui-pty.mjs"
+  },
+  "dependencies": {
+    "@xterm/xterm": "6.0.0",
+    "node-pty": "1.1.0",
+    "playwright": "1.62.1"
+  }
+}

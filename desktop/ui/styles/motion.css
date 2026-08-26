@@ -1,0 +1,38 @@
+.start-stage.booting .signal-packet {
+  opacity: 1;
+  animation: boot-signal var(--motion-boot) var(--ease-signal) both;
+}
+
+.run-signal.running .signal-packet { opacity: 1; transform: translateX(var(--signal-x, 0)); transition: transform var(--motion-stage) var(--ease-signal), opacity var(--motion-fast) var(--ease-standard); }
+.run-signal.waiting .signal-node { animation: signal-breath 1.4s var(--ease-standard) infinite; }
+
+.send-label,
+.cancel-label { transition: opacity var(--motion-swap) var(--ease-standard), filter var(--motion-swap) var(--ease-standard), transform var(--motion-swap) var(--ease-standard); }
+
+.cancel-label { opacity: 0; filter: blur(.35rem); transform: scale(.94); }
+.composer.busy .send-label { opacity: 0; filter: blur(.35rem); transform: scale(.94); }
+.composer.busy .cancel-label { opacity: 1; filter: blur(0); transform: scale(1); }
+
+@keyframes boot-signal {
+  0% { transform: translateX(0); opacity: 0; }
+  12% { opacity: 1; }
+  86% { opacity: 1; }
+  100% { transform: translateX(300%); opacity: 0; }
+}
+
+@keyframes signal-breath {
+  0%, 100% { opacity: 1; filter: drop-shadow(0 0 .2rem var(--signal-strong)); }
+  50% { opacity: .55; filter: drop-shadow(0 0 .55rem var(--signal-strong)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+
+  .signal-packet { display: none; }
+  .run-signal.waiting .signal-node { animation: none; opacity: 1; }
+}

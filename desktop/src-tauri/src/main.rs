@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use rafikx::chat::Session;
 use rafikx::config::Config;
 use rafikx::db::Db;
 use rafikx::obsidian;
+use rafikx::run::RunContext;
 use rafikx::ui::{self, Live};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -20,6 +21,9 @@ struct Inner {
     pending: Mutex<HashMap<String, oneshot::Sender<ApprovalChoice>>>,
     turn: AsyncMutex<()>,
     watch_stop: Mutex<Option<watch::Sender<bool>>>,
+    runs: Mutex<HashMap<String, RunContext>>,
+    cancel_pending: Mutex<HashSet<String>>,
+    active_sid: Mutex<Option<String>>,
 }
 
 type Shared = Arc<Inner>;
@@ -34,6 +38,12 @@ struct LivePayload {
 struct ApprovalPayload {
     id: String,
     preview: String,
+}
+
+#[derive(Serialize, Clone)]
+struct LifecyclePayload {
+    sid: String,
+    event: rafikx::lifecycle::LifecycleEvent,
 }
 
 #[derive(Serialize)]
@@ -105,7 +115,10 @@ fn install_live(app: AppHandle) {
             ),
             Live::Agent(agent) => (
                 "agent",
-                format!("{}:{}:{}:{}", agent.id, agent.role, agent.model, agent.status),
+                format!(
+                    "{}:{}:{}:{}",
+                    agent.id, agent.role, agent.model, agent.status
+                ),
             ),
         };
         let _ = app.emit(
@@ -135,11 +148,58 @@ fn local_ask(app: AppHandle, inner: Shared) -> LocalAsk {
                     preview,
                 },
             );
-            match tokio::time::timeout(Duration::from_secs(300), rx).await {
+            let choice = match tokio::time::timeout(Duration::from_secs(300), rx).await {
                 Ok(Ok(choice)) => choice,
                 _ => ApprovalChoice::No,
+            };
+            if let Ok(mut pending) = inner.pending.lock() {
+                pending.remove(&id);
             }
+            choice
         })
+    })
+}
+
+fn run_observer(app: AppHandle, inner: Shared, sid: String) -> rafikx::chat::RunObserver {
+    Arc::new(move |run: RunContext| {
+        let should_cancel = inner
+            .cancel_pending
+            .lock()
+            .map(|mut pending| pending.remove(&sid))
+            .unwrap_or(false);
+        if should_cancel {
+            run.cancel("desktop cancel command");
+        }
+        if let Ok(mut runs) = inner.runs.lock() {
+            runs.insert(sid.clone(), run.clone());
+        }
+        let mut events = run.subscribe_lifecycle();
+        for event in run.lifecycle_events() {
+            let _ = app.emit(
+                "lifecycle",
+                LifecyclePayload {
+                    sid: sid.clone(),
+                    event,
+                },
+            );
+        }
+        let app = app.clone();
+        let sid = sid.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                let terminal = event.state.is_terminal();
+                let _ = app.emit(
+                    "lifecycle",
+                    LifecyclePayload {
+                        sid: sid.clone(),
+                        event,
+                    },
+                );
+                if terminal {
+                    break;
+                }
+            }
+        });
     })
 }
 
@@ -182,11 +242,7 @@ async fn send(
     let inner = (*state).clone();
     let mut session = take_session(&inner, &sid)?;
     if let Some(c) = class {
-        session.class = if c.trim().is_empty() {
-            None
-        } else {
-            Some(c)
-        };
+        session.class = if c.trim().is_empty() { None } else { Some(c) };
     }
     if let Some(m) = mode {
         session.mode = if m.eq_ignore_ascii_case("plan") {
@@ -234,10 +290,24 @@ async fn send(
         session.class = Some("dev".into());
     }
 
+    if let Ok(mut active) = inner.active_sid.lock() {
+        *active = Some(sid.clone());
+    }
+    if let Ok(mut pending) = inner.cancel_pending.lock() {
+        pending.remove(&sid);
+    }
     let ask = local_ask(app.clone(), inner.clone());
+    let observer = run_observer(app.clone(), inner.clone(), sid.clone());
     install_live(app.clone());
-    let result = api::run_turn(&mut session, &prompt, obsidian, Some(ask)).await;
+    let result =
+        api::run_turn_observed(&mut session, &prompt, obsidian, Some(ask), Some(observer)).await;
     ui::set_live(None);
+    if let Ok(mut runs) = inner.runs.lock() {
+        runs.remove(&sid);
+    }
+    if let Ok(mut active) = inner.active_sid.lock() {
+        *active = None;
+    }
     let messages = api::transcript(&session);
     let session_id = session.session_id.clone();
     put_session(&inner, sid, session)?;
@@ -270,6 +340,25 @@ fn resolve_approval(state: State<Shared>, id: String, choice: String) -> Result<
 }
 
 #[tauri::command]
+fn cancel_run(state: State<Shared>, sid: String) -> Result<bool, String> {
+    let active = state.active_sid.lock().map_err(err)?.as_deref() == Some(sid.as_str());
+    if !active {
+        return Ok(false);
+    }
+    let requested = if let Some(run) = state.runs.lock().map_err(err)?.get(&sid) {
+        run.cancel("desktop cancel command")
+    } else {
+        state.cancel_pending.lock().map_err(err)?.insert(sid)
+    };
+    if requested {
+        for (_, sender) in state.pending.lock().map_err(err)?.drain() {
+            let _ = sender.send(ApprovalChoice::No);
+        }
+    }
+    Ok(requested)
+}
+
+#[tauri::command]
 async fn save_key(app: AppHandle, provider: String, key: String) -> Result<String, String> {
     let out = api::save_key(&provider, &key).map_err(err)?;
     // 키가 정상이면 원격 모델 목록을 자동으로 불러와 카탈로그에 저장한다.
@@ -287,7 +376,10 @@ async fn save_key(app: AppHandle, provider: String, key: String) -> Result<Strin
                         "live",
                         LivePayload {
                             kind: "system".into(),
-                            text: format!("[models] {pname} 사용 가능 {}개 — 기본 모델 자동 저장", models.len()),
+                            text: format!(
+                                "[models] {pname} 사용 가능 {}개 — 기본 모델 자동 저장",
+                                models.len()
+                            ),
                         },
                     );
                 }
@@ -444,6 +536,9 @@ fn main() {
         pending: Mutex::new(HashMap::new()),
         turn: AsyncMutex::new(()),
         watch_stop: Mutex::new(None),
+        runs: Mutex::new(HashMap::new()),
+        cancel_pending: Mutex::new(HashSet::new()),
+        active_sid: Mutex::new(None),
     });
 
     tauri::Builder::default()
@@ -454,6 +549,7 @@ fn main() {
             new_session,
             send,
             resolve_approval,
+            cancel_run,
             save_key,
             disconnect_provider,
             set_default_provider,

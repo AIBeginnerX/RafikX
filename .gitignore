@@ -23,3 +23,5 @@ accounts.json
 .rafikx-src/
 desktop/dist
 desktop/dist/
+scripts/qa/node_modules/
+scripts/qa/artifacts/
