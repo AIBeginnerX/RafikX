@@ -49,8 +49,14 @@ impl TaskTool {
             .as_deref()
             .map(str::trim)
             .filter(|r| crate::harness::profile_exists(&cfg, r));
-        let binding =
+        let mut binding =
             crate::harness::bind_profile(&cfg, task_class, profile, None, model.as_deref())?;
+        // 위임 서브에이전트도 실행 경로다 — 엔진 고정을 같은 규칙으로 적용한다.
+        if let Some(w) =
+            crate::harness::apply_engine_pin(&cfg, &mut binding, None, model.as_deref())
+        {
+            crate::ui::live_warn(&w);
+        }
         let nonce = crate::db::Db::new_id();
         let agent_id = AgentId::new(format!("agent-{nonce}"));
         let child_run_id = parent

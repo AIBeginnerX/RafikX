@@ -271,6 +271,9 @@ async fn ask_pipeline(bot: &Bot, msg: &Message, app: &Arc<App>, prompt: &str) ->
     let cfg = &app.cfg;
     let class = harness::classify(cfg, prompt, false, None).await?;
     let mut binding = harness::bind(cfg, class, None, None)?;
+    if let Some(w) = harness::apply_engine_pin(cfg, &mut binding, None, None) {
+        crate::ui::live_warn(&w);
+    }
     if !cfg.file.telegram.allow_agent {
         strip_remote_tools(&mut binding);
     }

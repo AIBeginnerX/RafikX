@@ -192,3 +192,55 @@ run_verify 성공 **후** (또는 검증 생략 시 그 자리에서), spec.veri
 - **Phase 3**: discipline 구현(loop·graph) + /discipline + status/doctor 표시 + DEFAULT_CONFIG 갱신 + 테스트 6,7 + 문서(README 한 단락)
 
 각 Phase 종료 조건: `cargo test` 전체 통과 + `cargo build --release` 성공.
+
+## 11. minimax 엔진 — 단일 프로바이더 고정 하네스 (Phase 4)
+
+목표: **MiniMax 모델만으로** 높은 품질을 내는 전용 엔진. 근거: Self-Harness(arXiv 2606.09498) 실증에서 MiniMax 계열이 하네스 개선 이득이 가장 큼(M2.5 기준 상대 +53%) — 모델 교체 없이 하네스가 품질을 견인한다.
+
+### 11.1 EngineSpec 확장 — pin_provider
+
+```rust
+pub struct EngineSpec {
+    // ... 기존 필드 ...
+    /// Some이면 실행 경로(계획·에이전트 루프·verify·검증자 게이트)의 프로바이더를
+    /// 이 값으로 고정한다. 자동 선택(manual_*, sticky, ranks, fallback)을 전부 이긴다.
+    /// CLI --provider 명시 오버라이드만 예외(사용자 직접 의지) — 이때 경고 1줄.
+    pub pin_provider: Option<Cow<'static, str>>,
+}
+```
+
+- `EngineOverride`에도 `pin_provider: Option<String>` 추가 (빈 문자열 = 고정 해제).
+- 일반 메커니즘이다: config `[engines.*]`로 어떤 엔진에든 다른 프로바이더를 고정할 수 있다.
+
+### 11.2 배선 지점
+
+1. **bind**: pin이 있고 명시 `--provider` 오버라이드가 없으면 binding의 provider를 pin으로 강제, 모델은 그 프로바이더의 `model_role` 규칙(main/small)으로 해석. `[harness] strategy=manual`의 manual_* 배정·sticky보다 pin이 우선. 명시 오버라이드가 pin과 다르면 오버라이드 존중 + "엔진 {name}은 {pin} 고정이지만 --provider 지정을 따릅니다" 경고 1줄.
+2. **fallback_order**: pin이면 해당 프로바이더 하나로 제한 (계정 다중 순회는 유지 — 리밋 시 같은 프로바이더의 다른 계정으로만).
+3. **독립 검증자 게이트**: pin이면 `manual_verify`를 무시하고 pin 프로바이더의 main 모델로 리뷰. (신선한 컨텍스트가 본질이므로 같은 모델이어도 유효 — 논문도 동일 모델 제안/실행.)
+4. **범위 밖(그대로 유지)**: lessons reflection·LLM classifier·self-harness proposer 같은 백그라운드 보조 호출은 기존 로직 유지 — 실행 경로만 고정한다.
+
+### 11.3 minimax 엔진 스펙
+
+| 필드 | 값 | 근거 |
+|---|---|---|
+| plan_depth | Contract | DoD가 통합 수준 결함(예: 지면 충돌 누락)을 검증 항목으로 끌어냄 |
+| verify_policy | Strict | 독립 검증자(신선한 컨텍스트의 MiniMax)가 DoD 대조 |
+| force_staged | false | Contract의 todo 시드가 이미 담당 |
+| max_continuations | 10 | MiniMax는 반복 여유가 유효 |
+| pin_provider | "minimax" | |
+
+prompt_block (한국어, 관찰된 실제 약점의 정면 보정):
+- 도구 호출 시 필수 인자(path 등)를 절대 누락하지 마라 — 호출 직전에 인자 완전성을 한 번 확인한다.
+- 큰 파일은 한 번에 통째로 쓰지 말고 처음부터 골격→분할 추가로 나눠 작성한다.
+- 구현 후 문법 검사에서 멈추지 말고, 핵심 상호작용·엣지케이스를 실행 관점에서 자체 시뮬레이션 점검한다 (플레이/호출 흐름을 따라가며 상태 변화를 검증).
+- 같은 실패를 같은 방식으로 반복하지 마라 — 2회 실패하면 접근을 바꾼다.
+
+summary: "MiniMax 전용 — 프로바이더 고정 + 약점 보정 + 계약형 계획·검증"
+
+### 11.4 테스트 계약
+
+1. 카탈로그에 minimax 포함(7종), pin_provider="minimax", is_selectable 통과.
+2. pin 우선순위: 자동 선택·manual_*를 이기고, 명시 오버라이드에는 진다 (순수 함수로 분리해 검증).
+3. fallback_order 제한: pin이면 결과가 pin 프로바이더 하나.
+4. EngineOverride.pin_provider 병합 (설정·해제).
+5. 기존 전체 테스트 통과 유지.

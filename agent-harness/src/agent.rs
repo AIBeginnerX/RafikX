@@ -246,7 +246,7 @@ pub async fn run_agent_with_context(
 
         // 프로바이더 폴백: 주 연결 실패(4xx·5xx·리밋) 시 fallback_order 의 다음 연결로.
         // 주 연결은 원래 모델을 그대로 쓰고, 이후 연결은 role(main) 기준 모델을 쓴다.
-        let order = crate::harness::fallback_order(cfg, provider_name, None);
+        let order = crate::harness::fallback_order_pinned(cfg, provider_name, None);
         let mut streamed = false;
         let (_used, resp) = {
             let response =

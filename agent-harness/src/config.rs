@@ -15,7 +15,7 @@ max_tokens = 32768                 # 응답 출력 상한 — 큰 단일 파일 
 max_context_chars = 200000
 approval = "ask"                   # ask | auto-safe | yolo
 classifier = "rules"               # rules | llm
-# engine = "rafikx"                # rafikx | claude | deepseek | qwen | kimi | pi (/engine 으로 변경)
+# engine = "rafikx"                # rafikx | claude | deepseek | qwen | kimi | pi | minimax (/engine 으로 변경)
 # discipline = "harness"           # harness | loop | graph (/discipline 으로 변경)
 
 [providers.anthropic]
@@ -269,6 +269,7 @@ inject_limit_chars = 2000
 # verify_policy = "strict"         # inherit | auto | strict
 # force_staged = true
 # max_continuations = 10
+# pin_provider = "minimax"         # 실행 경로를 이 연결로 고정 (빈 문자열이면 고정 해제)
 
 # Self-Harness — 하네스가 자기 실행 실패를 채굴해 스스로 개선 (arXiv:2606.09498).
 # meta = true 면 엔진과 무관하게 모든 실행 위에 자기개선 루프를 겹칩니다 (/selfharness on|off).

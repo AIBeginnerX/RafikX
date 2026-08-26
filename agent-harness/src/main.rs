@@ -526,7 +526,9 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
         harness::TaskClass::Advanced,
         harness::TaskClass::Dev,
     ] {
-        if let Ok(b) = harness::bind(&cfg, c, None, None) {
+        if let Ok(mut b) = harness::bind(&cfg, c, None, None) {
+            // 표는 실제 실행에 붙는 조합을 보여야 하므로 엔진 고정을 반영한다.
+            let _ = harness::apply_engine_pin(&cfg, &mut b, None, None);
             println!(
                 "  {:8} → {:8} {}/{}",
                 b.class.as_str(),
@@ -784,7 +786,15 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         cli.class.as_deref()
     };
     let class = classify(&cfg, prompt, obsidian, forced).await?;
-    let binding = bind(&cfg, class, cli.provider.as_deref(), cli.model.as_deref())?;
+    let mut binding = bind(&cfg, class, cli.provider.as_deref(), cli.model.as_deref())?;
+    if let Some(w) = harness::apply_engine_pin(
+        &cfg,
+        &mut binding,
+        cli.provider.as_deref(),
+        cli.model.as_deref(),
+    ) {
+        rafikx::ui::warn(&w);
+    }
     print_binding(&cfg, &binding);
 
     let mut task = prompt.to_string();

@@ -85,6 +85,21 @@ pub struct EngineSpec {
     pub verify_policy: VerifyPolicy,
     /// goal continuation 한도.
     pub max_continuations: u8,
+    /// Some 이면 실행 경로(계획·에이전트 루프·검증·검증자 게이트)의 프로바이더를 이 값으로
+    /// 고정한다. 자동 선택(manual_*·sticky·ranks·fallback)을 전부 이기고, 사용자의 명시
+    /// 오버라이드(--provider/--model)에만 진다. 일반 메커니즘이므로 config `[engines.*]`
+    /// 로 어떤 엔진에든 다른 프로바이더를 고정할 수 있다.
+    pub pin_provider: Option<Cow<'static, str>>,
+}
+
+impl EngineSpec {
+    /// 고정 프로바이더 — 공백뿐인 값은 고정 없음으로 본다.
+    pub fn pin(&self) -> Option<&str> {
+        self.pin_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// config `[engines.<name>]` 필드 단위 오버라이드 — 문구·플래그를 코드 수정 없이 튜닝.
@@ -104,6 +119,9 @@ pub struct EngineOverride {
     pub verify_policy: Option<String>,
     #[serde(default)]
     pub max_continuations: Option<u8>,
+    /// 프로바이더 고정. 빈 문자열이면 내장 고정을 해제한다.
+    #[serde(default)]
+    pub pin_provider: Option<String>,
 }
 
 impl EngineOverride {
@@ -123,6 +141,15 @@ impl EngineOverride {
         if let Some(v) = self.max_continuations {
             spec.max_continuations = v.max(1);
         }
+        if let Some(v) = &self.pin_provider {
+            let t = v.trim();
+            // 빈 문자열은 고정 해제 — 내장 pin 을 config 로 끌 수 있어야 한다.
+            spec.pin_provider = if t.is_empty() {
+                None
+            } else {
+                Some(Cow::Owned(t.to_string()))
+            };
+        }
     }
 }
 
@@ -138,6 +165,7 @@ static CATALOG: &[EngineSpec] = &[
         plan_depth: PlanDepth::Brief,
         verify_policy: VerifyPolicy::Inherit,
         max_continuations: 8,
+        pin_provider: None,
     },
     EngineSpec {
         name: Cow::Borrowed("claude"),
@@ -154,6 +182,7 @@ static CATALOG: &[EngineSpec] = &[
         plan_depth: PlanDepth::Contract,
         verify_policy: VerifyPolicy::Strict,
         max_continuations: 8,
+        pin_provider: None,
     },
     EngineSpec {
         name: Cow::Borrowed("deepseek"),
@@ -169,6 +198,7 @@ static CATALOG: &[EngineSpec] = &[
         plan_depth: PlanDepth::Brief,
         verify_policy: VerifyPolicy::Inherit,
         max_continuations: 8,
+        pin_provider: None,
     },
     EngineSpec {
         name: Cow::Borrowed("qwen"),
@@ -184,6 +214,7 @@ static CATALOG: &[EngineSpec] = &[
         plan_depth: PlanDepth::Brief,
         verify_policy: VerifyPolicy::Auto,
         max_continuations: 8,
+        pin_provider: None,
     },
     EngineSpec {
         name: Cow::Borrowed("kimi"),
@@ -201,6 +232,7 @@ static CATALOG: &[EngineSpec] = &[
         plan_depth: PlanDepth::Contract,
         verify_policy: VerifyPolicy::Strict,
         max_continuations: 8,
+        pin_provider: None,
     },
     EngineSpec {
         name: Cow::Borrowed("pi"),
@@ -214,10 +246,27 @@ static CATALOG: &[EngineSpec] = &[
         plan_depth: PlanDepth::Brief,
         verify_policy: VerifyPolicy::Inherit,
         max_continuations: 8,
+        pin_provider: None,
+    },
+    EngineSpec {
+        name: Cow::Borrowed("minimax"),
+        summary: Cow::Borrowed("MiniMax 전용 — 프로바이더 고정 + 약점 보정 + 계약형 계획·검증"),
+        prompt_block: Cow::Borrowed(
+            "\n\n[minimax harness]\n\
+             - 도구를 호출할 때 필수 인자(path 등)를 절대 누락하지 마라(NEVER). 호출 직전에 인자 완전성을 한 번 확인한다.\n\
+             - 큰 파일은 한 번에 통째로 쓰지 않는다. 처음부터 골격을 먼저 만들고 분할해서 덧붙여 완성한다.\n\
+             - 구현 후 문법 검사에서 멈추지 마라. 핵심 상호작용과 엣지케이스를 실행 관점에서 자체 시뮬레이션으로 점검한다(호출 흐름을 따라가며 상태 변화를 검증).\n\
+             - 같은 실패를 같은 방식으로 반복하지 마라(NEVER). 2회 실패하면 접근을 바꾼다.",
+        ),
+        force_staged: false,
+        plan_depth: PlanDepth::Contract,
+        verify_policy: VerifyPolicy::Strict,
+        max_continuations: 10,
+        pin_provider: Some(Cow::Borrowed("minimax")),
     },
 ];
 
-/// 내장 엔진 6종.
+/// 내장 엔진 7종.
 pub fn catalog() -> &'static [EngineSpec] {
     CATALOG
 }
@@ -325,7 +374,7 @@ pub fn normalize(raw: &str) -> (String, bool) {
     }
 }
 
-/// /engine 목록 표시용 — `rafikx|claude|deepseek|qwen|kimi|pi`.
+/// /engine 목록 표시용 — `rafikx|claude|deepseek|qwen|kimi|pi|minimax`.
 pub fn names_joined() -> String {
     CATALOG
         .iter()
@@ -334,7 +383,7 @@ pub fn names_joined() -> String {
         .join("|")
 }
 
-/// /engine 입력으로 받아들일 값인지 — 카탈로그 6종 + legacy `self`.
+/// /engine 입력으로 받아들일 값인지 — 카탈로그 7종 + legacy `self`.
 /// `dk`·`dkharness` 같은 제거된 값은 거부한다(normalize 만 흡수).
 pub fn is_selectable(name: &str) -> bool {
     let n = name.trim();
@@ -356,8 +405,10 @@ mod tests {
         // 미지원 값은 기본 엔진으로 떨어진다.
         assert_eq!(normalize("dkharness"), ("rafikx".into(), false));
         assert_eq!(normalize("gpt"), ("rafikx".into(), false));
-        // 카탈로그 6종은 이름 그대로 (대소문자 무시).
-        for name in ["rafikx", "claude", "deepseek", "qwen", "kimi", "pi"] {
+        // 카탈로그 7종은 이름 그대로 (대소문자 무시).
+        for name in [
+            "rafikx", "claude", "deepseek", "qwen", "kimi", "pi", "minimax",
+        ] {
             assert_eq!(normalize(name), (name.to_string(), false));
             assert_eq!(normalize(&name.to_uppercase()), (name.to_string(), false));
         }
@@ -365,7 +416,7 @@ mod tests {
 
     #[test]
     fn catalog_specs_match_design_table() {
-        assert_eq!(catalog().len(), 6);
+        assert_eq!(catalog().len(), 7);
         let deep = resolve("deepseek").expect("deepseek");
         assert!(deep.force_staged);
         assert_eq!(deep.plan_depth, PlanDepth::Brief);
@@ -395,6 +446,61 @@ mod tests {
             assert!(spec.prompt_block.contains("[변경 요약]"));
         }
         assert!(resolve("없는엔진").is_none());
+    }
+
+    #[test]
+    fn minimax_engine_pins_provider_and_corrects_weaknesses() {
+        let mm = resolve("minimax").expect("minimax");
+        assert_eq!(mm.plan_depth, PlanDepth::Contract);
+        assert_eq!(mm.verify_policy, VerifyPolicy::Strict);
+        assert!(
+            !mm.force_staged,
+            "Contract 의 todo 시드가 단계화를 담당한다"
+        );
+        assert_eq!(mm.max_continuations, 10);
+        assert_eq!(mm.pin(), Some("minimax"));
+        assert!(is_selectable("minimax"));
+        // 관찰된 약점(인자 누락·통짜 쓰기·문법 검사에서 멈춤·같은 실패 반복)의 정면 보정.
+        for key in ["필수 인자", "골격", "시뮬레이션", "2회 실패"] {
+            assert!(mm.prompt_block.contains(key), "{key} 지시 없음");
+        }
+        // 고정은 minimax 만 — 나머지 내장 엔진은 자동 선택을 그대로 쓴다.
+        for spec in catalog().iter().filter(|s| s.name != "minimax") {
+            assert_eq!(spec.pin(), None, "{} 에 고정이 걸려 있다", spec.name);
+        }
+    }
+
+    #[test]
+    fn config_override_sets_and_clears_pin_provider() {
+        // 어떤 엔진에든 프로바이더를 고정할 수 있는 일반 메커니즘이다.
+        let mut set: HashMap<String, EngineOverride> = HashMap::new();
+        set.insert(
+            "claude".into(),
+            EngineOverride {
+                pin_provider: Some("  glm  ".into()),
+                ..EngineOverride::default()
+            },
+        );
+        assert_eq!(resolve_with(&set, "claude").pin(), Some("glm"));
+
+        // 빈 문자열은 내장 고정을 해제한다.
+        let mut clear: HashMap<String, EngineOverride> = HashMap::new();
+        clear.insert(
+            "minimax".into(),
+            EngineOverride {
+                pin_provider: Some("".into()),
+                ..EngineOverride::default()
+            },
+        );
+        let spec = resolve_with(&clear, "minimax");
+        assert_eq!(spec.pin(), None);
+        // 다른 필드는 그대로.
+        assert_eq!(spec.plan_depth, PlanDepth::Contract);
+        assert_eq!(spec.max_continuations, 10);
+
+        // 지정하지 않으면 내장 고정 유지.
+        let untouched = resolve_with(&HashMap::new(), "minimax");
+        assert_eq!(untouched.pin(), Some("minimax"));
     }
 
     #[test]
@@ -483,12 +589,17 @@ mod tests {
 
     #[test]
     fn selectable_accepts_catalog_and_legacy_self_only() {
-        for name in ["rafikx", "claude", "deepseek", "qwen", "kimi", "pi", "self"] {
+        for name in [
+            "rafikx", "claude", "deepseek", "qwen", "kimi", "pi", "minimax", "self",
+        ] {
             assert!(is_selectable(name), "{name} 가 거부됨");
         }
         assert!(!is_selectable("dk"));
         assert!(!is_selectable("dkharness"));
         assert!(!is_selectable(""));
-        assert_eq!(names_joined(), "rafikx|claude|deepseek|qwen|kimi|pi");
+        assert_eq!(
+            names_joined(),
+            "rafikx|claude|deepseek|qwen|kimi|pi|minimax"
+        );
     }
 }

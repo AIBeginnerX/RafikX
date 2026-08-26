@@ -332,6 +332,134 @@ pub fn bind_profile(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 엔진 프로바이더 고정 (EngineSpec::pin_provider) — 배선은 이 구역 한 곳에만 둔다.
+// 진입점(chat·cli·telegram·task)은 bind 직후 apply_engine_pin 만 부르면 된다.
+// ---------------------------------------------------------------------------
+
+/// 현재 엔진이 고정한 프로바이더 — `[general] engine` + `[engines.*]` 오버라이드 결과.
+pub fn engine_pin(cfg: &Config) -> Option<String> {
+    let (engine, _) = crate::engine::normalize(&cfg.file.general.engine);
+    let spec = crate::engine::resolve_with(&cfg.file.engines, &engine);
+    spec.pin().map(str::to_string)
+}
+
+/// 고정 판정 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinDecision {
+    /// 고정할 것이 없다 — 엔진에 고정이 없거나 이미 그 프로바이더로 묶여 있다.
+    Keep,
+    /// 이 프로바이더로 다시 묶는다.
+    Apply(String),
+    /// 사용자가 직접 지정했으므로 고정을 양보한다 (경고 한 줄).
+    Yield { pin: String, explicit: String },
+}
+
+/// 고정 우선순위 판정 (순수 함수).
+/// 자동 선택(sticky 재사용·manual_*·ranks·프로파일 기본)은 고정에 지고,
+/// 사용자의 명시 오버라이드(--provider / --model)는 고정을 이긴다.
+pub fn decide_pin(
+    pin: Option<&str>,
+    current_provider: &str,
+    explicit_provider: Option<&str>,
+    explicit_model: Option<&str>,
+) -> PinDecision {
+    let Some(pin) = pin.map(str::trim).filter(|p| !p.is_empty()) else {
+        return PinDecision::Keep;
+    };
+    // 이미 고정 프로바이더로 묶여 있으면 다툴 것이 없다 (sticky 가 고정과 같은 경우 포함).
+    if current_provider.eq_ignore_ascii_case(pin) {
+        return PinDecision::Keep;
+    }
+    let explicit = explicit_provider
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|p| format!("provider={p}"))
+        .or_else(|| {
+            // 모델만 직접 고른 경우도 사용자 의지다 — 그 모델이 없는 프로바이더로 끌고 가지 않는다.
+            explicit_model
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|m| format!("model={m}"))
+        });
+    match explicit {
+        Some(explicit) => PinDecision::Yield {
+            pin: pin.to_string(),
+            explicit,
+        },
+        None => PinDecision::Apply(pin.to_string()),
+    }
+}
+
+/// 고정 프로바이더를 쓸 수 없는 이유 — 쓸 수 있으면 None.
+/// 고정이 가용성을 해치면 안 되므로(기존 capability binding 철학) 여기서 걸리면 고정을 포기한다.
+fn pin_unavailable(cfg: &Config, pin: &str, needs_tools: bool) -> Option<&'static str> {
+    let Ok(p) = cfg.provider(pin) else {
+        return Some("config 에 연결이 없음");
+    };
+    if !crate::auth::is_usable(cfg, pin) {
+        return Some("연결되지 않음");
+    }
+    if needs_tools && !p.supports_tools {
+        return Some("도구 미지원");
+    }
+    None
+}
+
+/// 엔진 고정을 바인딩에 적용한다 — 실행 경로 진입점이 bind 직후 한 번 호출한다.
+/// 반환값은 사용자에게 보여줄 경고 한 줄(없으면 None).
+pub fn apply_engine_pin(
+    cfg: &Config,
+    binding: &mut Binding,
+    explicit_provider: Option<&str>,
+    explicit_model: Option<&str>,
+) -> Option<String> {
+    let pin = engine_pin(cfg)?;
+    let (engine, _) = crate::engine::normalize(&cfg.file.general.engine);
+    match decide_pin(
+        Some(&pin),
+        &binding.provider_name,
+        explicit_provider,
+        explicit_model,
+    ) {
+        PinDecision::Keep => None,
+        PinDecision::Yield { pin, explicit } => Some(format!(
+            "엔진 {engine} 은 {pin} 고정이지만 직접 지정한 {explicit} 을(를) 따릅니다."
+        )),
+        PinDecision::Apply(pin) => {
+            if let Some(reason) = pin_unavailable(cfg, &pin, !binding.tools.is_empty()) {
+                return Some(format!(
+                    "엔진 {engine} 의 {pin} 고정을 건너뜁니다({reason}). {} 로 실행합니다.",
+                    binding.provider_name
+                ));
+            }
+            // 모델은 고정 프로바이더의 model_role 규칙으로 다시 해석한다.
+            match bind_profile(
+                cfg,
+                binding.class,
+                Some(&binding.profile_name),
+                Some(&pin),
+                None,
+            ) {
+                Ok(pinned) => {
+                    crate::applog::debug(&format!(
+                        "engine pin: {engine} → {}/{}",
+                        pinned.provider_name, pinned.model
+                    ));
+                    binding.provider_name = pinned.provider_name;
+                    binding.model = pinned.model;
+                    binding.kind = pinned.kind;
+                    binding.context_window = pinned.context_window;
+                    // 고정 실행은 manual_verify 를 따르지 않는다 (§11.2).
+                    binding.verify_model = pinned.verify_model;
+                    None
+                }
+                Err(e) => Some(format!("엔진 {engine} 의 {pin} 고정 실패({e}).")),
+            }
+        }
+    }
+}
+
 fn pick_single(cfg: &Config, needs_tools: bool) -> Result<(String, String, Option<String>)> {
     // Single 모드 계약: 사용자가 지정한 기본 연결(default_provider) 하나만 쓴다.
     // (/engine single <연결> 이 이 값을 저장한다.)
@@ -972,6 +1100,40 @@ pub fn fallback_order(cfg: &Config, primary: &str, cli_provider: Option<&str>) -
     order
 }
 
+/// 실행 경로(에이전트 루프·검증·검증자 게이트)용 폴백 순서.
+/// 엔진 고정이 있으면 그 프로바이더 하나로 제한한다 — 계정 다중 순회는 안쪽
+/// (chat_with_fallback)이 담당하므로 리밋 시 같은 프로바이더의 다른 계정으로만 넘어간다.
+/// 백그라운드 보조 호출(교훈 반성·LLM 분류·self-harness 제안)은 고정 대상이 아니므로
+/// 기존 `fallback_order` 를 그대로 쓴다 (설계 §11.2).
+pub fn fallback_order_pinned(
+    cfg: &Config,
+    primary: &str,
+    cli_provider: Option<&str>,
+) -> Vec<String> {
+    let order = fallback_order(cfg, primary, cli_provider);
+    limit_order_to_pin(engine_pin(cfg).as_deref(), cli_provider, order)
+}
+
+/// 고정이 걸린 실행의 폴백 순서 계산 (순수 함수).
+/// 사용자가 --provider 로 직접 지정했으면 고정을 양보하고, 고정 프로바이더가 순서에
+/// 아예 없으면(연결 없음) 원래 순서를 지킨다 — 가용성 우선.
+fn limit_order_to_pin(
+    pin: Option<&str>,
+    cli_provider: Option<&str>,
+    order: Vec<String>,
+) -> Vec<String> {
+    let Some(pin) = pin.map(str::trim).filter(|p| !p.is_empty()) else {
+        return order;
+    };
+    if cli_provider.map(str::trim).is_some_and(|p| !p.is_empty()) {
+        return order;
+    }
+    if order.iter().any(|p| p.eq_ignore_ascii_case(pin)) {
+        return vec![pin.to_string()];
+    }
+    order
+}
+
 fn model_for_fallback(
     cfg: &Config,
     name: &str,
@@ -1242,14 +1404,19 @@ pub fn print_binding_table(cfg: &Config) {
         TaskClass::Dev,
     ] {
         match bind(cfg, class, None, None) {
-            Ok(b) => println!(
-                "  {} → {} → {} ({}) → {}",
-                b.class.as_str(),
-                b.profile_name,
-                b.provider_name,
-                b.kind,
-                b.model
-            ),
+            // 표는 실제 실행에 붙는 조합을 보여야 하므로 엔진 고정을 반영한다
+            // (경고는 실행 경로에서만 낸다).
+            Ok(mut b) => {
+                let _ = apply_engine_pin(cfg, &mut b, None, None);
+                println!(
+                    "  {} → {} → {} ({}) → {}",
+                    b.class.as_str(),
+                    b.profile_name,
+                    b.provider_name,
+                    b.kind,
+                    b.model
+                );
+            }
             Err(e) => println!("  {} → (실패: {e})", class.as_str()),
         }
     }
@@ -1577,7 +1744,7 @@ async fn run_pipeline_inner(
         .get(&binding.profile_name)
         .map(|s| s.model_role.as_str())
         .unwrap_or("main");
-    let order = fallback_order(cfg, &binding.provider_name, cli_provider);
+    let order = fallback_order_pinned(cfg, &binding.provider_name, cli_provider);
     let lessons_block = if cfg.file.memory.enabled {
         Db::open(&Db::db_path()?)
             .ok()
@@ -2605,20 +2772,27 @@ async fn run_review_gate(
     local_ask: Option<agent::LocalAsk>,
     run_context: RunContext,
 ) -> AgentOutcome {
+    // 엔진 고정이 걸린 실행은 manual_verify 를 무시하고 고정 프로바이더의 main 모델로
+    // 리뷰한다 (§11.2) — 게이트의 본질은 신선한 컨텍스트이므로 같은 모델이어도 유효하다.
+    let pin = engine_pin(cfg).filter(|p| pin_unavailable(cfg, p, true).is_none());
     // [harness] manual_verify 가 지정돼 있으면 그 모델로 검증자를 돌린다.
-    let verify_pair = cfg
-        .file
-        .harness
-        .manual_verify
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|spec| resolve_spec(cfg, spec, true).ok());
+    let verify_pair = if pin.is_some() {
+        None
+    } else {
+        cfg.file
+            .harness
+            .manual_verify
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|spec| resolve_spec(cfg, spec, true).ok())
+    };
     let reviewer = match bind_profile(
         cfg,
         binding.class,
         Some("reviewer"),
-        verify_pair.as_ref().map(|(p, _)| p.as_str()),
+        pin.as_deref()
+            .or(verify_pair.as_ref().map(|(p, _)| p.as_str())),
         verify_pair.as_ref().map(|(_, m)| m.as_str()),
     ) {
         Ok(reviewer) => reviewer,
@@ -3708,6 +3882,85 @@ mod tests {
         assert!(sys.starts_with("메인"));
         assert!(sys.contains(PLAN_MODE_HEADER));
         assert!(sys.contains("[Self-Harness 계획 지침] 계획 면"));
+    }
+
+    #[test]
+    fn pin_beats_automatic_choice_but_yields_to_explicit_override() {
+        // 고정이 없으면 아무것도 하지 않는다.
+        assert_eq!(decide_pin(None, "anthropic", None, None), PinDecision::Keep);
+        assert_eq!(
+            decide_pin(Some("  "), "anthropic", None, None),
+            PinDecision::Keep
+        );
+
+        // 자동 선택(ranks·manual_*·프로파일 기본)이 고른 프로바이더는 고정에 진다.
+        assert_eq!(
+            decide_pin(Some("minimax"), "anthropic", None, None),
+            PinDecision::Apply("minimax".into())
+        );
+        // sticky 재사용도 "직접 지정"이 아니다 — bind 에는 값이 들어오지만 명시 인자는 비어 있다.
+        assert_eq!(
+            decide_pin(Some("minimax"), "openai", None, None),
+            PinDecision::Apply("minimax".into())
+        );
+
+        // 명시 --provider 는 고정을 이긴다 (경고 한 줄).
+        assert_eq!(
+            decide_pin(Some("minimax"), "anthropic", Some("anthropic"), None),
+            PinDecision::Yield {
+                pin: "minimax".into(),
+                explicit: "provider=anthropic".into()
+            }
+        );
+        // 모델만 직접 고른 경우도 사용자 의지 — 그 모델이 없는 프로바이더로 끌고 가지 않는다.
+        assert_eq!(
+            decide_pin(Some("minimax"), "openai", None, Some("gpt-5")),
+            PinDecision::Yield {
+                pin: "minimax".into(),
+                explicit: "model=gpt-5".into()
+            }
+        );
+
+        // 이미 고정 프로바이더면 명시가 있든 없든 조용히 통과한다.
+        assert_eq!(
+            decide_pin(Some("minimax"), "minimax", None, None),
+            PinDecision::Keep
+        );
+        assert_eq!(
+            decide_pin(
+                Some("minimax"),
+                "MiniMax",
+                Some("minimax"),
+                Some("minimax-m3")
+            ),
+            PinDecision::Keep
+        );
+    }
+
+    #[test]
+    fn pinned_fallback_order_keeps_one_provider() {
+        let order = || {
+            vec![
+                "anthropic".to_string(),
+                "minimax".to_string(),
+                "glm".to_string(),
+            ]
+        };
+        // 고정이면 그 프로바이더 하나만 남는다 (계정 순회는 안쪽이 담당).
+        assert_eq!(
+            limit_order_to_pin(Some("minimax"), None, order()),
+            vec!["minimax".to_string()]
+        );
+        // 고정이 없으면 원래 순서 그대로.
+        assert_eq!(limit_order_to_pin(None, None, order()), order());
+        assert_eq!(limit_order_to_pin(Some(""), None, order()), order());
+        // 명시 --provider 가 있으면 고정을 양보한다.
+        assert_eq!(
+            limit_order_to_pin(Some("minimax"), Some("anthropic"), order()),
+            order()
+        );
+        // 고정 프로바이더가 순서에 없으면(미연결) 가용성을 우선해 원래 순서를 지킨다.
+        assert_eq!(limit_order_to_pin(Some("moonshot"), None, order()), order());
     }
 
     #[test]

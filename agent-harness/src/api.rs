@@ -538,7 +538,7 @@ pub async fn remote_models(provider: &str) -> Result<Vec<String>> {
     auth::list_remote_models(&cfg, provider).await
 }
 
-/// 하네스 엔진 저장 (rafikx | claude | deepseek | qwen | kimi | pi, legacy self).
+/// 하네스 엔진 저장 (rafikx | claude | deepseek | qwen | kimi | pi | minimax, legacy self).
 pub fn set_engine(name: &str) -> Result<String> {
     let cfg = Config::load(None)?;
     set_engine_for(&cfg, name)

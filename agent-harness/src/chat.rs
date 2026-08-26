@@ -1419,6 +1419,15 @@ pub async fn run_turn_observed(
         ov_provider.as_deref(),
         ov_model.as_deref(),
     )?;
+    // 엔진 고정 — sticky 재사용은 "직접 지정"이 아니므로 고정이 이긴다.
+    if let Some(w) = crate::harness::apply_engine_pin(
+        &session.cfg,
+        &mut binding,
+        session.provider.as_deref(),
+        session.model.as_deref(),
+    ) {
+        crate::ui::live_warn(&w);
+    }
     // opencode 스타일 plan 모드 — 하네스 분류·모델 자동선택은 그대로 두고 도구만 제한.
     let plan = session.is_plan_mode();
     if plan {
