@@ -22,13 +22,13 @@ Windows · macOS · Linux. 명령 이름은 `rafikx` 입니다.
 **macOS / Linux**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AIBeginnerX/RafikX/master/install.sh | bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/AIBeginnerX/rafikx/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/AIBeginnerX/RafikX/master/install.ps1 | iex
 ```
 
 설치 후:
@@ -163,7 +163,7 @@ anthropic · openai · gemini · grok(xAI) · openrouter · opencode_zen · open
 ## 개발
 
 ```bash
-git clone https://github.com/AIBeginnerX/rafikx.git
+git clone https://github.com/AIBeginnerX/RafikX.git
 cd rafikx
 cargo test --manifest-path agent-harness/Cargo.toml
 cargo install --path agent-harness --force
