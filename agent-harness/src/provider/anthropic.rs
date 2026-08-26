@@ -39,8 +39,10 @@ impl AnthropicProvider {
     }
 
     fn create(token: String, oauth: bool) -> Result<Self> {
+        // 전체 timeout 은 긴 스트리밍 응답을 도중에 끊는다 — 연결·유휴에만 상한.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(180))
             .build()
             .context("HTTP 클라이언트를 만들 수 없습니다")?;
         Ok(Self {

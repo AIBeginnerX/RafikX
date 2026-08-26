@@ -170,6 +170,7 @@ pub async fn run_agent_with_context(
     let mut call_counts: HashMap<String, u32> = HashMap::new();
     let mut tool_errors: Vec<String> = Vec::new();
     let mut deny_reasons: Vec<String> = Vec::new();
+    let mut truncation_retries = 0u8;
     let max_iter = max_iterations.min(HARD_CAP);
 
     loop {
@@ -325,6 +326,32 @@ pub async fn run_agent_with_context(
                 _ => None,
             })
             .collect();
+
+        // 출력 상한(max_tokens)에서 잘려 도구 호출까지 유실된 응답 — 종료하지 말고
+        // 모델에게 잘렸다는 사실과 분할 전략을 알려준 뒤 같은 런에서 이어간다.
+        if resp.stop_reason == StopReason::MaxTokens
+            && tool_uses.is_empty()
+            && truncation_retries < 2
+        {
+            truncation_retries += 1;
+            if !resp.content.is_empty() {
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: resp.content.clone(),
+                });
+            }
+            messages.push(Message::user_text(
+                "[시스템] 직전 응답이 출력 토큰 상한(max_tokens)에 걸려 중간에 잘렸고, \
+                 잘린 도구 호출은 실행되지 않았다. 같은 내용을 통째로 다시 출력하지 마라. \
+                 큰 파일은 write_file 로 앞부분만 먼저 만들고, 나머지는 edit_file 이나 \
+                 apply_patch 로 여러 번에 나눠 이어 붙여라.",
+            ));
+            crate::ui::live_warn_in(
+                &run_context,
+                "출력이 토큰 상한에서 잘렸습니다 — 분할 지시 후 재시도합니다.",
+            );
+            continue;
+        }
 
         if resp.stop_reason != StopReason::ToolUse && tool_uses.is_empty() {
             messages.push(Message {
@@ -608,6 +635,8 @@ pub async fn run_agent_with_context(
             role: Role::User,
             content: results,
         });
+        // 도구가 실제로 실행된 반복 — 진전이 있었으므로 절단 재시도 카운터를 되돌린다.
+        truncation_retries = 0;
     }
 }
 

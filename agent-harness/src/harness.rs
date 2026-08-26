@@ -1090,11 +1090,13 @@ where
                     }
                     Err(e) => {
                         last_err = Some(e);
-                        if is_retryable(last_err.as_ref().unwrap())
-                            && emitted.load(Ordering::Relaxed) == 0
-                            && attempt < 2
-                        {
+                        if is_retryable(last_err.as_ref().unwrap()) && attempt < 2 {
                             attempt += 1;
+                            if emitted.load(Ordering::Relaxed) > 0 {
+                                // 출력이 이미 나간 뒤의 절단 — 같은 연결로만 다시 시도하고,
+                                // 재출력이 중복으로 보이지 않게 경계 표시를 남긴다.
+                                on_text("\n[연결 끊김 — 같은 연결로 재시도]\n");
+                            }
                             tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt)))
                                 .await;
                             continue;

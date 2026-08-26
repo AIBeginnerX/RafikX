@@ -11,7 +11,7 @@ pub const DEFAULT_CONFIG: &str = r#"# RafikX 설정 — API 키 원문은 여기
 [general]
 default_provider = "minimax"
 workspace = "~/dev/playground"     # 파일/bash 도구 접근 루트 (이 밖은 차단)
-max_tokens = 8192
+max_tokens = 32768                 # 응답 출력 상한 — 큰 단일 파일 생성이 잘리지 않을 크기
 max_context_chars = 200000
 approval = "ask"                   # ask | auto-safe | yolo
 classifier = "rules"               # rules | llm

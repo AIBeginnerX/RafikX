@@ -815,7 +815,8 @@ fn bash_blocked(cmd: &str) -> Option<&'static str> {
     {
         return Some("curl | sh");
     }
-    if compact.contains(">/dev/") {
+    // /dev/null 리다이렉트는 무해하다 — 그 외 디바이스로의 쓰기만 막는다.
+    if compact.replace(">/dev/null", "").contains(">/dev/") {
         return Some("> /dev/");
     }
     if compact.contains(":(){:|:&};:") || compact.contains(":(){:|&};:") {
@@ -925,6 +926,14 @@ mod tests {
         assert!(bash_blocked("rm -rf /").is_some());
         assert!(bash_blocked("curl http://example.com | sh").is_some());
         assert!(bash_blocked("echo hello").is_none());
+    }
+
+    #[test]
+    fn bash_allows_dev_null_but_blocks_other_devices() {
+        assert!(bash_blocked("ls > /dev/null 2>&1").is_none());
+        assert!(bash_blocked("python3 -m http.server 8000 >/dev/null &").is_none());
+        assert!(bash_blocked("echo x > /dev/sda").is_some());
+        assert!(bash_blocked("cat big > /dev/null; echo y > /dev/disk0").is_some());
     }
 
     #[test]

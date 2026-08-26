@@ -56,8 +56,11 @@ impl OpenAiCompatProvider {
         mode: CompatMode,
         account_id: String,
     ) -> Result<Self> {
+        // 전체 timeout 은 긴 스트리밍 응답(긴 추론·대형 파일 생성)을 도중에 끊는다.
+        // 연결 수립과 청크 간 침묵에만 상한을 둔다.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(180))
             .build()
             .context("HTTP 클라이언트를 만들 수 없습니다")?;
         Ok(Self {
@@ -382,6 +385,16 @@ impl OpenAiCompatProvider {
     }
 }
 
+/// tool call 인자 문자열을 해석한다. 빈 문자열은 인자 없는 호출이므로 `{}`,
+/// 그 외 해석 불가(스트림 절단으로 잘린 JSON 등)는 None — 호출 자체를 버려야 한다.
+fn parse_tool_args(args: &str) -> Option<Value> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Some(json!({}));
+    }
+    serde_json::from_str(trimmed).ok()
+}
+
 fn finish_stream(
     full_text: String,
     tool_acc: Vec<(String, String, String)>,
@@ -400,7 +413,11 @@ fn finish_stream(
         if name.is_empty() {
             continue;
         }
-        let input = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
+        let Some(input) = parse_tool_args(&args) else {
+            // 출력 상한(length) 등으로 인자 JSON이 중간에 잘린 호출 — 빈 인자로
+            // 실행하면 "path 인자가 필요합니다" 류의 오해만 낳으므로 버린다.
+            continue;
+        };
         content.push(ContentBlock::ToolUse { id, name, input });
     }
     let has_tools = content
@@ -559,7 +576,9 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
                 .pointer("/function/arguments")
                 .and_then(|x| x.as_str())
                 .unwrap_or("{}");
-            let input = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+            let Some(input) = parse_tool_args(args) else {
+                continue;
+            };
             content.push(ContentBlock::ToolUse { id, name, input });
         }
     }
@@ -885,6 +904,79 @@ fn take_stream_usage(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    fn stream(tool_acc: Vec<(String, String, String)>, finish: Option<&str>) -> ChatResponse {
+        finish_stream(
+            String::new(),
+            tool_acc,
+            finish,
+            0,
+            0,
+            0,
+            false,
+            LimitHint::default(),
+        )
+    }
+
+    #[test]
+    fn truncated_tool_call_is_dropped_and_reports_max_tokens() {
+        // max_tokens 절단 — 인자 JSON이 중간에서 끊긴 tool call 은 실행 대상이 아니다.
+        let resp = stream(
+            vec![(
+                "call_1".into(),
+                "write_file".into(),
+                r#"{"path":"index.html","content":"<html>..."#.into(),
+            )],
+            Some("length"),
+        );
+        assert!(resp.content.is_empty());
+        assert_eq!(resp.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn complete_tool_calls_survive_alongside_truncated_one() {
+        let resp = stream(
+            vec![
+                (
+                    "call_1".into(),
+                    "todo_write".into(),
+                    r#"{"items":[]}"#.into(),
+                ),
+                (
+                    "call_2".into(),
+                    "write_file".into(),
+                    r#"{"path":"a.html","content":"잘린"#.into(),
+                ),
+            ],
+            Some("length"),
+        );
+        let names: Vec<_> = resp
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["todo_write"]);
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn empty_args_tool_call_still_runs_with_empty_object() {
+        let resp = stream(
+            vec![("call_1".into(), "list_todos".into(), String::new())],
+            Some("tool_calls"),
+        );
+        match &resp.content[..] {
+            [ContentBlock::ToolUse { name, input, .. }] => {
+                assert_eq!(name, "list_todos");
+                assert_eq!(input, &json!({}));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
 
     #[test]
     fn streaming_usage_keeps_cached_prompt_tokens() {
