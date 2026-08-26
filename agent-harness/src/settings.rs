@@ -137,7 +137,8 @@ async fn run_quick_setup(mut cfg: Config) -> Result<Config> {
             names.get(n - 1).cloned()
         };
         let Some(name) = picked else { continue };
-        if auth::is_connected(&cfg, &name) && auth::auth_mode(&name, cfg.provider(&name)?) != "none" {
+        if auth::is_connected(&cfg, &name) && auth::auth_mode(&name, cfg.provider(&name)?) != "none"
+        {
             provider_card(&mut cfg, &name).await?;
         } else {
             match auth::connect_provider(&cfg, &name).await {
@@ -188,13 +189,11 @@ fn format_provider_choice(cfg: &Config, name: &str) -> String {
 
 fn pick_any_provider(cfg: &Config) -> Result<Option<String>> {
     let names = auth::menu_provider_names(cfg);
-    let items: Vec<String> = names.iter().map(|n| format_provider_choice(cfg, n)).collect();
-    let choice = menu::prompt_choice(
-        "서비스를 고르세요",
-        &items,
-        false,
-        "이름 또는 번호",
-    )?;
+    let items: Vec<String> = names
+        .iter()
+        .map(|n| format_provider_choice(cfg, n))
+        .collect();
+    let choice = menu::prompt_choice("서비스를 고르세요", &items, false, "이름 또는 번호")?;
     let n = choice.first().copied().unwrap_or(0);
     if n == 0 {
         return Ok(None);
@@ -355,7 +354,9 @@ async fn add_another_account(cfg: &mut Config) -> Result<()> {
     }
     if let Some(name) = names.get(n - 1) {
         match auth::add_account(cfg, name).await {
-            Ok(()) => crate::ui::ok("계정을 추가했습니다. 리밋이 나면 자동으로 이 계정으로 넘어갑니다."),
+            Ok(()) => {
+                crate::ui::ok("계정을 추가했습니다. 리밋이 나면 자동으로 이 계정으로 넘어갑니다.")
+            }
             Err(e) => crate::ui::fail(&format!("{e:#}")),
         }
         *cfg = cfg.reload()?;
@@ -367,15 +368,12 @@ fn disconnect_one_account(cfg: &mut Config) -> Result<()> {
     let mut rows = Vec::new();
     for name in auth::connected_names(cfg) {
         for (a, live, tail) in auth::list_account_rows(cfg, &name) {
-            let mark = if auth::account_has_stored_credential(cfg, &a.provider, &a.id).unwrap_or(false) {
-                if live {
-                    "연결"
+            let mark =
+                if auth::account_has_stored_credential(cfg, &a.provider, &a.id).unwrap_or(false) {
+                    if live { "연결" } else { "만료" }
                 } else {
-                    "만료"
-                }
-            } else {
-                "미연결"
-            };
+                    "미연결"
+                };
             rows.push((
                 a.id.clone(),
                 format!("{}  [{mark} ****{tail}]", crate::accounts::display(&a)),
@@ -430,7 +428,9 @@ fn pause_menu(cfg: &mut Config) -> Result<()> {
         if n == 0 {
             continue;
         }
-        let Some(name) = names.get(n - 1) else { continue };
+        let Some(name) = names.get(n - 1) else {
+            continue;
+        };
         let next = !auth::is_enabled(cfg, name);
         auth::set_provider_enabled(cfg, name, next)?;
     }
@@ -510,7 +510,12 @@ async fn menu_models(cfg: &mut Config) -> Result<()> {
         .iter()
         .map(|n| crate::accounts_ui::manage_row(cfg, n))
         .collect();
-    let choice = menu::prompt_choice("모델을 고를 서비스:", &items, false, "연결 전이어도 기본 모델을 바꿀 수 있습니다.")?;
+    let choice = menu::prompt_choice(
+        "모델을 고를 서비스:",
+        &items,
+        false,
+        "연결 전이어도 기본 모델을 바꿀 수 있습니다.",
+    )?;
     let n = choice.first().copied().unwrap_or(0);
     if n == 0 {
         return Ok(());
@@ -555,7 +560,12 @@ fn menu_harness(cfg: &mut Config) -> Result<()> {
 fn registered_choices(cfg: &Config) -> Vec<(String, String)> {
     auth::registered_models(cfg)
         .into_iter()
-        .map(|r| (format!("{}:{}", r.provider, r.id), format!("{} / {}", r.provider, r.id)))
+        .map(|r| {
+            (
+                format!("{}:{}", r.provider, r.id),
+                format!("{} / {}", r.provider, r.id),
+            )
+        })
         .collect()
 }
 
@@ -599,7 +609,11 @@ fn menu_telegram(cfg: &mut Config) -> Result<()> {
             tg.allowed_user_ids
         );
         let items = vec![
-            if tg.enabled { "끄기".into() } else { "켜기".into() },
+            if tg.enabled {
+                "끄기".into()
+            } else {
+                "켜기".into()
+            },
             "봇 토큰 붙여넣기".into(),
             if tg.allow_agent {
                 "원격 에이전트 끄기".into()
@@ -612,7 +626,11 @@ fn menu_telegram(cfg: &mut Config) -> Result<()> {
         match choice.first().copied().unwrap_or(0) {
             0 => return Ok(()),
             1 => {
-                let v = if cfg.file.telegram.enabled { "false" } else { "true" };
+                let v = if cfg.file.telegram.enabled {
+                    "false"
+                } else {
+                    "true"
+                };
                 config::write_toml_key(&cfg.path, "[telegram]", "enabled", v)?;
             }
             2 => {
@@ -648,7 +666,10 @@ fn menu_telegram(cfg: &mut Config) -> Result<()> {
                     } else {
                         let arr = format!(
                             "[{}]",
-                            ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+                            ids.iter()
+                                .map(|i| i.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
                         config::write_toml_key(&cfg.path, "[telegram]", "allowed_user_ids", &arr)?;
                     }
@@ -665,14 +686,22 @@ fn menu_obsidian(cfg: &mut Config) -> Result<()> {
         let ob = &cfg.file.obsidian;
         let extra = format!("enabled={}  vault={}", ob.enabled, ob.vault_path);
         let items = vec![
-            if ob.enabled { "끄기".into() } else { "켜기".into() },
+            if ob.enabled {
+                "끄기".into()
+            } else {
+                "켜기".into()
+            },
             "Vault 경로 붙여넣기".into(),
         ];
         let choice = menu::prompt_choice("옵시디언", &items, false, &extra)?;
         match choice.first().copied().unwrap_or(0) {
             0 => return Ok(()),
             1 => {
-                let v = if cfg.file.obsidian.enabled { "false" } else { "true" };
+                let v = if cfg.file.obsidian.enabled {
+                    "false"
+                } else {
+                    "true"
+                };
                 config::write_toml_key(&cfg.path, "[obsidian]", "enabled", v)?;
             }
             2 => {
@@ -696,7 +725,12 @@ fn menu_obsidian(cfg: &mut Config) -> Result<()> {
 async fn menu_ranks() -> Result<()> {
     println!("{}", ranks::status_line());
     let items = vec!["지금 갱신".into()];
-    let choice = menu::prompt_choice("모델 순위", &items, false, "인터넷이 없으면 번들 표를 유지합니다.")?;
+    let choice = menu::prompt_choice(
+        "모델 순위",
+        &items,
+        false,
+        "인터넷이 없으면 번들 표를 유지합니다.",
+    )?;
     if choice.first() == Some(&1) {
         match ranks::refresh(true).await {
             Ok(msg) => println!("{msg}"),

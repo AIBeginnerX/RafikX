@@ -411,7 +411,7 @@ async fn connect_frontier(name: &str, account_id: &str) -> Result<()> {
         return Err(anyhow!("잘못된 번호입니다"));
     };
     match action {
-        "import" => import_official_cli(name, account_id),
+        "import" => import_official_cli(name, account_id, true),
         "oauth" => match name {
             "anthropic" => oauth_anthropic(account_id).await,
             "openai" => oauth_openai(account_id).await,
@@ -431,7 +431,7 @@ async fn connect_frontier(name: &str, account_id: &str) -> Result<()> {
         }
         "cli" => {
             run_official_login(name)?;
-            import_official_cli(name, account_id)
+            import_official_cli(name, account_id, true)
         }
         _ => Err(anyhow!("알 수 없는 연결 방법")),
     }
@@ -524,7 +524,11 @@ pub fn maintain_accounts(cfg: &Config) -> Result<Vec<String>> {
     Ok(notes)
 }
 
-pub fn account_has_stored_credential(cfg: &Config, provider: &str, account_id: &str) -> Result<bool> {
+pub fn account_has_stored_credential(
+    cfg: &Config,
+    provider: &str,
+    account_id: &str,
+) -> Result<bool> {
     let p = cfg.provider(provider)?;
     if let Some(set) = load_token_set(account_id)? {
         if !set.access_token.is_empty() {
@@ -551,7 +555,11 @@ pub fn account_has_stored_credential(cfg: &Config, provider: &str, account_id: &
     Ok(false)
 }
 
-fn duplicate_account_for(_cfg: &Config, provider: &str, account_id: &str) -> Result<Option<String>> {
+fn duplicate_account_for(
+    _cfg: &Config,
+    provider: &str,
+    account_id: &str,
+) -> Result<Option<String>> {
     let Some(set) = load_token_set(account_id)? else {
         return Ok(None);
     };
@@ -603,10 +611,7 @@ fn dedupe_oauth_accounts(cfg: &Config) -> Result<Vec<String>> {
             }
             if let Some(first) = seen.get(&set.access_token) {
                 let _ = disconnect_account(&a.id);
-                notes.push(format!(
-                    "같은 로그인 중복 '{}' → '{}' 만 유지",
-                    a.id, first
-                ));
+                notes.push(format!("같은 로그인 중복 '{}' → '{}' 만 유지", a.id, first));
             } else {
                 seen.insert(set.access_token.clone(), a.id.clone());
             }
@@ -662,9 +667,7 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
                     ),
                     None => "https://api.anthropic.com/v1/models?limit=1000".to_string(),
                 };
-                let mut req = client
-                    .get(&url)
-                    .header("anthropic-version", "2023-06-01");
+                let mut req = client.get(&url).header("anthropic-version", "2023-06-01");
                 req = apply_anthropic_cred(req, &c);
                 let resp = req.send().await?;
                 let status = resp.status();
@@ -675,10 +678,7 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
                 if let Ok(mut part) = parse_id_list(&v) {
                     ids.append(&mut part);
                 }
-                let has_more = v
-                    .get("has_more")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(false);
+                let has_more = v.get("has_more").and_then(|x| x.as_bool()).unwrap_or(false);
                 next_page = v
                     .get("next_page")
                     .and_then(|x| x.as_str())
@@ -817,7 +817,9 @@ async fn oauth_openai(account_id: &str) -> Result<()> {
     let listener = bind_localhost(OPENAI_CALLBACK_PORT, "OpenAI Codex")?;
     let url = openai_authorize_url(&pkce.challenge, &state);
     println!("브라우저에서 ChatGPT 계정으로 로그인하세요.");
-    println!("로그인 창이 '필수 매개변수가 없습니다' 라고 하면, 아래 주소 전체를 주소창에 붙이세요.");
+    println!(
+        "로그인 창이 '필수 매개변수가 없습니다' 라고 하면, 아래 주소 전체를 주소창에 붙이세요."
+    );
     open_browser(&url)?;
     let cb = wait_for_callback(listener, Duration::from_secs(180))?;
     if !cb.state.is_empty() && cb.state != state {
@@ -899,7 +901,9 @@ fn bind_localhost(port: u16, who: &str) -> Result<TcpListener> {
 
 async fn connect_grok_key(account_id: &str) -> Result<()> {
     println!("xAI Grok API는 공개 OAuth가 없어, 콘솔에서 키를 받아 연결합니다.");
-    println!("브라우저에서 키를 만든 뒤 붙여넣으세요. 키는 config가 아니라 비밀 파일에만 저장됩니다.");
+    println!(
+        "브라우저에서 키를 만든 뒤 붙여넣으세요. 키는 config가 아니라 비밀 파일에만 저장됩니다."
+    );
     let _ = open_browser("https://console.x.ai");
     prompt_and_save_key(account_id, "XAI_API_KEY")
 }
@@ -975,7 +979,10 @@ async fn save_token_response(name: &str, resp: reqwest::Response) -> Result<()> 
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let snippet: String = text.chars().take(240).collect();
-        return Err(anyhow!("{name} 토큰 교환 실패 HTTP {}: {snippet}", status.as_u16()));
+        return Err(anyhow!(
+            "{name} 토큰 교환 실패 HTTP {}: {snippet}",
+            status.as_u16()
+        ));
     }
     let v: serde_json::Value =
         serde_json::from_str(&text).context("토큰 응답이 JSON이 아닙니다")?;
@@ -990,7 +997,11 @@ async fn save_token_response(name: &str, resp: reqwest::Response) -> Result<()> 
         .to_string();
     let expires_in = v.get("expires_in").and_then(|x| x.as_i64()).unwrap_or(3600);
     let id_token = v.get("id_token").and_then(|x| x.as_str());
-    let account = chatgpt_account_id(access, id_token, v.get("account_id").and_then(|x| x.as_str()));
+    let account = chatgpt_account_id(
+        access,
+        id_token,
+        v.get("account_id").and_then(|x| x.as_str()),
+    );
     let now = now_secs();
     save_tokens(
         name,
@@ -1001,10 +1012,7 @@ async fn save_token_response(name: &str, resp: reqwest::Response) -> Result<()> 
             account_id: account,
         },
     )?;
-    println!(
-        "{name} OAuth 연결 완료 (****{})",
-        tail4(access)
-    );
+    println!("{name} OAuth 연결 완료 (****{})", tail4(access));
     Ok(())
 }
 
@@ -1150,7 +1158,11 @@ async fn refresh_token(name: &str, set: &TokenSet) -> Result<Option<TokenSet>> {
         .to_string();
     let expires_in = v.get("expires_in").and_then(|x| x.as_i64()).unwrap_or(3600);
     let id_token = v.get("id_token").and_then(|x| x.as_str());
-    let mut account = chatgpt_account_id(access, id_token, v.get("account_id").and_then(|x| x.as_str()));
+    let mut account = chatgpt_account_id(
+        access,
+        id_token,
+        v.get("account_id").and_then(|x| x.as_str()),
+    );
     if account.is_empty() {
         account = set.account_id.clone();
     }
@@ -1353,7 +1365,10 @@ mod win_open {
     }
 
     fn wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     pub fn open(path_or_url: &str) -> bool {
@@ -1408,10 +1423,7 @@ fn random_bytes(n: usize) -> Vec<u8> {
 }
 
 fn random_hex(n: usize) -> String {
-    random_bytes(n)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    random_bytes(n).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn b64url(data: &[u8]) -> String {
@@ -1534,10 +1546,7 @@ pub fn has_cloud_credential(cfg: &Config) -> bool {
         if auth_mode(name, p) == "none" {
             return false;
         }
-        resolve_credential(cfg, name)
-            .ok()
-            .flatten()
-            .is_some()
+        resolve_credential(cfg, name).ok().flatten().is_some()
     })
 }
 
@@ -1676,7 +1685,10 @@ pub fn registered_models(cfg: &Config) -> Vec<RegisteredModel> {
         let small = p.small_model.clone().unwrap_or_default();
         for id in catalog_models(cfg, &name) {
             let is_small = !small.is_empty() && (id == small || crate::ranks::is_cheap_id(&id));
-            if !out.iter().any(|r: &RegisteredModel| r.provider == name && r.id == id) {
+            if !out
+                .iter()
+                .any(|r: &RegisteredModel| r.provider == name && r.id == id)
+            {
                 out.push(RegisteredModel {
                     provider: name.clone(),
                     id,
@@ -1719,7 +1731,10 @@ pub fn account_connected(cfg: &Config, provider: &str, account_id: &str) -> bool
         .is_some()
 }
 
-pub fn list_account_rows(cfg: &Config, provider: &str) -> Vec<(crate::accounts::Account, bool, String)> {
+pub fn list_account_rows(
+    cfg: &Config,
+    provider: &str,
+) -> Vec<(crate::accounts::Account, bool, String)> {
     let _ = seed_legacy_account(cfg, provider);
     crate::accounts::for_provider(provider)
         .into_iter()
@@ -1899,7 +1914,7 @@ pub fn auto_import_cli_logins(cfg: &Config) -> Vec<String> {
         if !cli_import_available(name) {
             continue;
         }
-        match import_official_cli(name, name) {
+        match import_official_cli(name, name, false) {
             Ok(_) => notes.push(format!(
                 "{}: 로컬 로그인 정보를 {} 에서 자동으로 가져왔습니다.",
                 provider_label(name),
@@ -1911,7 +1926,7 @@ pub fn auto_import_cli_logins(cfg: &Config) -> Vec<String> {
     notes
 }
 
-fn import_official_cli(name: &str, account_id: &str) -> Result<()> {
+fn import_official_cli(name: &str, account_id: &str, announce: bool) -> Result<()> {
     let paths = cli_credential_paths(name);
     for path in &paths {
         if !path.exists() {
@@ -1923,11 +1938,13 @@ fn import_official_cli(name: &str, account_id: &str) -> Result<()> {
             .with_context(|| format!("{} 이 JSON이 아닙니다", path.display()))?;
         if let Some(set) = parse_cli_tokens(name, &v) {
             save_tokens(account_id, set)?;
-            println!(
-                "{} 에서 가져왔습니다: {}",
-                official_cli_label(name),
-                path.display()
-            );
+            if announce {
+                crate::ui::note(&format!(
+                    "{} 에서 가져왔습니다: {}",
+                    official_cli_label(name),
+                    path.display()
+                ));
+            }
             return Ok(());
         }
     }
@@ -2103,7 +2120,11 @@ mod tests {
     fn pkce_challenge_is_base64url() {
         let p = generate_pkce();
         assert!(p.verifier.len() >= 32);
-        assert!(p.challenge.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(
+            p.challenge
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
         assert!(!p.challenge.contains('='));
     }
 

@@ -1,23 +1,25 @@
 mod md;
+mod start;
 mod view;
 
-use std::io::{stdout, Write};
-use std::sync::Arc;
+use std::io::{Write, stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, EventStream, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use futures_util::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{ApprovalChoice, LocalAsk};
@@ -26,7 +28,6 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::provider::{ContentBlock, Message, Role};
 use crate::ui::{self, Live};
-
 
 pub struct App {
     session: Session,
@@ -67,6 +68,11 @@ pub struct App {
     final_summary: bool,
     /// 현재 실행 중인 턴의 핸들 — Esc 인터럽트용
     pub turn_handle: Option<tokio::task::JoinHandle<()>>,
+    pub active_run: Arc<Mutex<Option<crate::run::RunContext>>>,
+    pub cancel_requested: Arc<AtomicBool>,
+    pub lifecycle_state: Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
+    pub show_start: bool,
+    pub motion_tick: u16,
     /// 새 릴리스 태그 — 있으면 U 키로 업그레이드 진행 가능
     pub upgrade: Option<String>,
     /// 업그레이드 진행 중 플래그
@@ -198,6 +204,8 @@ pub async fn run(
 
     let session = chat::open_session(cfg, yes, provider, model, class, resume, false)?;
     let cwd = session.cfg.workspace.display().to_string();
+    let show_start = session.messages.is_empty();
+    let reduced_motion = start::terminal_reduced_motion(&session);
     let mut app = App {
         transcript: hydrate(&session.messages),
         binding: binding_label(&session),
@@ -229,6 +237,11 @@ pub async fn run(
         agents: Vec::new(),
         final_summary: false,
         turn_handle: None,
+        active_run: Arc::new(Mutex::new(None)),
+        cancel_requested: Arc::new(AtomicBool::new(false)),
+        lifecycle_state: Arc::new(Mutex::new(None)),
+        show_start,
+        motion_tick: if reduced_motion { 16 } else { 0 },
         upgrade: None,
         upgrading: false,
     };
@@ -260,7 +273,8 @@ pub async fn run(
         let _ = live_tx.send(ev);
     })));
 
-    let (ask_tx, mut ask_rx) = mpsc::unbounded_channel::<(String, oneshot::Sender<ApprovalChoice>)>();
+    let (ask_tx, mut ask_rx) =
+        mpsc::unbounded_channel::<(String, oneshot::Sender<ApprovalChoice>)>();
     let local_ask: LocalAsk = {
         let ask_tx = ask_tx.clone();
         Arc::new(move |preview: String| {
@@ -277,8 +291,7 @@ pub async fn run(
 
     enable_raw_mode().context("raw mode")?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)
-    .context("alternate screen")?;
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste).context("alternate screen")?;
     // Kitty 키보드 프로토콜 — 지원 터미널(Ghostty·Kitty·WezTerm 등)에서
     // Shift+Enter·Ctrl+Enter 같은 변형키 조합을 정확한 이벤트로 받는다.
     // 미지원 터미널은 기존 xterm 이스케이프로 폴백한다.
@@ -353,7 +366,11 @@ pub async fn run(
             _ = tick.tick() => {
                 // 스피너가 돌 때만 주기 리드로우 — 유휴 상태에서는 이벤트가
                 // 있을 때만 그린다 (초당 12.5회 무조건 리드로우 제거).
-                if app.busy || app.upgrading {
+                if app.show_start && app.motion_tick < 16 {
+                    app.motion_tick += 1;
+                    dirty = true;
+                } else if app.busy || app.upgrading {
+                    app.motion_tick = app.motion_tick.wrapping_add(1);
                     dirty = true;
                 }
             }
@@ -439,18 +456,19 @@ fn handle_key(
     if let Some(mut prompt) = app.approval.take() {
         // 방향키(←/→)로 선택을 옮기고 Enter 로 확정한다 — 현재 선택은 푸터에
         // ▸ 하이라이트로 보인다. y/n/a 단축키와 Esc(=No)도 그대로 동작한다.
-        let confirm = |app: &mut App, choice: ApprovalChoice, tx: oneshot::Sender<ApprovalChoice>| {
-            if choice == ApprovalChoice::Always {
-                // Always 는 이번 턴이 아니라 세션 전체에 적용한다.
-                app.session.yes = true;
-                push(
-                    app,
-                    EntryKind::System,
-                    "이 세션의 도구 실행을 모두 자동 승인합니다. (/new 로 해제)",
-                );
-            }
-            let _ = tx.send(choice);
-        };
+        let confirm =
+            |app: &mut App, choice: ApprovalChoice, tx: oneshot::Sender<ApprovalChoice>| {
+                if choice == ApprovalChoice::Always {
+                    // Always 는 이번 턴이 아니라 세션 전체에 적용한다.
+                    app.session.yes = true;
+                    push(
+                        app,
+                        EntryKind::System,
+                        "이 세션의 도구 실행을 모두 자동 승인합니다. (/new 로 해제)",
+                    );
+                }
+                let _ = tx.send(choice);
+            };
         match k.code {
             KeyCode::Left => {
                 prompt.selected = prompt.selected.saturating_sub(1);
@@ -697,19 +715,23 @@ fn handle_key(
             if app.help {
                 app.help = false;
             } else if app.busy {
-                // opencode 스타일 interrupt — 실행 중 Esc 한 번으로 생성을 중단한다.
-                if let Some(h) = app.turn_handle.take() {
-                    h.abort();
+                app.cancel_requested.store(true, Ordering::Release);
+                if let Ok(active) = app.active_run.lock()
+                    && let Some(run) = active.as_ref()
+                {
+                    run.cancel("TUI Esc");
                 }
-                app.busy = false;
-                app.streaming = false;
-                app.status = "중단됨".into();
-                push(app, EntryKind::Warn, "응답을 중단했습니다. (Esc)");
+                app.status = "취소 요청 중…".into();
+                push(app, EntryKind::Warn, "실행 취소를 요청했습니다. (Esc)");
             }
         }
         KeyCode::Tab | KeyCode::BackTab => {
             // opencode 스타일 — Tab 으로 plan/build 하네스 모드를 전환한다.
-            let next = if app.session.is_plan_mode() { "build" } else { "plan" };
+            let next = if app.session.is_plan_mode() {
+                "build"
+            } else {
+                "plan"
+            };
             app.session.mode = next.to_string();
             app.binding = binding_label(&app.session);
             app.status = format!("모드: {next}");
@@ -765,10 +787,6 @@ fn handle_key(
         _ => {}
     }
 }
-
-
-
-
 
 fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<TurnDone>) {
     let line = app.input.trim().to_string();
@@ -890,6 +908,7 @@ fn start_turn(
     done_tx: &mpsc::UnboundedSender<TurnDone>,
 ) {
     app.final_summary = false;
+    app.show_start = false;
     promote_queued(app, &prompt);
     // 이번 턴의 시작 지점 — 종료 시 이 이후의 작업 노이즈만 접는다.
     app.turn_start = app.transcript.len();
@@ -897,17 +916,51 @@ fn start_turn(
     app.streaming = false;
     app.status = "실행 중…".into();
     app.binding = binding_label(&app.session);
+    app.cancel_requested.store(false, Ordering::Release);
+    if let Ok(mut active) = app.active_run.lock() {
+        *active = None;
+    }
+    if let Ok(mut state) = app.lifecycle_state.lock() {
+        *state = None;
+    }
 
     let mut session = app.session.clone();
     let local_ask = local_ask.clone();
     let done_tx = done_tx.clone();
+    let active_run = Arc::clone(&app.active_run);
+    let cancel_requested = Arc::clone(&app.cancel_requested);
+    let lifecycle_state = Arc::clone(&app.lifecycle_state);
+    let observer: chat::RunObserver = Arc::new(move |run| {
+        if cancel_requested.load(Ordering::Acquire) {
+            run.cancel("TUI Esc");
+        }
+        if let Ok(mut active) = active_run.lock() {
+            *active = Some(run.clone());
+        }
+        let mut events = run.subscribe_lifecycle();
+        let state = Arc::clone(&lifecycle_state);
+        if let Ok(mut current) = state.lock() {
+            *current = run.lifecycle_state();
+        }
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                if let Ok(mut current) = state.lock() {
+                    *current = Some(event.state);
+                }
+                if event.state.is_terminal() {
+                    break;
+                }
+            }
+        });
+    });
     let handle = tokio::spawn(async move {
-        let result = chat::run_turn(
+        let result = chat::run_turn_observed(
             &mut session,
             &prompt,
             class.as_deref(),
             obsidian,
             Some(local_ask),
+            Some(observer),
         )
         .await;
         let _ = done_tx.send(TurnDone { result, session });
@@ -937,15 +990,16 @@ fn finish_turn(
     app.busy = false;
     app.streaming = false;
     app.turn_handle = None;
+    if let Ok(mut active) = app.active_run.lock() {
+        *active = None;
+    }
+    app.cancel_requested.store(false, Ordering::Release);
     app.session = done.session;
     app.binding = binding_label(&app.session);
     match done.result {
         Ok(info) => {
             let secs = info.elapsed_ms as f64 / 1000.0;
-            app.status = format!(
-                "{}  {}  ·  {:.1}s",
-                info.status, info.label, secs
-            );
+            app.status = format!("{}  {}  ·  {:.1}s", info.status, info.label, secs);
             let fmt_k = |n: u32| -> String {
                 if n >= 1_000_000 {
                     format!("{:.0}M", n as f64 / 1e6)
@@ -963,8 +1017,7 @@ fn finish_turn(
                     .saturating_mul(100)
                     .checked_div(info.ctx_window)
                     .unwrap_or(0);
-                let cache =
-                    cache_usage_label(info.cached_in, info.ctx_used, info.cache_reported);
+                let cache = cache_usage_label(info.cached_in, info.ctx_used, info.cache_reported);
                 app.ctx = format!(
                     "ctx {}/{} ({}%) · {} · compact auto · mem {}",
                     fmt_k(info.ctx_used),
@@ -978,12 +1031,7 @@ fn finish_turn(
             }
             if !info.run_id.is_empty() {
                 let summary = completion_report(&info);
-                collapse_turn_noise(
-                    &mut app.transcript,
-                    app.turn_start,
-                    info.answer,
-                    summary,
-                );
+                collapse_turn_noise(&mut app.transcript, app.turn_start, info.answer, summary);
                 app.todos.clear();
                 app.agents.clear();
                 // 최신 결과(맨 아래)를 따라간다 — 예전 scroll=MAX·follow=false 는
@@ -1031,10 +1079,7 @@ fn collapse_turn_noise(
     });
 }
 
-fn start_compact(
-    app: &mut App,
-    done_tx: &mpsc::UnboundedSender<TurnDone>,
-) {
+fn start_compact(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>) {
     if app.busy {
         return;
     }
@@ -1060,6 +1105,9 @@ fn start_compact(
                     elapsed_ms: 0,
                     answer: String::new(),
                     summary: chat::CompletionSummary::default(),
+                    lifecycle_state: None,
+                    lifecycle: Vec::new(),
+                    context_sources: Vec::new(),
                 })
             }
             Err(e) => Err(e),
@@ -1070,14 +1118,15 @@ fn start_compact(
 
 /// /engine multi — 등록 연결의 모델을 원격 조회해 역할별로 자동 배정한다.
 /// 네트워크 조회가 껴 있어 start_compact 와 같은 백그라운드 턴으로 돈다.
-fn start_assign(
-    app: &mut App,
-    done_tx: &mpsc::UnboundedSender<TurnDone>,
-) {
+fn start_assign(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>) {
     if app.busy {
         return;
     }
-    push(app, EntryKind::System, "Provider 모델을 조회해 역할별로 배정하는 중…");
+    push(
+        app,
+        EntryKind::System,
+        "Provider 모델을 조회해 역할별로 배정하는 중…",
+    );
     app.busy = true;
     app.status = "역할 배정 중…".into();
     let mut session = app.session.clone();
@@ -1105,6 +1154,9 @@ fn start_assign(
                     elapsed_ms: 0,
                     answer: String::new(),
                     summary: chat::CompletionSummary::default(),
+                    lifecycle_state: None,
+                    lifecycle: Vec::new(),
+                    context_sources: Vec::new(),
                 })
             }
             Err(e) => Err(e),
@@ -1125,8 +1177,7 @@ fn apply_live(app: &mut App, ev: Live) {
     match ev {
         Live::Chunk(s) => {
             // 큐잉 엔트리 등이 사이에 끼어도 유실되지 않게, 붙일 곳이 없으면 새 답변을 연다.
-            if !app.streaming
-                || app.transcript.last().map(|e| e.kind) != Some(EntryKind::Assistant)
+            if !app.streaming || app.transcript.last().map(|e| e.kind) != Some(EntryKind::Assistant)
             {
                 app.transcript.push(Entry {
                     kind: EntryKind::Assistant,
@@ -1157,7 +1208,11 @@ fn apply_live(app: &mut App, ev: Live) {
         Live::System(s) => {
             if let Some(tag) = s.strip_prefix("[upgrade-ok]") {
                 app.upgrade = None;
-                push(app, EntryKind::System, format!("{tag} 설치 완료 — rafikx 를 다시 실행하면 새 버전으로 시작됩니다."));
+                push(
+                    app,
+                    EntryKind::System,
+                    format!("{tag} 설치 완료 — rafikx 를 다시 실행하면 새 버전으로 시작됩니다."),
+                );
                 return;
             }
             if s == "[upgrade-done]" {
@@ -1186,11 +1241,8 @@ fn apply_live(app: &mut App, ev: Live) {
                             n.to_string()
                         }
                     };
-                    app.tokens = format!(
-                        "{}/{}",
-                        fmt_k(metrics.total_in),
-                        fmt_k(metrics.total_out)
-                    );
+                    app.tokens =
+                        format!("{}/{}", fmt_k(metrics.total_in), fmt_k(metrics.total_out));
                     let win = crate::harness::current_ctx_window();
                     if win > 0 {
                         let pct = metrics
@@ -1365,10 +1417,30 @@ fn push(app: &mut App, kind: EntryKind, text: impl Into<String>) {
 }
 
 fn binding_label(session: &Session) -> String {
-    let model = session.model.as_deref().unwrap_or("auto");
-    let provider = session.provider.as_deref().unwrap_or("auto");
+    let sticky = session.sticky.as_ref();
+    let provider = session
+        .provider
+        .as_deref()
+        .or_else(|| sticky.map(|(provider, _)| provider.as_str()))
+        .unwrap_or(session.cfg.file.general.default_provider.as_str());
+    let model = session
+        .model
+        .as_deref()
+        .or_else(|| sticky.map(|(_, model)| model.as_str()))
+        .or_else(|| {
+            session
+                .cfg
+                .provider(provider)
+                .ok()
+                .map(|config| config.model.as_str())
+        })
+        .unwrap_or("unconfigured");
     let class = session.class.as_deref().unwrap_or("auto");
-    let mode = if session.is_plan_mode() { "plan" } else { "build" };
+    let mode = if session.is_plan_mode() {
+        "plan"
+    } else {
+        "build"
+    };
     format!("{provider} · {model} · {class} · {mode}")
 }
 
@@ -1391,8 +1463,14 @@ fn hydrate(messages: &[Message]) -> Vec<Entry> {
             match b {
                 ContentBlock::Text { text } if !text.trim().is_empty() => texts.push(text.clone()),
                 ContentBlock::ToolUse { name, .. } => tools.push(format!("[도구] {name}")),
-                ContentBlock::ToolResult { content, is_error, .. } => {
-                    let tag = if *is_error { "도구 오류" } else { "도구 결과" };
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let tag = if *is_error {
+                        "도구 오류"
+                    } else {
+                        "도구 결과"
+                    };
                     tools.push(format!("{tag}: {}", truncate(content, 400)));
                 }
                 _ => {}
@@ -1473,11 +1551,19 @@ fn delete(app: &mut App) {
 }
 
 fn prev_idx(s: &str, i: usize) -> usize {
-    s[..i].chars().next_back().map(|c| i - c.len_utf8()).unwrap_or(0)
+    s[..i]
+        .chars()
+        .next_back()
+        .map(|c| i - c.len_utf8())
+        .unwrap_or(0)
 }
 
 fn next_idx(s: &str, i: usize) -> usize {
-    s[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(s.len())
+    s[i..]
+        .chars()
+        .next()
+        .map(|c| i + c.len_utf8())
+        .unwrap_or(s.len())
 }
 
 fn history_prev(app: &mut App) {
@@ -1524,7 +1610,11 @@ fn start_upgrade(app: &mut App) {
     crate::update::request_update();
     app.quit = true;
     app.status = "종료 후 업데이트를 실행합니다…".into();
-    push(app, EntryKind::System, "에이전트를 종료하고 업데이트를 실행합니다. 곧 화면이 전환됩니다.");
+    push(
+        app,
+        EntryKind::System,
+        "에이전트를 종료하고 업데이트를 실행합니다. 곧 화면이 전환됩니다.",
+    );
 }
 
 fn open_model_picker(app: &mut App) {
@@ -1607,9 +1697,19 @@ fn resume_goal(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSen
     push(
         app,
         EntryKind::System,
-        format!("목표 재개: {} (Todo {}/{})", goal.objective, goal.completed, goal.total),
+        format!(
+            "목표 재개: {} (Todo {}/{})",
+            goal.objective, goal.completed, goal.total
+        ),
     );
-    start_turn(app, goal.objective, Some("dev".into()), false, local_ask, done_tx);
+    start_turn(
+        app,
+        goal.objective,
+        Some("dev".into()),
+        false,
+        local_ask,
+        done_tx,
+    );
 }
 
 /// /goal clear — 활성 목표 해제 (Esc 중단으로 active 가 고착된 경우 포함).
@@ -1652,12 +1752,7 @@ fn open_action_picker(app: &mut App, name: &str) {
         "기본값으로 설정".into(),
         "기본 모델 바꾸기".into(),
     ];
-    let mut ids = vec![
-        "key".into(),
-        "use".into(),
-        "default".into(),
-        "model".into(),
-    ];
+    let mut ids = vec!["key".into(), "use".into(), "default".into(), "model".into()];
     if app
         .session
         .cfg
@@ -1685,9 +1780,11 @@ fn start_connect(app: &mut App, raw: &str) {
     let alias = crate::auth::resolve_provider_alias(raw).unwrap_or_else(|| raw.trim().to_string());
     let names = crate::auth::menu_provider_names(&app.session.cfg);
     let Some(name) = names.iter().find(|n| *n == &alias).cloned().or_else(|| {
-        names
-            .into_iter()
-            .find(|n| crate::auth::provider_label(n).to_lowercase().contains(&raw.to_lowercase()))
+        names.into_iter().find(|n| {
+            crate::auth::provider_label(n)
+                .to_lowercase()
+                .contains(&raw.to_lowercase())
+        })
     }) else {
         push(
             app,
@@ -1726,11 +1823,7 @@ fn apply_picker(app: &mut App, picker: Picker) {
                         &r.provider,
                         &r.id,
                     );
-                    crate::chat::persist_last_choice(
-                        &app.session.cfg.clone(),
-                        &r.provider,
-                        &r.id,
-                    );
+                    crate::chat::persist_last_choice(&app.session.cfg.clone(), &r.provider, &r.id);
                     push(
                         app,
                         EntryKind::System,
@@ -1758,30 +1851,33 @@ fn apply_picker(app: &mut App, picker: Picker) {
                 return;
             };
             match db.load_session(&id) {
-                Ok(Some(row)) => {
-                    match serde_json::from_str::<Vec<Message>>(&row.messages_json) {
-                        Ok(mut messages) => {
-                            crate::agent::sanitize_tool_pairs(&mut messages);
-                            app.session.messages = messages;
-                            app.session.session_id = Some(row.id.clone());
-                            app.session.dirty = false;
-                            app.session.attachments.clear();
-                            app.transcript.clear();
-                            app.turn_start = 0;
-                            push(
-                                app,
-                                EntryKind::System,
-                                format!(
-                                    "세션 재개: {}  ({})",
-                                    row.id,
-                                    row.title.unwrap_or_else(|| "(제목 없음)".into())
-                                ),
-                            );
-                        }
-                        Err(_) => push(app, EntryKind::Warn, "세션 메시지를 읽지 못했습니다."),
+                Ok(Some(row)) => match serde_json::from_str::<Vec<Message>>(&row.messages_json) {
+                    Ok(mut messages) => {
+                        crate::agent::sanitize_tool_pairs(&mut messages);
+                        app.session.messages = messages;
+                        app.session.session_id = Some(row.id.clone());
+                        app.session.dirty = false;
+                        app.session.attachments.clear();
+                        app.transcript.clear();
+                        app.show_start = false;
+                        app.turn_start = 0;
+                        push(
+                            app,
+                            EntryKind::System,
+                            format!(
+                                "세션 재개: {}  ({})",
+                                row.id,
+                                row.title.unwrap_or_else(|| "(제목 없음)".into())
+                            ),
+                        );
                     }
-                }
-                _ => push(app, EntryKind::Warn, format!("세션 '{id}' 를 찾지 못했습니다.")),
+                    Err(_) => push(app, EntryKind::Warn, "세션 메시지를 읽지 못했습니다."),
+                },
+                _ => push(
+                    app,
+                    EntryKind::Warn,
+                    format!("세션 '{id}' 를 찾지 못했습니다."),
+                ),
             }
         }
         PickerKind::Action => {
@@ -1793,7 +1889,11 @@ fn apply_picker(app: &mut App, picker: Picker) {
 
 fn pick_managed(app: &mut App, name: &str) {
     let Ok(p) = app.session.cfg.provider(name) else {
-        push(app, EntryKind::Warn, format!("'{name}' 이(가) config에 없습니다."));
+        push(
+            app,
+            EntryKind::Warn,
+            format!("'{name}' 이(가) config에 없습니다."),
+        );
         return;
     };
     if crate::auth::auth_mode(name, p) == "none" {
@@ -1926,7 +2026,10 @@ fn confirm_yes(app: &mut App, c: ConfirmPrompt) {
             push(
                 app,
                 EntryKind::System,
-                format!("{} 연결을 해제했습니다.", crate::auth::provider_label(&c.provider)),
+                format!(
+                    "{} 연결을 해제했습니다.",
+                    crate::auth::provider_label(&c.provider)
+                ),
             );
         }
         Err(e) => push(app, EntryKind::Warn, format!("{e:#}")),
@@ -1962,8 +2065,7 @@ fn finish_secret(app: &mut App, secret: SecretPrompt) {
                         if let Err(e) = crate::auth::save_catalog(&cfg2, &pname, &models) {
                             crate::applog::info(&format!("catalog save: {e}"));
                         }
-                        let (main_m, _small) =
-                            crate::auth::pick_preferred(&models, &pname);
+                        let (main_m, _small) = crate::auth::pick_preferred(&models, &pname);
                         let mut note = format!(
                             "[models] {} 사용 가능 {}개 — /model 로 선택하세요",
                             crate::auth::provider_label(&pname),
@@ -2055,7 +2157,11 @@ fn finish_text(app: &mut App, text: TextPrompt) {
             {
                 Ok(()) => {
                     reload_cfg(app);
-                    push(app, EntryKind::System, format!("'{name}' 를 추가했습니다. 키를 붙이세요."));
+                    push(
+                        app,
+                        EntryKind::System,
+                        format!("'{name}' 를 추가했습니다. 키를 붙이세요."),
+                    );
                     open_secret(app, &name);
                 }
                 Err(e) => push(app, EntryKind::Warn, format!("{e:#}")),
@@ -2094,7 +2200,6 @@ fn handle_paste(app: &mut App, raw: &str) {
         }
     }
 }
-
 
 fn read_clipboard() -> Option<String> {
     #[cfg(windows)]
@@ -2191,22 +2296,44 @@ mod upgrade_tests {
         assert_eq!(cache_usage_label(0, 0, false), "cache --");
     }
 
-
-
     #[test]
     fn collapse_turn_noise_preserves_previous_conversation() {
         // pi 스타일 스크롤백: 이전 턴의 대화는 남고, 이번 턴 노이즈만 접힌다.
         let mut transcript = vec![
-            Entry { kind: EntryKind::User, text: "첫 질문".into() },
-            Entry { kind: EntryKind::Assistant, text: "첫 답변".into() },
-            Entry { kind: EntryKind::User, text: "둘째 질문".into() },
-            Entry { kind: EntryKind::Tool, text: "[도구] read_file".into() },
-            Entry { kind: EntryKind::System, text: "진행 중…".into() },
+            Entry {
+                kind: EntryKind::User,
+                text: "첫 질문".into(),
+            },
+            Entry {
+                kind: EntryKind::Assistant,
+                text: "첫 답변".into(),
+            },
+            Entry {
+                kind: EntryKind::User,
+                text: "둘째 질문".into(),
+            },
+            Entry {
+                kind: EntryKind::Tool,
+                text: "[도구] read_file".into(),
+            },
+            Entry {
+                kind: EntryKind::System,
+                text: "진행 중…".into(),
+            },
         ];
         // 둘째 질문(인덱스 2) 직후가 턴 시작 → 노이즈(3,4)만 접힌다.
         collapse_turn_noise(&mut transcript, 3, "둘째 답변".into(), "Run summary".into());
         let texts: Vec<&str> = transcript.iter().map(|e| e.text.as_str()).collect();
-        assert_eq!(texts, vec!["첫 질문", "첫 답변", "둘째 질문", "둘째 답변", "Run summary"]);
+        assert_eq!(
+            texts,
+            vec![
+                "첫 질문",
+                "첫 답변",
+                "둘째 질문",
+                "둘째 답변",
+                "Run summary"
+            ]
+        );
     }
 
     #[test]
@@ -2248,6 +2375,9 @@ mod upgrade_tests {
             cache_reported: false,
             elapsed_ms: 1,
             answer: "완료".into(),
+            lifecycle_state: None,
+            lifecycle: Vec::new(),
+            context_sources: Vec::new(),
             summary: chat::CompletionSummary {
                 changed_files: vec!["src/main.rs".into()],
                 iterations: 1,
@@ -2296,7 +2426,9 @@ mod upgrade_tests {
         // 늦은 스트리밍 조각은 무시, System/Warn 같은 실제 알림은 통과.
         assert!(ignore_after_final_summary(&Live::Chunk("late".into())));
         assert!(ignore_after_final_summary(&Live::Assistant("late".into())));
-        assert!(!ignore_after_final_summary(&Live::System("모델 12개 등록".into())));
+        assert!(!ignore_after_final_summary(&Live::System(
+            "모델 12개 등록".into()
+        )));
         assert!(!ignore_after_final_summary(&Live::Warn("경고".into())));
         assert!(ignore_after_final_summary(&Live::Status(
             "[tokens] total_in=1 total_out=1 context=1".into()

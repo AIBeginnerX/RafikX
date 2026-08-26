@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -15,19 +16,20 @@ use rafikx::db::Db;
 use rafikx::graph;
 use rafikx::harness;
 use rafikx::harness::{
-    bind, classify, ping_provider, print_binding, print_binding_table, run_pipeline,
+    bind, classify, ping_provider, print_binding, print_binding_table, run_pipeline_with_context,
 };
 use rafikx::inspector;
 use rafikx::lessons;
 use rafikx::model_wizard;
 use rafikx::obsidian;
 use rafikx::ranks;
+use rafikx::run::{RunContext, RunId};
 use rafikx::settings;
-use rafikx::ui;
 #[cfg(feature = "telegram")]
 use rafikx::telegram;
 #[cfg(feature = "tui")]
 use rafikx::tui;
+use rafikx::ui;
 
 #[derive(Parser)]
 #[command(
@@ -127,7 +129,7 @@ enum Commands {
     Theme {
         /// rafikx | opal | synth (생략 시 현재값 표시)
         theme: Option<String>,
-        /// light | dark | auto (시간 자동)
+        /// light | dark | auto (운영체제 설정 자동)
         #[arg(long)]
         appearance: Option<String>,
     },
@@ -170,6 +172,7 @@ enum Commands {
         #[arg(long)]
         with_watch: bool,
     },
+    Rpc,
 }
 
 #[derive(Subcommand)]
@@ -203,9 +206,7 @@ enum ModelCmd {
     /// 연결·모델 현황 표
     List,
     /// 기본 연결·모델 변경 (번호 또는 provider:model)
-    Use {
-        arg: String,
-    },
+    Use { arg: String },
 }
 
 #[tokio::main]
@@ -229,7 +230,13 @@ async fn main() -> ExitCode {
             model,
             mode,
             clear,
-        }) => cmd_harness(&cli, class.as_deref(), model.as_deref(), mode.as_deref(), *clear),
+        }) => cmd_harness(
+            &cli,
+            class.as_deref(),
+            model.as_deref(),
+            mode.as_deref(),
+            *clear,
+        ),
         Some(Commands::Models { provider }) => cmd_models(&cli, provider).await,
         Some(Commands::Find { query }) => cmd_find(&cli, query),
         Some(Commands::Model { action }) => cmd_model(&cli, action.as_ref()).await,
@@ -239,9 +246,7 @@ async fn main() -> ExitCode {
         Some(Commands::Index) => cmd_index(&cli),
         Some(Commands::Search { query }) => cmd_search(&cli, query),
         Some(Commands::Watch) => cmd_watch(&cli).await,
-        Some(Commands::Chat { list, resume }) => {
-            cmd_chat_entry(&cli, *list, resume.clone()).await
-        }
+        Some(Commands::Chat { list, resume }) => cmd_chat_entry(&cli, *list, resume.clone()).await,
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
         Some(Commands::Inspect {
@@ -253,6 +258,7 @@ async fn main() -> ExitCode {
             ReportCmd::Last => inspector::cmd_report_last(),
         },
         Some(Commands::Telegram { with_watch }) => cmd_telegram(&cli, *with_watch).await,
+        Some(Commands::Rpc) => rafikx::rpc::stdio().await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -295,7 +301,7 @@ fn cmd_theme(cli: &Cli, theme: Option<&str>, appearance: Option<&str>) -> Result
     if theme.is_none() && appearance.is_none() {
         println!("테마    {}   (rafikx | opal | synth)", cfg.file.ui.theme);
         println!(
-            "배경    {}   (light | dark | auto — auto 는 07~19시 밝게)",
+            "배경    {}   (light | dark | auto — auto 는 운영체제 설정 사용)",
             cfg.file.ui.appearance
         );
         println!("변경 예: rafikx theme opal   ·   rafikx theme --appearance dark");
@@ -320,7 +326,11 @@ fn cmd_theme(cli: &Cli, theme: Option<&str>, appearance: Option<&str>) -> Result
         config::write_toml_key(&cfg.path, "[ui]", "appearance", &config::toml_string(m))?;
         ui::ok(&format!(
             "배경 모드 저장: {m}{}",
-            if m == "auto" { " (07~19시 밝게)" } else { "" }
+            if m == "auto" {
+                " (운영체제 설정)"
+            } else {
+                ""
+            }
         ));
     }
     Ok(())
@@ -354,20 +364,29 @@ fn cmd_harness(
     let cfg = Config::load(cli.config.as_deref())?;
     if let Some(m) = mode {
         harness::set_selection_mode(&cfg, m)?;
-        let applied = if m.eq_ignore_ascii_case("manual") { "manual" } else { "auto" };
+        let applied = if m.eq_ignore_ascii_case("manual") {
+            "manual"
+        } else {
+            "auto"
+        };
         ui::ok(&format!("하네스 선정 모드: {applied}"));
     }
     if clear || model.is_some() {
         let Some(c) = class else {
-            anyhow::bail!("분류가 필요합니다. 예: rafikx harness dev gpt-5.6  ·  rafikx harness --clear dev");
+            anyhow::bail!(
+                "분류가 필요합니다. 예: rafikx harness dev gpt-5.6  ·  rafikx harness --clear dev"
+            );
         };
-        let tc = harness::TaskClass::parse(c)
-            .ok_or_else(|| anyhow::anyhow!("분류는 simple|medium|advanced|dev 중 하나여야 합니다"))?;
+        let tc = harness::TaskClass::parse(c).ok_or_else(|| {
+            anyhow::anyhow!("분류는 simple|medium|advanced|dev 중 하나여야 합니다")
+        })?;
         let spec = if clear { "" } else { model.unwrap_or("") };
         let msg = harness::set_manual_model(&cfg, tc, spec)?;
         ui::ok(&msg);
         if !clear && !spec.is_empty() && cfg.file.harness.selection.eq_ignore_ascii_case("auto") {
-            ui::note("현재 선정 모드가 auto 입니다. 수동 지정을 쓰려면: rafikx harness --mode manual");
+            ui::note(
+                "현재 선정 모드가 auto 입니다. 수동 지정을 쓰려면: rafikx harness --mode manual",
+            );
         }
     }
     // 상태 표시 (변경이 있었으면 다시 읽는다)
@@ -423,7 +442,11 @@ async fn cmd_models(cli: &Cli, provider: &str) -> Result<()> {
         println!("{provider}: 사용 가능한 원격 모델 목록이 비어 있습니다 (키/연결 확인)");
         return Ok(());
     }
-    println!("{} 사용 가능 모델 {}개:", auth::provider_label(provider), models.len());
+    println!(
+        "{} 사용 가능 모델 {}개:",
+        auth::provider_label(provider),
+        models.len()
+    );
     for m in &models {
         println!("  {m}");
     }
@@ -459,17 +482,11 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
 
     let default_name = cfg.file.general.default_provider.clone();
     let (label, model) = match cfg.provider(&default_name) {
-        Ok(p) => (
-            crate::auth::provider_label(&default_name),
-            p.model.clone(),
-        ),
+        Ok(p) => (crate::auth::provider_label(&default_name), p.model.clone()),
         Err(_) => (default_name.clone(), "-".into()),
     };
     ui::section("연결");
-    println!(
-        "  기본  {label} / {}",
-        ui::bold(&model)
-    );
+    println!("  기본  {label} / {}", ui::bold(&model));
     for r in model_wizard::rows(&cfg).iter().filter(|r| r.connected) {
         if r.id != default_name {
             println!("  연결  {} / {}", r.label, r.model);
@@ -545,7 +562,10 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
     if cfg.workspace.exists() {
         ui::ok(&format!("워크스페이스  {}", cfg.workspace.display()));
     } else {
-        ui::warn(&format!("워크스페이스  {} (폴더가 아직 없습니다)", cfg.workspace.display()));
+        ui::warn(&format!(
+            "워크스페이스  {} (폴더가 아직 없습니다)",
+            cfg.workspace.display()
+        ));
         ok = false;
     }
 
@@ -575,7 +595,10 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
     if vault.exists() {
         ui::ok(&format!("Vault  {}", vault.display()));
     } else {
-        ui::warn(&format!("Vault  {} (폴더가 아직 없습니다. index 시 생성됩니다)", vault.display()));
+        ui::warn(&format!(
+            "Vault  {} (폴더가 아직 없습니다. index 시 생성됩니다)",
+            vault.display()
+        ));
     }
     ui::ok(&format!(
         "tokenizer {}  enabled={}",
@@ -605,7 +628,10 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
         tool_names.join(", ")
     ));
 
-    ui::section(&format!("서비스  (기본={})", cfg.file.general.default_provider));
+    ui::section(&format!(
+        "서비스  (기본={})",
+        cfg.file.general.default_provider
+    ));
     ui::note("키: 환경변수 또는 secrets.toml. Zen=OPENCODE_API_KEY  Go=OPENCODE_GO_API_KEY");
     let mut names: Vec<String> = cfg.file.providers.keys().cloned().collect();
     names.sort_by_key(|n| auth::provider_sort_key(n));
@@ -626,11 +652,7 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
             }
         } else {
             any_ready = true;
-            ui::ok(&format!(
-                "{name:14}  {}  모델={}",
-                mode,
-                p.model
-            ));
+            ui::ok(&format!("{name:14}  {}  모델={}", mode, p.model));
             for (a, live, tail) in rows {
                 if live {
                     ui::note(&format!("{}  ****{tail}", accounts::display(&a)));
@@ -665,10 +687,15 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
     print_binding_table(&cfg);
 
     // OMO doctor 의 모델 해석 검증 수용: 4개 분류가 전부 유효한 모델로 묶이는지.
-    let ok_classes = [harness::TaskClass::Simple, harness::TaskClass::Medium, harness::TaskClass::Advanced, harness::TaskClass::Dev]
-        .iter()
-        .filter(|c| harness::bind(&cfg, **c, None, None).is_ok())
-        .count();
+    let ok_classes = [
+        harness::TaskClass::Simple,
+        harness::TaskClass::Medium,
+        harness::TaskClass::Advanced,
+        harness::TaskClass::Dev,
+    ]
+    .iter()
+    .filter(|c| harness::bind(&cfg, **c, None, None).is_ok())
+    .count();
     if ok_classes == 4 {
         ui::ok("폴백 체인  4/4 분류 유효");
     } else {
@@ -739,12 +766,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         cli.class.as_deref()
     };
     let class = classify(&cfg, prompt, obsidian, forced).await?;
-    let binding = bind(
-        &cfg,
-        class,
-        cli.provider.as_deref(),
-        cli.model.as_deref(),
-    )?;
+    let binding = bind(&cfg, class, cli.provider.as_deref(), cli.model.as_deref())?;
     print_binding(&binding);
 
     let mut task = prompt.to_string();
@@ -752,20 +774,20 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         if !cfg.file.obsidian.enabled {
             println!("[Obsidian] 꺼져 있습니다. rafikx settings 에서 켜세요.");
         } else {
-        match obsidian::ask_context(&cfg, prompt) {
-            Ok(ctx) => {
-                if ctx.sources.is_empty() {
-                    println!("[Obsidian] 검색 결과 없음 (index 를 먼저 실행하세요)");
-                } else {
-                    println!("[Obsidian] 출처:");
-                    for s in &ctx.sources {
-                        println!("  - {s}");
+            match obsidian::ask_context(&cfg, prompt) {
+                Ok(ctx) => {
+                    if ctx.sources.is_empty() {
+                        println!("[Obsidian] 검색 결과 없음 (index 를 먼저 실행하세요)");
+                    } else {
+                        println!("[Obsidian] 출처:");
+                        for s in &ctx.sources {
+                            println!("  - {s}");
+                        }
                     }
+                    task = format!("{}\n\n(질문)\n{prompt}", ctx.block);
                 }
-                task = format!("{}\n\n(질문)\n{prompt}", ctx.block);
+                Err(e) => eprintln!("Obsidian 컨텍스트를 넣지 못했습니다: {e}"),
             }
-            Err(e) => eprintln!("Obsidian 컨텍스트를 넣지 못했습니다: {e}"),
-        }
         }
     }
 
@@ -779,7 +801,10 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         Some(&binding.model),
     )?;
     let _g = graph::scope(&run_id);
-    graph::trace_start(
+    let run_context = RunContext::for_config(RunId::new(run_id.clone()), Arc::new(cfg.clone()))
+        .with_live_sink(ui::current_live_sink());
+    graph::trace_start_in(
+        &run_context,
         binding.class.as_str(),
         &binding.profile_name,
         &binding.provider_name,
@@ -795,8 +820,8 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
     ));
 
     // 진행 표시 — 첫 출력이 나오면 스피너는 스스로 물러난다.
-    let sp = rafikx::spinner::Spinner::start("응답 생성 중…");
-    match run_pipeline(
+    let sp = rafikx::spinner::Spinner::start_in(run_context.clone(), "응답 생성 중…");
+    match run_pipeline_with_context(
         &cfg,
         &binding,
         &task,
@@ -805,13 +830,14 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         None,
         None,
         None,
+        run_context.clone(),
     )
     .await
     {
         Ok(outcome) => {
             sp.finish();
             agent::record_finish(&db, &run_id, &outcome)?;
-            graph::node("persist", &outcome.status, "", Some("bind"));
+            graph::node_in(&run_context, "persist", &outcome.status, "", Some("bind"));
             println!(
                 "[run] class={} profile={} status={} iter={} tokens in={} out={}",
                 binding.class.as_str(),
@@ -970,4 +996,3 @@ async fn cmd_chat_entry(cli: &Cli, list: bool, resume: Option<String>) -> Result
     )
     .await
 }
-

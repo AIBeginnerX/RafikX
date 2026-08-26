@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -8,8 +9,9 @@ use crate::config::{Config, ProviderConfig};
 use crate::db::Db;
 use crate::provider::{
     AnthropicProvider, ChatRequest, ChatResponse, ContentBlock, DynProvider, Message,
-    OpenAiCompatProvider, is_rate_limited, is_retryable,
+    OpenAiCompatProvider, StopReason, is_rate_limited, is_retryable,
 };
+use crate::run::{RunContext, RunId, TerminalState};
 use crate::tools::{self, ToolCtx, ToolRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,8 +92,19 @@ pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
     if contains_any(
         text,
         &[
-            "요약", "정리", "번역", "초안", "검색", "찾아", "노트", "문서",
-            "파일", "마크다운", "폴더", "디렉토리", "워크스페이스",
+            "요약",
+            "정리",
+            "번역",
+            "초안",
+            "검색",
+            "찾아",
+            "노트",
+            "문서",
+            "파일",
+            "마크다운",
+            "폴더",
+            "디렉토리",
+            "워크스페이스",
         ],
     ) {
         return TaskClass::Medium;
@@ -167,8 +180,7 @@ fn list_item_count(text: &str) -> usize {
             t.starts_with("- ")
                 || t.starts_with("* ")
                 || t.starts_with("• ")
-                || t
-                    .chars()
+                || t.chars()
                     .next()
                     .is_some_and(|c| c.is_ascii_digit() && t.contains('.'))
         })
@@ -204,8 +216,8 @@ pub fn bind(
     let needs_tools = !sub.tools.is_empty();
     let selection = cfg.file.harness.selection.trim().to_ascii_lowercase();
     let manual = selection == "manual";
-    let strategy = HarnessStrategy::parse(&cfg.file.harness.strategy)
-        .unwrap_or(HarnessStrategy::Single);
+    let strategy =
+        HarnessStrategy::parse(&cfg.file.harness.strategy).unwrap_or(HarnessStrategy::Single);
 
     let (provider_name, model, verify_model) = if let (Some(p), Some(m)) =
         (provider_override, model_override)
@@ -220,7 +232,10 @@ pub fn bind(
                 "'{p}' 연결은 도구를 지원하지 않습니다. 선택한 모델 '{m}' 은(는) 코딩 작업에 쓸 수 없습니다."
             );
         }
-        crate::applog::debug(&format!("bind: direct pair {p}/{m} tools_ok={}", pc.supports_tools));
+        crate::applog::debug(&format!(
+            "bind: direct pair {p}/{m} tools_ok={}",
+            pc.supports_tools
+        ));
         (p.to_string(), m.to_string(), None)
     } else if let Some(m) = model_override {
         let p = provider_override
@@ -246,16 +261,17 @@ pub fn bind(
     };
 
     let p = cfg.provider(&provider_name)?;
-    if !crate::auth::is_usable(cfg, &provider_name) && crate::auth::auth_mode(&provider_name, p) != "none"
+    if !crate::auth::is_usable(cfg, &provider_name)
+        && crate::auth::auth_mode(&provider_name, p) != "none"
     {
-        if crate::auth::is_connected(cfg, &provider_name) && !crate::auth::is_enabled(cfg, &provider_name) {
+        if crate::auth::is_connected(cfg, &provider_name)
+            && !crate::auth::is_enabled(cfg, &provider_name)
+        {
             anyhow::bail!(
                 "'{provider_name}' 는 사용 중지입니다. rafikx settings 에서 다시 켜세요."
             );
         }
-        anyhow::bail!(
-            "'{provider_name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요."
-        );
+        anyhow::bail!("'{provider_name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요.");
     }
 
     let window = crate::packer::context_window_for(&provider_name, &model, Some(p));
@@ -283,10 +299,7 @@ pub fn bind(
     })
 }
 
-fn pick_single(
-    cfg: &Config,
-    needs_tools: bool,
-) -> Result<(String, String, Option<String>)> {
+fn pick_single(cfg: &Config, needs_tools: bool) -> Result<(String, String, Option<String>)> {
     // Single 모드 계약: 사용자가 지정한 기본 연결(default_provider) 하나만 쓴다.
     // (/engine single <연결> 이 이 값을 저장한다.)
     let default = cfg.file.general.default_provider.clone();
@@ -316,7 +329,9 @@ fn pick_single(
     });
     fallback
         .map(|model| (model.provider, model.id, None))
-        .ok_or_else(|| anyhow!("사용 가능한 단일 모델 연결이 없습니다. /connect 로 모델을 연결하세요."))
+        .ok_or_else(|| {
+            anyhow!("사용 가능한 단일 모델 연결이 없습니다. /connect 로 모델을 연결하세요.")
+        })
 }
 
 pub fn set_strategy(cfg: &Config, strategy: HarnessStrategy) -> Result<()> {
@@ -363,11 +378,7 @@ fn parse_manual_spec(spec: &str) -> (Option<String>, String) {
     (None, t.to_string())
 }
 
-fn resolve_spec(
-    cfg: &Config,
-    spec: &str,
-    needs_tools: bool,
-) -> Result<(String, String)> {
+fn resolve_spec(cfg: &Config, spec: &str, needs_tools: bool) -> Result<(String, String)> {
     let (p, m) = parse_manual_spec(spec);
     if let Some(p) = p {
         ensure_connected(cfg, &p)?;
@@ -433,7 +444,12 @@ pub fn set_selection_mode(cfg: &Config, mode: &str) -> Result<()> {
     } else {
         "auto"
     };
-    crate::config::write_toml_key(&cfg.path, "[harness]", "selection", &crate::config::toml_string(m))
+    crate::config::write_toml_key(
+        &cfg.path,
+        "[harness]",
+        "selection",
+        &crate::config::toml_string(m),
+    )
 }
 
 /// 분류별 수동 모델 지정. 빈 spec 이면 해당 분류의 수동 지정을 지운다(자동 폴백).
@@ -441,7 +457,12 @@ pub fn set_manual_model(cfg: &Config, class: TaskClass, spec: &str) -> Result<St
     let key = manual_key_for(class);
     if spec.trim().is_empty() {
         // 값 제거: auto 로 덮어쓰고 주석 처리된 형태가 되지 않게 빈 문자열로 둔다.
-        crate::config::write_toml_key(&cfg.path, "[harness]", key, &crate::config::toml_string(""))?;
+        crate::config::write_toml_key(
+            &cfg.path,
+            "[harness]",
+            key,
+            &crate::config::toml_string(""),
+        )?;
         return Ok(format!("{} 수동 지정 해제 (자동 사용)", class.as_str()));
     }
     // 지정 형식 검증 — 연결된 프로바이더에서 찾을 수 있어야 한다.
@@ -458,12 +479,7 @@ pub fn set_manual_model(cfg: &Config, class: TaskClass, spec: &str) -> Result<St
         key,
         &crate::config::toml_string(spec.trim()),
     )?;
-    Ok(format!(
-        "{} 수동 모델: {} / {}",
-        class.as_str(),
-        p,
-        m
-    ))
+    Ok(format!("{} 수동 모델: {} / {}", class.as_str(), p, m))
 }
 
 /// /engine single <연결> — 지정한 하나의 연결만 쓰도록 저장한다.
@@ -575,9 +591,7 @@ pub async fn auto_assign_roles(cfg: &Config) -> Result<Vec<String>> {
     let strongest = |exclude: Option<&RoleCandidate>| -> Option<&RoleCandidate> {
         pool.iter()
             .filter(|c| c.tools)
-            .filter(|c| {
-                exclude.is_none_or(|e| !(c.provider == e.provider && c.id == e.id))
-            })
+            .filter(|c| exclude.is_none_or(|e| !(c.provider == e.provider && c.id == e.id)))
             .max_by_key(|c| c.score)
     };
     let dev = strongest(None)
@@ -705,7 +719,11 @@ fn pick_cheap(
         return all.first().cloned();
     }
     cheap.sort_by_key(|r| {
-        let pref = if r.provider == preferred_provider { 0 } else { 1 };
+        let pref = if r.provider == preferred_provider {
+            0
+        } else {
+            1
+        };
         (pref, crate::ranks::score_of(table, &r.id).unwrap_or(50))
     });
     cheap.first().cloned().cloned()
@@ -719,7 +737,11 @@ fn pick_strongest(
         .iter()
         .filter_map(|r| {
             let e = crate::ranks::match_entry(table, &r.id)?;
-            Some((e.score, crate::ranks::Tier::parse(&e.tier) == crate::ranks::Tier::Top5, r))
+            Some((
+                e.score,
+                crate::ranks::Tier::parse(&e.tier) == crate::ranks::Tier::Top5,
+                r,
+            ))
         })
         .collect();
     if !ranked.is_empty() {
@@ -783,12 +805,12 @@ pub fn build_provider_account(cfg: &Config, name: &str, account_id: &str) -> Res
     match p.kind.as_str() {
         "anthropic" => {
             let c = cred.ok_or_else(|| {
-                anyhow!(
-                    "'{name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요"
-                )
+                anyhow!("'{name}' 연결이 없습니다. rafikx settings 에서 번호로 연결하세요")
             })?;
             if c.oauth {
-                Ok(DynProvider::Anthropic(AnthropicProvider::with_oauth(c.token)?))
+                Ok(DynProvider::Anthropic(AnthropicProvider::with_oauth(
+                    c.token,
+                )?))
             } else {
                 Ok(DynProvider::Anthropic(AnthropicProvider::new(c.token)?))
             }
@@ -829,11 +851,7 @@ fn account_ids_for(name: &str) -> Vec<String> {
     }
 }
 
-async fn try_accounts<F, Fut>(
-    cfg: &Config,
-    name: &str,
-    mut call: F,
-) -> Result<ChatResponse>
+async fn try_accounts<F, Fut>(cfg: &Config, name: &str, mut call: F) -> Result<ChatResponse>
 where
     F: FnMut(DynProvider) -> Fut,
     Fut: std::future::Future<Output = Result<ChatResponse>>,
@@ -956,10 +974,7 @@ pub fn current_ctx_window() -> u32 {
 static FALLBACK_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_fallback_quiet(quiet: bool) {
-    FALLBACK_QUIET.store(
-        quiet,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    FALLBACK_QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn fallback_warn(msg: &str) {
@@ -980,7 +995,8 @@ pub async fn chat_with_fallback(
     let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err = None;
     for name in order {
-        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary) else {
+        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary)
+        else {
             continue;
         };
         req.model = model;
@@ -992,10 +1008,7 @@ pub async fn chat_with_fallback(
         {
             Ok(resp) => return Ok((name.clone(), resp)),
             Err(e) => {
-                fallback_warn(&format!(
-                    "{name} 호출 실패 ({}) → 다음 연결",
-                    short_err(&e)
-                ));
+                fallback_warn(&format!("{name} 호출 실패 ({}) → 다음 연결", short_err(&e)));
                 if Some(name.as_str()) == primary && primary_err.is_none() {
                     primary_err = Some(e);
                 } else {
@@ -1032,7 +1045,8 @@ where
     let emitted = AtomicUsize::new(0);
 
     for name in order {
-        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary) else {
+        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary)
+        else {
             continue;
         };
         req.model = model;
@@ -1066,7 +1080,10 @@ where
                         return Ok((name.clone(), resp));
                     }
                     Err(e) if is_rate_limited(&e) => {
-                        crate::usage::mark_limited(id, crate::usage::parse_retry_after(&format!("{e:#}")));
+                        crate::usage::mark_limited(
+                            id,
+                            crate::usage::parse_retry_after(&format!("{e:#}")),
+                        );
                         crate::ui::warn("리밋 → 다음 계정으로 전환");
                         last_err = Some(e);
                         break;
@@ -1078,7 +1095,8 @@ where
                             && attempt < 2
                         {
                             attempt += 1;
-                            tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt))).await;
+                            tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt)))
+                                .await;
                             continue;
                         }
                         break;
@@ -1103,11 +1121,7 @@ where
         .unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
 }
 
-pub async fn chat_accounts(
-    cfg: &Config,
-    provider: &str,
-    req: ChatRequest,
-) -> Result<ChatResponse> {
+pub async fn chat_accounts(cfg: &Config, provider: &str, req: ChatRequest) -> Result<ChatResponse> {
     try_accounts(cfg, provider, |client| {
         let req = req.clone();
         async move { client.chat(&req).await }
@@ -1122,7 +1136,8 @@ pub async fn classify(
     forced: Option<&str>,
 ) -> Result<TaskClass> {
     if let Some(s) = forced {
-        return TaskClass::parse(s).ok_or_else(|| anyhow!("--class 값은 simple|medium|advanced|dev 여야 합니다"));
+        return TaskClass::parse(s)
+            .ok_or_else(|| anyhow!("--class 값은 simple|medium|advanced|dev 여야 합니다"));
     }
     if cfg.file.general.classifier == "llm" {
         match classify_llm(cfg, text).await {
@@ -1334,7 +1349,89 @@ pub async fn run_pipeline(
     remote: Option<agent::RemoteApproval>,
     local_ask: Option<agent::LocalAsk>,
 ) -> Result<AgentOutcome> {
-    crate::harness::set_current_ctx_window(binding.context_window);
+    let run_id =
+        crate::graph::current_run().unwrap_or_else(|| format!("run-{}", crate::db::Db::new_id()));
+    let context = RunContext::for_config(RunId::new(run_id), Arc::new(cfg.clone()))
+        .with_live_sink(crate::ui::current_live_sink());
+    run_pipeline_with_context(
+        cfg,
+        binding,
+        task,
+        yes,
+        cli_provider,
+        resume,
+        remote,
+        local_ask,
+        context,
+    )
+    .await
+}
+
+pub async fn run_pipeline_with_context(
+    cfg: &Config,
+    binding: &Binding,
+    task: &str,
+    yes: bool,
+    cli_provider: Option<&str>,
+    resume: Option<Vec<Message>>,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
+    run_context: RunContext,
+) -> Result<AgentOutcome> {
+    let start_event = if binding.plan_first {
+        crate::lifecycle::LifecycleEventData::PlanningStarted
+    } else {
+        crate::lifecycle::LifecycleEventData::RunStarted {
+            model: Some(binding.model.clone()),
+        }
+    };
+    let _ = run_context.transition_lifecycle(start_event);
+    let result = run_pipeline_inner(
+        cfg,
+        binding,
+        task,
+        yes,
+        cli_provider,
+        resume,
+        remote,
+        local_ask,
+        run_context.clone(),
+    )
+    .await;
+    match &result {
+        Ok(outcome) => {
+            let state = match outcome.status.as_str() {
+                "ok" => TerminalState::Succeeded,
+                "cancelled" => TerminalState::Cancelled,
+                "limit" | "incomplete" => TerminalState::Limited,
+                _ => TerminalState::Failed,
+            };
+            run_context.finish_with_error(state, outcome.error.clone());
+        }
+        Err(error) => {
+            run_context.finish_with_error(TerminalState::Failed, Some(error.to_string()));
+        }
+    }
+    result
+}
+
+async fn run_pipeline_inner(
+    cfg: &Config,
+    binding: &Binding,
+    task: &str,
+    yes: bool,
+    cli_provider: Option<&str>,
+    resume: Option<Vec<Message>>,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
+    run_context: RunContext,
+) -> Result<AgentOutcome> {
+    run_context
+        .metrics()
+        .set_context_window(binding.context_window);
+    if run_context.is_cancelled() {
+        return Ok(cancelled_outcome());
+    }
     let role = cfg
         .file
         .subagents
@@ -1346,8 +1443,9 @@ pub async fn run_pipeline(
         Db::open(&Db::db_path()?)
             .ok()
             .map(|db| {
-                crate::lessons::inject_block(
+                crate::lessons::inject_block_for_project(
                     &db,
+                    &cfg.workspace,
                     task,
                     cfg.file.memory.inject_limit_chars as usize,
                 )
@@ -1358,11 +1456,18 @@ pub async fn run_pipeline(
     };
     if !lessons_block.is_empty() {
         crate::applog::info(&format!("lessons inject:\n{lessons_block}"));
-        crate::graph::node("pre_step", "lessons", "injected", Some("bind"));
+        crate::graph::node_in(
+            &run_context,
+            "pre_step",
+            "lessons",
+            "injected",
+            Some("bind"),
+        );
     } else {
-        crate::graph::node("pre_step", "lessons", "none", Some("bind"));
+        crate::graph::node_in(&run_context, "pre_step", "lessons", "none", Some("bind"));
     }
     let mut system = system_prompt(cfg, &binding.system_extra, &lessons_block);
+    crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
     system.push_str(&format!(
         "\n\n[현재 실행 정보]\nProvider: {}\nModel: {}\nContext window: {} tokens\n\
          사용자가 현재 provider, model, context window를 물으면 이 값을 그대로 답한다.",
@@ -1380,8 +1485,9 @@ pub async fn run_pipeline(
     let mut system = system;
     if staged {
         // 배너 없이 조용히 — 단계 진행은 Todo 패널이 보여준다 (pi 저소음).
-        crate::tools_more::clear_todos();
-        crate::graph::node(
+        crate::tools_more::clear_todos_in(&run_context);
+        crate::graph::node_in(
+            &run_context,
             "pre_step",
             "staging",
             if engine_deep { "deepseek" } else { "auto" },
@@ -1394,8 +1500,10 @@ pub async fn run_pipeline(
              모든 단계가 끝나면 단계별 핵심 결과를 짧게 요약해 답을 마친다.",
         );
         if engine_deep {
-            directive.push_str(" 각 단계 시작 시 `[N/총M] 단계명` 형식의 한 줄 상태를 출력한다. \
-                검증 가능한 작업(빌드·테스트·파일 수정)은 마지막에 검증 방법과 결과를 함께 남긴다.");
+            directive.push_str(
+                " 각 단계 시작 시 `[N/총M] 단계명` 형식의 한 줄 상태를 출력한다. \
+                검증 가능한 작업(빌드·테스트·파일 수정)은 마지막에 검증 방법과 결과를 함께 남긴다.",
+            );
         }
         system.push_str(&directive);
     }
@@ -1411,15 +1519,19 @@ pub async fn run_pipeline(
     let mut effective_max_iter = binding.max_iterations;
     if engine_self {
         let sh = crate::self_harness::SelfHarnessState::load();
-        crate::ui::live_line(&format!(
-            "[하네스] self-harness v{} — 자기개선 루프 활성{}",
-            sh.version,
-            sh.trial
-                .as_ref()
-                .map(|t| format!(" · trial #{} 검증 중", t.candidate_id))
-                .unwrap_or_default()
-        ));
-        crate::graph::node(
+        crate::ui::live_line_in(
+            &run_context,
+            &format!(
+                "[하네스] self-harness v{} — 자기개선 루프 활성{}",
+                sh.version,
+                sh.trial
+                    .as_ref()
+                    .map(|t| format!(" · trial #{} 검증 중", t.candidate_id))
+                    .unwrap_or_default()
+            ),
+        );
+        crate::graph::node_in(
+            &run_context,
             "pre_step",
             "self_harness",
             &format!("v{}", sh.version),
@@ -1442,18 +1554,46 @@ pub async fn run_pipeline(
         };
         match chat_with_fallback(cfg, &order, role, req).await {
             Ok((_n, resp)) => {
-                crate::graph::node("plan", "plan_first", "", Some("pre_step"));
-                crate::ui::live_line("[계획]");
+                crate::graph::node_in(&run_context, "plan", "plan_first", "", Some("pre_step"));
+                crate::ui::live_line_in(&run_context, "[계획]");
                 for b in &resp.content {
                     if let ContentBlock::Text { text } = b {
-                        crate::ui::live_assistant(&format!(
-                            "[모델 작업]\n{text}\n[/모델 작업]"
-                        ));
+                        crate::ui::live_assistant_in(
+                            &run_context,
+                            &format!("[모델 작업]\n{text}\n[/모델 작업]"),
+                        );
                     }
                 }
+                let plan = resp
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.trim()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !plan.is_empty() {
+                    crate::context::record_plan(&run_context, &plan, 1024);
+                    run_context.emit(
+                        crate::run::RunEventKind::Plan,
+                        serde_json::json!({"plan": plan}),
+                    );
+                    system.push_str("\n\n[실행 계획]\n");
+                    system.push_str(&plan);
+                    system.push_str(
+                        "\n이 계획을 실행 상태의 기준으로 사용하되, 새 증거가 생기면 안전하게 조정하라.",
+                    );
+                }
             }
-            Err(e) => crate::ui::live_warn(&format!("계획 단계 실패(계속 진행): {e}")),
+            Err(e) => {
+                crate::ui::live_warn_in(&run_context, &format!("계획 단계 실패(계속 진행): {e}"))
+            }
         }
+        let _ =
+            run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted {
+                model: Some(binding.model.clone()),
+            });
     }
 
     let use_tools = !binding.tools.is_empty();
@@ -1475,34 +1615,54 @@ pub async fn run_pipeline(
             max_tokens: cfg.file.general.max_tokens,
             stream: true,
         };
-        let (_name, resp) = stream_with_fallback(cfg, &order, role, req, |piece| {
-            crate::ui::live_chunk(piece);
-        })
-        .await?;
-        crate::graph::node(
+        let response = stream_with_fallback(cfg, &order, role, req, |piece| {
+            crate::ui::live_chunk_in(&run_context, piece);
+        });
+        tokio::pin!(response);
+        let (_name, resp) = tokio::select! {
+            result = &mut response => result?,
+            _ = run_context.cancelled_reason() => return Ok(cancelled_outcome()),
+        };
+        let _ = run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::Tokens {
+            input: resp.input_tokens,
+            output: resp.output_tokens,
+            cached: resp.cached_tokens,
+        });
+        crate::graph::node_in(
+            &run_context,
             "request",
             &binding.model,
             &format!("in={} out={}", resp.input_tokens, resp.output_tokens),
             Some("pre_step"),
         );
-        crate::ui::live_chunk("\n");
-        crate::ui::live_status(&format!(
-            "[tokens] in={} out={} stop={:?}",
-            resp.input_tokens, resp.output_tokens, resp.stop_reason
-        ));
+        crate::ui::live_chunk_in(&run_context, "\n");
+        crate::ui::live_status_in(
+            &run_context,
+            &format!(
+                "[tokens] in={} out={} stop={:?}",
+                resp.input_tokens, resp.output_tokens, resp.stop_reason
+            ),
+        );
         messages.push(Message {
             role: crate::provider::Role::Assistant,
             content: resp.content.clone(),
         });
+        let _ =
+            run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted);
+        let hit_token_limit = resp.stop_reason == StopReason::MaxTokens;
         return Ok(AgentOutcome {
-            status: "ok".into(),
+            status: if hit_token_limit {
+                "incomplete".into()
+            } else {
+                "ok".into()
+            },
             iterations: 1,
             input_tokens: resp.input_tokens,
             output_tokens: resp.output_tokens,
             context_tokens: resp.input_tokens,
             cached_tokens: resp.cached_tokens,
             cache_reported: resp.cache_reported,
-            error: None,
+            error: hit_token_limit.then(|| "모델 출력 토큰 상한에 도달했습니다.".into()),
             messages,
             changed_files: vec![],
             tool_errors: vec![],
@@ -1513,10 +1673,13 @@ pub async fn run_pipeline(
 
     if !cfg.workspace.exists() {
         std::fs::create_dir_all(&cfg.workspace)?;
-        crate::ui::live_line(&format!(
-            "워크스페이스 폴더를 만들었습니다: {}",
-            cfg.workspace.display()
-        ));
+        crate::ui::live_line_in(
+            &run_context,
+            &format!(
+                "워크스페이스 폴더를 만들었습니다: {}",
+                cfg.workspace.display()
+            ),
+        );
     }
 
     let mut next_resume = resume;
@@ -1531,6 +1694,7 @@ pub async fn run_pipeline(
     let mut all_denials = Vec::new();
     if staged {
         persist_goal_state(
+            &run_context,
             task,
             "active",
             0,
@@ -1543,28 +1707,33 @@ pub async fn run_pipeline(
     let mut outcome = loop {
         let registry = ToolRegistry::with_names(&binding.tools);
         let resume_for_failure = next_resume.clone().unwrap_or_default();
-        let run = agent::run_agent(AgentRun {
-            cfg,
-            provider_name: &binding.provider_name,
-            model: &binding.model,
-            task,
-            yes,
-            max_iterations: effective_max_iter,
-            system: system.clone(),
-            registry,
-            resume: next_resume.take(),
-            remote: remote.clone(),
-            local_ask: local_ask.clone(),
-            context_window: binding.context_window,
-        })
+        let run = agent::run_agent_with_context(
+            AgentRun {
+                cfg,
+                provider_name: &binding.provider_name,
+                model: &binding.model,
+                task,
+                yes,
+                max_iterations: effective_max_iter,
+                system: system.clone(),
+                registry,
+                resume: next_resume.take(),
+                remote: remote.clone(),
+                local_ask: local_ask.clone(),
+                context_window: binding.context_window,
+            },
+            run_context.clone(),
+        )
         .await;
         let mut current = match run {
             Ok(outcome) => outcome,
             Err(error) => {
                 if staged {
-                    let progress =
-                        crate::tools_more::todo_progress(&crate::tools_more::current_todos());
+                    let progress = crate::tools_more::todo_progress(
+                        &crate::tools_more::current_todos_in(&run_context),
+                    );
                     persist_goal_state(
+                        &run_context,
                         task,
                         "failed",
                         progress.completed,
@@ -1588,7 +1757,7 @@ pub async fn run_pipeline(
         all_tool_errors.extend(current.tool_errors.clone());
         all_denials.extend(current.deny_reasons.clone());
 
-        let todos = crate::tools_more::current_todos();
+        let todos = crate::tools_more::current_todos_in(&run_context);
         let progress = crate::tools_more::todo_progress(&todos);
         let signature = (progress.completed, progress.total);
         if previous_progress == Some(signature) {
@@ -1597,7 +1766,8 @@ pub async fn run_pipeline(
             stale_rounds = 0;
             previous_progress = Some(signature);
         }
-        crate::graph::node(
+        crate::graph::node_in(
+            &run_context,
             "goal",
             &format!("{}/{}", progress.completed, progress.total),
             &format!("continuations={continuations} stale={stale_rounds}"),
@@ -1638,6 +1808,7 @@ pub async fn run_pipeline(
                 ));
             }
             persist_goal_state(
+                &run_context,
                 task,
                 if current.status == "ok" && progress.completed >= progress.total {
                     "complete"
@@ -1662,6 +1833,7 @@ pub async fn run_pipeline(
 
         continuations = continuations.saturating_add(1);
         persist_goal_state(
+            &run_context,
             task,
             "active",
             progress.completed,
@@ -1669,11 +1841,15 @@ pub async fn run_pipeline(
             continuations,
             &current.messages,
         );
-        crate::ui::live_line(&format!(
-            "[목표 계속] Todo {}/{} · 연속 실행 {continuations}/8",
-            progress.completed, progress.total
-        ));
-        crate::graph::node(
+        crate::ui::live_line_in(
+            &run_context,
+            &format!(
+                "[목표 계속] Todo {}/{} · 연속 실행 {continuations}/8",
+                progress.completed, progress.total
+            ),
+        );
+        crate::graph::node_in(
+            &run_context,
             "goal_continue",
             &format!("cycle {continuations}"),
             &format!("{}/{}", progress.completed, progress.total),
@@ -1689,19 +1865,31 @@ pub async fn run_pipeline(
     };
 
     if binding.verify && outcome.status != "incomplete" {
-        crate::graph::node("verify", "start", "", Some("request"));
-        crate::spinner::set_label("검증 중…");
-        outcome =
-            run_verify(cfg, binding, task, yes, system, outcome, remote.clone(), local_ask.clone())
-                .await?;
-        crate::graph::node("verify", &outcome.status, "", Some("verify"));
+        crate::graph::node_in(&run_context, "verify", "start", "", Some("request"));
+        crate::spinner::set_label_in(&run_context, "검증 중…");
+        outcome = run_verify(
+            cfg,
+            binding,
+            task,
+            yes,
+            system,
+            outcome,
+            remote.clone(),
+            local_ask.clone(),
+            run_context.clone(),
+        )
+        .await?;
+        crate::graph::node_in(&run_context, "verify", &outcome.status, "", Some("verify"));
     }
     // 도구 없는 프로파일(quick)의 응답에 tool-call 텍스트가 새어 있으면 —
     // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이라는 뜻이다. 모델이
     // 도구 문법을 텍스트로 흉내 낸 오염 응답을 걷어내고 coder 로 1회 승격해
     // 다시 실행한다. (승격된 바인딩은 tools 가 비지 않으므로 재귀는 1회로 끝.)
     if binding.tools.is_empty() && leaked_tool_call(&agent::assistant_text(&outcome.messages)) {
-        crate::ui::live_line("도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.");
+        crate::ui::live_line_in(
+            &run_context,
+            "도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.",
+        );
         if let Ok(dev) = bind(cfg, TaskClass::Dev, cli_provider, None)
             && !dev.tools.is_empty()
         {
@@ -1709,7 +1897,7 @@ pub async fn run_pipeline(
             while matches!(clean.last(), Some(m) if m.role == crate::provider::Role::Assistant) {
                 clean.pop();
             }
-            return Box::pin(run_pipeline(
+            return Box::pin(run_pipeline_inner(
                 cfg,
                 &dev,
                 task,
@@ -1718,6 +1906,7 @@ pub async fn run_pipeline(
                 Some(clean),
                 remote,
                 local_ask,
+                run_context,
             ))
             .await;
         }
@@ -1730,6 +1919,14 @@ pub async fn run_pipeline(
     Ok(outcome)
 }
 
+fn cancelled_outcome() -> AgentOutcome {
+    AgentOutcome {
+        status: "cancelled".into(),
+        error: Some("실행이 취소되었습니다.".into()),
+        ..AgentOutcome::default()
+    }
+}
+
 /// 모델이 도구 호출을 구조체가 아니라 텍스트로 흉내 낸 흔적 —
 /// MiniMax 계열의 내부 마커(`]<]`)와 `<tool_call>` JSON 조각을 감지한다.
 fn leaked_tool_call(text: &str) -> bool {
@@ -1740,6 +1937,7 @@ fn leaked_tool_call(text: &str) -> bool {
 }
 
 fn persist_goal_state(
+    run: &RunContext,
     objective: &str,
     status: &str,
     completed: usize,
@@ -1747,9 +1945,6 @@ fn persist_goal_state(
     continuations: u8,
     messages: &[Message],
 ) {
-    let Some(run_id) = crate::graph::current_run() else {
-        return;
-    };
     let Ok(messages_json) = serde_json::to_string(messages) else {
         return;
     };
@@ -1757,7 +1952,7 @@ fn persist_goal_state(
         && let Ok(db) = Db::open(&path)
     {
         let _ = db.save_goal(&crate::db::GoalRow {
-            id: run_id,
+            id: run.run_id().to_string(),
             objective: objective.to_string(),
             status: status.to_string(),
             completed,
@@ -1786,38 +1981,43 @@ async fn run_verify(
     mut outcome: AgentOutcome,
     remote: Option<agent::RemoteApproval>,
     local_ask: Option<agent::LocalAsk>,
+    run_context: RunContext,
 ) -> Result<AgentOutcome> {
     let mut cmd = binding.verify_command.clone();
     if cmd.trim().is_empty() {
         cmd = auto_verify_command(cfg, &outcome.changed_files);
     }
     if cmd.is_empty() {
-        crate::ui::live_line("검증 생략: 자동 감지할 빌드가 없습니다.");
+        crate::ui::live_line_in(&run_context, "검증 생략: 자동 감지할 빌드가 없습니다.");
         return Ok(outcome);
     }
 
     let bash = ToolRegistry::all();
     let Some(tool) = bash.get("bash") else {
-        crate::ui::live_line("검증 생략: bash 도구가 없습니다.");
+        crate::ui::live_line_in(&run_context, "검증 생략: bash 도구가 없습니다.");
         return Ok(outcome);
     };
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
     ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
     ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
+    ctx.local_ask = local_ask.clone();
+    ctx.remote = remote.clone();
+    ctx.run = Some(run_context.clone());
 
     let yes = agent::effective_yes(yes, &remote);
     for round in 0..3 {
-        crate::ui::live_line(&format!("[검증] {cmd}"));
-        crate::spinner::set_label(&format!("검증 실행: {cmd}"));
+        crate::ui::live_line_in(&run_context, &format!("[검증] {cmd}"));
+        crate::spinner::set_label_in(&run_context, &format!("검증 실행: {cmd}"));
         let input = serde_json::json!({"command": cmd});
         if tool.needs_approval(&input) && !yes {
             match tools::approval_preview("bash", &input, &ctx) {
                 Ok(p) => {
-                    crate::ui::live_line(&p);
+                    crate::ui::live_line_in(&run_context, &p);
                     let denied = if let Some(ask) = &local_ask {
                         !matches!(
                             ask(p.clone()).await,
-                            crate::agent::ApprovalChoice::Yes | crate::agent::ApprovalChoice::Always
+                            crate::agent::ApprovalChoice::Yes
+                                | crate::agent::ApprovalChoice::Always
                         )
                     } else if let Some(r) = &remote {
                         let ask = r.ask.clone();
@@ -1833,13 +2033,16 @@ async fn run_verify(
                         t == "n" || t == "no"
                     };
                     if denied {
-                        crate::ui::live_line("검증이 거부되었습니다.");
+                        crate::ui::live_line_in(&run_context, "검증이 거부되었습니다.");
                         outcome.status = "denied".into();
                         return Ok(outcome);
                     }
                 }
                 Err(e) => {
-                    crate::ui::live_line(&format!("검증 명령을 실행할 수 없습니다: {e}"));
+                    crate::ui::live_line_in(
+                        &run_context,
+                        &format!("검증 명령을 실행할 수 없습니다: {e}"),
+                    );
                     return Ok(outcome);
                 }
             }
@@ -1848,7 +2051,7 @@ async fn run_verify(
             Ok(out) if !out.contains("[exit") => {
                 // 성공 시 원문 대신 요약 한 줄 — 실패했을 때만 상세가 필요하다.
                 let lines = out.trim().lines().count();
-                crate::ui::live_line(&format!("검증 성공 ({lines}줄 출력)"));
+                crate::ui::live_line_in(&run_context, &format!("검증 성공 ({lines}줄 출력)"));
                 return Ok(outcome);
             }
             other => {
@@ -1857,17 +2060,17 @@ async fn run_verify(
                     Err(e) => e.to_string(),
                 };
                 if round >= 2 {
-                    crate::ui::live_line("검증이 2회 재시도 후에도 실패했습니다.");
-                    crate::ui::live_line(&err);
+                    crate::ui::live_line_in(&run_context, "검증이 2회 재시도 후에도 실패했습니다.");
+                    crate::ui::live_line_in(&run_context, &err);
                     outcome.status = "fail".into();
                     outcome.error = Some(err.chars().take(500).collect());
                     outcome.verify_fail = Some(err.chars().take(500).collect());
                     return Ok(outcome);
                 }
-                crate::ui::live_line(&format!(
-                    "검증 실패, 오류를 되먹여 재시도합니다 ({}/2)",
-                    round + 1
-                ));
+                crate::ui::live_line_in(
+                    &run_context,
+                    &format!("검증 실패, 오류를 되먹여 재시도합니다 ({}/2)", round + 1),
+                );
                 let cause: String = err.chars().take(500).collect();
                 let mut msgs = outcome.messages.clone();
                 if msgs.is_empty() {
@@ -1876,20 +2079,23 @@ async fn run_verify(
                 msgs.push(Message::user_text(format!(
                     "검증 명령이 실패했습니다. 오류를 고치세요.\n{err}"
                 )));
-                let mut next = agent::run_agent(AgentRun {
-                    cfg,
-                    provider_name: &binding.provider_name,
-                    model: binding.verify_model.as_deref().unwrap_or(&binding.model),
-                    task,
-                    yes,
-                    max_iterations: binding.max_iterations,
-                    system: system.clone(),
-                    registry: ToolRegistry::with_names(&binding.tools),
-                    resume: Some(msgs),
-                    remote: remote.clone(),
-                    local_ask: local_ask.clone(),
-                    context_window: binding.context_window,
-                })
+                let mut next = agent::run_agent_with_context(
+                    AgentRun {
+                        cfg,
+                        provider_name: &binding.provider_name,
+                        model: binding.verify_model.as_deref().unwrap_or(&binding.model),
+                        task,
+                        yes,
+                        max_iterations: binding.max_iterations,
+                        system: system.clone(),
+                        registry: ToolRegistry::with_names(&binding.tools),
+                        resume: Some(msgs),
+                        remote: remote.clone(),
+                        local_ask: local_ask.clone(),
+                        context_window: binding.context_window,
+                    },
+                    run_context.clone(),
+                )
                 .await?;
                 if next.verify_fail.is_none() {
                     next.verify_fail = Some(cause);
@@ -1942,8 +2148,14 @@ mod tests {
         // 흉내 내던 질문 — 이제 도구 있는 클래스로 분류되어야 한다.
         let q = "그럼 니가 잘 하는 걸 더 잘 하게 만들 수 있게 마크다운 파일을 업그레이드 하면 좋지 않을 까?";
         assert_ne!(classify_rules(q, false), TaskClass::Simple);
-        assert_eq!(classify_rules("AGENTS.md 업그레이드해줘", false), TaskClass::Dev);
-        assert_ne!(classify_rules("워크스페이스에 뭐가 있어?", false), TaskClass::Simple);
+        assert_eq!(
+            classify_rules("AGENTS.md 업그레이드해줘", false),
+            TaskClass::Dev
+        );
+        assert_ne!(
+            classify_rules("워크스페이스에 뭐가 있어?", false),
+            TaskClass::Simple
+        );
     }
 
     #[test]
@@ -1951,7 +2163,9 @@ mod tests {
         assert!(leaked_tool_call(
             "워크스페이스부터 확인하겠습니다.]<]minimax[>[<tool_call> { \"name\": \"run_command\""
         ));
-        assert!(leaked_tool_call("<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>"));
+        assert!(leaked_tool_call(
+            "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>"
+        ));
         assert!(!leaked_tool_call("마크다운을 이렇게 고치면 됩니다."));
         assert!(!leaked_tool_call("파일 이름은 name 필드에 적습니다."));
     }
@@ -2045,8 +2259,14 @@ mod tests {
 
     #[test]
     fn harness_strategy_accepts_single_and_multi_only() {
-        assert_eq!(HarnessStrategy::parse("single"), Some(HarnessStrategy::Single));
-        assert_eq!(HarnessStrategy::parse("multi"), Some(HarnessStrategy::Multi));
+        assert_eq!(
+            HarnessStrategy::parse("single"),
+            Some(HarnessStrategy::Single)
+        );
+        assert_eq!(
+            HarnessStrategy::parse("multi"),
+            Some(HarnessStrategy::Multi)
+        );
         assert_eq!(HarnessStrategy::parse("manual"), None);
     }
 }

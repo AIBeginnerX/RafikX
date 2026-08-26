@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use teloxide::dispatching::Dispatcher;
 use teloxide::dptree;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup};
 use teloxide::utils::command::BotCommands;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 use crate::agent::{self, RemoteApproval};
 use crate::applog;
@@ -21,6 +21,7 @@ use crate::harness::{self, Binding};
 use crate::inspector;
 use crate::lessons;
 use crate::obsidian;
+use crate::run::{RunContext, RunId};
 
 const TELEGRAM_MAX: usize = 4096;
 const START_MSG: &str = "작업 시작…";
@@ -34,6 +35,8 @@ enum Command {
     Obsidian(String),
     #[command(description = "최근 실행·오늘 토큰")]
     Status,
+    #[command(description = "현재 실행 취소")]
+    Cancel,
     #[command(description = "마지막 점검 요약")]
     Report,
     #[command(description = "교훈 등록")]
@@ -46,7 +49,8 @@ enum Command {
 
 struct App {
     cfg: Config,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    pending: Arc<Mutex<HashMap<String, (ChatId, oneshot::Sender<bool>)>>>,
+    active: Arc<Mutex<HashMap<ChatId, RunContext>>>,
     seq: AtomicU32,
 }
 
@@ -76,6 +80,7 @@ pub async fn run(config_path: Option<&Path>, with_watch: bool) -> Result<()> {
     let app = Arc::new(App {
         cfg: cfg.clone(),
         pending: Arc::new(Mutex::new(HashMap::new())),
+        active: Arc::new(Mutex::new(HashMap::new())),
         seq: AtomicU32::new(1),
     });
 
@@ -158,7 +163,12 @@ async fn on_command(bot: Bot, msg: Message, cmd: Command, app: Arc<App>) -> Resp
         Command::Obsidian(q) => {
             let q = q.trim().to_string();
             if q.is_empty() {
-                send_chunks(&bot, msg.chat.id, "검색어를 적어 주세요. 예: /obsidian 키워드").await?;
+                send_chunks(
+                    &bot,
+                    msg.chat.id,
+                    "검색어를 적어 주세요. 예: /obsidian 키워드",
+                )
+                .await?;
             } else {
                 send_chunks(&bot, msg.chat.id, START_MSG).await?;
                 let text = obsidian::search_text(&app.cfg, &q)
@@ -171,6 +181,20 @@ async fn on_command(bot: Bot, msg: Message, cmd: Command, app: Arc<App>) -> Resp
             let text = status_text().unwrap_or_else(|e| format!("상태 조회 실패: {e}"));
             send_chunks(&bot, msg.chat.id, &text).await?;
         }
+        Command::Cancel => {
+            let run = app.active.lock().await.get(&msg.chat.id).cloned();
+            let text = if let Some(run) = run {
+                reject_pending_for_chat(&app, msg.chat.id).await;
+                if run.cancel("Telegram /cancel") {
+                    "현재 실행에 취소를 요청했습니다."
+                } else {
+                    "이미 취소 중이거나 종료된 실행입니다."
+                }
+            } else {
+                "현재 이 대화에서 실행 중인 작업이 없습니다."
+            };
+            send_chunks(&bot, msg.chat.id, text).await?;
+        }
         Command::Report => {
             send_chunks(&bot, msg.chat.id, START_MSG).await?;
             let text = report_text().unwrap_or_else(|e| format!("리포트 조회 실패: {e}"));
@@ -179,7 +203,12 @@ async fn on_command(bot: Bot, msg: Message, cmd: Command, app: Arc<App>) -> Resp
         Command::Lesson(text) => {
             let text = text.trim().to_string();
             if text.is_empty() {
-                send_chunks(&bot, msg.chat.id, "교훈 문장을 적어 주세요. 예: /lesson 수정 전 read_file").await?;
+                send_chunks(
+                    &bot,
+                    msg.chat.id,
+                    "교훈 문장을 적어 주세요. 예: /lesson 수정 전 read_file",
+                )
+                .await?;
             } else {
                 send_chunks(&bot, msg.chat.id, START_MSG).await?;
                 let out = lessons::add_text(&app.cfg, &text)
@@ -222,7 +251,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, app: Arc<App>) -> ResponseResul
         bot.answer_callback_query(q.id).await?;
         return Ok(());
     };
-    if let Some(tx) = app.pending.lock().await.remove(id) {
+    if let Some((_, tx)) = app.pending.lock().await.remove(id) {
         let _ = tx.send(ok);
     }
     bot.answer_callback_query(q.id).await?;
@@ -263,7 +292,14 @@ async fn ask_pipeline(bot: &Bot, msg: &Message, app: &Arc<App>, prompt: &str) ->
         )?
     };
     let _g = graph::scope(&run_id);
-    graph::trace_start(
+    let run_context = RunContext::for_config(RunId::new(run_id.clone()), Arc::new(cfg.clone()))
+        .with_live_sink(crate::ui::current_live_sink());
+    app.active
+        .lock()
+        .await
+        .insert(msg.chat.id, run_context.clone());
+    graph::trace_start_in(
+        &run_context,
         binding.class.as_str(),
         &binding.profile_name,
         &binding.provider_name,
@@ -271,12 +307,25 @@ async fn ask_pipeline(bot: &Bot, msg: &Message, app: &Arc<App>, prompt: &str) ->
         false,
     );
 
-    match harness::run_pipeline(cfg, &binding, prompt, false, None, None, remote, None).await {
+    let result = harness::run_pipeline_with_context(
+        cfg,
+        &binding,
+        prompt,
+        false,
+        None,
+        None,
+        remote,
+        None,
+        run_context.clone(),
+    )
+    .await;
+    app.active.lock().await.remove(&msg.chat.id);
+    match result {
         Ok(outcome) => {
             if let Ok(db) = Db::open(&Db::db_path()?) {
                 let _ = agent::record_finish(&db, &run_id, &outcome);
             }
-            graph::node("persist", &outcome.status, "", Some("bind"));
+            graph::node_in(&run_context, "persist", &outcome.status, "", Some("bind"));
             lessons::maybe_spawn(cfg, prompt, &outcome);
             let mut text = agent::assistant_text(&outcome.messages);
             if text.trim().is_empty() {
@@ -288,7 +337,13 @@ async fn ask_pipeline(bot: &Bot, msg: &Message, app: &Arc<App>, prompt: &str) ->
             if let Ok(db) = Db::open(&Db::db_path()?) {
                 let _ = db.finish_run(&run_id, "fail", 0, 0, 0, Some(&e.to_string()));
             }
-            graph::node("persist", "fail", &e.to_string(), Some("bind"));
+            graph::node_in(
+                &run_context,
+                "persist",
+                "fail",
+                &e.to_string(),
+                Some("bind"),
+            );
             let fail = agent::AgentOutcome {
                 status: "fail".into(),
                 error: Some(e.to_string()),
@@ -319,7 +374,7 @@ fn make_remote(bot: Bot, chat_id: ChatId, app: &Arc<App>) -> RemoteApproval {
             Box::pin(async move {
                 let id = next_approval_id(&app);
                 let (tx, rx) = oneshot::channel();
-                pending.lock().await.insert(id.clone(), tx);
+                pending.lock().await.insert(id.clone(), (chat_id, tx));
                 let kb = InlineKeyboardMarkup::new([[
                     InlineKeyboardButton::callback("✅ 승인", format!("ok:{id}")),
                     InlineKeyboardButton::callback("❌ 거부", format!("no:{id}")),
@@ -337,6 +392,20 @@ fn make_remote(bot: Bot, chat_id: ChatId, app: &Arc<App>) -> RemoteApproval {
                 rx.await.unwrap_or(false)
             })
         }),
+    }
+}
+
+async fn reject_pending_for_chat(app: &App, chat_id: ChatId) {
+    let mut pending = app.pending.lock().await;
+    let ids: Vec<String> = pending
+        .iter()
+        .filter(|(_, (pending_chat, _))| *pending_chat == chat_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        if let Some((_, sender)) = pending.remove(&id) {
+            let _ = sender.send(false);
+        }
     }
 }
 
@@ -391,7 +460,7 @@ fn report_text() -> Result<String> {
 }
 
 fn help_text() -> String {
-    "RafikX 명령:\n/ask 질문\n/obsidian 검색어\n/status\n/report\n/lesson 교훈 문장\n일반 글은 /ask 와 같습니다."
+    "RafikX 명령:\n/ask 질문\n/cancel\n/obsidian 검색어\n/status\n/report\n/lesson 교훈 문장\n일반 글은 /ask 와 같습니다."
         .into()
 }
 

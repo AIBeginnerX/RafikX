@@ -185,7 +185,9 @@ fn render_chart(body: &[&str], max_w: Option<usize>) -> String {
     if available < 10 {
         return rows
             .iter()
-            .flat_map(|(label, value)| wrap_text(&format!("{label} {}", fmt_num(*value)), available))
+            .flat_map(|(label, value)| {
+                wrap_text(&format!("{label} {}", fmt_num(*value)), available)
+            })
             .collect::<Vec<_>>()
             .join("\n");
     }
@@ -200,9 +202,7 @@ fn render_chart(body: &[&str], max_w: Option<usize>) -> String {
         .max()
         .unwrap_or(0);
     let label_w = natural_label.min((available / 3).max(1));
-    let bar_w = available
-        .saturating_sub(label_w + value_w + 4)
-        .max(1);
+    let bar_w = available.saturating_sub(label_w + value_w + 4).max(1);
     let mut out: Vec<String> = Vec::new();
     for (label, v) in &rows {
         let label = truncate_width(label, label_w);
@@ -369,7 +369,10 @@ fn render_grid_with_width(rows: &[Vec<String>], max_w: Option<usize>) -> String 
                 Some(x) => x,
                 None => break,
             };
-            widths[bi] -= 2.max((widths[bi] - min_col) / 4).min(widths[bi] - min_col).max(1);
+            widths[bi] -= 2
+                .max((widths[bi] - min_col) / 4)
+                .min(widths[bi] - min_col)
+                .max(1);
             // 해당 열의 셀들을 새 폭에 맞게 재포장
             for roww in wrapped_rows.iter_mut() {
                 let cell_lines = &mut roww[bi];
@@ -442,7 +445,9 @@ fn render_grid_with_width(rows: &[Vec<String>], max_w: Option<usize>) -> String 
 }
 
 fn is_known_command(tok: &str) -> bool {
-    crate::chat::SLASH_COMMANDS.iter().any(|(name, _)| *name == tok)
+    crate::chat::SLASH_COMMANDS
+        .iter()
+        .any(|(name, _)| *name == tok)
 }
 
 fn push_inline(line: &str, out: &mut Vec<MdSeg>) {
@@ -534,20 +539,29 @@ mod tests {
     fn markdown_heading_and_code() {
         let segs = markdown_segs("# 제목\n`code` and **bold**\n");
         assert!(segs.iter().any(|s| s.kind == MdKind::Heading));
-        assert!(segs.iter().any(|s| s.kind == MdKind::Code && s.text == "code"));
-        assert!(segs.iter().any(|s| s.kind == MdKind::Emphasis && s.text == "bold"));
+        assert!(
+            segs.iter()
+                .any(|s| s.kind == MdKind::Code && s.text == "code")
+        );
+        assert!(
+            segs.iter()
+                .any(|s| s.kind == MdKind::Emphasis && s.text == "bold")
+        );
     }
 
     #[test]
     fn slash_commands_are_highlighted() {
         let segs = markdown_segs("모드는 /mode plan 으로 바꾸세요. 경로 /etc/hosts 는 아니다.");
-        assert!(segs
-            .iter()
-            .any(|s| s.kind == MdKind::Command && s.text == "/mode"));
+        assert!(
+            segs.iter()
+                .any(|s| s.kind == MdKind::Command && s.text == "/mode")
+        );
         // 숫자·기호로 시작하면 명령어가 아니라 일반 텍스트다.
-        assert!(!segs
-            .iter()
-            .any(|s| s.kind == MdKind::Command && s.text.starts_with("/etc")));
+        assert!(
+            !segs
+                .iter()
+                .any(|s| s.kind == MdKind::Command && s.text.starts_with("/etc"))
+        );
     }
 
     #[test]
@@ -601,21 +615,21 @@ mod tests {
     #[test]
     fn charts_and_tables_fit_requested_width() {
         let chart = markdown_segs_with_width("```chart\n긴라벨: 100\nB: 50\n```", Some(18));
-        assert!(chart.iter().all(|seg| {
-            seg.text
-                .lines()
-                .all(|line| display_width(line) <= 18)
-        }));
+        assert!(
+            chart
+                .iter()
+                .all(|seg| { seg.text.lines().all(|line| display_width(line) <= 18) })
+        );
 
         let table = markdown_segs_with_width(
             "| 이름 | 아주 긴 설명 |\n|---|---|\n| 항목 | 창 너비에 맞춰 줄바꿈되어야 한다 |",
             Some(22),
         );
-        assert!(table.iter().all(|seg| {
-            seg.text
-                .lines()
-                .all(|line| display_width(line) <= 22)
-        }));
+        assert!(
+            table
+                .iter()
+                .all(|seg| { seg.text.lines().all(|line| display_width(line) <= 22) })
+        );
         assert!(
             table
                 .iter()
@@ -632,4 +646,3 @@ mod tests {
         assert!(KEY_HELP.contains("y / n / a"));
     }
 }
-

@@ -284,7 +284,8 @@ approval_timeout_secs = 300
 
 [ui]
 theme = "rafikx"                   # rafikx | opal | synth | claude
-appearance = "auto"                # 데스크탑: light | dark | auto (시간대 자동)
+appearance = "auto"                # 데스크탑: light | dark | auto (운영체제 설정 자동)
+reduced_motion = false              # TUI 애니메이션 최소화
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -499,6 +500,8 @@ pub struct UiConfig {
     /// 데스크탑 화면 배경: light | dark | auto (시간대 자동).
     #[serde(default = "default_appearance")]
     pub appearance: String,
+    #[serde(default)]
+    pub reduced_motion: bool,
 }
 
 fn default_theme() -> String {
@@ -514,6 +517,7 @@ impl Default for UiConfig {
         Self {
             theme: default_theme(),
             appearance: default_appearance(),
+            reduced_motion: false,
         }
     }
 }
@@ -545,7 +549,8 @@ impl Config {
 
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         let data_dir = Self::data_dir()?;
-        fs::create_dir_all(&data_dir).with_context(|| format!("{} 폴더를 만들 수 없습니다", data_dir.display()))?;
+        fs::create_dir_all(&data_dir)
+            .with_context(|| format!("{} 폴더를 만들 수 없습니다", data_dir.display()))?;
 
         let path = match explicit {
             Some(p) => expand_tilde(&p.to_string_lossy()),
@@ -601,7 +606,14 @@ impl Config {
     #[allow(dead_code)]
     pub fn api_key_tail(&self, provider_name: &str) -> Result<Option<String>> {
         Ok(self.api_key(provider_name)?.map(|k| {
-            let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+            let tail: String = k
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
             tail
         }))
     }
@@ -679,7 +691,8 @@ pub fn toml_string(s: &str) -> String {
 }
 
 pub fn write_toml_key(path: &Path, header: &str, key: &str, formatted: &str) -> Result<()> {
-    let raw = fs::read_to_string(path).with_context(|| format!("{} 파일을 읽을 수 없습니다", path.display()))?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("{} 파일을 읽을 수 없습니다", path.display()))?;
     let new_raw = upsert_toml_key(&raw, header, key, formatted);
     fs::write(path, new_raw)?;
     set_owner_only_mode(path);
@@ -688,7 +701,8 @@ pub fn write_toml_key(path: &Path, header: &str, key: &str, formatted: &str) -> 
 
 pub fn append_toml(path: &Path, block: &str) -> Result<()> {
     let mut raw = if path.exists() {
-        fs::read_to_string(path).with_context(|| format!("{} 파일을 읽을 수 없습니다", path.display()))?
+        fs::read_to_string(path)
+            .with_context(|| format!("{} 파일을 읽을 수 없습니다", path.display()))?
     } else {
         String::new()
     };
@@ -814,10 +828,7 @@ mod tests {
 
     #[test]
     fn data_dir_prefers_rafikx_then_legacy() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rafikx-dir-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("rafikx-dir-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         assert_eq!(resolve_default_data_dir(&tmp), tmp.join(".rafikx"));
@@ -833,7 +844,10 @@ mod tests {
 
     #[test]
     fn old_harness_without_selection_defaults_auto() {
-        let raw = DEFAULT_CONFIG.replace("selection = \"auto\"             # auto | manual  (수동이면 아래 모델 ID)\n", "");
+        let raw = DEFAULT_CONFIG.replace(
+            "selection = \"auto\"             # auto | manual  (수동이면 아래 모델 ID)\n",
+            "",
+        );
         let file: ConfigFile = toml::from_str(&raw).expect("parse");
         assert_eq!(file.harness.selection, "auto");
         assert!(!file.general.setup_done);
@@ -851,7 +865,9 @@ mod tests {
         let file: ConfigFile = toml::from_str(DEFAULT_CONFIG).expect("parse");
         assert_eq!(file.general.default_provider, "minimax");
         assert_eq!(
-            file.providers.get("minimax").map(|provider| provider.model.as_str()),
+            file.providers
+                .get("minimax")
+                .map(|provider| provider.model.as_str()),
             Some("minimax-m3")
         );
         let zen = file.providers.get("opencode_zen").expect("zen");
@@ -859,7 +875,10 @@ mod tests {
         assert_eq!(zen.kind, "openai_compat");
         let go = file.providers.get("opencode_go").expect("go");
         assert_eq!(go.api_key_env, "OPENCODE_GO_API_KEY");
-        assert_eq!(go.base_url.as_deref(), Some("https://opencode.ai/zen/go/v1"));
+        assert_eq!(
+            go.base_url.as_deref(),
+            Some("https://opencode.ai/zen/go/v1")
+        );
     }
 
     #[test]

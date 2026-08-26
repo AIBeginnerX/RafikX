@@ -99,10 +99,7 @@ pub fn remove(id: &str) -> Result<Option<Account>> {
 
 pub fn remove_provider(provider: &str) -> Result<Vec<Account>> {
     let mut file = load()?;
-    let (keep, gone): (Vec<_>, Vec<_>) = file
-        .items
-        .drain(..)
-        .partition(|a| a.provider != provider);
+    let (keep, gone): (Vec<_>, Vec<_>) = file.items.drain(..).partition(|a| a.provider != provider);
     file.items = keep;
     save(&file)?;
     Ok(gone)

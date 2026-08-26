@@ -83,12 +83,7 @@ pub fn valid_custom_id(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
 }
 
-pub fn append_custom_openai(
-    cfg: &Config,
-    name: &str,
-    base_url: &str,
-    model: &str,
-) -> Result<()> {
+pub fn append_custom_openai(cfg: &Config, name: &str, base_url: &str, model: &str) -> Result<()> {
     if !valid_custom_id(name) {
         return Err(anyhow!(
             "이름은 영문 소문자로 시작하고 영문·숫자·밑줄만 (최대 32자)"
@@ -99,7 +94,9 @@ pub fn append_custom_openai(
     }
     let base = base_url.trim().trim_end_matches('/');
     if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err(anyhow!("base URL 은 http:// 또는 https:// 로 시작해야 합니다"));
+        return Err(anyhow!(
+            "base URL 은 http:// 또는 https:// 로 시작해야 합니다"
+        ));
     }
     let model = model.trim();
     if model.is_empty() {
@@ -130,14 +127,8 @@ pub fn manage_row(cfg: &Config, name: &str) -> String {
     } else {
         "미연결"
     };
-    let model = cfg
-        .provider(name)
-        .map(|p| p.model.as_str())
-        .unwrap_or("");
-    format!(
-        "{star}{}  [{mark}]  {model}",
-        auth::provider_label(name)
-    )
+    let model = cfg.provider(name).map(|p| p.model.as_str()).unwrap_or("");
+    format!("{star}{}  [{mark}]  {model}", auth::provider_label(name))
 }
 
 #[cfg(test)]

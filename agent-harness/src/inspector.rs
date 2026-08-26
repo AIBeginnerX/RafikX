@@ -93,7 +93,9 @@ async fn build_report(
     } else {
         match call_inspector(cfg, subagent_override, &stats_md).await {
             Ok(text) if !text.trim().is_empty() => redact(&text),
-            Ok(_) => String::from("## 분석\n모델이 빈 응답을 반환했습니다. 위 통계만 참고하세요.\n"),
+            Ok(_) => {
+                String::from("## 분석\n모델이 빈 응답을 반환했습니다. 위 통계만 참고하세요.\n")
+            }
             Err(e) => format!(
                 "## 분석\n모델 호출을 건너뛰었습니다 ({e}). 위 통계는 코드가 계산한 사실입니다.\n"
             ),
@@ -178,13 +180,7 @@ fn compute_stats(runs: &[RunRow]) -> Stats {
     }
 }
 
-fn format_stats(
-    s: &Stats,
-    n: usize,
-    lesson_n: usize,
-    log_tail: &str,
-    doctor: &str,
-) -> String {
+fn format_stats(s: &Stats, n: usize, lesson_n: usize, log_tail: &str, doctor: &str) -> String {
     let rate = if s.total == 0 {
         0.0
     } else {

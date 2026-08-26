@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 
 use super::md::MdKind;
 use super::{App, EntryKind};
@@ -214,7 +214,11 @@ fn todo_panel_height(app: &App, width: u16) -> u16 {
         let todo_rows = app
             .todos
             .iter()
-            .map(|item| super::md::wrap_text(&item.content, content_width).len().max(1))
+            .map(|item| {
+                super::md::wrap_text(&item.content, content_width)
+                    .len()
+                    .max(1)
+            })
             .sum();
         progress_panel_height(todo_rows, app.agents.len(), width)
     }
@@ -238,7 +242,9 @@ fn draw_todo_panel(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let mut rows = vec![Line::from(vec![
         Span::styled(
             format!(" Todo {}/{} ", progress.completed, progress.total),
-            Style::default().fg(th.secondary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(th.secondary)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("■".repeat(filled), Style::default().fg(th.accent)),
         Span::styled("·".repeat(bar_width - filled), Style::default().fg(th.mute)),
@@ -285,16 +291,14 @@ fn draw_todo_panel(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         .border_style(Style::default().fg(th.border))
         .style(Style::default().bg(th.bg));
     f.render_widget(
-        Paragraph::new(rows)
-            .block(block)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(rows).block(block).wrap(Wrap { trim: false }),
         area,
     );
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let version = env!("CARGO_PKG_VERSION");
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(
             " RAFIKX ",
             Style::default()
@@ -317,11 +321,22 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             ),
             Style::default().fg(th.code),
         ),
-        Span::raw("  "),
-        // 프로젝트 경로
-        Span::styled(&app.cwd, Style::default().fg(th.secondary)),
     ];
-    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)), area);
+    if area.width >= 112 {
+        spans.push(Span::raw("   "));
+        spans.extend(super::start::compact_signal(app, th));
+    } else if area.width >= 72 {
+        spans.push(Span::raw("   "));
+        spans.extend(super::start::short_signal(app, th));
+    }
+    if area.width >= 96 {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(&app.cwd, Style::default().fg(th.secondary)));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
+        area,
+    );
 }
 
 /// 대화 영역을 테두리로 감싼 뒤 내부에 트랜스크립트를 그린다.
@@ -341,6 +356,10 @@ fn draw_transcript_frame(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
 }
 
 fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
+    if app.show_start {
+        super::start::draw(f, app, area, th);
+        return;
+    }
     let width = area.width.max(1);
     let theme_name = app.session.cfg.file.ui.theme.clone();
     // 엔트리 단위 렌더 캐시 — 마크다운 파싱·syntect 하이라이트·줄바꿈까지
@@ -376,6 +395,23 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     cache.truncate(count);
     drop(cache);
 
+    if let Some(approval) = &app.approval {
+        visual.push(Line::default());
+        visual.push(Line::from(Span::styled(
+            " APPROVAL  도구 실행 승인 필요",
+            Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+        )));
+        let content_width = width.saturating_sub(3).max(1) as usize;
+        for row in approval.preview.lines() {
+            for wrapped in super::md::wrap_text(row, content_width) {
+                visual.push(Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(th.warn)),
+                    Span::styled(wrapped, Style::default().fg(th.text)),
+                ]));
+            }
+        }
+    }
+
     if visual.is_empty() {
         visual.push(Line::from(Span::styled(
             "  할 일을 말하면 실행합니다.  ?  키 도움말",
@@ -404,10 +440,7 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let block = Block::default()
         .borders(Borders::NONE)
         .style(Style::default().bg(th.bg));
-    f.render_widget(
-        Paragraph::new(visible).block(block),
-        area,
-    );
+    f.render_widget(Paragraph::new(visible).block(block), area);
 }
 
 /// 스트리밍 중 답변의 경량 렌더 — 마크다운 파싱·코드 하이라이팅 없이
@@ -419,7 +452,11 @@ fn render_streaming_tail(text: &str, width: u16, th: &Pal) -> Vec<Line<'static>>
     let mut first = true;
     for row in shown.lines() {
         let pieces = super::md::wrap_text(row, content_width);
-        let pieces = if pieces.is_empty() { vec![String::new()] } else { pieces };
+        let pieces = if pieces.is_empty() {
+            vec![String::new()]
+        } else {
+            pieces
+        };
         for piece in pieces {
             if first {
                 lines.push(Line::from(vec![
@@ -459,173 +496,157 @@ fn entry_render_hash(e: &super::Entry, width: u16, theme: &str) -> u64 {
 fn render_entry(e: &super::Entry, width: u16, th: &Pal) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
-        let text = match e.kind {
-            EntryKind::Assistant => compact_blank(&display_model_work(&e.text)),
-            EntryKind::User | EntryKind::Queued => super::collapsed_input(&e.text),
-            _ => e.text.clone(),
-        };
-        if text.trim().is_empty() && e.kind == EntryKind::Assistant {
-            return Vec::new();
+    let text = match e.kind {
+        EntryKind::Assistant => compact_blank(&display_model_work(&e.text)),
+        EntryKind::User | EntryKind::Queued => super::collapsed_input(&e.text),
+        _ => e.text.clone(),
+    };
+    if text.trim().is_empty() && e.kind == EntryKind::Assistant {
+        return Vec::new();
+    }
+    let role = coding_role(&text);
+    let (tag, style) = match e.kind {
+        EntryKind::User => (
+            "you",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ),
+        EntryKind::Queued => ("wait", Style::default().fg(th.mute)),
+        EntryKind::Assistant => (
+            "rafikx",
+            Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+        ),
+        EntryKind::System => ("sys", Style::default().fg(th.mute)),
+        EntryKind::Tool => match role {
+            CodeRole::Create => ("create", Style::default().fg(Color::Green)),
+            CodeRole::Edit => ("edit", Style::default().fg(th.warn)),
+            CodeRole::Delete => ("delete", Style::default().fg(th.err)),
+            CodeRole::Verify => ("verify", Style::default().fg(th.secondary)),
+            CodeRole::Other => ("tool", Style::default().fg(th.secondary)),
+        },
+        EntryKind::Warn => (
+            "!",
+            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+        ),
+    };
+    // 컴팩트 레이아웃: 태그를 첫 줄에 인라인으로 붙이고 이후 줄은 세로선만.
+    let tag_pad = format!("{tag:<6}");
+    let mut first = true;
+    let push_row = |lines: &mut Vec<Line>, text: &str, st: Style, first: &mut bool| {
+        if *first {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {tag_pad}"), style),
+                Span::styled(format!(" {text}"), st),
+            ]));
+            *first = false;
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(CONTINUATION_PREFIX, Style::default().fg(th.mute)),
+                Span::styled(format!(" {text}"), st),
+            ]));
         }
-        let role = coding_role(&text);
-        let (tag, style) = match e.kind {
-            EntryKind::User => (
-                "you",
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ),
-            EntryKind::Queued => ("wait", Style::default().fg(th.mute)),
-            EntryKind::Assistant => (
-                "rafikx",
-                Style::default().fg(th.code).add_modifier(Modifier::BOLD),
-            ),
-            EntryKind::System => ("sys", Style::default().fg(th.mute)),
-            EntryKind::Tool => match role {
-                CodeRole::Create => ("create", Style::default().fg(Color::Green)),
-                CodeRole::Edit => ("edit", Style::default().fg(th.warn)),
-                CodeRole::Delete => ("delete", Style::default().fg(th.err)),
-                CodeRole::Verify => ("verify", Style::default().fg(th.secondary)),
-                CodeRole::Other => ("tool", Style::default().fg(th.secondary)),
-            },
-            EntryKind::Warn => (
-                "!",
-                Style::default()
-                    .fg(th.err)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        };
-        // 컴팩트 레이아웃: 태그를 첫 줄에 인라인으로 붙이고 이후 줄은 세로선만.
-        let tag_pad = format!("{tag:<6}");
-        let mut first = true;
-        let push_row = |lines: &mut Vec<Line>, text: &str, st: Style, first: &mut bool| {
-            if *first {
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {tag_pad}"), style),
-                    Span::styled(format!(" {text}"), st),
-                ]));
-                *first = false;
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled(CONTINUATION_PREFIX, Style::default().fg(th.mute)),
-                    Span::styled(format!(" {text}"), st),
-                ]));
-            }
-        };
+    };
 
-        if e.kind == EntryKind::Assistant {
-            let content_width = width.saturating_sub(8).max(1) as usize;
-            for (is_work, section) in split_model_work(&text) {
-                if is_work {
-                    let work_style = Style::default()
-                        .fg(th.thinking)
-                        .add_modifier(Modifier::ITALIC);
-                    push_row(&mut lines, "모델 작업", work_style, &mut first);
-                    for row in super::md::wrap_text(&section, content_width) {
-                        push_row(&mut lines, &row, work_style, &mut first);
-                    }
+    if e.kind == EntryKind::Assistant {
+        let content_width = width.saturating_sub(8).max(1) as usize;
+        for (is_work, section) in split_model_work(&text) {
+            if is_work {
+                let work_style = Style::default()
+                    .fg(th.thinking)
+                    .add_modifier(Modifier::ITALIC);
+                push_row(&mut lines, "모델 작업", work_style, &mut first);
+                for row in super::md::wrap_text(&section, content_width) {
+                    push_row(&mut lines, &row, work_style, &mut first);
+                }
+                continue;
+            }
+            let segs = crate::tui::md::markdown_segs_with_width(&section, Some(content_width));
+            for seg in &segs {
+                if seg.kind == MdKind::CodeBlock {
+                    push_code_rows(
+                        &mut lines,
+                        &seg.text,
+                        seg.lang.as_deref(),
+                        th,
+                        &tag_pad,
+                        &mut first,
+                    );
                     continue;
                 }
-                let segs =
-                    crate::tui::md::markdown_segs_with_width(&section, Some(content_width));
-                for seg in &segs {
-                    if seg.kind == MdKind::CodeBlock {
-                        push_code_rows(
-                            &mut lines,
-                            &seg.text,
-                            seg.lang.as_deref(),
-                            th,
-                            &tag_pad,
-                            &mut first,
-                        );
-                        continue;
+                let st = match seg.kind {
+                    MdKind::Heading => Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    MdKind::Emphasis => Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    MdKind::Code | MdKind::CodeBlock | MdKind::Table | MdKind::Chart => {
+                        Style::default().fg(th.code).bg(th.panel)
                     }
-                    let st = match seg.kind {
-                        MdKind::Heading => Style::default()
-                            .fg(th.accent)
-                            .add_modifier(Modifier::BOLD),
-                        MdKind::Emphasis => Style::default()
-                            .fg(th.accent)
-                            .add_modifier(Modifier::BOLD),
-                        MdKind::Code | MdKind::CodeBlock | MdKind::Table | MdKind::Chart => {
-                            Style::default().fg(th.code).bg(th.panel)
-                        }
-                        MdKind::Command => Style::default()
-                            .fg(th.secondary)
-                            .add_modifier(Modifier::BOLD),
-                        MdKind::Text => Style::default().fg(th.text),
-                    };
-                    for piece in seg.text.split('\n') {
-                        push_row(&mut lines, piece, st, &mut first);
-                    }
+                    MdKind::Command => Style::default()
+                        .fg(th.secondary)
+                        .add_modifier(Modifier::BOLD),
+                    MdKind::Text => Style::default().fg(th.text),
+                };
+                for piece in seg.text.split('\n') {
+                    push_row(&mut lines, piece, st, &mut first);
                 }
             }
-        } else if e.kind == EntryKind::System {
-            if text.starts_with("Run summary") {
-                for (index, row) in text.split('\n').enumerate() {
-                    let style = if index == 0 {
-                        Style::default()
-                            .fg(th.code)
-                            .add_modifier(Modifier::BOLD)
-                    } else if row.trim_start().starts_with('✓') {
-                        Style::default()
-                            .fg(th.success)
-                            .add_modifier(Modifier::BOLD)
-                    } else if row.trim_start().starts_with('!') {
-                        Style::default()
-                            .fg(th.err)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(th.body)
-                    };
-                    lines.push(Line::from(Span::styled(
-                        format!("   {row}"),
-                        style,
-                    )));
-                }
-            } else {
-                // 시스템 안내는 태그 없이 들여쓰기만 (sys 접두어가 거슬리므로)
-                for row in text.split('\n') {
-                    lines.push(Line::from(Span::styled(
-                        format!("   · {row}"),
-                        Style::default().fg(th.mute),
-                    )));
-                }
+        }
+    } else if e.kind == EntryKind::System {
+        if text.starts_with("Run summary") {
+            for (index, row) in text.split('\n').enumerate() {
+                let style = if index == 0 {
+                    Style::default().fg(th.code).add_modifier(Modifier::BOLD)
+                } else if row.trim_start().starts_with('✓') {
+                    Style::default().fg(th.success).add_modifier(Modifier::BOLD)
+                } else if row.trim_start().starts_with('!') {
+                    Style::default().fg(th.err).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.body)
+                };
+                lines.push(Line::from(Span::styled(format!("   {row}"), style)));
             }
         } else {
-            let failed_tool = e.kind == EntryKind::Tool && text.contains("도구 오류");
-            if matches!(e.kind, EntryKind::Warn) || failed_tool {
-                // 에러는 붉은 계열 본문 + 중요 단어만 다크엘로우 굵게.
-                for row in text.split('\n') {
-                    let mut spans: Vec<Span> = Vec::new();
-                    if first {
-                        spans.push(Span::styled(format!(" {tag_pad}"), style));
-                        first = false;
-                    } else {
-                        spans.push(Span::styled(
-                            CONTINUATION_PREFIX,
-                            Style::default().fg(th.mute),
-                        ));
-                    }
-                    append_alert_spans(&mut spans, row, th);
-                    lines.push(Line::from(spans));
-                }
-            } else {
-                let st = match role {
-                    CodeRole::Create => Style::default().fg(Color::Green),
-                    CodeRole::Edit => Style::default().fg(th.warn),
-                    CodeRole::Delete => Style::default().fg(th.err),
-                    CodeRole::Verify => Style::default().fg(th.secondary),
-                    CodeRole::Other => Style::default().fg(th.body),
-                };
-                for row in text.split('\n') {
-                    push_row(&mut lines, row, st, &mut first);
-                }
+            // 시스템 안내는 태그 없이 들여쓰기만 (sys 접두어가 거슬리므로)
+            for row in text.split('\n') {
+                lines.push(Line::from(Span::styled(
+                    format!("   · {row}"),
+                    Style::default().fg(th.mute),
+                )));
             }
         }
-        // 빈 줄은 도구·경고 뒤에만 — 대화 본문은 태그 색으로 구분해 밀도를 높인다.
-        if matches!(e.kind, EntryKind::Tool | EntryKind::Warn) {
-            lines.push(Line::from(""));
+    } else {
+        let failed_tool = e.kind == EntryKind::Tool && text.contains("도구 오류");
+        if matches!(e.kind, EntryKind::Warn) || failed_tool {
+            // 에러는 붉은 계열 본문 + 중요 단어만 다크엘로우 굵게.
+            for row in text.split('\n') {
+                let mut spans: Vec<Span> = Vec::new();
+                if first {
+                    spans.push(Span::styled(format!(" {tag_pad}"), style));
+                    first = false;
+                } else {
+                    spans.push(Span::styled(
+                        CONTINUATION_PREFIX,
+                        Style::default().fg(th.mute),
+                    ));
+                }
+                append_alert_spans(&mut spans, row, th);
+                lines.push(Line::from(spans));
+            }
+        } else {
+            let st = match role {
+                CodeRole::Create => Style::default().fg(Color::Green),
+                CodeRole::Edit => Style::default().fg(th.warn),
+                CodeRole::Delete => Style::default().fg(th.err),
+                CodeRole::Verify => Style::default().fg(th.secondary),
+                CodeRole::Other => Style::default().fg(th.body),
+            };
+            for row in text.split('\n') {
+                push_row(&mut lines, row, st, &mut first);
+            }
         }
-    
+    }
+    // 빈 줄은 도구·경고 뒤에만 — 대화 본문은 태그 색으로 구분해 밀도를 높인다.
+    if matches!(e.kind, EntryKind::Tool | EntryKind::Warn) {
+        lines.push(Line::from(""));
+    }
+
     // 논리 줄을 터미널 폭 기준 비주얼 행으로 잘라 반환한다.
     let w = width.max(1) as usize;
     let mut visual: Vec<Line<'static>> = Vec::with_capacity(lines.len());
@@ -740,11 +761,7 @@ fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
         .collect()
 }
 
-fn pad_line_to_width(
-    mut line: Line<'static>,
-    width: usize,
-    background: Color,
-) -> Line<'static> {
+fn pad_line_to_width(mut line: Line<'static>, width: usize, background: Color) -> Line<'static> {
     let used: usize = line
         .spans
         .iter()
@@ -821,18 +838,13 @@ fn compact_blank(s: &str) -> String {
 
 /// 오류·경고 본문의 중요 단어 사전 — 붉은 본문 위에 다크엘로우 굵게 칠한다.
 const ALERT_KEYWORDS: &[&str] = &[
-    "오류", "실패", "거부", "중단", "경고", "위험",
-    "error", "Error", "ERROR",
-    "failed", "Failed", "FAILED", "fail",
-    "warning", "Warning",
-    "denied", "refused", "timeout",
+    "오류", "실패", "거부", "중단", "경고", "위험", "error", "Error", "ERROR", "failed", "Failed",
+    "FAILED", "fail", "warning", "Warning", "denied", "refused", "timeout",
 ];
 
 fn append_alert_spans(spans: &mut Vec<Span<'static>>, text: &str, th: &Pal) {
     let err_style = Style::default().fg(th.err);
-    let kw_style = Style::default()
-        .fg(th.kw)
-        .add_modifier(Modifier::BOLD);
+    let kw_style = Style::default().fg(th.kw).add_modifier(Modifier::BOLD);
     let lower = text.to_lowercase();
     let mut rest_start = 0usize;
     let bytes = text.as_bytes();
@@ -848,10 +860,7 @@ fn append_alert_spans(spans: &mut Vec<Span<'static>>, text: &str, th: &Pal) {
         match hit {
             Some((p, l)) => {
                 if p > rest_start {
-                    spans.push(Span::styled(
-                        text[rest_start..p].to_string(),
-                        err_style,
-                    ));
+                    spans.push(Span::styled(text[rest_start..p].to_string(), err_style));
                 }
                 spans.push(Span::styled(text[p..p + l].to_string(), kw_style));
                 i = p + l;
@@ -955,7 +964,10 @@ fn highlight_code(code: &str, lang: Option<&str>, th: &Pal) -> Vec<Vec<Span<'sta
         out.push(spans);
     }
     if out.is_empty() {
-        out.push(vec![Span::styled(" ".to_string(), Style::default().bg(th.panel))]);
+        out.push(vec![Span::styled(
+            " ".to_string(),
+            Style::default().bg(th.panel),
+        )]);
     }
     out
 }
@@ -1030,13 +1042,11 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     } else {
         (">", Style::default().fg(th.accent))
     };
-    let body_style = Style::default()
-        .fg(th.accent)
-        .add_modifier(if app.busy {
-            Modifier::empty()
-        } else {
-            Modifier::BOLD
-        });
+    let body_style = Style::default().fg(th.accent).add_modifier(if app.busy {
+        Modifier::empty()
+    } else {
+        Modifier::BOLD
+    });
     let mut lines: Vec<Line> = Vec::new();
     let shown = super::collapsed_input(&app.input);
     let mut rows = shown.split('\n');
@@ -1051,7 +1061,10 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             Span::styled(row.to_string(), body_style),
         ]));
     }
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(th.bg)), area);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(th.bg)),
+        area,
+    );
 
     if shown == app.input
         && !app.busy
@@ -1097,7 +1110,6 @@ fn cursor_xy(text: &str, cursor: usize, width: u16) -> (u16, u16) {
     (x, y)
 }
 
-
 /// 단일 푸터 (pi 스타일) — 모드 배지 · 상태(스피너/승인/완료) · 모델 · 통계를
 /// 한 줄에 담는다. 옛 상태 스트립의 역할(스피너·승인 버튼)을 흡수했다.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
@@ -1130,20 +1142,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         let yolo = " YOLO ";
         line_spans.push(Span::styled(
             yolo,
-            Style::default().fg(th.bg).bg(th.err).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(th.bg)
+                .bg(th.err)
+                .add_modifier(Modifier::BOLD),
         ));
         used += super::md::display_width(yolo);
     }
 
     // 상태 — 승인 대기가 최우선, 그다음 실행 스피너, 마지막 idle 결과.
     if let Some(ap) = &app.approval {
-        for (i, (label, color)) in [
-            ("Yes", Color::Green),
-            ("No", th.err),
-            ("Always", th.warn),
-        ]
-        .iter()
-        .enumerate()
+        for (i, (label, color)) in [("Yes", Color::Green), ("No", th.err), ("Always", th.warn)]
+            .iter()
+            .enumerate()
         {
             let picked = i == ap.selected;
             let text = if picked {
@@ -1184,7 +1195,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         ));
     }
 
-    let mut secondary = vec![(model, Style::default().fg(th.accent).add_modifier(Modifier::BOLD))];
+    let mut secondary = vec![(
+        model,
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+    )];
     if !app.tokens.is_empty() {
         secondary.push((app.tokens.clone(), Style::default().fg(th.mute)));
     }
@@ -1317,7 +1331,6 @@ fn active_status_label(status: &str) -> &'static str {
     }
 }
 
-
 fn selected_context_label(app: &App) -> String {
     let cfg = &app.session.cfg;
     let (provider, model) = match (&app.session.provider, &app.session.model) {
@@ -1385,10 +1398,7 @@ fn spin_frame<'a>(frames: &[&'a str], interval_ms: u64) -> &'a str {
 
 /// opencode 동일 braille 10-frame (80ms).
 fn braille_spin() -> &'static str {
-    spin_frame(
-        &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-        80,
-    )
+    spin_frame(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 80)
 }
 
 /// 입력이 "/명령 접두어" 형태일 때 일치하는 명령 목록 (공백이 들어가면 숨긴다).
@@ -1515,7 +1525,15 @@ fn draw_picker(f: &mut Frame, area: Rect, picker: &super::Picker, th: &Pal) {
         .collect::<Vec<_>>()
         .join("\n");
     let shown = (end - start + 2).min(18) as u16;
-    draw_overlay_sized(f, area, &picker.title, &body, 80, shown.saturating_add(5), th);
+    draw_overlay_sized(
+        f,
+        area,
+        &picker.title,
+        &body,
+        80,
+        shown.saturating_add(5),
+        th,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1536,9 +1554,7 @@ fn draw_field_overlay(
         .borders(Borders::ALL)
         .title(Span::styled(
             format!(" {title} "),
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(th.code))
         .style(Style::default().bg(th.bg).fg(th.accent));
@@ -1575,9 +1591,7 @@ fn draw_field_overlay(
     } else {
         Span::styled(
             field,
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         )
     };
     let field_block = Block::default()
@@ -1624,9 +1638,7 @@ fn draw_overlay_sized(
         .borders(Borders::ALL)
         .title(Span::styled(
             format!(" {title} "),
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(th.accent))
         .style(Style::default().bg(th.bg).fg(th.accent));
@@ -1640,8 +1652,7 @@ fn draw_overlay_sized(
 }
 
 pub(super) fn overlay_rect(area: Rect, max_w: u16, max_h: u16) -> Rect {
-    let tight = area.width <= max_w.saturating_add(4)
-        || area.height <= max_h.saturating_add(2);
+    let tight = area.width <= max_w.saturating_add(4) || area.height <= max_h.saturating_add(2);
     if tight {
         return area;
     }
@@ -1654,7 +1665,6 @@ pub(super) fn overlay_rect(area: Rect, max_w: u16, max_h: u16) -> Rect {
         height,
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1684,7 +1694,10 @@ mod tests {
 
     #[test]
     fn final_answer_preserves_single_paragraph_spacing() {
-        assert_eq!(compact_blank("첫 문단\n\n둘째 문단"), "첫 문단\n\n둘째 문단");
+        assert_eq!(
+            compact_blank("첫 문단\n\n둘째 문단"),
+            "첫 문단\n\n둘째 문단"
+        );
         assert_eq!(
             compact_blank("첫 문단\n\n\n\n둘째 문단"),
             "첫 문단\n\n둘째 문단"
@@ -1693,9 +1706,7 @@ mod tests {
 
     #[test]
     fn model_work_sections_are_separated_from_final_answer() {
-        let sections = split_model_work(
-            "[모델 작업]\n파일을 분석 중\n[/모델 작업]\n최종 답변",
-        );
+        let sections = split_model_work("[모델 작업]\n파일을 분석 중\n[/모델 작업]\n최종 답변");
         assert_eq!(sections.len(), 2);
         assert!(sections[0].0);
         assert_eq!(sections[0].1, "파일을 분석 중");
@@ -1751,15 +1762,24 @@ mod tests {
 
     #[test]
     fn code_changes_have_distinct_visual_roles() {
-        assert_eq!(coding_role("[코드 변경] 등록 src/a.rs:1-2"), CodeRole::Create);
+        assert_eq!(
+            coding_role("[코드 변경] 등록 src/a.rs:1-2"),
+            CodeRole::Create
+        );
         assert_eq!(coding_role("[코드 변경] 수정 src/a.rs:1-2"), CodeRole::Edit);
-        assert_eq!(coding_role("[코드 변경] 삭제 src/a.rs:1-2"), CodeRole::Delete);
+        assert_eq!(
+            coding_role("[코드 변경] 삭제 src/a.rs:1-2"),
+            CodeRole::Delete
+        );
         assert_eq!(coding_role("[검증] cargo test"), CodeRole::Verify);
     }
 
     #[test]
     fn top_and_bottom_bar_labels_are_english() {
-        assert_eq!(harness_header_label(false, "rafikx"), "Harness Auto · rafikx");
+        assert_eq!(
+            harness_header_label(false, "rafikx"),
+            "Harness Auto · rafikx"
+        );
         assert_eq!(harness_header_label(true, "pi"), "Harness Manual · pi");
         assert_eq!(footer_state_label("준비"), "Ready");
         assert_eq!(footer_state_label("실패"), "Failed");

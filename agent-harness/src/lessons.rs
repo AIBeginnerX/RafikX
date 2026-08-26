@@ -16,6 +16,21 @@ pub fn inject_block(db: &Db, task: &str, limit_chars: usize) -> String {
     assemble_block(&rows, limit_chars)
 }
 
+pub fn inject_block_for_project(
+    db: &Db,
+    workspace: &std::path::Path,
+    task: &str,
+    limit_chars: usize,
+) -> String {
+    if limit_chars == 0 {
+        return String::new();
+    }
+    let Ok(rows) = db.project_lessons_for_inject(workspace, task, 5, 2) else {
+        return String::new();
+    };
+    assemble_block(&rows, limit_chars)
+}
+
 pub fn assemble_block(rows: &[LessonRow], limit_chars: usize) -> String {
     if rows.is_empty() || limit_chars == 0 {
         return String::new();
@@ -36,7 +51,10 @@ pub fn assemble_block(rows: &[LessonRow], limit_chars: usize) -> String {
 
 pub fn keywords_from_text(text: &str) -> String {
     text.split_whitespace()
-        .filter(|w| w.chars().any(|c| c.is_alphanumeric() || ('가'..='힣').contains(&c)))
+        .filter(|w| {
+            w.chars()
+                .any(|c| c.is_alphanumeric() || ('가'..='힣').contains(&c))
+        })
         .take(6)
         .collect::<Vec<_>>()
         .join(" ")
@@ -69,19 +87,15 @@ pub fn parse_reflection_json(text: &str) -> Option<(String, String)> {
 
 pub fn cmd_list(cfg: &Config) -> Result<()> {
     let db = Db::open(&Db::db_path()?)?;
-    let rows = db.list_lessons()?;
+    let rows = db.list_project_lessons(&cfg.workspace)?;
     if rows.is_empty() {
         println!("저장된 교훈이 없습니다.");
         return Ok(());
     }
     println!("id  w  trigger      lesson");
     for r in rows {
-        println!(
-            "{:<3} {:<2} {:<12} {}",
-            r.id, r.weight, r.trigger, r.lesson
-        );
+        println!("{:<3} {:<2} {:<12} {}", r.id, r.weight, r.trigger, r.lesson);
     }
-    let _ = cfg;
     Ok(())
 }
 
@@ -93,7 +107,7 @@ pub fn add_text(cfg: &Config, text: &str) -> Result<String> {
     let db = Db::open(&Db::db_path()?)?;
     let keywords = keywords_from_text(lesson);
     let max = cfg.file.memory.max_lessons;
-    let msg = match db.add_lesson("manual", &keywords, lesson, max)? {
+    let msg = match db.add_project_lesson(&cfg.workspace, "manual", &keywords, lesson, max)? {
         db::LessonWrite::Inserted { id } => format!("교훈을 저장했습니다 (id={id})"),
         db::LessonWrite::Bumped { id } => {
             format!("비슷한 교훈이 있어 가중치만 올렸습니다 (id={id})")
@@ -194,7 +208,13 @@ async fn reflect_and_save(cfg: &Config, task: &str, trigger: &str, detail: &str)
         return Ok(());
     };
     let db = Db::open(&Db::db_path()?)?;
-    let _ = db.add_lesson(trigger, &keywords, &lesson, cfg.file.memory.max_lessons)?;
+    let _ = db.add_project_lesson(
+        &cfg.workspace,
+        trigger,
+        &keywords,
+        &lesson,
+        cfg.file.memory.max_lessons,
+    )?;
     applog::info(&format!("lesson saved trigger={trigger} {lesson}"));
     Ok(())
 }

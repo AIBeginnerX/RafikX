@@ -6,9 +6,7 @@ const KEEP_TAIL: usize = 8;
 pub const AUTO_COMPACT_PERCENT: u32 = 80;
 
 pub const fn needs_auto_compaction(used: u32, window: u32) -> bool {
-    window > 0
-        && used.saturating_mul(100)
-            >= window.saturating_mul(AUTO_COMPACT_PERCENT)
+    window > 0 && used.saturating_mul(100) >= window.saturating_mul(AUTO_COMPACT_PERCENT)
 }
 
 /// 대략적인 토큰 수 (문자/4). 정밀 토크나이저는 쓰지 않는다.
@@ -266,10 +264,19 @@ mod tests {
     #[test]
     fn catalog_context_wins_over_provider_heuristics() {
         // gemini 계열이지만 2.5 pro 는 1M — provider 휴리스틱(400k)보다 카탈로그 우선
-        assert_eq!(context_window_for("gemini", "gemini-2.5-pro", None), 1_000_000);
+        assert_eq!(
+            context_window_for("gemini", "gemini-2.5-pro", None),
+            1_000_000
+        );
         assert_eq!(context_window_for("xai", "grok-4", None), 256_000);
-        assert_eq!(context_window_for("opencode_zen", "minimax-m2.7", None), 204_800);
-        assert_eq!(context_window_for("anthropic", "claude-sonnet-4.6", None), 200_000);
+        assert_eq!(
+            context_window_for("opencode_zen", "minimax-m2.7", None),
+            204_800
+        );
+        assert_eq!(
+            context_window_for("anthropic", "claude-sonnet-4.6", None),
+            200_000
+        );
         // config 명시값이 카탈로그보다 우선
         let pc = ProviderConfig {
             kind: "openai_compat".into(),
@@ -313,7 +320,10 @@ mod tests {
     fn packer_respects_window() {
         let mut msgs = Vec::new();
         for i in 0..20 {
-            msgs.push(Message::user_text(format!("메시지 {i} {}", "가나다라 ".repeat(40))));
+            msgs.push(Message::user_text(format!(
+                "메시지 {i} {}",
+                "가나다라 ".repeat(40)
+            )));
             msgs.push(Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {

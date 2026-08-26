@@ -11,7 +11,9 @@ use anyhow::Result;
 use crate::applog;
 use crate::config::Config;
 use crate::db::Db;
+use crate::lifecycle::{ApprovalDecision, LifecycleEventData, LifecycleState};
 use crate::provider::{ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason};
+use crate::run::{RunContext, RunId};
 use crate::tools::{self, ToolCtx, ToolRegistry};
 
 pub const HARD_CAP: u32 = 50;
@@ -93,6 +95,17 @@ enum Approval {
 }
 
 pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
+    let context = RunContext::isolated(
+        RunId::new(format!("agent-{}", crate::db::Db::new_id())),
+        run.cfg.workspace.clone(),
+    );
+    run_agent_with_context(run, context).await
+}
+
+pub async fn run_agent_with_context(
+    run: AgentRun<'_>,
+    run_context: RunContext,
+) -> Result<AgentOutcome> {
     let AgentRun {
         cfg,
         provider_name,
@@ -108,28 +121,45 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         context_window,
     } = run;
 
+    if run_context.lifecycle_state() == Some(LifecycleState::Queued) {
+        let _ = run_context.transition_lifecycle(LifecycleEventData::RunStarted {
+            model: Some(model.to_string()),
+        });
+    }
+
     // 원격(텔레그램)에서는 yolo/--yes 를 코드 수준에서 금지
     let yes = effective_yes(yes, &remote);
+    if yes {
+        run_context.approve_run_tree();
+    }
 
     if !cfg.workspace.exists() {
         std::fs::create_dir_all(&cfg.workspace)?;
-        crate::ui::live_line(&format!(
-            "워크스페이스 폴더를 만들었습니다: {}",
-            cfg.workspace.display()
-        ));
+        crate::ui::live_line_in(
+            &run_context,
+            &format!(
+                "워크스페이스 폴더를 만들었습니다: {}",
+                cfg.workspace.display()
+            ),
+        );
     }
-    warn_if_not_git(&cfg.workspace);
+    warn_if_not_git(&run_context, &cfg.workspace);
 
     if yes {
-        crate::ui::live_warn("경고: --yes 는 모든 도구를 승인 없이 실행합니다.");
+        crate::ui::live_warn_in(
+            &run_context,
+            "경고: --yes 는 모든 도구를 승인 없이 실행합니다.",
+        );
     }
 
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
     ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
     ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
     ctx.local_ask = local_ask.clone();
+    ctx.remote = remote.clone();
+    ctx.run = Some(run_context.clone());
     let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
-    let mut allow_all = yes;
+    let mut allow_all = yes || run_context.run_tree_approved();
     let mut iterations = 0u32;
     let mut input_tokens = 0u32;
     let mut output_tokens = 0u32;
@@ -138,14 +168,30 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let mut context_tokens = 0u32;
     let mut denied_any = false;
     let mut call_counts: HashMap<String, u32> = HashMap::new();
-    let mut changed_files: Vec<String> = Vec::new();
     let mut tool_errors: Vec<String> = Vec::new();
     let mut deny_reasons: Vec<String> = Vec::new();
     let max_iter = max_iterations.min(HARD_CAP);
 
     loop {
+        if run_context.is_cancelled() {
+            return Ok(AgentOutcome {
+                status: "cancelled".into(),
+                iterations,
+                input_tokens,
+                output_tokens,
+                context_tokens,
+                cached_tokens,
+                cache_reported,
+                error: Some("실행이 취소되었습니다.".into()),
+                messages,
+                changed_files: committed_files(&run_context),
+                tool_errors,
+                deny_reasons,
+                verify_fail: None,
+            });
+        }
         if iterations >= max_iter {
-            crate::ui::live_line("상한 도달, 여기까지 결과");
+            crate::ui::live_line_in(&run_context, "상한 도달, 여기까지 결과");
             return Ok(AgentOutcome {
                 status: "limit".into(),
                 iterations,
@@ -156,14 +202,21 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 cache_reported,
                 error: Some("반복 상한".into()),
                 messages,
-                changed_files,
+                changed_files: committed_files(&run_context),
                 tool_errors,
                 deny_reasons,
                 verify_fail: None,
             });
         }
         iterations += 1;
-        crate::spinner::set_label(&format!("반복 {iterations}/{max_iter} · 모델 호출"));
+        let _ = run_context.transition_lifecycle(LifecycleEventData::Iteration {
+            current: iterations,
+            max: max_iter,
+        });
+        crate::spinner::set_label_in(
+            &run_context,
+            &format!("반복 {iterations}/{max_iter} · 모델 호출"),
+        );
         let specs = registry.specs();
         messages = crate::packer::pack_messages(
             &messages,
@@ -173,7 +226,8 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
             cfg.file.general.max_tokens,
             cfg.file.general.max_context_chars,
         );
-        crate::graph::node(
+        crate::graph::node_in(
+            &run_context,
             "pre_step",
             &format!("iter {iterations}"),
             &format!("msgs={} window={context_window}", messages.len()),
@@ -193,18 +247,36 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         // 주 연결은 원래 모델을 그대로 쓰고, 이후 연결은 role(main) 기준 모델을 쓴다.
         let order = crate::harness::fallback_order(cfg, provider_name, None);
         let mut streamed = false;
-        let (_used, resp) = crate::harness::stream_with_fallback(
-            cfg,
-            &order,
-            "main",
-            req,
-            |piece| {
-                streamed = true;
-                crate::ui::live_chunk(piece);
-            },
-        )
-        .await?;
-        crate::graph::node(
+        let (_used, resp) = {
+            let response =
+                crate::harness::stream_with_fallback(cfg, &order, "main", req, |piece| {
+                    streamed = true;
+                    crate::ui::live_chunk_in(&run_context, piece);
+                });
+            tokio::pin!(response);
+            tokio::select! {
+                result = &mut response => result?,
+                _ = run_context.cancelled_reason() => {
+                    return Ok(AgentOutcome {
+                        status: "cancelled".into(),
+                        iterations,
+                        input_tokens,
+                        output_tokens,
+                        context_tokens,
+                        cached_tokens,
+                        cache_reported,
+                        error: Some("실행이 취소되었습니다.".into()),
+                        messages,
+                        changed_files: committed_files(&run_context),
+                        tool_errors,
+                        deny_reasons,
+                        verify_fail: None,
+                    });
+                }
+            }
+        };
+        crate::graph::node_in(
+            &run_context,
             "request",
             model,
             &format!("in={} out={}", resp.input_tokens, resp.output_tokens),
@@ -219,20 +291,28 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
         } else {
             resp.input_tokens
         };
-        crate::ui::live_status(&format!(
-            "[tokens] total_in={} total_out={} context={} cache={}",
-            input_tokens,
-            output_tokens,
-            context_tokens,
-            if cache_reported {
-                cached_tokens.to_string()
-            } else {
-                "n/a".into()
-            }
-        ));
+        let _ = run_context.transition_lifecycle(LifecycleEventData::Tokens {
+            input: resp.input_tokens,
+            output: resp.output_tokens,
+            cached: resp.cached_tokens,
+        });
+        crate::ui::live_status_in(
+            &run_context,
+            &format!(
+                "[tokens] total_in={} total_out={} context={} cache={}",
+                input_tokens,
+                output_tokens,
+                context_tokens,
+                if cache_reported {
+                    cached_tokens.to_string()
+                } else {
+                    "n/a".into()
+                }
+            ),
+        );
 
         if !streamed {
-            print_text_blocks(&resp);
+            print_text_blocks(&run_context, &resp);
         }
 
         let tool_uses: Vec<(String, String, serde_json::Value)> = resp
@@ -251,17 +331,25 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 role: Role::Assistant,
                 content: resp.content.clone(),
             });
+            let hit_token_limit = resp.stop_reason == StopReason::MaxTokens;
+            let _ = run_context.transition_lifecycle(LifecycleEventData::AnswerStarted);
             return Ok(AgentOutcome {
-                status: if denied_any { "denied".into() } else { "ok".into() },
+                status: if hit_token_limit {
+                    "incomplete".into()
+                } else if denied_any {
+                    "denied".into()
+                } else {
+                    "ok".into()
+                },
                 iterations,
                 input_tokens,
                 output_tokens,
                 context_tokens,
                 cached_tokens,
                 cache_reported,
-                error: None,
+                error: hit_token_limit.then(|| "모델 출력 토큰 상한에 도달했습니다.".into()),
                 messages,
-                changed_files,
+                changed_files: committed_files(&run_context),
                 tool_errors,
                 deny_reasons,
                 verify_fail: None,
@@ -274,16 +362,16 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                 content: resp.content.clone(),
             });
             return Ok(AgentOutcome {
-                status: "ok".into(),
+                status: "incomplete".into(),
                 iterations,
                 input_tokens,
                 output_tokens,
                 context_tokens,
                 cached_tokens,
                 cache_reported,
-                error: None,
+                error: Some("모델이 실행할 도구 호출을 반환하지 않았습니다.".into()),
                 messages,
-                changed_files,
+                changed_files: committed_files(&run_context),
                 tool_errors,
                 deny_reasons,
                 verify_fail: None,
@@ -297,11 +385,28 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
 
         let mut results: Vec<ContentBlock> = Vec::new();
         for (id, name, input) in tool_uses {
+            if run_context.is_cancelled() {
+                return Ok(AgentOutcome {
+                    status: "cancelled".into(),
+                    iterations,
+                    input_tokens,
+                    output_tokens,
+                    context_tokens,
+                    cached_tokens,
+                    cache_reported,
+                    error: Some("실행이 취소되었습니다.".into()),
+                    messages,
+                    changed_files: committed_files(&run_context),
+                    tool_errors,
+                    deny_reasons,
+                    verify_fail: None,
+                });
+            }
             let key = format!("{name}:{}", input);
             let count = call_counts.entry(key).or_insert(0);
             *count += 1;
             if *count >= 3 {
-                crate::ui::live_line("동일 도구·입력이 3회 반복되어 중단합니다.");
+                crate::ui::live_line_in(&run_context, "동일 도구·입력이 3회 반복되어 중단합니다.");
                 return Ok(AgentOutcome {
                     status: "limit".into(),
                     iterations,
@@ -312,16 +417,18 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                     cache_reported,
                     error: Some("동일 도구 3회 반복".into()),
                     messages,
-                    changed_files,
+                    changed_files: committed_files(&run_context),
                     tool_errors,
                     deny_reasons,
                     verify_fail: None,
                 });
             }
 
-            crate::ui::live_line(&format!("[도구] {name}"));
-            crate::spinner::set_label(&format!("도구 실행: {name}"));
-            crate::graph::node("tool_pre", &name, "", Some("request"));
+            crate::ui::live_line_in(&run_context, &format!("[도구] {name}"));
+            let _ = run_context
+                .transition_lifecycle(LifecycleEventData::ToolStarted { name: name.clone() });
+            crate::spinner::set_label_in(&run_context, &format!("도구 실행: {name}"));
+            crate::graph::node_in(&run_context, "tool_pre", &name, "", Some("request"));
             let Some(tool) = registry.get(&name) else {
                 let msg = format!("알 수 없는 도구: {name}");
                 tool_errors.push(msg.clone());
@@ -330,16 +437,81 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                     content: msg,
                     is_error: true,
                 });
+                let _ = run_context
+                    .transition_lifecycle(LifecycleEventData::ToolFinished { name, ok: false });
                 continue;
             };
 
             if tool.needs_approval(&input) && !allow_all {
                 match tools::approval_preview(tool.name(), &input, &ctx) {
                     Ok(preview) => {
-                        crate::ui::live_line(&preview);
-                        match decide_approval(&remote, &local_ask, preview).await? {
-                            Approval::Yes => {}
-                            Approval::Always => allow_all = true,
+                        crate::ui::live_line_in(&run_context, &preview);
+                        let approval_id = format!("approval-{}", Db::new_id());
+                        let _ = run_context.transition_lifecycle(
+                            LifecycleEventData::ApprovalRequested {
+                                approval_id: approval_id.clone(),
+                                preview: preview.clone(),
+                            },
+                        );
+                        let Some(choice) = decide_approval_or_cancel(
+                            &remote,
+                            &local_ask,
+                            preview.clone(),
+                            &run_context,
+                        )
+                        .await?
+                        else {
+                            return Ok(AgentOutcome {
+                                status: "cancelled".into(),
+                                iterations,
+                                input_tokens,
+                                output_tokens,
+                                context_tokens,
+                                cached_tokens,
+                                cache_reported,
+                                error: Some("실행이 취소되었습니다.".into()),
+                                messages,
+                                changed_files: committed_files(&run_context),
+                                tool_errors,
+                                deny_reasons,
+                                verify_fail: None,
+                            });
+                        };
+                        let decision = match &choice {
+                            Approval::Yes => ApprovalDecision::Yes,
+                            Approval::No => ApprovalDecision::No,
+                            Approval::Always => ApprovalDecision::Always,
+                        };
+                        let _ = run_context.transition_lifecycle(
+                            LifecycleEventData::ApprovalResolved {
+                                approval_id,
+                                decision,
+                            },
+                        );
+                        match choice {
+                            choice @ (Approval::Yes | Approval::Always) => {
+                                let refreshed = tools::approval_preview(tool.name(), &input, &ctx)?;
+                                if refreshed != preview {
+                                    let message = "승인 후 대상 상태가 바뀌어 실행을 중단했습니다. 최신 프리뷰로 다시 시도하세요.".to_string();
+                                    tool_errors.push(message.clone());
+                                    results.push(ContentBlock::ToolResult {
+                                        tool_use_id: id,
+                                        content: message,
+                                        is_error: true,
+                                    });
+                                    let _ = run_context.transition_lifecycle(
+                                        LifecycleEventData::ToolFinished {
+                                            name: name.clone(),
+                                            ok: false,
+                                        },
+                                    );
+                                    continue;
+                                }
+                                if matches!(choice, Approval::Always) {
+                                    allow_all = true;
+                                    run_context.approve_run_tree();
+                                }
+                            }
                             Approval::No => {
                                 denied_any = true;
                                 let reason = if remote.is_some() || local_ask.is_some() {
@@ -362,6 +534,12 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                                     content: msg,
                                     is_error: true,
                                 });
+                                let _ = run_context.transition_lifecycle(
+                                    LifecycleEventData::ToolFinished {
+                                        name: name.clone(),
+                                        ok: false,
+                                    },
+                                );
                                 continue;
                             }
                         }
@@ -373,40 +551,54 @@ pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
                             is_error: true,
                         });
                         tool_errors.push(e.to_string());
+                        let _ =
+                            run_context.transition_lifecycle(LifecycleEventData::ToolFinished {
+                                name: name.clone(),
+                                ok: false,
+                            });
                         continue;
                     }
                 }
             } else if tool.needs_approval(&input) && allow_all {
-                crate::ui::live_warn(&format!("[자동승인] {name}"));
+                crate::ui::live_warn_in(&run_context, &format!("[자동승인] {name}"));
             }
 
             match tool.run(input.clone(), &ctx) {
                 Ok(out) => {
-                    crate::graph::node("tool_post", &name, "ok", Some("tool_pre"));
+                    crate::graph::node_in(&run_context, "tool_post", &name, "ok", Some("tool_pre"));
                     if name != "todo_write" {
                         // 도구 출력 원문 전량 투척 대신 요약 한 줄 (pi 저소음).
-                        crate::ui::live_line(&tool_output_summary(&name, &out));
-                    }
-                    for path in changed_paths(&name, &input) {
-                        if !changed_files.contains(&path) {
-                            changed_files.push(path);
-                        }
+                        crate::ui::live_line_in(&run_context, &tool_output_summary(&name, &out));
                     }
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id,
                         content: out,
                         is_error: false,
                     });
+                    let _ = run_context.transition_lifecycle(LifecycleEventData::ToolFinished {
+                        name: name.clone(),
+                        ok: true,
+                    });
                 }
                 Err(e) => {
-                    crate::graph::node("tool_post", &name, "error", Some("tool_pre"));
+                    crate::graph::node_in(
+                        &run_context,
+                        "tool_post",
+                        &name,
+                        "error",
+                        Some("tool_pre"),
+                    );
                     applog::error(&format!("tool {name}: {e}"));
-                    crate::ui::live_line(&format!("도구 오류: {e}"));
+                    crate::ui::live_line_in(&run_context, &format!("도구 오류: {e}"));
                     tool_errors.push(format!("{name}: {e}"));
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id,
                         content: e.to_string(),
                         is_error: true,
+                    });
+                    let _ = run_context.transition_lifecycle(LifecycleEventData::ToolFinished {
+                        name: name.clone(),
+                        ok: false,
                     });
                 }
             }
@@ -432,46 +624,34 @@ fn tool_output_summary(name: &str, out: &str) -> String {
     format!("{first}  … ({name} 결과 {lines}줄)")
 }
 
-fn changed_paths(name: &str, input: &serde_json::Value) -> Vec<String> {
-    if matches!(name, "write_file" | "edit_file" | "multi_edit") {
-        return input
-            .get("path")
-            .and_then(|value| value.as_str())
-            .map(|path| vec![path.to_string()])
-            .unwrap_or_default();
-    }
-    if name != "apply_patch" {
-        return Vec::new();
-    }
-    let Some(patch) = input.get("patch").and_then(|value| value.as_str()) else {
-        return Vec::new();
-    };
-    crate::tools_more::ApplyPatch::parse(patch)
-        .map(|ops| {
-            ops.into_iter()
-                .map(|op| match op {
-                    crate::tools_more::PatchOp::Add(path, _)
-                    | crate::tools_more::PatchOp::Update(path, _)
-                    | crate::tools_more::PatchOp::Delete(path) => path,
-                })
-                .collect()
+fn committed_files(run: &RunContext) -> Vec<String> {
+    run.committed_paths()
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(run.workspace())
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
-fn print_text_blocks(resp: &ChatResponse) {
+fn print_text_blocks(run: &RunContext, resp: &ChatResponse) {
     for b in &resp.content {
         if let ContentBlock::Text { text } = b {
             if !text.trim().is_empty() {
-                crate::ui::live_assistant(text);
+                crate::ui::live_assistant_in(run, text);
             }
         }
     }
 }
 
-fn warn_if_not_git(workspace: &Path) {
+fn warn_if_not_git(run: &RunContext, workspace: &Path) {
     if !workspace.join(".git").exists() {
-        crate::ui::live_warn("경고: 이 폴더는 git 저장소가 아닙니다. git init 을 권장합니다.");
+        crate::ui::live_warn_in(
+            run,
+            "경고: 이 폴더는 git 저장소가 아닙니다. git init 을 권장합니다.",
+        );
     }
 }
 
@@ -511,7 +691,13 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             }
             continue;
         }
-        if messages[i].role == Role::User && has_result && !messages[i].content.iter().any(|b| matches!(b, ContentBlock::Text { .. })) {
+        if messages[i].role == Role::User
+            && has_result
+            && !messages[i]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. }))
+        {
             i += 1;
             continue;
         }
@@ -558,6 +744,18 @@ async fn decide_approval(
     }
 }
 
+async fn decide_approval_or_cancel(
+    remote: &Option<RemoteApproval>,
+    local_ask: &Option<LocalAsk>,
+    preview: String,
+    run: &RunContext,
+) -> Result<Option<Approval>> {
+    tokio::select! {
+        result = decide_approval(remote, local_ask, preview) => result.map(Some),
+        _ = run.cancelled_reason() => Ok(None),
+    }
+}
+
 pub fn effective_yes(yes: bool, remote: &Option<RemoteApproval>) -> bool {
     if remote.is_some() { false } else { yes }
 }
@@ -580,11 +778,7 @@ pub fn assistant_text(messages: &[Message]) -> String {
     parts.join("\n")
 }
 
-pub fn record_finish(
-    db: &Db,
-    run_id: &str,
-    outcome: &AgentOutcome,
-) -> Result<()> {
+pub fn record_finish(db: &Db, run_id: &str, outcome: &AgentOutcome) -> Result<()> {
     db.finish_run(
         run_id,
         &outcome.status,

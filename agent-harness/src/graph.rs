@@ -19,8 +19,10 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use serde::Serialize;
+use serde_json::json;
 
 use crate::db::Db;
+use crate::run::{RunContext, RunEventKind};
 
 static CURRENT: Mutex<Option<String>> = Mutex::new(None);
 
@@ -63,6 +65,29 @@ pub fn trace_start(class: &str, profile: &str, provider: &str, model: &str, obsi
     }
 }
 
+pub fn trace_start_in(
+    run: &RunContext,
+    class: &str,
+    profile: &str,
+    provider: &str,
+    model: &str,
+    obsidian: bool,
+) {
+    node_in(run, "classify", class, "", None);
+    node_in(
+        run,
+        "bind",
+        profile,
+        &format!("{provider} · {model}"),
+        Some("classify"),
+    );
+    if obsidian {
+        node_in(run, "context", "obsidian", "vault search", Some("bind"));
+    } else {
+        node_in(run, "context", "none", "", Some("bind"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphNode {
     pub seq: i64,
@@ -81,7 +106,27 @@ pub fn node(kind: &str, label: &str, detail: &str, parent: Option<&str>) {
     let _ = persist(&run_id, kind, label, &detail, parent);
 }
 
-fn persist(run_id: &str, kind: &str, label: &str, detail: &str, parent: Option<&str>) -> Result<()> {
+pub fn node_in(run: &RunContext, kind: &str, label: &str, detail: &str, parent: Option<&str>) {
+    let detail: String = detail.chars().take(400).collect();
+    run.emit(
+        RunEventKind::Graph,
+        json!({
+            "kind": kind,
+            "label": label,
+            "detail": detail,
+            "parent": parent,
+        }),
+    );
+    let _ = persist(run.run_id().as_str(), kind, label, &detail, parent);
+}
+
+fn persist(
+    run_id: &str,
+    kind: &str,
+    label: &str,
+    detail: &str,
+    parent: Option<&str>,
+) -> Result<()> {
     let db = Db::open(&Db::db_path()?)?;
     db.push_graph_event(run_id, kind, label, detail, parent)
 }

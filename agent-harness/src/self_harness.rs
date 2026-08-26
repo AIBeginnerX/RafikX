@@ -36,14 +36,14 @@ use crate::provider::{ChatRequest, ContentBlock, Message};
 /// m(에이전트 메커니즘) 고정 어휘 — 논문 4.3 절의 관찰된 메커니즘에서 추렸다.
 /// 자유 텍스트 대신 이 목록에서 고르게 해 시그니처 정확 일치 클러스터링을 지킨다.
 pub const MECHANISMS: &[&str] = &[
-    "missing_artifact",        // 요구 산출물을 만들지 않고 종료
-    "unproductive_tool_loop",  // 같은 도구·입력 반복, 진전 없는 루프
-    "premature_conclusion",    // 검증 없이 완료 주장
-    "blind_retry",             // 실패한 명령을 그대로 재시도
-    "endless_exploration",     // 탐색만 계속하고 구현·검증으로 전환 실패
-    "state_not_persisted",     // 셸 세션 간 환경·상태 유지 실패
-    "dependency_missing",      // 의존성 사전 확인 누락
-    "schema_mismatch",         // 도구 입력/출력 형식 오류
+    "missing_artifact",       // 요구 산출물을 만들지 않고 종료
+    "unproductive_tool_loop", // 같은 도구·입력 반복, 진전 없는 루프
+    "premature_conclusion",   // 검증 없이 완료 주장
+    "blind_retry",            // 실패한 명령을 그대로 재시도
+    "endless_exploration",    // 탐색만 계속하고 구현·검증으로 전환 실패
+    "state_not_persisted",    // 셸 세션 간 환경·상태 유지 실패
+    "dependency_missing",     // 의존성 사전 확인 누락
+    "schema_mismatch",        // 도구 입력/출력 형식 오류
     "other",
 ];
 
@@ -181,7 +181,9 @@ impl SelfHarnessState {
         match surface {
             "bootstrap_instruction" => self.surfaces.bootstrap_instruction = value.to_string(),
             "execution_instruction" => self.surfaces.execution_instruction = value.to_string(),
-            "verification_instruction" => self.surfaces.verification_instruction = value.to_string(),
+            "verification_instruction" => {
+                self.surfaces.verification_instruction = value.to_string()
+            }
             "failure_recovery_instruction" => {
                 self.surfaces.failure_recovery_instruction = value.to_string()
             }
@@ -237,7 +239,9 @@ impl SelfHarnessState {
     pub fn effective_iter_cap(&self) -> Option<u32> {
         let eff = self.effective();
         if eff.runtime_policy.enabled {
-            eff.runtime_policy.max_iterations_override.filter(|n| *n > 0)
+            eff.runtime_policy
+                .max_iterations_override
+                .filter(|n| *n > 0)
         } else {
             None
         }
@@ -314,18 +318,31 @@ fn trace_summary(outcome: &AgentOutcome) -> String {
     }
     let mut s = format!(
         "도구 시퀀스: {}\n반복: {} · 도구 오류 결과: {}",
-        if tools.is_empty() { "(없음)".into() } else { tools.join(" → ") },
+        if tools.is_empty() {
+            "(없음)".into()
+        } else {
+            tools.join(" → ")
+        },
         outcome.iterations,
         error_results
     );
     for e in outcome.tool_errors.iter().take(3) {
-        s.push_str(&format!("\n오류: {}", e.chars().take(200).collect::<String>()));
+        s.push_str(&format!(
+            "\n오류: {}",
+            e.chars().take(200).collect::<String>()
+        ));
     }
     if let Some(v) = &outcome.verify_fail {
-        s.push_str(&format!("\n검증 실패: {}", v.chars().take(300).collect::<String>()));
+        s.push_str(&format!(
+            "\n검증 실패: {}",
+            v.chars().take(300).collect::<String>()
+        ));
     }
     if let Some(e) = &outcome.error {
-        s.push_str(&format!("\n종료 오류: {}", e.chars().take(200).collect::<String>()));
+        s.push_str(&format!(
+            "\n종료 오류: {}",
+            e.chars().take(200).collect::<String>()
+        ));
     }
     s
 }
@@ -337,7 +354,11 @@ async fn infer_mechanism(
     cause: &str,
     trace: &str,
 ) -> (String, String, String) {
-    let default = ("contributing".to_string(), "other".to_string(), String::new());
+    let default = (
+        "contributing".to_string(),
+        "other".to_string(),
+        String::new(),
+    );
     let order = harness::fallback_order(cfg, &cfg.file.general.default_provider, None);
     let system = format!(
         "너는 에이전트 실행 실패 분석가다. 실패 트레이스를 보고 에이전트 측 행동 메커니즘을 분류하라.\n\
@@ -480,7 +501,11 @@ async fn propose_candidates(
         ev.sample_detail,
         baseline_n,
         baseline_success * 100.0,
-        if attempts.is_empty() { "(없음)" } else { attempts },
+        if attempts.is_empty() {
+            "(없음)"
+        } else {
+            attempts
+        },
     );
     let req = ChatRequest {
         model: String::new(),
@@ -495,7 +520,8 @@ async fn propose_candidates(
     harness::set_fallback_quiet(false);
     let (_n, resp) = call?;
     let text = first_text(&resp.content);
-    let arr = extract_json_array(&text).ok_or_else(|| anyhow!("proposer 응답에 JSON 배열이 없습니다"))?;
+    let arr =
+        extract_json_array(&text).ok_or_else(|| anyhow!("proposer 응답에 JSON 배열이 없습니다"))?;
     let proposals: Vec<Proposal> = serde_json::from_value(arr)?;
     Ok(proposals)
 }
@@ -664,7 +690,12 @@ fn run_validation(
             cand.baseline_success * 100.0,
             trial_success * 100.0
         );
-        state.promote_trial(trial, &cand_summary(&cand), cand.baseline_success, trial_success)?;
+        state.promote_trial(
+            trial,
+            &cand_summary(&cand),
+            cand.baseline_success,
+            trial_success,
+        )?;
         state.save()?;
         db.sh_decide_candidate(trial.candidate_id, "accepted", &note)?;
         db.sh_mark_addressed(cand.evidence_id)?;
@@ -684,7 +715,10 @@ fn run_validation(
         state.trial = None;
         state.save()?;
         db.sh_decide_candidate(trial.candidate_id, "rejected", &note)?;
-        applog::info(&format!("self-harness reject: #{} {note}", trial.candidate_id));
+        applog::info(&format!(
+            "self-harness reject: #{} {note}",
+            trial.candidate_id
+        ));
         // 같은 세대의 다음 후보가 있으면 이어서 trial (순차 평가).
         if let Some(next) = db.sh_next_proposed(state.version as i64)? {
             start_trial(db, state, &next)?;
@@ -808,7 +842,11 @@ fn start_trial(db: &Db, state: &mut SelfHarnessState, cand: &ShCandidateRow) -> 
 fn cand_summary(cand: &ShCandidateRow) -> String {
     let effect = serde_json::from_str::<serde_json::Value>(&cand.audit_json)
         .ok()
-        .and_then(|v| v.get("expected_effect").and_then(|x| x.as_str()).map(String::from))
+        .and_then(|v| {
+            v.get("expected_effect")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
         .unwrap_or_default();
     if effect.is_empty() {
         format!("{} 수정", cand.surface)
@@ -920,7 +958,8 @@ mod tests {
     fn state_roundtrip_and_surface_edit() {
         let mut s = SelfHarnessState::default();
         assert_eq!(s.version, 0);
-        s.set_surface("verification_instruction", "새 검증 규칙").unwrap();
+        s.set_surface("verification_instruction", "새 검증 규칙")
+            .unwrap();
         assert_eq!(s.surfaces.verification_instruction, "새 검증 규칙");
         s.set_surface(
             "runtime_policy",
@@ -968,9 +1007,15 @@ mod tests {
         s.promote_trial(&trial, "복구 지시 강화", 0.5, 0.8).unwrap();
         assert_eq!(s.version, 1);
         assert!(s.trial.is_none());
-        assert_eq!(s.surfaces.failure_recovery_instruction, "오류 파일을 먼저 복구하라");
+        assert_eq!(
+            s.surfaces.failure_recovery_instruction,
+            "오류 파일을 먼저 복구하라"
+        );
         assert_eq!(s.lineage.len(), 1);
-        assert_eq!(s.lineage[0].target_signature, "tool_loop|direct|blind_retry");
+        assert_eq!(
+            s.lineage[0].target_signature,
+            "tool_loop|direct|blind_retry"
+        );
     }
 
     #[test]
@@ -1008,9 +1053,14 @@ mod tests {
 
     #[test]
     fn json_extractors_tolerate_prose() {
-        let obj = extract_json_object("답: {\"mechanism\":\"blind_retry\",\"causal\":\"direct\"} 끝").unwrap();
+        let obj =
+            extract_json_object("답: {\"mechanism\":\"blind_retry\",\"causal\":\"direct\"} 끝")
+                .unwrap();
         assert_eq!(obj.get("mechanism").unwrap().as_str(), Some("blind_retry"));
-        let arr = extract_json_array("후보는 다음과 같다 [{\"surface\":\"runtime_policy\",\"new_value\":{}}] .").unwrap();
+        let arr = extract_json_array(
+            "후보는 다음과 같다 [{\"surface\":\"runtime_policy\",\"new_value\":{}}] .",
+        )
+        .unwrap();
         assert!(arr.is_array());
         assert!(extract_json_array("배열 없음 {}").is_none());
     }

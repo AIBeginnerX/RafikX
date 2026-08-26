@@ -91,7 +91,20 @@ fn unix_ymd(secs: i64) -> String {
         days -= len;
         year += 1;
     }
-    let md = [31, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let md = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1u32;
     for d in md {
         if days < d {
@@ -142,7 +155,11 @@ pub fn select_account(accounts: &[Account]) -> Option<String> {
     for a in accounts {
         let u = get(&a.id);
         if u.limited_until <= now {
-            ready.push((a.id.clone(), u.reset_at.unwrap_or(i64::MAX), u.tokens_in_today + u.tokens_out_today));
+            ready.push((
+                a.id.clone(),
+                u.reset_at.unwrap_or(i64::MAX),
+                u.tokens_in_today + u.tokens_out_today,
+            ));
         } else {
             waiting.push((a.id.clone(), u.limited_until));
         }
@@ -236,7 +253,11 @@ pub fn parse_retry_after(err: &str) -> u64 {
         }
     }
     if let Some(i) = low.find("retry-after") {
-        let rest: String = low[i..].chars().filter(|c| c.is_ascii_digit()).take(4).collect();
+        let rest: String = low[i..]
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(4)
+            .collect();
         if let Ok(v) = rest.parse::<u64>() {
             return v.clamp(5, 3600);
         }
@@ -271,7 +292,11 @@ pub fn footer_lines() -> Vec<String> {
             .remaining
             .map(|r| format!("  남은요청 {r}"))
             .unwrap_or_default();
-        let mark = if active { ui::green("●") } else { ui::dim("○") };
+        let mark = if active {
+            ui::green("●")
+        } else {
+            ui::dim("○")
+        };
         lines.push(format!(
             "{mark} {}  {} tok  {status}{rem}",
             accounts::display(&a),

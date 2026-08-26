@@ -33,7 +33,12 @@ fn drain_line(buf: &mut Vec<u8>) -> Option<String> {
 
 impl OpenAiCompatProvider {
     pub fn new(base_url: String, api_key: Option<String>) -> Result<Self> {
-        Self::create(base_url, api_key, CompatMode::ChatCompletions, String::new())
+        Self::create(
+            base_url,
+            api_key,
+            CompatMode::ChatCompletions,
+            String::new(),
+        )
     }
 
     pub fn with_codex_oauth(token: String, account_id: String) -> Result<Self> {
@@ -95,7 +100,11 @@ impl OpenAiCompatProvider {
             CompatMode::CodexResponses => build_codex_body(req, false),
             CompatMode::ChatCompletions => build_body(req, false),
         };
-        let builder = self.apply_auth(self.client.post(self.url()).header("content-type", "application/json"));
+        let builder = self.apply_auth(
+            self.client
+                .post(self.url())
+                .header("content-type", "application/json"),
+        );
         let resp = builder
             .json(&body)
             .send()
@@ -123,7 +132,11 @@ impl OpenAiCompatProvider {
             return self.chat_codex_stream(req, on_text).await;
         }
         let body = build_body(req, true);
-        let builder = self.apply_auth(self.client.post(self.url()).header("content-type", "application/json"));
+        let builder = self.apply_auth(
+            self.client
+                .post(self.url())
+                .header("content-type", "application/json"),
+        );
         let resp = builder
             .json(&body)
             .send()
@@ -156,7 +169,9 @@ impl OpenAiCompatProvider {
                 if line.is_empty() {
                     continue;
                 }
-                let Some(data) = line.strip_prefix("data:") else { continue };
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
                 let data = data.trim();
                 if data == "[DONE]" {
                     if reasoning_started {
@@ -173,7 +188,9 @@ impl OpenAiCompatProvider {
                         hint.clone(),
                     ));
                 }
-                let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
                 take_stream_usage(
                     &v,
                     &mut input_tokens,
@@ -181,7 +198,11 @@ impl OpenAiCompatProvider {
                     &mut cached_tokens,
                     &mut cache_reported,
                 );
-                let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) else {
+                let Some(choice) = v
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|a| a.first())
+                else {
                     continue;
                 };
                 if let Some(fr) = choice.get("finish_reason").and_then(|x| x.as_str()) {
@@ -215,17 +236,21 @@ impl OpenAiCompatProvider {
                     }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                         for tc in tcs {
-                            let idx = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                            let idx =
+                                tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                             while tool_acc.len() <= idx {
                                 tool_acc.push((String::new(), String::new(), String::new()));
                             }
                             if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
                                 tool_acc[idx].0.push_str(id);
                             }
-                            if let Some(name) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                            if let Some(name) =
+                                tc.pointer("/function/name").and_then(|x| x.as_str())
+                            {
                                 tool_acc[idx].1.push_str(name);
                             }
-                            if let Some(args) = tc.pointer("/function/arguments").and_then(|x| x.as_str())
+                            if let Some(args) =
+                                tc.pointer("/function/arguments").and_then(|x| x.as_str())
                             {
                                 tool_acc[idx].2.push_str(args);
                             }
@@ -240,7 +265,10 @@ impl OpenAiCompatProvider {
             anyhow::bail!("응답이 시작되기 전에 스트림이 종료되었습니다");
         }
         if finish.is_none() {
-            anyhow::bail!("응답이 완료되기 전에 스트림이 종료되었습니다 ({}자 수신)", full_text.chars().count());
+            anyhow::bail!(
+                "응답이 완료되기 전에 스트림이 종료되었습니다 ({}자 수신)",
+                full_text.chars().count()
+            );
         }
         if reasoning_started {
             on_text("\n[/모델 작업]\n");
@@ -263,7 +291,11 @@ impl OpenAiCompatProvider {
         F: FnMut(&str),
     {
         let body = build_codex_body(req, true);
-        let builder = self.apply_auth(self.client.post(self.url()).header("content-type", "application/json"));
+        let builder = self.apply_auth(
+            self.client
+                .post(self.url())
+                .header("content-type", "application/json"),
+        );
         let resp = builder
             .json(&body)
             .send()
@@ -299,13 +331,17 @@ impl OpenAiCompatProvider {
                 if line.is_empty() || line.starts_with("event:") {
                     continue;
                 }
-                let Some(data) = line.strip_prefix("data:") else { continue };
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
                 let data = data.trim();
                 if data == "[DONE]" {
                     finished = true;
                     break;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
                 apply_codex_event(
                     &v,
                     &mut full_text,
@@ -327,7 +363,10 @@ impl OpenAiCompatProvider {
             anyhow::bail!("응답이 시작되기 전에 Codex 스트림이 종료되었습니다");
         }
         if !finished {
-            anyhow::bail!("응답이 완료되기 전에 Codex 스트림이 종료되었습니다 ({}자 수신)", full_text.chars().count());
+            anyhow::bail!(
+                "응답이 완료되기 전에 Codex 스트림이 종료되었습니다 ({}자 수신)",
+                full_text.chars().count()
+            );
         }
 
         Ok(finish_stream(
@@ -364,7 +403,9 @@ fn finish_stream(
         let input = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
         content.push(ContentBlock::ToolUse { id, name, input });
     }
-    let has_tools = content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    let has_tools = content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     ChatResponse {
         content,
         stop_reason: if has_tools {
@@ -486,7 +527,8 @@ fn concat_text(blocks: &[ContentBlock]) -> String {
 }
 
 fn parse_completion(text: &str) -> Result<ChatResponse> {
-    let v: Value = serde_json::from_str(text).context("OpenAI 호환 응답 JSON을 해석할 수 없습니다")?;
+    let v: Value =
+        serde_json::from_str(text).context("OpenAI 호환 응답 JSON을 해석할 수 없습니다")?;
     let choice = v
         .get("choices")
         .and_then(|c| c.as_array())
@@ -496,12 +538,18 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
     let mut content = Vec::new();
     if let Some(t) = message.get("content").and_then(|x| x.as_str()) {
         if !t.is_empty() {
-            content.push(ContentBlock::Text { text: t.to_string() });
+            content.push(ContentBlock::Text {
+                text: t.to_string(),
+            });
         }
     }
     if let Some(tcs) = message.get("tool_calls").and_then(|x| x.as_array()) {
         for tc in tcs {
-            let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let id = tc
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let name = tc
                 .pointer("/function/name")
                 .and_then(|x| x.as_str())
@@ -623,7 +671,12 @@ fn build_codex_body(req: &ChatRequest, stream: bool) -> Value {
                     }));
                 }
                 for b in &m.content {
-                    if let ContentBlock::ToolUse { id, name, input: args } = b {
+                    if let ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input: args,
+                    } = b
+                    {
                         input.push(json!({
                             "type": "function_call",
                             "call_id": id,
@@ -731,19 +784,39 @@ fn apply_codex_event<F>(
                 cache_reported,
             );
         }
-        take_stream_usage(v, input_tokens, output_tokens, cached_tokens, cache_reported);
+        take_stream_usage(
+            v,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            cache_reported,
+        );
     }
-    take_stream_usage(v, input_tokens, output_tokens, cached_tokens, cache_reported);
+    take_stream_usage(
+        v,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        cache_reported,
+    );
 }
 
-fn collect_codex_output(output: &Value, full_text: &mut String, tools: &mut Vec<(String, String, String)>) {
+fn collect_codex_output(
+    output: &Value,
+    full_text: &mut String,
+    tools: &mut Vec<(String, String, String)>,
+) {
     let Some(arr) = output.as_array() else { return };
     for item in arr {
         collect_codex_item(item, full_text, tools);
     }
 }
 
-fn collect_codex_item(item: &Value, full_text: &mut String, tools: &mut Vec<(String, String, String)>) {
+fn collect_codex_item(
+    item: &Value,
+    full_text: &mut String,
+    tools: &mut Vec<(String, String, String)>,
+) {
     let kind = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
     if kind == "function_call" {
         let id = item
@@ -752,7 +825,11 @@ fn collect_codex_item(item: &Value, full_text: &mut String, tools: &mut Vec<(Str
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let name = item
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let args = item
             .get("arguments")
             .and_then(|x| x.as_str())
@@ -822,13 +899,7 @@ mod usage_tests {
         let mut output = 0;
         let mut cached = 0;
         let mut reported = false;
-        take_stream_usage(
-            &event,
-            &mut input,
-            &mut output,
-            &mut cached,
-            &mut reported,
-        );
+        take_stream_usage(&event, &mut input, &mut output, &mut cached, &mut reported);
         assert_eq!((input, output, cached), (1200, 80, 900));
         assert!(reported);
     }

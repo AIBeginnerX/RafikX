@@ -5,6 +5,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
+mod lifecycle;
+mod migrations;
+mod project_memory;
+mod session_stream;
+
+pub use session_stream::{SessionEventRow, SessionSnapshotRow};
+
 static SEQ: AtomicU32 = AtomicU32::new(1);
 
 pub struct Db {
@@ -132,12 +139,21 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_sh_candidates ON sh_candidates(state, base_version, id);
             "#,
         )?;
+        migrations::apply(&conn)?;
         let db = Self { conn };
         if db.notes_fts_sql()?.is_none() {
             db.create_notes_fts(&fts_tokenize_clause("unicode61"))?;
         }
         db.ensure_lessons_fts()?;
         Ok(db)
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        migrations::current_version(&self.conn)
+    }
+
+    pub fn ensure_project(&self, workspace: &Path) -> Result<String> {
+        project_memory::ensure_project(&self.conn, workspace)
     }
 
     pub fn has_fts5(&self) -> Result<bool> {
@@ -171,11 +187,14 @@ impl Db {
     }
 
     fn notes_fts_sql(&self) -> Result<Option<String>> {
-        let sql: Option<String> = self.conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes_fts'",
-            [],
-            |r| r.get(0),
-        ).optional()?;
+        let sql: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
         Ok(sql)
     }
 
@@ -190,11 +209,9 @@ impl Db {
 
     pub fn note_mtime(&self, path: &str) -> Result<Option<i64>> {
         self.conn
-            .query_row(
-                "SELECT mtime FROM notes WHERE path=?1",
-                [path],
-                |r| r.get(0),
-            )
+            .query_row("SELECT mtime FROM notes WHERE path=?1", [path], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(Into::into)
     }
@@ -208,8 +225,10 @@ impl Db {
         content: &str,
         mtime: i64,
     ) -> Result<()> {
-        self.conn.execute("DELETE FROM notes WHERE path=?1", [path])?;
-        self.conn.execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
+        self.conn
+            .execute("DELETE FROM notes WHERE path=?1", [path])?;
+        self.conn
+            .execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
         self.conn.execute(
             "INSERT INTO notes (path, title, tags, links, mtime) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![path, title, tags, links, mtime],
@@ -222,8 +241,11 @@ impl Db {
     }
 
     pub fn delete_note(&self, path: &str) -> Result<bool> {
-        let n = self.conn.execute("DELETE FROM notes WHERE path=?1", [path])?;
-        self.conn.execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
+        let n = self
+            .conn
+            .execute("DELETE FROM notes WHERE path=?1", [path])?;
+        self.conn
+            .execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
         Ok(n > 0)
     }
 
@@ -288,23 +310,26 @@ impl Db {
 
     pub fn note_content(&self, path: &str) -> Result<Option<String>> {
         self.conn
-            .query_row(
-                "SELECT content FROM notes_fts WHERE path=?1",
-                [path],
-                |r| r.get(0),
-            )
+            .query_row("SELECT content FROM notes_fts WHERE path=?1", [path], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn backlinks(&self, targets: &[String], exclude_path: &str, limit: usize) -> Result<Vec<NoteRow>> {
+    pub fn backlinks(
+        &self,
+        targets: &[String],
+        exclude_path: &str,
+        limit: usize,
+    ) -> Result<Vec<NoteRow>> {
         if targets.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT path, title, tags, links, mtime FROM notes WHERE path != ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, title, tags, links, mtime FROM notes WHERE path != ?1")?;
         let rows = stmt.query_map([exclude_path], |r| {
             Ok(NoteRow {
                 path: r.get(0)?,
@@ -317,9 +342,10 @@ impl Db {
         for row in rows {
             let row = row?;
             let hay = format!(",{},", row.links);
-            if targets.iter().any(|t| {
-                !t.is_empty() && hay.contains(&format!(",{t},"))
-            }) {
+            if targets
+                .iter()
+                .any(|t| !t.is_empty() && hay.contains(&format!(",{t},")))
+            {
                 out.push(row);
                 if out.len() >= limit {
                     break;
@@ -396,41 +422,33 @@ impl Db {
         title: &str,
         messages_json: &str,
     ) -> Result<String> {
-        let now = now_secs();
-        if let Some(id) = id {
-            let n = self.conn.execute(
-                "UPDATE sessions SET updated_at=?1, title=?2, messages_json=?3 WHERE id=?4",
-                rusqlite::params![now, title, messages_json, id],
-            )?;
-            if n > 0 {
-                return Ok(id.to_string());
-            }
-        }
-        let id = Self::new_id();
-        self.conn.execute(
-            "INSERT INTO sessions (id, created_at, updated_at, title, messages_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![id, now, now, title, messages_json],
-        )?;
-        Ok(id)
+        session_stream::save(&self.conn, id, title, messages_json)
     }
 
     pub fn load_session(&self, id: &str) -> Result<Option<SessionRow>> {
-        self.conn
-            .query_row(
-                "SELECT id, created_at, updated_at, title, messages_json FROM sessions WHERE id=?1",
-                [id],
-                |r| {
-                    Ok(SessionRow {
-                        id: r.get(0)?,
-                        created_at: r.get(1)?,
-                        updated_at: r.get(2)?,
-                        title: r.get(3)?,
-                        messages_json: r.get(4)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
+        session_stream::load(&self.conn, id)
+    }
+
+    pub fn save_session_compaction(
+        &self,
+        id: Option<&str>,
+        title: &str,
+        source_json: &str,
+        compacted_json: &str,
+    ) -> Result<String> {
+        session_stream::save_compaction(&self.conn, id, title, source_json, compacted_json)
+    }
+
+    pub fn session_events(&self, id: &str) -> Result<Vec<SessionEventRow>> {
+        session_stream::events(&self.conn, id)
+    }
+
+    pub fn session_snapshots(&self, id: &str) -> Result<Vec<SessionSnapshotRow>> {
+        session_stream::snapshots(&self.conn, id)
+    }
+
+    pub fn restore_session_snapshot(&self, id: &str, seq: i64) -> Result<String> {
+        session_stream::restore(&self.conn, id, seq)
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {
@@ -637,6 +655,39 @@ impl Db {
         Ok(LessonWrite::Inserted { id })
     }
 
+    pub fn add_project_lesson(
+        &self,
+        workspace: &Path,
+        trigger: &str,
+        keywords: &str,
+        lesson: &str,
+        max_lessons: u32,
+    ) -> Result<LessonWrite> {
+        let project_id = self.ensure_project(workspace)?;
+        let write = self.add_lesson(trigger, keywords, lesson, max_lessons)?;
+        let lesson_id = match write {
+            LessonWrite::Inserted { id } | LessonWrite::Bumped { id } => id,
+        };
+        project_memory::link_lesson(&self.conn, &project_id, lesson_id)?;
+        Ok(write)
+    }
+
+    pub fn list_project_lessons(&self, workspace: &Path) -> Result<Vec<LessonRow>> {
+        let project_id = self.ensure_project(workspace)?;
+        project_memory::list(&self.conn, &project_id)
+    }
+
+    pub fn project_lessons_for_inject(
+        &self,
+        workspace: &Path,
+        task: &str,
+        fts_limit: usize,
+        weight_limit: usize,
+    ) -> Result<Vec<LessonRow>> {
+        let project_id = self.ensure_project(workspace)?;
+        project_memory::for_inject(&self.conn, &project_id, task, fts_limit, weight_limit)
+    }
+
     fn find_similar_lesson(&self, lesson: &str, keywords: &str) -> Result<Option<i64>> {
         let q = build_fts_query(&format!("{keywords} {lesson}"));
         if q.is_empty() {
@@ -697,13 +748,18 @@ impl Db {
     }
 
     pub fn delete_lesson(&self, id: i64) -> Result<bool> {
-        let n = self.conn.execute("DELETE FROM lessons WHERE id=?1", [id])?;
         self.conn
-            .execute("DELETE FROM lessons_fts WHERE lesson_id=?1", [id.to_string()])?;
+            .execute("DELETE FROM project_lessons WHERE lesson_id=?1", [id])?;
+        let n = self.conn.execute("DELETE FROM lessons WHERE id=?1", [id])?;
+        self.conn.execute(
+            "DELETE FROM lessons_fts WHERE lesson_id=?1",
+            [id.to_string()],
+        )?;
         Ok(n > 0)
     }
 
     pub fn clear_lessons(&self) -> Result<usize> {
+        self.conn.execute("DELETE FROM project_lessons", [])?;
         let n = self.conn.execute("DELETE FROM lessons", [])?;
         self.conn.execute("DELETE FROM lessons_fts", [])?;
         Ok(n)
@@ -1290,6 +1346,127 @@ mod tests {
     }
 
     #[test]
+    fn migrations_are_versioned_and_idempotent() {
+        let dir = std::env::temp_dir().join(format!("rafikx-migration-{}", Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("create migration directory");
+        let path = dir.join("data.db");
+        let first = Db::open(&path).expect("first database open");
+        assert_eq!(first.schema_version().expect("first schema version"), 4);
+        drop(first);
+        let second = Db::open(&path).expect("second database open");
+        assert_eq!(second.schema_version().expect("second schema version"), 4);
+        let rows: i64 = second
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("migration row count");
+        assert_eq!(rows, 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_stream_recovers_corrupt_legacy_snapshot() {
+        let dir = std::env::temp_dir().join(format!("rafikx-session-recover-{}", Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("create session directory");
+        let db = Db::open(&dir.join("data.db")).expect("open database");
+        let messages = r#"[{"role":"user","content":[]}]"#;
+        let id = db
+            .save_session(None, "recovery", messages)
+            .expect("save session");
+        db.conn
+            .execute(
+                "UPDATE sessions SET messages_json='corrupt' WHERE id=?1",
+                [&id],
+            )
+            .expect("corrupt legacy snapshot");
+        let recovered = db
+            .load_session(&id)
+            .expect("load session")
+            .expect("session exists");
+        assert_eq!(recovered.messages_json, messages);
+        assert_eq!(db.session_events(&id).expect("events").len(), 1);
+        assert_eq!(db.session_snapshots(&id).expect("snapshots").len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_keeps_source_snapshot_restorable() {
+        let dir = std::env::temp_dir().join(format!("rafikx-session-compact-{}", Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("create compaction directory");
+        let db = Db::open(&dir.join("data.db")).expect("open database");
+        let source = r#"[{"role":"user","content":[{"type":"text","text":"original"}]}]"#;
+        let compacted = r#"[{"role":"user","content":[{"type":"text","text":"summary"}]}]"#;
+        let id = db
+            .save_session_compaction(None, "compact", source, compacted)
+            .expect("save compaction");
+        let snapshots = db.session_snapshots(&id).expect("compaction snapshots");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].reason, "compaction_source");
+        assert_eq!(
+            db.load_session(&id)
+                .expect("load compacted")
+                .expect("session")
+                .messages_json,
+            compacted
+        );
+        let restored = db
+            .restore_session_snapshot(&id, snapshots[0].seq)
+            .expect("restore source");
+        assert_eq!(restored, source);
+        assert_eq!(
+            db.load_session(&id)
+                .expect("load restored")
+                .expect("session")
+                .messages_json,
+            source
+        );
+        assert_eq!(db.session_events(&id).expect("events").len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_memory_does_not_leak_between_workspaces() {
+        let dir = std::env::temp_dir().join(format!("rafikx-project-memory-{}", Db::new_id()));
+        let first = dir.join("first");
+        let second = dir.join("second");
+        std::fs::create_dir_all(&first).expect("create first workspace");
+        std::fs::create_dir_all(&second).expect("create second workspace");
+        let db = Db::open(&dir.join("data.db")).expect("open database");
+        db.add_project_lesson(
+            &first,
+            "manual",
+            "cargo test",
+            "첫 프로젝트에서는 cargo test를 실행한다",
+            100,
+        )
+        .expect("add first project lesson");
+        assert_eq!(
+            db.list_project_lessons(&first)
+                .expect("first lessons")
+                .len(),
+            1
+        );
+        assert!(
+            db.list_project_lessons(&second)
+                .expect("second lessons")
+                .is_empty()
+        );
+        assert_eq!(
+            db.project_lessons_for_inject(&first, "cargo test", 5, 2)
+                .expect("first inject")
+                .len(),
+            1
+        );
+        assert!(
+            db.project_lessons_for_inject(&second, "cargo test", 5, 2)
+                .expect("second inject")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lesson_add_and_inject() {
         let dir = std::env::temp_dir().join(format!(
             "rafikx-lesson-{}",
@@ -1327,10 +1504,24 @@ mod tests {
         let sig = "verify_fail|direct|missing_artifact";
 
         // 시그니처 정확 일치 클러스터링 — 같은 φ 는 support 만 오른다.
-        db.sh_upsert_evidence(sig, "verify_fail", "direct", "missing_artifact", "작업 A", "노트")
-            .unwrap();
-        db.sh_upsert_evidence(sig, "verify_fail", "direct", "missing_artifact", "작업 B", "노트2")
-            .unwrap();
+        db.sh_upsert_evidence(
+            sig,
+            "verify_fail",
+            "direct",
+            "missing_artifact",
+            "작업 A",
+            "노트",
+        )
+        .unwrap();
+        db.sh_upsert_evidence(
+            sig,
+            "verify_fail",
+            "direct",
+            "missing_artifact",
+            "작업 B",
+            "노트2",
+        )
+        .unwrap();
         assert!(db.sh_top_unaddressed(3).unwrap().is_none()); // 임계 미달
         let ev = db.sh_top_unaddressed(2).unwrap().expect("클러스터");
         assert_eq!(ev.support, 2);
@@ -1348,7 +1539,16 @@ mod tests {
 
         // 후보 등록 → trial → trial 에피소드 통계 → 판정 기록.
         let cid = db
-            .sh_add_candidate(ev.id, "verification_instruction", "새 검증 지시", "{}", 0, sig, rate, target)
+            .sh_add_candidate(
+                ev.id,
+                "verification_instruction",
+                "새 검증 지시",
+                "{}",
+                0,
+                sig,
+                rate,
+                target,
+            )
             .unwrap();
         assert!(!db.sh_has_candidates_for(ev.id, 1).unwrap());
         assert!(db.sh_has_candidates_for(ev.id, 0).unwrap());
@@ -1356,8 +1556,15 @@ mod tests {
         db.sh_add_episode(0, Some(cid), true, "").unwrap();
         db.sh_add_episode(0, Some(cid), true, "").unwrap();
         let other_sig = "tool_loop|direct|blind_retry";
-        db.sh_upsert_evidence(other_sig, "tool_loop", "direct", "blind_retry", "작업 C", "")
-            .unwrap();
+        db.sh_upsert_evidence(
+            other_sig,
+            "tool_loop",
+            "direct",
+            "blind_retry",
+            "작업 C",
+            "",
+        )
+        .unwrap();
         db.sh_add_episode(0, Some(cid), false, other_sig).unwrap();
         let stats = db.sh_trial_stats(cid, sig).unwrap();
         assert_eq!(stats.episodes, 3);
@@ -1371,7 +1578,16 @@ mod tests {
 
         // 세대가 지난 proposed 후보는 stale 처리된다.
         let old = db
-            .sh_add_candidate(ev.id, "execution_instruction", "다른 지시", "{}", 0, sig, rate, target)
+            .sh_add_candidate(
+                ev.id,
+                "execution_instruction",
+                "다른 지시",
+                "{}",
+                0,
+                sig,
+                rate,
+                target,
+            )
             .unwrap();
         db.sh_stale_proposed(1).unwrap();
         assert!(db.sh_next_proposed(0).unwrap().is_none());

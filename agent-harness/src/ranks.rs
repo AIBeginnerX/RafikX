@@ -102,7 +102,10 @@ pub fn normalize_id(id: &str) -> String {
         // keep ollama tag prefix like qwen3:8b as-is except lowercased
         let _ = idx;
     }
-    s = s.trim_end_matches("-latest").trim_end_matches(":latest").to_string();
+    s = s
+        .trim_end_matches("-latest")
+        .trim_end_matches(":latest")
+        .to_string();
     // strip trailing YYYYMMDD or YYYY-MM-DD conservatively
     let nlen = s.len();
     if nlen >= 9 {
@@ -135,8 +138,7 @@ pub fn match_entry<'a>(table: &'a RankTable, model_id: &str) -> Option<&'a RankE
             if a.is_empty() {
                 continue;
             }
-            let hit = norm == a
-                || (a.len() >= 4 && (norm.contains(&a) || a.contains(&norm)));
+            let hit = norm == a || (a.len() >= 4 && (norm.contains(&a) || a.contains(&norm)));
             if hit {
                 let score = a.len();
                 if best.map(|(_, n)| n).unwrap_or(0) < score {
@@ -159,9 +161,11 @@ pub fn tier_of(table: &RankTable, model_id: &str) -> Option<Tier> {
 
 pub fn is_cheap_id(model_id: &str) -> bool {
     let n = normalize_id(model_id);
-    ["haiku", "flash", "mini", "nano", "lite", "small", "turbo", "instant", "luna"]
-        .iter()
-        .any(|k| n.contains(k))
+    [
+        "haiku", "flash", "mini", "nano", "lite", "small", "turbo", "instant", "luna",
+    ]
+    .iter()
+    .any(|k| n.contains(k))
 }
 
 fn today() -> String {
@@ -188,7 +192,10 @@ fn today() -> String {
 fn file_age_secs(path: &std::path::Path) -> Option<u64> {
     let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
-    SystemTime::now().duration_since(modified).ok().map(|d| d.as_secs())
+    SystemTime::now()
+        .duration_since(modified)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 pub fn is_stale() -> bool {
@@ -350,12 +357,19 @@ async fn fetch_lmarena_elo(client: &reqwest::Client) -> Option<Vec<(String, i32)
         let Some(arr) = arr else { continue };
         let mut out = Vec::new();
         for item in arr {
-            let name = ["model_name", "modelName", "display_name", "name", "slug", "model"]
-                .iter()
-                .find_map(|k| item.get(*k).and_then(|x| x.as_str()))
-                .or_else(|| item.pointer("/model/name").and_then(|x| x.as_str()))
-                .unwrap_or("")
-                .to_string();
+            let name = [
+                "model_name",
+                "modelName",
+                "display_name",
+                "name",
+                "slug",
+                "model",
+            ]
+            .iter()
+            .find_map(|k| item.get(*k).and_then(|x| x.as_str()))
+            .or_else(|| item.pointer("/model/name").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string();
             if name.is_empty() {
                 continue;
             }
@@ -436,10 +450,7 @@ fn merge_scored(table: &mut RankTable, aa: &[(String, i32)], elo: &[(String, i32
 pub async fn refresh(force: bool) -> Result<String> {
     let mut table = load();
     if !force && !is_stale() {
-        return Ok(format!(
-            "순위표가 최신입니다 (기준일 {}).",
-            table.updated
-        ));
+        return Ok(format!("순위표가 최신입니다 (기준일 {}).", table.updated));
     }
     let url = if table.fetch_url.trim().is_empty() {
         bundled().fetch_url
@@ -453,7 +464,9 @@ pub async fn refresh(force: bool) -> Result<String> {
         .build()?;
 
     let mut sources: Vec<String> = Vec::new();
-    let aa = fetch_artificial_analysis(&client, &url).await.unwrap_or_default();
+    let aa = fetch_artificial_analysis(&client, &url)
+        .await
+        .unwrap_or_default();
     if !aa.is_empty() {
         sources.push("Artificial Analysis".into());
     }
@@ -474,7 +487,11 @@ pub async fn refresh(force: bool) -> Result<String> {
     table.source = format!(
         "{} 교차 검증{}",
         sources.join(" + "),
-        if table.sources.len() >= 2 { "" } else { " (단일 소스)" }
+        if table.sources.len() >= 2 {
+            ""
+        } else {
+            " (단일 소스)"
+        }
     );
     save(&table)?;
     Ok(format!(
@@ -525,10 +542,7 @@ mod tests {
 
     #[test]
     fn normalize_strips_dates_conservatively() {
-        assert_eq!(
-            normalize_id("Claude-Opus-5-20260801"),
-            "claude-opus-5"
-        );
+        assert_eq!(normalize_id("Claude-Opus-5-20260801"), "claude-opus-5");
         assert_eq!(normalize_id("openai/gpt-4.1"), "gpt-4.1");
         assert!(is_cheap_id("gemini-2.5-flash"));
         assert!(!is_cheap_id("claude-opus-5"));

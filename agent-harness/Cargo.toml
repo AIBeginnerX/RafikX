@@ -1,8 +1,8 @@
 [package]
 name = "rafikx"
-version = "0.7.3"
+version = "1.0.0"
 edition = "2024"
-description = "RafikX ??personal AI coding agent for the terminal and Telegram"
+description = "A personal AI coding-agent runtime for the terminal, desktop, and Telegram"
 license = "MIT"
 repository = "https://github.com/AIBeginnerX/RafikX"
 homepage = "https://github.com/AIBeginnerX/RafikX"
@@ -44,7 +44,7 @@ similar = "3.1.2"
 unicode-width = { version = "0.2", optional = true }
 syntect = { version = "5", optional = true, default-features = false, features = ["default-fancy"] }
 teloxide = { version = "0.17.0", optional = true, default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util", "sync", "signal", "net"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util", "io-std", "sync", "signal", "net"] }
 toml = "1.1.4"
 
 [profile.release]

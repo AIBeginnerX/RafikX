@@ -1,0 +1,191 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde_json::Value;
+
+mod data;
+mod lifecycle_api;
+
+use super::events::{EventBus, EventTap};
+use super::{
+    AgentId, ContextSourceRecord, EventReceiver, ProgressState, RunControl, RunEventKind, RunId,
+    TodoStore,
+};
+use crate::lifecycle::{LifecycleRuntime, LifecycleStore};
+
+pub type RunLiveSink = Arc<dyn Fn(crate::ui::Live) + Send + Sync>;
+
+#[derive(Default)]
+pub struct RunMetrics {
+    context_window: AtomicU32,
+    fallback_quiet: AtomicBool,
+}
+
+impl RunMetrics {
+    pub fn context_window(&self) -> u32 {
+        self.context_window.load(Ordering::Relaxed)
+    }
+
+    pub fn set_context_window(&self, value: u32) {
+        self.context_window.store(value, Ordering::Relaxed);
+    }
+
+    pub fn fallback_quiet(&self) -> bool {
+        self.fallback_quiet.load(Ordering::Relaxed)
+    }
+
+    pub fn set_fallback_quiet(&self, value: bool) {
+        self.fallback_quiet.store(value, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub struct RunContext {
+    run_id: RunId,
+    parent_run_id: Option<RunId>,
+    agent_id: Option<AgentId>,
+    workspace: Arc<PathBuf>,
+    config: Option<Arc<crate::config::Config>>,
+    events: EventBus,
+    control: RunControl,
+    todos: TodoStore,
+    progress: Arc<ProgressState>,
+    metrics: Arc<RunMetrics>,
+    live_sink: Option<RunLiveSink>,
+    committed_paths: Arc<Mutex<Vec<PathBuf>>>,
+    context_sources: Arc<Mutex<Vec<ContextSourceRecord>>>,
+    lifecycle: Arc<LifecycleRuntime>,
+    approval_all: Arc<AtomicBool>,
+}
+
+impl RunContext {
+    pub fn isolated(run_id: RunId, workspace: PathBuf) -> Self {
+        Self::new(run_id, workspace, None, None, EventBus::new(), None)
+    }
+
+    pub fn for_config(run_id: RunId, config: Arc<crate::config::Config>) -> Self {
+        let store = LifecycleStore::open(&config.data_dir.join("data.db")).ok();
+        Self::new(
+            run_id,
+            config.workspace.clone(),
+            Some(config),
+            None,
+            EventBus::new(),
+            store,
+        )
+    }
+
+    pub fn with_live_sink(mut self, sink: Option<RunLiveSink>) -> Self {
+        self.live_sink = sink;
+        self
+    }
+
+    pub fn with_event_tap(mut self, tap: EventTap) -> Self {
+        self.events = self.events.with_tap(tap);
+        self
+    }
+
+    pub fn child(&self, run_id: RunId, agent_id: AgentId) -> Self {
+        let lifecycle = self.lifecycle.child(run_id.clone(), agent_id.clone());
+        Self {
+            run_id,
+            parent_run_id: Some(self.run_id.clone()),
+            agent_id: Some(agent_id),
+            workspace: Arc::clone(&self.workspace),
+            config: self.config.clone(),
+            events: self.events.clone(),
+            control: self.control.child(),
+            todos: TodoStore::new(),
+            progress: Arc::new(ProgressState::new()),
+            metrics: Arc::new(RunMetrics::default()),
+            live_sink: self.live_sink.clone(),
+            committed_paths: Arc::new(Mutex::new(Vec::new())),
+            context_sources: Arc::new(Mutex::new(Vec::new())),
+            lifecycle,
+            approval_all: Arc::clone(&self.approval_all),
+        }
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn parent_run_id(&self) -> Option<&RunId> {
+        self.parent_run_id.as_ref()
+    }
+
+    pub fn agent_id(&self) -> Option<&AgentId> {
+        self.agent_id.as_ref()
+    }
+
+    pub fn workspace(&self) -> &Path {
+        self.workspace.as_path()
+    }
+
+    pub fn config(&self) -> Option<Arc<crate::config::Config>> {
+        self.config.clone()
+    }
+
+    pub fn metrics(&self) -> &RunMetrics {
+        &self.metrics
+    }
+
+    pub fn subscribe(&self) -> EventReceiver {
+        self.events.subscribe()
+    }
+
+    pub fn emit(&self, kind: RunEventKind, payload: Value) {
+        self.events.emit(
+            self.run_id.clone(),
+            self.parent_run_id.clone(),
+            self.agent_id.clone(),
+            kind,
+            payload,
+        );
+    }
+
+    pub fn emit_live(&self, event: crate::ui::Live) -> bool {
+        let Some(sink) = &self.live_sink else {
+            return false;
+        };
+        sink(event);
+        true
+    }
+
+    pub fn has_live_sink(&self) -> bool {
+        self.live_sink.is_some()
+    }
+
+    pub(crate) fn progress(&self) -> &ProgressState {
+        &self.progress
+    }
+
+    fn new(
+        run_id: RunId,
+        workspace: PathBuf,
+        config: Option<Arc<crate::config::Config>>,
+        live_sink: Option<RunLiveSink>,
+        events: EventBus,
+        store: Option<LifecycleStore>,
+    ) -> Self {
+        let lifecycle = LifecycleRuntime::root(run_id.clone(), store);
+        Self {
+            run_id,
+            parent_run_id: None,
+            agent_id: None,
+            workspace: Arc::new(workspace),
+            config,
+            events,
+            control: RunControl::new(),
+            todos: TodoStore::new(),
+            progress: Arc::new(ProgressState::new()),
+            metrics: Arc::new(RunMetrics::default()),
+            live_sink,
+            committed_paths: Arc::new(Mutex::new(Vec::new())),
+            context_sources: Arc::new(Mutex::new(Vec::new())),
+            lifecycle,
+            approval_all: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}

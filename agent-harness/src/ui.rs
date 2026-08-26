@@ -1,6 +1,11 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::run::{RunContext, RunEventKind};
+
 static COLOR: OnceLock<bool> = OnceLock::new();
 
 pub fn init() {
@@ -52,12 +57,19 @@ pub fn rule() {
 pub fn banner(subtitle: &str) {
     init();
     println!();
-    println!("{}", gold("+--------------------------------------------------------------+"));
+    println!(
+        "{}",
+        gold("+--------------------------------------------------------------+")
+    );
     println!(
         "{} {} {}",
         gold("|"),
         pad_visible(
-            &format!("{}  {}", gold("RAFIKX"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            &format!(
+                "{}  {}",
+                gold("RAFIKX"),
+                dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+            ),
             WIDTH - 2,
         ),
         gold("|")
@@ -70,7 +82,10 @@ pub fn banner(subtitle: &str) {
             gold("|")
         );
     }
-    println!("{}", gold("+--------------------------------------------------------------+"));
+    println!(
+        "{}",
+        gold("+--------------------------------------------------------------+")
+    );
 }
 
 fn visible_len(s: &str) -> usize {
@@ -154,7 +169,8 @@ pub fn print_footer() {
 }
 
 /// Agent/TUI live output. When a sink is installed, prints go there instead of stdout.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum Live {
     Chunk(String),
     Assistant(String),
@@ -165,7 +181,7 @@ pub enum Live {
     Agent(AgentProgress),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentProgress {
     pub id: String,
     pub role: String,
@@ -173,7 +189,7 @@ pub struct AgentProgress {
     pub status: String,
 }
 
-type LiveFn = Arc<dyn Fn(Live) + Send + Sync>;
+pub type LiveFn = Arc<dyn Fn(Live) + Send + Sync>;
 
 fn live_slot() -> &'static Mutex<Option<LiveFn>> {
     static SLOT: OnceLock<Mutex<Option<LiveFn>>> = OnceLock::new();
@@ -186,12 +202,12 @@ pub fn set_live(sink: Option<LiveFn>) {
     }
 }
 
+pub fn current_live_sink() -> Option<LiveFn> {
+    live_slot().lock().ok().and_then(|sink| sink.clone())
+}
+
 pub fn live_active() -> bool {
-    live_slot()
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .is_some()
+    live_slot().lock().ok().and_then(|g| g.clone()).is_some()
 }
 
 fn emit(ev: Live) -> bool {
@@ -202,6 +218,76 @@ fn emit(ev: Live) -> bool {
     } else {
         false
     }
+}
+
+fn emit_in(run: &RunContext, event: Live) -> bool {
+    run.emit(
+        RunEventKind::Live,
+        serde_json::to_value(&event).unwrap_or_else(|_| json!({"type":"unknown"})),
+    );
+    run.emit_live(event.clone()) || emit(event)
+}
+
+pub fn live_chunk_in(run: &RunContext, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    run.progress().mark_answer_started();
+    if !emit_in(run, Live::Chunk(s.to_string())) {
+        print!("{s}");
+        let _ = io::stdout().flush();
+    }
+}
+
+pub fn live_assistant_in(run: &RunContext, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    run.progress().mark_answer_started();
+    if !emit_in(run, Live::Assistant(s.to_string())) {
+        println!("{s}");
+    }
+}
+
+pub fn live_line_in(run: &RunContext, s: &str) {
+    if run.progress().is_running() {
+        run.progress().push_note(s);
+        run.progress().set_label(s);
+        return;
+    }
+    if !emit_in(run, Live::System(s.to_string())) {
+        println!("{s}");
+    }
+}
+
+pub fn live_status_in(run: &RunContext, s: &str) {
+    if run.progress().is_running() {
+        run.progress().set_label(s);
+        return;
+    }
+    if !emit_in(run, Live::Status(s.to_string())) {
+        note(s);
+    }
+}
+
+pub fn live_warn_in(run: &RunContext, s: &str) {
+    if run.progress().is_running() {
+        let note = format!("⚠ {s}");
+        run.progress().push_note(&note);
+        run.progress().set_label(s);
+        return;
+    }
+    if !emit_in(run, Live::Warn(s.to_string())) {
+        warn(s);
+    }
+}
+
+pub fn live_todo_in(run: &RunContext, items: &[crate::tools_more::TodoItem]) {
+    let _ = emit_in(run, Live::Todo(items.to_vec()));
+}
+
+pub fn live_agent_in(run: &RunContext, progress: AgentProgress) {
+    let _ = emit_in(run, Live::Agent(progress));
 }
 
 pub fn live_chunk(s: &str) {

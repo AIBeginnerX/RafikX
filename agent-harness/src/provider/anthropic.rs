@@ -23,11 +23,7 @@ fn drain_event(buf: &mut Vec<u8>) -> Option<String> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|i| (i, 4))
-        .or_else(|| {
-            buf.windows(2)
-                .position(|w| w == b"\n\n")
-                .map(|i| (i, 2))
-        })?;
+        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2)))?;
     let (idx, sep_len) = pos;
     let event_bytes: Vec<u8> = buf.drain(..idx + sep_len).collect();
     Some(String::from_utf8_lossy(&event_bytes).into_owned())
@@ -144,8 +140,12 @@ impl AnthropicProvider {
                             );
                         }
                         Some("content_block_delta") => {
-                            if v.pointer("/delta/type").and_then(|x| x.as_str()) == Some("text_delta") {
-                                if let Some(piece) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
+                            if v.pointer("/delta/type").and_then(|x| x.as_str())
+                                == Some("text_delta")
+                            {
+                                if let Some(piece) =
+                                    v.pointer("/delta/text").and_then(|x| x.as_str())
+                                {
                                     if !piece.is_empty() {
                                         if thinking_started {
                                             on_text("\n[/모델 작업]\n");
@@ -175,7 +175,9 @@ impl AnthropicProvider {
                             stop_reason = map_stop_reason(
                                 v.pointer("/delta/stop_reason").and_then(|x| x.as_str()),
                             );
-                            if let Some(n) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
+                            if let Some(n) =
+                                v.pointer("/usage/output_tokens").and_then(|x| x.as_u64())
+                            {
                                 output_tokens = n as u32;
                             }
                         }
@@ -183,9 +185,7 @@ impl AnthropicProvider {
                             if thinking_started {
                                 on_text("\n[/모델 작업]\n");
                             }
-                            if let Some(stopped_cache) =
-                                crate::provider::cached_tokens_entry(&v)
-                            {
+                            if let Some(stopped_cache) = crate::provider::cached_tokens_entry(&v) {
                                 cached_tokens = stopped_cache;
                                 cache_reported = true;
                             }
@@ -303,13 +303,16 @@ fn to_api_messages(msgs: &[Message]) -> Vec<Value> {
 }
 
 fn parse_message_json(text: &str) -> Result<ChatResponse> {
-    let v: Value = serde_json::from_str(text).context("Anthropic 응답 JSON을 해석할 수 없습니다")?;
+    let v: Value =
+        serde_json::from_str(text).context("Anthropic 응답 JSON을 해석할 수 없습니다")?;
     let mut blocks = Vec::new();
     if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
         for item in arr {
             if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                 if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                    blocks.push(ContentBlock::Text { text: t.to_string() });
+                    blocks.push(ContentBlock::Text {
+                        text: t.to_string(),
+                    });
                 }
             } else if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                 let id = item

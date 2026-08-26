@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::run::RunContext;
+
 const FRAMES: &[char] = &['|', '/', '-', '\\'];
 const BAR_WIDTH: usize = 16;
 const SEGMENT: usize = 5;
@@ -18,6 +20,10 @@ static ANSWER_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn mark_answer_started() {
     ANSWER_STARTED.store(true, Ordering::Relaxed);
+}
+
+pub fn mark_answer_started_in(run: &RunContext) {
+    run.progress().mark_answer_started();
 }
 
 fn answer_started() -> bool {
@@ -37,9 +43,17 @@ pub fn set_label(msg: &str) {
     }
 }
 
+pub fn set_label_in(run: &RunContext, msg: &str) {
+    run.progress().set_label(msg);
+}
+
 /// 현재 라벨 — TUI 진행바가 단계 상태를 표시할 때 읽는다.
 pub fn current_label() -> Option<String> {
     label_slot().lock().ok().and_then(|g| g.clone())
+}
+
+pub fn current_label_in(run: &RunContext) -> Option<String> {
+    run.progress().label()
 }
 
 /// 스피너 구동 중 들어온 시스템 메시지 버퍼 — 종료 때 한 번에 출력해 유실 없다.
@@ -54,6 +68,10 @@ pub fn push_note(line: &str) {
     }
 }
 
+pub fn push_note_in(run: &RunContext, line: &str) {
+    run.progress().push_note(line);
+}
+
 pub fn drain_notes() -> Vec<String> {
     notes_slot()
         .lock()
@@ -61,8 +79,16 @@ pub fn drain_notes() -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub fn drain_notes_in(run: &RunContext) -> Vec<String> {
+    run.progress().drain_notes()
+}
+
 pub fn is_running() -> bool {
     RUNNING.load(Ordering::Relaxed)
+}
+
+pub fn is_running_in(run: &RunContext) -> bool {
+    run.progress().is_running()
 }
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -101,11 +127,7 @@ fn render_bar(tick: usize) -> String {
     // 슬라이딩 세그먼트 — 총량을 모르는 작업용 인디케이터
     let span = BAR_WIDTH - SEGMENT + 1;
     let pos = tick % (span * 2);
-    let pos = if pos < span {
-        pos
-    } else {
-        span * 2 - 1 - pos
-    };
+    let pos = if pos < span { pos } else { span * 2 - 1 - pos };
     let mut bar = String::with_capacity(BAR_WIDTH * 3);
     bar.push('[');
     for i in 0..BAR_WIDTH {
@@ -120,6 +142,7 @@ pub struct Spinner {
     stop: Option<Arc<AtomicBool>>,
     handle: Option<tokio::task::JoinHandle<()>>,
     active: bool,
+    run: Option<RunContext>,
 }
 
 impl Spinner {
@@ -132,6 +155,7 @@ impl Spinner {
                 stop: None,
                 handle: None,
                 active: false,
+                run: None,
             };
         }
         ANSWER_STARTED.store(false, Ordering::Relaxed);
@@ -176,6 +200,58 @@ impl Spinner {
             stop: Some(stop),
             handle: Some(handle),
             active: true,
+            run: None,
+        }
+    }
+
+    pub fn start_in(run: RunContext, msg: &str) -> Self {
+        let active =
+            stderr_is_terminal() && !run.has_live_sink() && std::env::var_os("NO_COLOR").is_none();
+        if !active {
+            return Self {
+                stop: None,
+                handle: None,
+                active: false,
+                run: Some(run),
+            };
+        }
+        run.progress().reset();
+        run.progress().set_running(true);
+        run.progress().set_label(msg);
+        enable_stderr_vt();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let run_t = run.clone();
+        let handle = tokio::spawn(async move {
+            let mut err = std::io::stderr();
+            let started = Instant::now();
+            let mut i = 0usize;
+            loop {
+                if stop_t.load(Ordering::Relaxed) || run_t.progress().answer_started() {
+                    break;
+                }
+                let elapsed = started.elapsed().as_secs();
+                let label = run_t.progress().label().unwrap_or_default();
+                let _ = write!(
+                    err,
+                    "\r\x1b[36m{}\x1b[0m {} {:>3}초 {} ",
+                    FRAMES[i % FRAMES.len()],
+                    render_bar(i),
+                    elapsed,
+                    label
+                );
+                let _ = err.flush();
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(90)).await;
+            }
+            let _ = write!(err, "\r\x1b[2K");
+            let _ = err.flush();
+        });
+        Self {
+            stop: Some(stop),
+            handle: Some(handle),
+            active: true,
+            run: Some(run),
         }
     }
 
@@ -197,11 +273,19 @@ impl Spinner {
         if let Some(h) = self.handle.take() {
             let _ = h.await_ok();
         }
-        // 버퍼된 시스템 메시지를 유실 없이 출력
-        for line in drain_notes() {
+        let notes = self
+            .run
+            .as_ref()
+            .map(drain_notes_in)
+            .unwrap_or_else(drain_notes);
+        for line in notes {
             println!("{line}");
         }
-        RUNNING.store(false, Ordering::Relaxed);
+        if let Some(run) = &self.run {
+            run.progress().set_running(false);
+        } else {
+            RUNNING.store(false, Ordering::Relaxed);
+        }
         self.active = false;
     }
 }
@@ -251,10 +335,7 @@ mod tests {
     #[test]
     fn label_roundtrip() {
         set_label("반복 2/25");
-        assert_eq!(
-            label_slot().lock().unwrap().as_deref(),
-            Some("반복 2/25")
-        );
+        assert_eq!(label_slot().lock().unwrap().as_deref(), Some("반복 2/25"));
         *label_slot().lock().unwrap() = None;
     }
 }

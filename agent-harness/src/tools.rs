@@ -14,9 +14,19 @@ use tokio::time::timeout;
 use crate::db::Db;
 use crate::obsidian;
 use crate::provider::ToolSpec;
+use crate::run::{RunContext, RunEventKind};
 
-use crate::agent::LocalAsk;
-use crate::tools_more::{ApplyPatch, GlobTool, MultiEdit, TaskTool, TodoRead, TodoWrite, WebFetch, WebSearch};
+use crate::agent::{LocalAsk, RemoteApproval};
+use crate::tools_more::{
+    ApplyPatch, GlobTool, MultiEdit, TodoRead, TodoWrite, WebFetch, WebSearch,
+};
+
+mod lsp_tools;
+pub mod mutation;
+mod task;
+
+use lsp_tools::{LspDefinition, LspDiagnostics};
+pub use task::{TaskResult, TaskTool};
 
 pub const MAX_LIST_ITEMS: usize = 500;
 pub const MAX_GREP_LINES: usize = 200;
@@ -38,6 +48,8 @@ pub struct ToolCtx {
     pub db_path: PathBuf,
     /// 서브에이전트(task 도구)가 승인 흐름을 이어받기 위한 채널.
     pub local_ask: Option<LocalAsk>,
+    pub remote: Option<RemoteApproval>,
+    pub run: Option<RunContext>,
 }
 
 impl ToolCtx {
@@ -47,7 +59,30 @@ impl ToolCtx {
             vault: None,
             db_path: PathBuf::from("."),
             local_ask: None,
+            remote: None,
+            run: None,
         }
+    }
+
+    pub(crate) fn commit_mutation(
+        &self,
+        plan: mutation::MutationPlan,
+    ) -> Result<mutation::MutationReceipt> {
+        let receipt = plan.commit()?;
+        if let Some(run) = &self.run {
+            run.record_committed_paths(receipt.changed.iter().cloned());
+            run.emit(
+                RunEventKind::Mutation,
+                json!({
+                    "committed": receipt.committed,
+                    "changed": receipt.changed,
+                    "created": receipt.created,
+                    "updated": receipt.updated,
+                    "deleted": receipt.deleted,
+                }),
+            );
+        }
+        Ok(receipt)
     }
 }
 
@@ -65,6 +100,8 @@ impl ToolRegistry {
                 Box::new(GlobTool),
                 Box::new(WebFetch),
                 Box::new(WebSearch),
+                Box::new(LspDiagnostics),
+                Box::new(LspDefinition),
                 Box::new(EditFile),
                 Box::new(MultiEdit),
                 Box::new(WriteFile),
@@ -86,6 +123,8 @@ impl ToolRegistry {
         "glob",
         "webfetch",
         "web_search",
+        "lsp_diagnostics",
+        "lsp_definition",
         "todo_read",
         "todo_write",
         "obsidian_search",
@@ -141,7 +180,10 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&(dyn Tool + Send + Sync)> {
-        self.tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.as_ref())
     }
 }
 
@@ -264,8 +306,16 @@ pub fn code_change_summary(
         .find(old)
         .map(|idx| before[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
         .unwrap_or(1);
-    let removed = if old.is_empty() { 0 } else { old.lines().count().max(1) };
-    let added = if new.is_empty() { 0 } else { new.lines().count().max(1) };
+    let removed = if old.is_empty() {
+        0
+    } else {
+        old.lines().count().max(1)
+    };
+    let added = if new.is_empty() {
+        0
+    } else {
+        new.lines().count().max(1)
+    };
     let span = removed.max(added).max(1);
     let end = start + span - 1;
     format!(
@@ -336,7 +386,9 @@ pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<Stri
             let patch = str_field(input, "patch")?;
             let ops = crate::tools_more::ApplyPatch::parse(patch)?;
             let report = crate::tools_more::ApplyPatch::dry_run(&ctx.workspace, &ops)?;
-            Ok(format!("[승인] apply_patch\n{report}\n--- patch ---\n{patch}"))
+            Ok(format!(
+                "[승인] apply_patch\n{report}\n--- patch ---\n{patch}"
+            ))
         }
         other => Ok(format!("[승인] {other}")),
     }
@@ -486,7 +538,10 @@ impl Tool for Grep {
             .unwrap_or(0)
             .clamp(0, 5) as usize;
         let mut hits = Vec::new();
-        let walker = ignore::WalkBuilder::new(&root).hidden(false).git_ignore(true).build();
+        let walker = ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .git_ignore(true)
+            .build();
         for entry in walker.flatten() {
             if hits.len() >= MAX_GREP_LINES {
                 break;
@@ -501,7 +556,9 @@ impl Tool for Grep {
                     continue;
                 }
             }
-            let Ok(text) = fs::read_to_string(path) else { continue };
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
             let rel = path.strip_prefix(&ctx.workspace).unwrap_or(path);
             let lines: Vec<&str> = text.lines().collect();
             let matched: Vec<usize> = lines
@@ -514,7 +571,10 @@ impl Tool for Grep {
                 continue;
             }
             if context == 0 {
-                for i in matched.iter().take(MAX_GREP_LINES.saturating_sub(hits.len())) {
+                for i in matched
+                    .iter()
+                    .take(MAX_GREP_LINES.saturating_sub(hits.len()))
+                {
                     hits.push(format!("{}:{}:{}", rel.display(), i + 1, lines[*i]));
                 }
             } else {
@@ -522,7 +582,9 @@ impl Tool for Grep {
                 let mut ranges: Vec<(usize, usize)> = Vec::new();
                 for &i in &matched {
                     match ranges.last_mut() {
-                        Some(r) if i <= r.1 + 1 => r.1 = (i + context).min(lines.len().saturating_sub(1)),
+                        Some(r) if i <= r.1 + 1 => {
+                            r.1 = (i + context).min(lines.len().saturating_sub(1))
+                        }
                         _ => ranges.push((
                             i.saturating_sub(context),
                             (i + context).min(lines.len().saturating_sub(1)),
@@ -600,7 +662,13 @@ impl Tool for EditFile {
             ));
         }
         let updated = body.replacen(old_str, new_str, 1);
-        fs::write(&resolved, updated)?;
+        let mut plan = mutation::MutationPlan::new(&ctx.workspace)?;
+        plan.replace(
+            &resolved,
+            mutation::MutationState::Present(body.as_bytes().to_vec()),
+            updated.into_bytes(),
+        )?;
+        ctx.commit_mutation(plan)?;
         Ok(code_change_summary(
             "수정", &resolved, &body, old_str, new_str,
         ))
@@ -632,11 +700,15 @@ impl Tool for WriteFile {
         let content = str_field(&input, "content")?;
         let resolved = resolve_tool_path(ctx, path)?;
         let before = fs::read_to_string(&resolved).unwrap_or_default();
-        let action = if resolved.exists() { "덮어쓰기" } else { "등록" };
-        if let Some(parent) = resolved.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&resolved, content)?;
+        let action = if resolved.exists() {
+            "덮어쓰기"
+        } else {
+            "등록"
+        };
+        let before_state = mutation::read_state(&resolved)?;
+        let mut plan = mutation::MutationPlan::new(&ctx.workspace)?;
+        plan.replace(&resolved, before_state, content.as_bytes().to_vec())?;
+        ctx.commit_mutation(plan)?;
         Ok(code_change_summary(
             action, &resolved, &before, &before, content,
         ))
@@ -771,7 +843,9 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
         .kill_on_drop(true)
         .stdin(Stdio::null());
 
-    let mut child = cmd.spawn().map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let mut out_buf = Vec::new();
@@ -893,4 +967,3 @@ mod tests {
         assert!(shown.contains("+2 -1"));
     }
 }
-

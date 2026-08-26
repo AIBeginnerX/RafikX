@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 use pulldown_cmark::{Event, Parser, TagEnd};
 use regex::Regex;
-use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 
 use crate::config::{self, Config};
 use crate::db::{Db, NoteHit};
@@ -116,7 +116,8 @@ pub fn ask_context(cfg: &Config, query: &str) -> Result<AskContext> {
 
     let mut sources: Vec<String> = Vec::new();
     let mut used_paths: HashSet<String> = HashSet::new();
-    let mut body = String::from("[Obsidian 컨텍스트]\n다음 노트 발췌를 근거로 답하고, 출처 경로를 밝혀라.\n");
+    let mut body =
+        String::from("[Obsidian 컨텍스트]\n다음 노트 발췌를 근거로 답하고, 출처 경로를 밝혀라.\n");
     let mut extra_slots = 3usize;
 
     for h in &hits {
@@ -151,7 +152,10 @@ pub fn ask_context(cfg: &Config, query: &str) -> Result<AskContext> {
         }
     }
 
-    Ok(AskContext { block: body, sources })
+    Ok(AskContext {
+        block: body,
+        sources,
+    })
 }
 
 pub async fn watch_vault(cfg: &Config) -> Result<()> {
@@ -159,7 +163,10 @@ pub async fn watch_vault(cfg: &Config) -> Result<()> {
 }
 
 /// Same watcher as the CLI, but stop when `cancel` becomes true (desktop).
-pub async fn watch_vault_until(cfg: &Config, mut cancel: tokio::sync::watch::Receiver<bool>) -> Result<String> {
+pub async fn watch_vault_until(
+    cfg: &Config,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<String> {
     let vault = vault_dir(cfg)?;
     let path = vault.display().to_string();
     let db = open_notes_db(cfg)?;
@@ -294,7 +301,8 @@ fn upsert_file(db: &Db, vault: &Path, path: &Path, retry: bool) -> Result<Upsert
         Ok(s) => s,
         Err(_) if retry => {
             std::thread::sleep(Duration::from_millis(200));
-            fs::read_to_string(path).with_context(|| format!("{} 를 읽을 수 없습니다", path.display()))?
+            fs::read_to_string(path)
+                .with_context(|| format!("{} 를 읽을 수 없습니다", path.display()))?
         }
         Err(e) => return Err(e).with_context(|| format!("{} 를 읽을 수 없습니다", path.display())),
     };
@@ -423,7 +431,10 @@ fn hash_tags(body: &str) -> Vec<String> {
     let re = Regex::new(r"(?:^|[\s(])#([^\s#\[\]]+)").expect("hash tag regex");
     re.captures_iter(body)
         .filter_map(|c| c.get(1))
-        .map(|m| m.as_str().trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ':' | ';')))
+        .map(|m| {
+            m.as_str()
+                .trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ':' | ';'))
+        })
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
@@ -505,13 +516,14 @@ fn is_skipped_path(vault: &Path, path: &Path) -> bool {
         if is_temp_name(path) {
             return true;
         }
-        return path.components().any(|c| {
-            matches!(c.as_os_str().to_str(), Some(".obsidian" | ".trash"))
-        });
+        return path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some(".obsidian" | ".trash")));
     };
-    if stripped.components().any(|c| {
-        matches!(c.as_os_str().to_str(), Some(".obsidian" | ".trash"))
-    }) {
+    if stripped
+        .components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some(".obsidian" | ".trash")))
+    {
         return true;
     }
     is_temp_name(path)
@@ -597,10 +609,7 @@ mod tests {
         assert!(inline.tags.contains("project"));
         assert_eq!(inline.links, "WikiPage");
 
-        let list = parse_note(
-            "b.md",
-            "---\ntags:\n  - one\n  - two\n---\nbody\n",
-        );
+        let list = parse_note("b.md", "---\ntags:\n  - one\n  - two\n---\nbody\n");
         assert!(list.tags.contains("one"));
         assert!(list.tags.contains("two"));
         assert_eq!(list.title, "b");

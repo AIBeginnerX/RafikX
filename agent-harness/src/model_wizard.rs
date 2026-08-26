@@ -49,9 +49,8 @@ fn read_line(prompt: &str) -> Result<String> {
 pub fn parse_model_arg(s: &str) -> (Option<String>, String) {
     let ident = |x: &str| {
         !x.is_empty()
-            && x.chars().all(|c| {
-                c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
-            })
+            && x.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     };
     let t = s.trim();
     if let Some((p, m)) = t.split_once(':') {
@@ -135,8 +134,9 @@ pub async fn cmd_use(cfg: &Config, arg: &str) -> Result<()> {
                         r.id.eq_ignore_ascii_case(arg.trim())
                             || r.label.to_lowercase().contains(&arg.trim().to_lowercase())
                     });
-                    hit.map(|r| r.id.clone())
-                        .ok_or_else(|| anyhow!("'{arg}' 를 서비스로 해석하지 못했습니다. rafikx model list"))?
+                    hit.map(|r| r.id.clone()).ok_or_else(|| {
+                        anyhow!("'{arg}' 를 서비스로 해석하지 못했습니다. rafikx model list")
+                    })?
                 }
             }
         }
@@ -180,7 +180,11 @@ pub async fn run_wizard(cfg: Config) -> Result<()> {
     let rs = rows(&cfg);
     for (i, r) in rs.iter().enumerate() {
         let mark = if r.is_default { "*" } else { " " };
-        let state = if r.connected { "연결됨" } else { "미연결" };
+        let state = if r.connected {
+            "연결됨"
+        } else {
+            "미연결"
+        };
         println!("{mark}[{:>2}] {:<18} {state}", i + 1, r.label);
     }
     let ans = read_line("서비스 번호 (Enter=취소): ")?;
@@ -245,12 +249,7 @@ pub async fn run_wizard(cfg: Config) -> Result<()> {
         crate::harness::TaskClass::Dev,
     ] {
         match crate::harness::bind(&cfg3, c, None, None) {
-            Ok(b) => println!(
-                "  {:8} → {}/{}",
-                b.class.as_str(),
-                b.provider_name,
-                b.model
-            ),
+            Ok(b) => println!("  {:8} → {}/{}", b.class.as_str(), b.provider_name, b.model),
             Err(e) => println!("  {:8} → ({e:#})", c.as_str()),
         }
     }

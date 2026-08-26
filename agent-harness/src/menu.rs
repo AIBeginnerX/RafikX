@@ -13,7 +13,10 @@ pub fn parse_numbers(
         return None;
     }
     let parts: Vec<&str> = if t.contains(',') {
-        t.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
+        t.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
     } else if t.split_whitespace().count() > 1 {
         t.split_whitespace().collect()
     } else {
@@ -43,11 +46,7 @@ pub fn parse_numbers(
             out.push(n);
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// 1-based indices whose label uniquely matches `query` (case-insensitive).
@@ -66,7 +65,10 @@ pub fn match_items(query: &str, items: &[String]) -> Vec<usize> {
             exact.push(n);
             continue;
         }
-        let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let words: Vec<&str> = t
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
         if t.starts_with(&q) || words.iter().any(|w| *w == q || w.starts_with(&q)) {
             prefix.push(n);
         } else if t.contains(&q) {

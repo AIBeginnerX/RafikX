@@ -3,10 +3,10 @@
 
 use std::fs;
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::tools::{Tool, ToolCtx};
@@ -18,7 +18,7 @@ pub const MAX_FETCH_CHARS: usize = 20_000;
 // todo 공유 상태 (프로세스 단위 — 마지막 실행의 목록을 /todo 에서도 보여준다)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String,
     pub status: String,
@@ -54,8 +54,16 @@ pub fn has_open_todos() -> bool {
         .any(|item| item.status != "completed")
 }
 
+pub fn has_open_todos_in(run: &crate::run::RunContext) -> bool {
+    run.todos().iter().any(|item| item.status != "completed")
+}
+
 pub fn clear_todos() {
     store_todos(&[]);
+}
+
+pub fn clear_todos_in(run: &crate::run::RunContext) {
+    store_todos_in(run, &[]);
 }
 
 fn todo_slot() -> &'static Mutex<Vec<TodoItem>> {
@@ -67,11 +75,20 @@ pub fn current_todos() -> Vec<TodoItem> {
     todo_slot().lock().map(|g| g.clone()).unwrap_or_default()
 }
 
+pub fn current_todos_in(run: &crate::run::RunContext) -> Vec<TodoItem> {
+    run.todos()
+}
+
 fn store_todos(items: &[TodoItem]) {
     if let Ok(mut g) = todo_slot().lock() {
         *g = items.to_vec();
     }
     crate::ui::live_todo(items);
+}
+
+fn store_todos_in(run: &crate::run::RunContext, items: &[TodoItem]) {
+    run.replace_todos(items);
+    crate::ui::live_todo_in(run, items);
 }
 
 pub fn render_todos(items: &[TodoItem]) -> String {
@@ -85,7 +102,13 @@ pub fn render_todos(items: &[TodoItem]) -> String {
             "in_progress" => "[~]",
             _ => "[ ]",
         };
-        out.push(format!("{}. {} {} ({})", i + 1, mark, t.content, t.priority));
+        out.push(format!(
+            "{}. {} {} ({})",
+            i + 1,
+            mark,
+            t.content,
+            t.priority
+        ));
     }
     out.join("\n")
 }
@@ -117,10 +140,18 @@ fn parse_todos(input: &Value) -> Result<Vec<TodoItem>> {
         if content.is_empty() {
             return Err(anyhow!("빈 항목은 넣을 수 없습니다"));
         }
-        let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
-        let priority = t.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
+        let status = t
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
+        let priority = t
+            .get("priority")
+            .and_then(|v| v.as_str())
+            .unwrap_or("medium");
         if !valid_status(status) {
-            return Err(anyhow!("status 는 pending|in_progress|completed 중 하나여야 합니다"));
+            return Err(anyhow!(
+                "status 는 pending|in_progress|completed 중 하나여야 합니다"
+            ));
         }
         if !valid_priority(priority) {
             return Err(anyhow!("priority 는 high|medium|low 중 하나여야 합니다"));
@@ -167,9 +198,13 @@ impl Tool for TodoWrite {
     fn needs_approval(&self, _input: &Value) -> bool {
         false
     }
-    fn run(&self, input: Value, _ctx: &ToolCtx) -> Result<String> {
+    fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
         let items = parse_todos(&input)?;
-        store_todos(&items);
+        if let Some(run) = &ctx.run {
+            store_todos_in(run, &items);
+        } else {
+            store_todos(&items);
+        }
         Ok(render_todos(&items))
     }
 }
@@ -189,8 +224,13 @@ impl Tool for TodoRead {
     fn needs_approval(&self, _input: &Value) -> bool {
         false
     }
-    fn run(&self, _input: Value, _ctx: &ToolCtx) -> Result<String> {
-        Ok(render_todos(&current_todos()))
+    fn run(&self, _input: Value, ctx: &ToolCtx) -> Result<String> {
+        let items = ctx
+            .run
+            .as_ref()
+            .map(current_todos_in)
+            .unwrap_or_else(current_todos);
+        Ok(render_todos(&items))
     }
 }
 
@@ -274,7 +314,11 @@ impl Tool for GlobTool {
             }
             let rel = path.strip_prefix(&ctx.workspace).unwrap_or(path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
-            if re.is_match(&rel_str) || path.file_name().is_some_and(|n| re.is_match(n.to_string_lossy().as_ref())) {
+            if re.is_match(&rel_str)
+                || path
+                    .file_name()
+                    .is_some_and(|n| re.is_match(n.to_string_lossy().as_ref()))
+            {
                 hits.push(rel_str);
             }
         }
@@ -502,15 +546,17 @@ impl Tool for MultiEdit {
         let mut reports = Vec::new();
         for (old, new) in &edits {
             reports.push(crate::tools::code_change_summary(
-                "수정",
-                &resolved,
-                &updated,
-                old,
-                new,
+                "수정", &resolved, &updated, old, new,
             ));
             updated = Self::apply(&updated, &[(old.clone(), new.clone())])?;
         }
-        fs::write(&resolved, updated)?;
+        let mut plan = crate::tools::mutation::MutationPlan::new(&ctx.workspace)?;
+        plan.replace(
+            &resolved,
+            crate::tools::mutation::MutationState::Present(body.as_bytes().to_vec()),
+            updated.into_bytes(),
+        )?;
+        ctx.commit_mutation(plan)?;
         Ok(reports.join("\n"))
     }
 }
@@ -595,8 +641,9 @@ impl WebSearch {
             return Err(anyhow!("HTTP {}", resp.status()));
         }
         let body = resp.text().await.unwrap_or_default();
-        let link_re = Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
-            .expect("fixed regex");
+        let link_re =
+            Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
+                .expect("fixed regex");
         let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#)
             .expect("fixed regex");
         let snippets: Vec<String> = snippet_re
@@ -614,7 +661,13 @@ impl WebSearch {
                 continue;
             }
             let snip = snippets.get(i).cloned().unwrap_or_default();
-            out.push(format!("{}. {}\n   {}\n   {}", out.len() + 1, title, href, snip));
+            out.push(format!(
+                "{}. {}\n   {}\n   {}",
+                out.len() + 1,
+                title,
+                href,
+                snip
+            ));
         }
         if out.is_empty() {
             return Err(anyhow!("검색 결과가 없습니다"));
@@ -687,13 +740,14 @@ impl ApplyPatch {
         let mut rem: Vec<String> = Vec::new();
         let mut addl: Vec<String> = Vec::new();
 
-        let flush_change = |rem: &mut Vec<String>, addl: &mut Vec<String>, changes: &mut Vec<(String, String)>| {
-            if !rem.is_empty() || !addl.is_empty() {
-                changes.push((rem.join("\n"), addl.join("\n")));
-                rem.clear();
-                addl.clear();
-            }
-        };
+        let flush_change =
+            |rem: &mut Vec<String>, addl: &mut Vec<String>, changes: &mut Vec<(String, String)>| {
+                if !rem.is_empty() || !addl.is_empty() {
+                    changes.push((rem.join("\n"), addl.join("\n")));
+                    rem.clear();
+                    addl.clear();
+                }
+            };
 
         for raw in trimmed.lines().skip(1) {
             let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -833,30 +887,27 @@ impl ApplyPatch {
     }
 
     fn apply(ctx: &ToolCtx, ops: &[PatchOp]) -> Result<Vec<String>> {
+        let mut plan = crate::tools::mutation::MutationPlan::new(&ctx.workspace)?;
         let mut done = Vec::new();
         for op in ops {
             match op {
                 PatchOp::Add(rel, content) => {
                     let f = crate::tools::resolve_tool_path(ctx, rel)?;
-                    if f.exists() {
+                    let before = crate::tools::mutation::read_state(&f)?;
+                    if !matches!(before, crate::tools::mutation::MutationState::Missing) {
                         return Err(anyhow!("Add File 이지만 이미 존재합니다: {}", f.display()));
                     }
-                    if let Some(parent) = f.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&f, content)?;
+                    plan.replace(&f, before, content.as_bytes().to_vec())?;
                     done.push(crate::tools::code_change_summary(
                         "등록", &f, "", "", content,
                     ));
                 }
                 PatchOp::Delete(rel) => {
                     let f = crate::tools::resolve_tool_path(ctx, rel)?;
-                    if !f.is_file() {
-                        return Err(anyhow!("삭제 대상이 파일이 아닙니다: {}", f.display()));
-                    }
+                    let before = crate::tools::mutation::read_state(&f)?;
                     let body = fs::read_to_string(&f)
                         .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", f.display()))?;
-                    fs::remove_file(&f)?;
+                    plan.delete(&f, before)?;
                     done.push(crate::tools::code_change_summary(
                         "삭제", &f, &body, &body, "",
                     ));
@@ -879,10 +930,15 @@ impl ApplyPatch {
                         ));
                         updated = updated.replacen(o.as_str(), n.as_str(), 1);
                     }
-                    fs::write(&f, updated)?;
+                    plan.replace(
+                        &f,
+                        crate::tools::mutation::MutationState::Present(body.into_bytes()),
+                        updated.into_bytes(),
+                    )?;
                 }
             }
         }
+        ctx.commit_mutation(plan)?;
         Ok(done)
     }
 }
@@ -917,147 +973,7 @@ impl Tool for ApplyPatch {
     }
 }
 
-// ---------------------------------------------------------------------------
-// task — 서브에이전트 위임 (하네스 파이프라인 재사용, 재귀 금지)
-// ---------------------------------------------------------------------------
-
-pub struct TaskTool;
-
-impl TaskTool {
-    pub const NAME: &'static str = "task";
-
-    fn resolve_class(prompt: &str, class: Option<&str>) -> crate::harness::TaskClass {
-        if let Some(c) = class {
-            if let Some(tc) = crate::harness::TaskClass::parse(c) {
-                return tc;
-            }
-        }
-        crate::harness::classify_rules(prompt, false)
-    }
-
-    async fn delegate(
-        cfg: crate::config::Config,
-        prompt: String,
-        class: Option<String>,
-        role: Option<String>,
-        model: Option<String>,
-    ) -> Result<String> {
-        let tc = Self::resolve_class(&prompt, class.as_deref());
-        let binding = crate::harness::bind(&cfg, tc, None, model.as_deref())?;
-        static NEXT_AGENT: AtomicU64 = AtomicU64::new(1);
-        let agent_id = format!("agent-{}", NEXT_AGENT.fetch_add(1, Ordering::Relaxed));
-        let role = role.unwrap_or_else(|| binding.profile_name.clone());
-        crate::ui::live_agent(crate::ui::AgentProgress {
-            id: agent_id.clone(),
-            role: role.clone(),
-            model: binding.model.clone(),
-            status: "running".into(),
-        });
-        crate::ui::live_line(&format!(
-            "[task] {} · {} → {} ({})",
-            agent_id,
-            binding.class.as_str(),
-            role,
-            binding.model
-        ));
-        // 재귀 방지: 안쪽 실행에서는 task 도구를 제거한다.
-        let tools: Vec<String> = binding
-            .tools
-            .iter()
-            .filter(|t| t.as_str() != Self::NAME)
-            .cloned()
-            .collect();
-        let binding = crate::harness::Binding {
-            tools,
-            ..binding.clone()
-        };
-        let outcome = match crate::harness::run_pipeline(
-            &cfg, &binding, &prompt, false, None, None, None, None,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                crate::ui::live_agent(crate::ui::AgentProgress {
-                    id: agent_id,
-                    role,
-                    model: binding.model.clone(),
-                    status: "failed".into(),
-                });
-                return Err(error);
-            }
-        };
-        crate::ui::live_agent(crate::ui::AgentProgress {
-            id: agent_id,
-            role,
-            model: binding.model.clone(),
-            status: outcome.status.clone(),
-        });
-        let summary = crate::agent::assistant_text(&outcome.messages);
-        Ok(format!(
-            "[task 결과] class={} profile={} model={} status={}\n{summary}",
-            binding.class.as_str(),
-            binding.profile_name,
-            binding.model,
-            outcome.status
-        ))
-    }
-}
-
-impl Tool for TaskTool {
-    fn name(&self) -> &'static str {
-        Self::NAME
-    }
-    fn description(&self) -> &'static str {
-        "독립된 작업만 서브에이전트에게 위임합니다. role과 필요한 경우 model을 명시하세요. 불필요한 위임은 토큰을 낭비합니다."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string", "description": "위임할 작업 지시"},
-                "class": {"type": "string", "enum": ["simple", "medium", "advanced", "dev"], "description": "강제 분류. 생략 시 규칙 분류"},
-                "role": {"type": "string", "description": "화면에 표시할 짧은 역할 이름"},
-                "model": {"type": "string", "description": "등록된 모델 ID. 생략하면 하네스가 능력과 비용에 따라 선택"}
-            },
-            "required": ["prompt"]
-        })
-    }
-    fn needs_approval(&self, _input: &Value) -> bool {
-        false
-    }
-    fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
-        let prompt = input
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("prompt 인자가 필요합니다"))?
-            .trim()
-            .to_string();
-        if prompt.is_empty() {
-            return Err(anyhow!("prompt 가 비어 있습니다"));
-        }
-        let class = input
-            .get("class")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let role = input
-            .get("role")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let model = input
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let cfg = crate::config::Config::load(None)?;
-        let ask = ctx.local_ask.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let _ = ask; // 승인 흐름은 안쪽 run_pipeline 에서 원래 채널(local_ask)을 쓴다
-            Self::delegate(cfg, prompt, class, role, model).await
-            })
-        })
-    }
-}
+pub use crate::tools::TaskTool;
 
 #[cfg(test)]
 mod tests {
@@ -1093,7 +1009,10 @@ mod tests {
         ];
         let out = MultiEdit::apply(&body, &edits).unwrap();
         assert_eq!(out, "x\ny");
-        let dup = vec![("a".to_string(), "z".to_string()), ("a".to_string(), "w".to_string())];
+        let dup = vec![
+            ("a".to_string(), "z".to_string()),
+            ("a".to_string(), "w".to_string()),
+        ];
         assert!(MultiEdit::apply(&body, &dup).is_err());
     }
 
@@ -1128,13 +1047,13 @@ mod tests {
         assert!(report.contains("b.txt"));
         // 중복·불일치 매칭은 dry_run 에서 거부
         fs::write(dir.join("dup.txt"), "xx\n").unwrap();
-        let dup = ApplyPatch::parse(
-            "*** Begin Patch\n*** Update File: dup.txt\n-x\n-y\n*** End Patch",
-        )
-        .unwrap();
+        let dup =
+            ApplyPatch::parse("*** Begin Patch\n*** Update File: dup.txt\n-x\n-y\n*** End Patch")
+                .unwrap();
         assert!(ApplyPatch::dry_run(&dir, &dup).is_err());
         // Add 대상이 이미 존재하면 거부
-        let bad = ApplyPatch::parse("*** Begin Patch\n*** Add File: dup.txt\n+z\n*** End Patch").unwrap();
+        let bad =
+            ApplyPatch::parse("*** Begin Patch\n*** Add File: dup.txt\n+z\n*** End Patch").unwrap();
         assert!(ApplyPatch::dry_run(&dir, &bad).is_err());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1145,7 +1064,10 @@ mod tests {
             decode_ddg_href("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb&rut=1"),
             "https://example.com/a?b"
         );
-        assert_eq!(decode_ddg_href("https://plain.example.com"), "https://plain.example.com");
+        assert_eq!(
+            decode_ddg_href("https://plain.example.com"),
+            "https://plain.example.com"
+        );
     }
 
     #[test]

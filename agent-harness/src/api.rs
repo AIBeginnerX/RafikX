@@ -99,6 +99,12 @@ pub struct TurnResult {
     pub elapsed_ms: u64,
     pub session_id: Option<String>,
     pub graph: Vec<graph::GraphNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<crate::lifecycle::LifecycleState>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle: Vec<crate::lifecycle::LifecycleEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_sources: Vec<crate::run::ContextSourceRecord>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -294,7 +300,9 @@ pub fn transcript(session: &Session) -> Vec<ChatMessage> {
                         }
                         text.push_str(&format!("[도구] {name}"));
                     }
-                    ContentBlock::ToolResult { content, is_error, .. } => {
+                    ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => {
                         if !text.is_empty() {
                             text.push('\n');
                         }
@@ -324,9 +332,27 @@ pub async fn run_turn(
     obsidian: bool,
     local_ask: Option<LocalAsk>,
 ) -> Result<TurnResult> {
+    run_turn_observed(session, prompt, obsidian, local_ask, None).await
+}
+
+pub async fn run_turn_observed(
+    session: &mut Session,
+    prompt: &str,
+    obsidian: bool,
+    local_ask: Option<LocalAsk>,
+    observer: Option<chat::RunObserver>,
+) -> Result<TurnResult> {
     session.cfg = Config::load(None)?;
     let class = session.class.clone();
-    let info = chat::run_turn(session, prompt, class.as_deref(), obsidian, local_ask).await?;
+    let info = chat::run_turn_observed(
+        session,
+        prompt,
+        class.as_deref(),
+        obsidian,
+        local_ask,
+        observer,
+    )
+    .await?;
     let nodes = if info.run_id.is_empty() {
         Vec::new()
     } else {
@@ -344,6 +370,9 @@ pub async fn run_turn(
         elapsed_ms: info.elapsed_ms,
         session_id: session.session_id.clone(),
         graph: nodes,
+        lifecycle_state: info.lifecycle_state,
+        lifecycle: info.lifecycle,
+        context_sources: info.context_sources,
     })
 }
 
@@ -472,7 +501,12 @@ pub fn set_appearance(mode: &str) -> Result<String> {
         _ => "auto",
     };
     let cfg = Config::load(None)?;
-    crate::config::write_toml_key(&cfg.path, "[ui]", "appearance", &crate::config::toml_string(m))?;
+    crate::config::write_toml_key(
+        &cfg.path,
+        "[ui]",
+        "appearance",
+        &crate::config::toml_string(m),
+    )?;
     Ok(m.to_string())
 }
 
@@ -511,11 +545,15 @@ pub async fn remote_models(provider: &str) -> Result<Vec<String>> {
 
 /// 하네스 엔진 저장 (rafikx | deepseek | pi | self).
 pub fn set_engine(name: &str) -> Result<String> {
+    let cfg = Config::load(None)?;
+    set_engine_for(&cfg, name)
+}
+
+pub(crate) fn set_engine_for(cfg: &Config, name: &str) -> Result<String> {
     let e = name.trim().to_ascii_lowercase();
     if !crate::chat::is_valid_engine(&e) {
         anyhow::bail!("엔진은 rafikx|deepseek|pi|self 중 하나여야 합니다");
     }
-    let cfg = Config::load(None)?;
     crate::config::write_toml_key(
         &cfg.path,
         "[general]",
