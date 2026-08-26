@@ -89,7 +89,10 @@ pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
     }
     if contains_any(
         text,
-        &["요약", "정리", "번역", "초안", "검색", "찾아", "노트", "문서"],
+        &[
+            "요약", "정리", "번역", "초안", "검색", "찾아", "노트", "문서",
+            "파일", "마크다운", "폴더", "디렉토리", "워크스페이스",
+        ],
     ) {
         return TaskClass::Medium;
     }
@@ -102,7 +105,7 @@ fn looks_like_dev(text: &str) -> bool {
     }
     let exts = [
         ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".toml", ".json", ".go", ".java", ".c", ".cpp",
-        ".h", ".cs", ".rb", ".php", ".kt", ".swift", ".sh", ".ps1",
+        ".h", ".cs", ".rb", ".php", ".kt", ".swift", ".sh", ".ps1", ".md", ".yml", ".yaml",
     ];
     if exts.iter().any(|e| text.contains(e)) {
         return true;
@@ -125,6 +128,11 @@ fn looks_like_dev(text: &str) -> bool {
             "스크립트",
             "함수",
             "에러 잡아",
+            "업그레이드",
+            "만들어",
+            "생성해",
+            "작성해",
+            "적용해",
         ],
     )
 }
@@ -1683,8 +1691,36 @@ pub async fn run_pipeline(
     if binding.verify && outcome.status != "incomplete" {
         crate::graph::node("verify", "start", "", Some("request"));
         crate::spinner::set_label("검증 중…");
-        outcome = run_verify(cfg, binding, task, yes, system, outcome, remote, local_ask).await?;
+        outcome =
+            run_verify(cfg, binding, task, yes, system, outcome, remote.clone(), local_ask.clone())
+                .await?;
         crate::graph::node("verify", &outcome.status, "", Some("verify"));
+    }
+    // 도구 없는 프로파일(quick)의 응답에 tool-call 텍스트가 새어 있으면 —
+    // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이라는 뜻이다. 모델이
+    // 도구 문법을 텍스트로 흉내 낸 오염 응답을 걷어내고 coder 로 1회 승격해
+    // 다시 실행한다. (승격된 바인딩은 tools 가 비지 않으므로 재귀는 1회로 끝.)
+    if binding.tools.is_empty() && leaked_tool_call(&agent::assistant_text(&outcome.messages)) {
+        crate::ui::live_line("도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.");
+        if let Ok(dev) = bind(cfg, TaskClass::Dev, cli_provider, None)
+            && !dev.tools.is_empty()
+        {
+            let mut clean = outcome.messages.clone();
+            while matches!(clean.last(), Some(m) if m.role == crate::provider::Role::Assistant) {
+                clean.pop();
+            }
+            return Box::pin(run_pipeline(
+                cfg,
+                &dev,
+                task,
+                yes,
+                cli_provider,
+                Some(clean),
+                remote,
+                local_ask,
+            ))
+            .await;
+        }
     }
     // Self-Harness 에피소드 관찰 — TUI/CLI/텔레그램 세 진입 경로가 모두 여기를
     // 지나므로 이 지점 하나로 전 경로의 실행 증거가 수집된다. 백그라운드 실행.
@@ -1692,6 +1728,15 @@ pub async fn run_pipeline(
         crate::self_harness::maybe_observe(cfg, task, &outcome);
     }
     Ok(outcome)
+}
+
+/// 모델이 도구 호출을 구조체가 아니라 텍스트로 흉내 낸 흔적 —
+/// MiniMax 계열의 내부 마커(`]<]`)와 `<tool_call>` JSON 조각을 감지한다.
+fn leaked_tool_call(text: &str) -> bool {
+    if text.contains("<tool_call>") || text.contains("]<]") {
+        return true;
+    }
+    text.contains("\"name\"") && text.contains("\"arguments\"")
 }
 
 fn persist_goal_state(
@@ -1889,6 +1934,26 @@ mod tests {
     #[test]
     fn classifies_simple_hello() {
         assert_eq!(classify_rules("안녕", false), TaskClass::Simple);
+    }
+
+    #[test]
+    fn korean_file_work_is_never_simple() {
+        // 실사례: simple(quick, 도구 0개)로 떨어져 모델이 tool call 을 텍스트로
+        // 흉내 내던 질문 — 이제 도구 있는 클래스로 분류되어야 한다.
+        let q = "그럼 니가 잘 하는 걸 더 잘 하게 만들 수 있게 마크다운 파일을 업그레이드 하면 좋지 않을 까?";
+        assert_ne!(classify_rules(q, false), TaskClass::Simple);
+        assert_eq!(classify_rules("AGENTS.md 업그레이드해줘", false), TaskClass::Dev);
+        assert_ne!(classify_rules("워크스페이스에 뭐가 있어?", false), TaskClass::Simple);
+    }
+
+    #[test]
+    fn leaked_tool_call_detects_text_tool_syntax() {
+        assert!(leaked_tool_call(
+            "워크스페이스부터 확인하겠습니다.]<]minimax[>[<tool_call> { \"name\": \"run_command\""
+        ));
+        assert!(leaked_tool_call("<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>"));
+        assert!(!leaked_tool_call("마크다운을 이렇게 고치면 됩니다."));
+        assert!(!leaked_tool_call("파일 이름은 name 필드에 적습니다."));
     }
 
     #[test]

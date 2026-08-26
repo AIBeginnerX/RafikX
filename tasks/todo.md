@@ -1,3 +1,25 @@
+# tool-call 텍스트 누출 수정 (2026-08-26 오전)
+
+증상: "마크다운 파일을 업그레이드 하면 좋지 않을까?" 에 모델이
+`]<]minimax[>[<tool_call> {"name":"run_command"...` 원시 텍스트를 뱉고 종료.
+
+원인 사슬: 분류기가 simple 로 오분류(.md 확장자·"업그레이드"·"파일" 키워드
+부재) → quick 프로파일 = 도구 0개 → 도구 전제 시스템 프롬프트를 받은 모델이
+tool call 문법을 텍스트로 흉내(가짜 도구 run_command) → RafikX 는 텍스트라
+최종 답변으로 화면에 출력하고 정상 종료(사용자에겐 '멈춤'으로 보임).
+
+- [x] 분류기 보강: exts 에 .md/.yml/.yaml, dev 키워드에 업그레이드·만들어·
+      생성해·작성해·적용해, medium 키워드에 파일·마크다운·폴더·디렉토리·
+      워크스페이스
+- [x] 자동 승격 방어: 도구 없는 바인딩의 응답에서 leaked_tool_call
+      (<tool_call>·]<]·name+arguments) 감지 시 오염 응답을 걷어내고 coder 로
+      1회 승격 재실행 (run_pipeline, Box::pin 재귀 — 승격 후 tools 비지
+      않으므로 1회 보장)
+- [x] 검증: 단위 2개 추가(129 통과) + 원래 질문 실전 재현 → dev/coder,
+      status=ok, 누출 없음. 설치본 갱신.
+
+---
+
 # pi 미니멀 UI/UX 대개편 (2026-08-26 오전)
 
 earendil-works/pi 와 code-yeongyu/oh-my-openagent 분석 후, pi 의 핵심 장점
