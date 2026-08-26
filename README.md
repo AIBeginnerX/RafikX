@@ -13,6 +13,14 @@ Windows · macOS · Linux. 명령 이름은 `rafikx` 입니다.
 
 터미널 표현: Kitty 키보드 프로토콜(지원 터미널에서 Shift+Enter 등 변형키 정확 인식, 미지원은 xterm 폴백) · syntect 코드블록 문법 하이라이트(oh-my-pi 스타일 어두운 패널) · 24bit 트루컬러 진행바.
 
+하네스 v2: 실행 방식을 두 축으로 고릅니다.
+
+- 엔진 6종 — `/engine rafikx|claude|deepseek|qwen|kimi|pi`. 각 하네스의 품질 장치(계획 가시화·단계별 보고·ReAct 사이클·성공 루브릭)를 프롬프트와 실행 플래그로 옮겨 담았습니다. `[engines.<이름>]` 으로 문구까지 바꿀 수 있습니다.
+- 분야 3종 — `/discipline harness|loop|graph`. 기본 파이프라인, 정체를 감지하면 전략을 바꾸는 루프 강화, 계획이 낳은 노드 DAG를 위상순으로 따로 실행하는 그래프.
+- 전문가 프로파일 — `planner · frontend · backend · reviewer` 가 내장되어, 큰 작업은 기획 → 구현 → 리뷰로 나눠 맡깁니다.
+- 독립 검증자 게이트 — claude·kimi 엔진은 완료를 선언하기 전에 신선한 컨텍스트의 리뷰어가 완료 기준과 대조합니다 (`[harness] strict_gate`).
+- 자기개선 — `/selfharness on` 이면 어떤 엔진 위에서도 실패를 채굴해 하네스 자신을 고칩니다.
+
 [설치](docs/INSTALL.md) · [보안](SECURITY.md) · [기여](CONTRIBUTING.md) · [운영 흐름](RAFIKX_WORKFLOW.html)
 
 ---

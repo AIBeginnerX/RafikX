@@ -200,18 +200,51 @@ pub fn profile_name_for(cfg: &Config, class: TaskClass) -> &str {
     }
 }
 
+/// 프로파일 사양 조회 — config `[subagents.<name>]` 이 내장 전문가 프리셋을 이긴다.
+/// (기존 사용자 config 에 planner/reviewer 가 없어도 동작하게 하는 폴백.)
+pub fn resolve_profile(cfg: &Config, name: &str) -> Option<crate::config::SubAgentConfig> {
+    let n = name.trim();
+    if n.is_empty() {
+        return None;
+    }
+    cfg.file
+        .subagents
+        .get(n)
+        .cloned()
+        .or_else(|| crate::config::builtin_profile(n))
+}
+
+/// config `[subagents]` 또는 내장 프리셋에 있는 프로파일 이름인지.
+pub fn profile_exists(cfg: &Config, name: &str) -> bool {
+    resolve_profile(cfg, name).is_some()
+}
+
 pub fn bind(
     cfg: &Config,
     class: TaskClass,
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<Binding> {
-    let profile_name = profile_name_for(cfg, class).to_string();
-    let sub = cfg
-        .file
-        .subagents
-        .get(&profile_name)
+    bind_profile(cfg, class, None, provider_override, model_override)
+}
+
+/// 프로파일을 직접 지정하는 bind — 전문가 역할 위임(task role)과 독립 검증자 게이트가 쓴다.
+/// `profile_override` 가 없으면 분류가 가리키는 config 프로파일을 쓴다.
+/// config 에 이름이 없으면 내장 프리셋(planner/frontend/backend/reviewer)으로 폴백한다.
+pub fn bind_profile(
+    cfg: &Config,
+    class: TaskClass,
+    profile_override: Option<&str>,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<Binding> {
+    let profile_name = profile_override
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| profile_name_for(cfg, class).to_string());
+    let sub = resolve_profile(cfg, &profile_name)
         .ok_or_else(|| anyhow!("서브에이전트 '{profile_name}' 이(가) config에 없습니다"))?;
+    let sub = &sub;
 
     let needs_tools = !sub.tools.is_empty();
     let selection = cfg.file.harness.selection.trim().to_ascii_lowercase();
@@ -1174,14 +1207,29 @@ async fn classify_llm(cfg: &Config, text: &str) -> Result<TaskClass> {
     TaskClass::parse(word).ok_or_else(|| anyhow!("llm 분류 모호: {word}"))
 }
 
-pub fn print_binding(b: &Binding) {
+pub fn print_binding(cfg: &Config, b: &Binding) {
     crate::ui::note(&format!(
-        "하네스  {} → {}  ·  {}/{}",
+        "하네스  {} → {}  ·  {}/{}{}",
         b.class.as_str(),
         b.profile_name,
         b.provider_name,
-        crate::ui::bold(&b.model)
+        crate::ui::bold(&b.model),
+        engine_suffix(cfg)
     ));
+}
+
+/// 기본값이 아닐 때만 붙는 실행 축 표시 — ` · engine=claude · graph`.
+pub fn engine_suffix(cfg: &Config) -> String {
+    let mut s = String::new();
+    let (engine, _) = crate::engine::normalize(&cfg.file.general.engine);
+    if engine != crate::engine::DEFAULT_ENGINE {
+        s.push_str(&format!("  ·  engine={engine}"));
+    }
+    let discipline = crate::engine::normalize_discipline(&cfg.file.general.discipline);
+    if discipline != crate::engine::Discipline::Harness {
+        s.push_str(&format!("  ·  {}", discipline.as_str()));
+    }
+    s
 }
 
 pub fn print_binding_table(cfg: &Config) {
@@ -1417,6 +1465,95 @@ pub async fn run_pipeline_with_context(
     result
 }
 
+/// 계획 호출은 메인 system 을 그대로 이어받고 이 머리말만 덧붙인다.
+const PLAN_MODE_HEADER: &str = "\n\n[계획 모드] 지금은 계획만 세운다. 도구는 쓰지 마라.\n";
+
+const PLAN_BRIEF_INSTRUCTION: &str = "작업 계획을 3~7개 항목으로만 출력하라.";
+
+/// PlanDepth::Contract — 산출물을 3부로 강제한다 (dev/advanced 클래스에서만 활성).
+const PLAN_CONTRACT_INSTRUCTION: &str = "\
+    20년 경력 시니어가 착수 전 검토하듯 계획하라: 기존 코드·파일 구조에 대한 가정을 명시하고, \
+    위험(호환성·회귀·엣지케이스)을 한 줄씩 짚는다.\n\
+    출력은 반드시 아래 세 부분으로만 구성한다. 머리표는 대괄호 그대로 쓴다.\n\
+    [해석] 요구사항을 한 문단으로 재진술하고, 모호한 점과 그중 채택한 해석을 밝힌다.\n\
+    [완료 기준] 검증 가능한 체크리스트 3~10항목. 각 항목은 '무엇이 충족되어야 하는가'와 \
+    '어떻게 확인하는가(명령·파일·관찰 대상)'를 함께 적는다.\n\
+    [작업 분해] 실행 순서 3~9단계. 각 단계는 한 줄로 적고 결과물을 명시한다.";
+
+/// discipline = loop — 종료 조건을 시스템 프롬프트에 못 박는다.
+const LOOP_DISCIPLINE_RULE: &str =
+    "\n\n[루프 규율] 모든 todo 완료 + 검증 통과 전에는 완료를 선언하지 마라.";
+
+/// discipline = loop — 정체를 감지한 사이클의 continuation 에 덧붙이는 전략 전환 지시.
+const LOOP_STALE_SWITCH: &str = "\n직전 사이클에서 진전이 없었다. 현재 todo를 더 작은 단위로 \
+     쪼개거나 다른 도구/경로로 전환하라. 같은 접근의 반복을 금지한다.";
+
+/// discipline = graph — 계획이 완료 기준과 노드 DAG 를 함께 산출한다.
+/// JSON 은 산문 뒤에 와야 한다: [완료 기준] 추출이 첫 `{` 앞까지만 훑기 때문이다.
+const PLAN_GRAPH_INSTRUCTION: &str = "\
+    작업을 상태 그래프로 분해하라. 출력은 아래 두 부분으로만, 이 순서로 구성한다.\n\
+    먼저 [완료 기준] 절: 검증 가능한 체크리스트 3~10항목. 각 항목에 '어떻게 확인하는가'를 함께 적는다.\n\
+    그다음 노드 DAG 를 JSON 한 덩어리로 적는다. JSON 뒤에는 아무 설명도 붙이지 않는다.\n\
+    {\"nodes\":[{\"id\":\"n1\",\"goal\":\"이 노드에서 끝낼 일\",\"deps\":[],\"produces\":\"산출물 한 줄\"}]}\n\
+    - 노드는 3~7개. id 는 짧게, goal 과 produces 는 한국어로 쓴다.\n\
+    - deps 에는 먼저 끝나야 하는 노드의 id 만 넣는다. 순환은 금지(NEVER)다.\n\
+    - 각 노드는 신선한 컨텍스트에서 따로 실행된다. goal 만 읽고도 무엇을 할지 알 수 있게 쓴다.";
+
+/// 계획 호출용 시스템 프롬프트 — 메인 system 조립 결과를 그대로 이어받고 계획 모드
+/// 지시만 덧붙인다. lessons·system_extra·프로젝트 규칙(AGENTS.md)·엔진 블록이
+/// 계획에도 반영되어야 하므로 절대 통째로 교체하지 않는다.
+/// `plan_extra` 는 Self-Harness 의 계획 전용 면(plan_instruction) — 메타 레이어가
+/// 켜졌을 때만 채워지고, decorate_system 이 아니라 여기서만 붙는다.
+fn plan_system_prompt(system: &str, depth: crate::engine::PlanDepth, plan_extra: &str) -> String {
+    plan_system_prompt_with(
+        system,
+        if depth == crate::engine::PlanDepth::Contract {
+            PLAN_CONTRACT_INSTRUCTION
+        } else {
+            PLAN_BRIEF_INSTRUCTION
+        },
+        plan_extra,
+    )
+}
+
+/// 계획 지시만 갈아끼우는 공통 조립 — depth 별 지시와 graph 분야 지시가 함께 쓴다.
+fn plan_system_prompt_with(system: &str, instruction: &str, plan_extra: &str) -> String {
+    let mut s = String::with_capacity(system.len() + instruction.len() + 64);
+    s.push_str(system);
+    s.push_str(PLAN_MODE_HEADER);
+    s.push_str(instruction);
+    let extra = plan_extra.trim();
+    if !extra.is_empty() {
+        s.push_str("\n\n[Self-Harness 계획 지침] ");
+        s.push_str(extra);
+    }
+    s
+}
+
+/// 계획 텍스트에서 `[머리표]` 절만 잘라낸다 — 다음 `[`로 시작하는 줄 직전까지.
+fn extract_plan_section(plan: &str, header: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut inside = false;
+    for line in plan.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(header) {
+            inside = true;
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                out.push(rest);
+            }
+            continue;
+        }
+        if inside {
+            if trimmed.starts_with('[') {
+                break;
+            }
+            out.push(line);
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
 async fn run_pipeline_inner(
     cfg: &Config,
     binding: &Binding,
@@ -1477,13 +1614,23 @@ async fn run_pipeline_inner(
     ));
 
     // 난이도 기반 단계별 실행 (dsh ctx.goals 영향 수용):
-    // 단순 업무는 즉답, medium 이상은 todo 스테이징. deepseek/dk 엔진은 모든 도구 작업에 적용.
-    let engine = cfg.file.general.engine.to_ascii_lowercase();
-    let engine_deep = engine == "deepseek";
-    let engine_pi = engine == "pi";
-    let engine_self = engine == "self";
+    // 단순 업무는 즉답, medium 이상은 todo 스테이징. force_staged 엔진(deepseek)은
+    // 모든 도구 작업에 적용. 엔진 차이는 EngineSpec 데이터로만 표현한다.
+    let (engine_name, _legacy_self) = crate::engine::normalize(&cfg.file.general.engine);
+    let spec = crate::engine::resolve_with(&cfg.file.engines, &engine_name);
+    // Self-Harness 는 엔진 위에 겹치는 메타 레이어다 — legacy engine="self" 또는
+    // [self_harness] meta = true. 관찰 경로와 같은 판정을 쓴다.
+    let self_meta_on = crate::self_harness::meta_active(cfg);
+    // 실행 분야 — 엔진(품질 장치)과 직교하는 축이다. 제어 전략만 바꾼다.
+    let discipline = crate::engine::normalize_discipline(&cfg.file.general.discipline);
+    // 그래프 분야는 도구를 쓰는 설계·개발 작업에서만 발동한다. 그 밖은 harness 와 동일.
+    let graph_mode = discipline == crate::engine::Discipline::Graph
+        && matches!(binding.class, TaskClass::Dev | TaskClass::Advanced)
+        && !binding.tools.is_empty();
+    // 그래프는 노드가 단계 역할을 하므로 전역 todo 스테이징을 강제하지 않는다.
     let staged = !binding.tools.is_empty()
-        && (engine_deep || binding.class != crate::harness::TaskClass::Simple);
+        && (spec.force_staged || binding.class != crate::harness::TaskClass::Simple)
+        && !graph_mode;
     let mut system = system;
     if staged {
         // 배너 없이 조용히 — 단계 진행은 Todo 패널이 보여준다 (pi 저소음).
@@ -1492,34 +1639,35 @@ async fn run_pipeline_inner(
             &run_context,
             "pre_step",
             "staging",
-            if engine_deep { "deepseek" } else { "auto" },
+            if spec.force_staged {
+                spec.name.as_ref()
+            } else {
+                "auto"
+            },
             Some("bind"),
         );
-        let mut directive = String::from(
+        system.push_str(
             "\n\n[실행 방식 — 단계별 처리]\n\
              이 작업은 여러 단계가 필요하다. 다른 도구를 쓰기 전에 먼저 todo_write 로 2~6개의 실행 단계를 등록하고, \
              한 단계를 마칠 때마다 todo_write 로 상태를 갱신하라. \
              모든 단계가 끝나면 단계별 핵심 결과를 짧게 요약해 답을 마친다.",
         );
-        if engine_deep {
-            directive.push_str(
-                " 각 단계 시작 시 `[N/총M] 단계명` 형식의 한 줄 상태를 출력한다. \
-                검증 가능한 작업(빌드·테스트·파일 수정)은 마지막에 검증 방법과 결과를 함께 남긴다.",
-            );
-        }
-        system.push_str(&directive);
     }
-    if engine_pi {
-        system.push_str(
-            "\n\n[pi harness]\n\
-             작업 중에는 지금 수행하는 단계와 도구 결과를 짧고 사실적으로 알리고, \
-             최종 답변과 분리하라. 공개 응답에 포함된 추론·진행 텍스트는 숨기지 않는다.",
-        );
+    // 엔진 프롬프트 블록 — 각 하네스의 품질 장치를 한 지점에서 주입한다.
+    if !spec.prompt_block.is_empty() {
+        system.push_str(&spec.prompt_block);
     }
-    // Self-Harness 엔진 (arXiv:2606.09498) — 자기개선 루프가 유지하는 하네스 상태를
+    // loop 분야 — 종료 조건을 명시해 조기 완료 선언을 막는다 (Ralph 루프 계열).
+    if discipline == crate::engine::Discipline::Loop {
+        system.push_str(LOOP_DISCIPLINE_RULE);
+    }
+    // Self-Harness (arXiv:2606.09498) — 자기개선 루프가 유지하는 하네스 상태를
     // 시스템 프롬프트와 런타임 제어에 반영한다. 상태는 에피소드 관찰이 갱신한다.
+    // 엔진 지시 뒤에 붙어 학습된 지시가 우선하게 한다.
     let mut effective_max_iter = binding.max_iterations;
-    if engine_self {
+    // 계획 호출 전용 면 — 메타 레이어가 켜졌을 때만 채워져 plan_system_prompt 로 넘어간다.
+    let mut sh_plan_instruction = String::new();
+    if self_meta_on {
         let sh = crate::self_harness::SelfHarnessState::load();
         crate::ui::live_line_in(
             &run_context,
@@ -1540,18 +1688,47 @@ async fn run_pipeline_inner(
             Some("bind"),
         );
         sh.decorate_system(&mut system);
+        sh_plan_instruction = sh.plan_instruction();
         if let Some(cap) = sh.effective_iter_cap() {
             effective_max_iter = effective_max_iter.min(cap).max(1);
         }
     }
 
-    if binding.plan_first {
+    // 계획 단계 — 메인 system 을 그대로 이어받아 lessons·system_extra·프로젝트 규칙·
+    // 엔진 지시가 계획에도 반영되게 한다 (system 을 통째로 교체하던 결함 수정).
+    // Contract 깊이는 dev/advanced 클래스에서만 활성하고 그 밖은 Brief 로 낮춘다.
+    let plan_depth = match spec.plan_depth {
+        crate::engine::PlanDepth::Contract
+            if !matches!(binding.class, TaskClass::Dev | TaskClass::Advanced) =>
+        {
+            crate::engine::PlanDepth::Brief
+        }
+        other => other,
+    };
+    let contract_plan = plan_depth == crate::engine::PlanDepth::Contract;
+    // 계획이 산출한 DoD 체크리스트 — 독립 검증자 게이트(§5)의 입력.
+    let mut dod_checklist = String::new();
+    // Contract 계획이 실제로 나왔을 때만 첫 사용자 메시지에 todo 시드 지시를 붙인다.
+    let mut seed_todo_from_plan = false;
+    // graph 분야가 실행할 노드 DAG — 계획이 형식을 지켰을 때만 채워진다.
+    let mut dag: Option<(Vec<DagNode>, Vec<usize>)> = None;
+    // 그래프는 계획 산출물(DAG) 없이는 성립하지 않으므로 계획 호출을 반드시 지난다.
+    if (binding.plan_first || graph_mode) && plan_depth != crate::engine::PlanDepth::Off {
+        let plan_budget: u32 = if contract_plan || graph_mode {
+            2048
+        } else {
+            1024
+        };
         let req = ChatRequest {
             model: binding.model.clone(),
-            system: "작업 계획을 3~7개 항목으로만 출력하라. 도구는 쓰지 마라.".into(),
+            system: if graph_mode {
+                plan_system_prompt_with(&system, PLAN_GRAPH_INSTRUCTION, &sh_plan_instruction)
+            } else {
+                plan_system_prompt(&system, plan_depth, &sh_plan_instruction)
+            },
             messages: vec![Message::user_text(task)],
             tools: vec![],
-            max_tokens: 1024,
+            max_tokens: plan_budget,
             stream: false,
         };
         match chat_with_fallback(cfg, &order, role, req).await {
@@ -1576,7 +1753,7 @@ async fn run_pipeline_inner(
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !plan.is_empty() {
-                    crate::context::record_plan(&run_context, &plan, 1024);
+                    crate::context::record_plan(&run_context, &plan, plan_budget);
                     run_context.emit(
                         crate::run::RunEventKind::Plan,
                         serde_json::json!({"plan": plan}),
@@ -1586,6 +1763,35 @@ async fn run_pipeline_inner(
                     system.push_str(
                         "\n이 계획을 실행 상태의 기준으로 사용하되, 새 증거가 생기면 안전하게 조정하라.",
                     );
+                    if graph_mode {
+                        // DAG JSON 과 별개로 [완료 기준] 절도 요구한다 — 게이트의 입력.
+                        dod_checklist = extract_plan_section(plan_prose(&plan), "[완료 기준]");
+                        dag = match parse_dag(&plan) {
+                            Some(nodes) => match topo_order(&nodes) {
+                                Ok(order) => Some((nodes, order)),
+                                Err(cycle) => {
+                                    crate::ui::live_warn_in(
+                                        &run_context,
+                                        &format!(
+                                            "그래프 폴백: {cycle} — 기본 파이프라인으로 진행합니다."
+                                        ),
+                                    );
+                                    None
+                                }
+                            },
+                            None => {
+                                crate::ui::live_warn_in(
+                                    &run_context,
+                                    "그래프 폴백: 계획에서 노드 DAG 를 읽지 못했습니다 — 기본 파이프라인으로 진행합니다.",
+                                );
+                                None
+                            }
+                        };
+                    } else if contract_plan {
+                        dod_checklist = extract_plan_section(&plan, "[완료 기준]");
+                        seed_todo_from_plan =
+                            !extract_plan_section(&plan, "[작업 분해]").is_empty();
+                    }
                 }
             }
             Err(e) => {
@@ -1684,6 +1890,63 @@ async fn run_pipeline_inner(
         );
     }
 
+    // Contract 계획의 [작업 분해]를 todo 로 옮겨 staged goal continuation 과 결합한다.
+    // 첫 사용자 메시지에만 붙는다 (이어하기에는 resume 이 우선).
+    let agent_task = if seed_todo_from_plan {
+        format!(
+            "{task}\n\n[착수 지시] 위 [작업 분해]의 단계들을 먼저 todo_write 로 등록한 뒤 \
+             첫 항목부터 실행하라. 항목을 마칠 때마다 상태를 갱신한다."
+        )
+    } else {
+        task.to_string()
+    };
+
+    // 그래프 분야 — 위상순 노드 실행이 전역 goal continuation 루프를 대체한다.
+    // 검증·게이트는 그래프 전체가 끝난 뒤 합산 outcome 위에서 1회만 돈다.
+    if let Some((nodes, node_order)) = dag {
+        crate::graph::node_in(
+            &run_context,
+            "plan",
+            "graph",
+            &format!("{}개 노드", nodes.len()),
+            Some("plan_first"),
+        );
+        let mut outcome = run_graph_discipline(
+            cfg,
+            binding,
+            task,
+            &nodes,
+            &node_order,
+            &system,
+            yes,
+            remote.clone(),
+            local_ask.clone(),
+            run_context.clone(),
+        )
+        .await?;
+        outcome = finish_verification(
+            cfg,
+            binding,
+            &spec,
+            task,
+            &dod_checklist,
+            yes,
+            &system,
+            outcome,
+            remote,
+            local_ask,
+            run_context,
+        )
+        .await?;
+        if self_meta_on {
+            crate::self_harness::maybe_observe(cfg, task, &outcome);
+        }
+        return Ok(outcome);
+    }
+
+    // loop 분야는 계속 실행 한도를 엔진 값 +4(상한 12)로 늘린다.
+    let max_continuations =
+        crate::engine::max_continuations_for(discipline, spec.max_continuations);
     let mut next_resume = resume;
     let mut continuations = 0u8;
     let mut stale_rounds = 0u8;
@@ -1714,7 +1977,7 @@ async fn run_pipeline_inner(
                 cfg,
                 provider_name: &binding.provider_name,
                 model: &binding.model,
-                task,
+                task: &agent_task,
                 yes,
                 max_iterations: effective_max_iter,
                 system: system.clone(),
@@ -1793,6 +2056,7 @@ async fn run_pipeline_inner(
                     progress.total,
                     stale_rounds,
                     continuations,
+                    max_continuations,
                 ));
         if !should_continue {
             // todo 를 등록하고도 못 끝낸 경우만 미완료다. todo 자체를 만들지 않고
@@ -1846,7 +2110,7 @@ async fn run_pipeline_inner(
         crate::ui::live_line_in(
             &run_context,
             &format!(
-                "[목표 계속] Todo {}/{} · 연속 실행 {continuations}/8",
+                "[목표 계속] Todo {}/{} · 연속 실행 {continuations}/{max_continuations}",
                 progress.completed, progress.total
             ),
         );
@@ -1858,31 +2122,34 @@ async fn run_pipeline_inner(
             Some("goal"),
         );
         let mut messages = current.messages;
-        messages.push(Message::user_text(
+        let mut nudge = String::from(
             "목표가 아직 완료되지 않았다. 현재 Todo와 도구 결과를 확인하고, \
              완료되지 않은 다음 항목부터 즉시 계속 실행하라. 이미 끝낸 작업은 반복하지 말고, \
              항목을 마칠 때마다 todo_write 상태를 갱신하라. 모든 Todo가 완료된 뒤에만 최종 답변하라.",
-        ));
+        );
+        // loop 분야는 정체를 감지한 그 사이클에서 바로 전략 전환을 지시한다
+        // (기본 분야는 stale 2회에서 루프를 끊는 기존 동작 그대로).
+        if discipline == crate::engine::Discipline::Loop && stale_rounds > 0 {
+            nudge.push_str(LOOP_STALE_SWITCH);
+        }
+        messages.push(Message::user_text(nudge));
         next_resume = Some(messages);
     };
 
-    if binding.verify && outcome.status != "incomplete" {
-        crate::graph::node_in(&run_context, "verify", "start", "", Some("request"));
-        crate::spinner::set_label_in(&run_context, "검증 중…");
-        outcome = run_verify(
-            cfg,
-            binding,
-            task,
-            yes,
-            system,
-            outcome,
-            remote.clone(),
-            local_ask.clone(),
-            run_context.clone(),
-        )
-        .await?;
-        crate::graph::node_in(&run_context, "verify", &outcome.status, "", Some("verify"));
-    }
+    outcome = finish_verification(
+        cfg,
+        binding,
+        &spec,
+        task,
+        &dod_checklist,
+        yes,
+        &system,
+        outcome,
+        remote.clone(),
+        local_ask.clone(),
+        run_context.clone(),
+    )
+    .await?;
     // 도구 없는 프로파일(quick)의 응답에 tool-call 텍스트가 새어 있으면 —
     // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이라는 뜻이다. 모델이
     // 도구 문법을 텍스트로 흉내 낸 오염 응답을 걷어내고 coder 로 1회 승격해
@@ -1915,8 +2182,72 @@ async fn run_pipeline_inner(
     }
     // Self-Harness 에피소드 관찰 — TUI/CLI/텔레그램 세 진입 경로가 모두 여기를
     // 지나므로 이 지점 하나로 전 경로의 실행 증거가 수집된다. 백그라운드 실행.
-    if engine_self {
+    if self_meta_on {
         crate::self_harness::maybe_observe(cfg, task, &outcome);
+    }
+    Ok(outcome)
+}
+
+/// 종료 검증부 — 검증 실행 + 독립 검증자 게이트. harness 루프와 graph 실행이
+/// 같은 지점을 지나도록 한 함수로 모았다 (그래프는 전체 종료 후 1회만 지난다).
+#[allow(clippy::too_many_arguments)]
+async fn finish_verification(
+    cfg: &Config,
+    binding: &Binding,
+    spec: &crate::engine::EngineSpec,
+    task: &str,
+    dod: &str,
+    yes: bool,
+    system: &str,
+    mut outcome: AgentOutcome,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
+    run_context: RunContext,
+) -> Result<AgentOutcome> {
+    // 검증 강도 — Auto/Strict 는 프로파일의 verify 가 꺼져 있어도 자동 감지 명령으로 검증한다.
+    let verify_forced = matches!(
+        spec.verify_policy,
+        crate::engine::VerifyPolicy::Auto | crate::engine::VerifyPolicy::Strict
+    );
+    if (binding.verify || verify_forced) && outcome.status != "incomplete" {
+        crate::graph::node_in(&run_context, "verify", "start", "", Some("request"));
+        crate::spinner::set_label_in(&run_context, "검증 중…");
+        outcome = run_verify(
+            cfg,
+            binding,
+            task,
+            yes,
+            system.to_string(),
+            outcome,
+            remote.clone(),
+            local_ask.clone(),
+            run_context.clone(),
+        )
+        .await?;
+        crate::graph::node_in(&run_context, "verify", &outcome.status, "", Some("verify"));
+    }
+    // 독립 검증자 게이트 (§5) — 자기평가 편향을 막기 위해 신선한 컨텍스트의 리뷰어가
+    // 완료 기준과 대조한다. 게이트가 가용성을 해치면 안 되므로 게이트 자체의 실패는
+    // 경고 한 줄 후 통과로 취급한다.
+    if spec.verify_policy == crate::engine::VerifyPolicy::Strict
+        && cfg.file.harness.strict_gate
+        && matches!(binding.class, TaskClass::Dev | TaskClass::Advanced)
+        && outcome.status == "ok"
+        && !run_context.is_cancelled()
+    {
+        outcome = run_review_gate(
+            cfg,
+            binding,
+            task,
+            dod,
+            yes,
+            system,
+            outcome,
+            remote,
+            local_ask,
+            run_context,
+        )
+        .await;
     }
     Ok(outcome)
 }
@@ -1970,8 +2301,9 @@ fn goal_should_continue(
     total: usize,
     stale_rounds: u8,
     continuations: u8,
+    max_continuations: u8,
 ) -> bool {
-    total > 0 && completed < total && stale_rounds < 2 && continuations < 8
+    total > 0 && completed < total && stale_rounds < 2 && continuations < max_continuations
 }
 
 async fn run_verify(
@@ -2107,6 +2439,726 @@ async fn run_verify(
         }
     }
     Ok(outcome)
+}
+
+// ---------------------------------------------------------------------------
+// 독립 검증자 게이트 (VerifyPolicy::Strict) — 근거: K2 검증자 선택, fresh-context 리뷰어 노드
+// ---------------------------------------------------------------------------
+
+/// 게이트 미니 루프 상한 — 리뷰어는 읽고 판정만 한다.
+const REVIEW_GATE_MAX_ITER: u32 = 6;
+/// 리뷰 피드백 보존 상한 (재개 메시지에 그대로 실린다).
+const REVIEW_SUMMARY_CAP: usize = 2000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewVerdict {
+    Pass,
+    Fail { summary: String },
+}
+
+/// 리뷰어 출력에서 판정을 뽑는 순수 함수.
+/// `[판정]` 줄이 없으면 통과로 본다 — 게이트가 가용성을 해치면 안 된다.
+fn parse_review_verdict(text: &str) -> ReviewVerdict {
+    let mut failed = None;
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("[판정]") else {
+            continue;
+        };
+        let v = rest.trim().to_ascii_lowercase();
+        // '미통과'가 '통과'를 포함하므로 실패 표지를 먼저 본다.
+        failed = Some(
+            v.contains("fail")
+                || v.contains("미통과")
+                || v.contains("불합격")
+                || v.contains("실패"),
+        );
+        break;
+    }
+    if failed != Some(true) {
+        return ReviewVerdict::Pass;
+    }
+    let mut summary = String::new();
+    for header in ["[미충족 항목]", "[결함]"] {
+        let section = extract_plan_section(text, header);
+        let section = section.trim();
+        if section.is_empty() || section == "없음" {
+            continue;
+        }
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(header);
+        summary.push(' ');
+        summary.push_str(section);
+    }
+    if summary.is_empty() {
+        // 구조를 지키지 않은 출력 — 본문을 그대로 근거로 쓴다.
+        summary = text.trim().to_string();
+    }
+    ReviewVerdict::Fail {
+        summary: summary.chars().take(REVIEW_SUMMARY_CAP).collect(),
+    }
+}
+
+/// 판정 뒤 게이트가 취할 동작 — 재개는 1회만, 2번째 미통과면 기록 후 종료한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateAction {
+    /// 통과 — outcome 그대로 완료.
+    Accept,
+    /// 지적을 되먹여 본 작업을 1회 재개한다.
+    Resume(String),
+    /// 재개 후에도 미통과 — status 는 유지하고 error 에만 사유를 남긴다.
+    Report(String),
+}
+
+/// 게이트 상태 전이 (순수 함수). `attempt` 는 0-based 검증 회차.
+fn gate_action(verdict: ReviewVerdict, attempt: u8) -> GateAction {
+    match verdict {
+        ReviewVerdict::Pass => GateAction::Accept,
+        ReviewVerdict::Fail { summary } if attempt == 0 => GateAction::Resume(summary),
+        ReviewVerdict::Fail { summary } => GateAction::Report(summary),
+    }
+}
+
+/// 미통과 사유 한 줄 요약 — outcome.error 와 진행 표시에 쓴다.
+fn verdict_headline(summary: &str) -> String {
+    summary
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("사유 미상")
+        .chars()
+        .take(120)
+        .collect()
+}
+
+/// 검증자 입력 — 원 작업 + 완료 기준 + 변경 파일 목록.
+/// diff 전문은 넣지 않는다: 리뷰어가 도구로 직접 읽어야 신선한 시각이 유지된다.
+fn review_prompt(task: &str, dod: &str, changed: &[String]) -> String {
+    let mut s = String::from("아래 작업의 산출물을 완료 기준과 대조해 판정하라.\n\n[원 작업]\n");
+    s.extend(task.trim().chars().take(4000));
+    let dod = dod.trim();
+    if !dod.is_empty() {
+        s.push_str("\n\n[완료 기준]\n");
+        s.extend(dod.chars().take(4000));
+    }
+    s.push_str("\n\n[변경된 파일]\n");
+    if changed.is_empty() {
+        s.push_str("(도구가 보고한 변경 파일 없음)\n");
+    } else {
+        for path in changed.iter().take(40) {
+            s.push_str("- ");
+            s.push_str(path);
+            s.push('\n');
+        }
+    }
+    s.push_str(
+        "\n변경 내용은 첨부하지 않았다. read_file·grep 으로 직접 읽어 확인하고, 필요하면 \
+         bash 로 빌드·테스트를 실행하라. 확인하지 않은 파일에 대해서는 판정하지 않는다(NEVER).",
+    );
+    s
+}
+
+/// 리뷰어 미니 루프 1회. 게이트 자체의 오류는 호출자가 통과로 처리한다.
+async fn run_review_once(
+    cfg: &Config,
+    reviewer: &Binding,
+    prompt: &str,
+    yes: bool,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
+    run_context: RunContext,
+) -> Result<AgentOutcome> {
+    agent::run_agent_with_context(
+        AgentRun {
+            cfg,
+            provider_name: &reviewer.provider_name,
+            model: &reviewer.model,
+            task: prompt,
+            yes,
+            max_iterations: reviewer.max_iterations.min(REVIEW_GATE_MAX_ITER).max(1),
+            // 신선한 컨텍스트: 본 작업의 대화·lessons 를 물려받지 않는다.
+            system: system_prompt(cfg, &reviewer.system_extra, ""),
+            registry: ToolRegistry::with_names(&reviewer.tools),
+            resume: None,
+            remote,
+            local_ask,
+            context_window: reviewer.context_window,
+        },
+        run_context,
+    )
+    .await
+}
+
+/// 독립 검증자 게이트 — pass 면 그대로, fail 이면 지적을 되먹여 1회 재개 후 재검증.
+/// 2번째 fail 이면 status 는 유지하고 error 에만 사유를 남긴다 (무한루프 방지).
+#[allow(clippy::too_many_arguments)]
+async fn run_review_gate(
+    cfg: &Config,
+    binding: &Binding,
+    task: &str,
+    dod: &str,
+    yes: bool,
+    system: &str,
+    mut outcome: AgentOutcome,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
+    run_context: RunContext,
+) -> AgentOutcome {
+    // [harness] manual_verify 가 지정돼 있으면 그 모델로 검증자를 돌린다.
+    let verify_pair = cfg
+        .file
+        .harness
+        .manual_verify
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|spec| resolve_spec(cfg, spec, true).ok());
+    let reviewer = match bind_profile(
+        cfg,
+        binding.class,
+        Some("reviewer"),
+        verify_pair.as_ref().map(|(p, _)| p.as_str()),
+        verify_pair.as_ref().map(|(_, m)| m.as_str()),
+    ) {
+        Ok(reviewer) => reviewer,
+        Err(e) => {
+            crate::ui::live_warn_in(
+                &run_context,
+                &format!("검증자 게이트 생략(바인딩 실패): {e}"),
+            );
+            return outcome;
+        }
+    };
+
+    for attempt in 0..2u8 {
+        crate::graph::node_in(
+            &run_context,
+            "critic",
+            "start",
+            &format!("{} · {}회차", reviewer.model, attempt + 1),
+            Some("verify"),
+        );
+        crate::spinner::set_label_in(&run_context, "독립 검증자 대조 중…");
+        crate::ui::live_line_in(
+            &run_context,
+            &format!("[검증자] {} — 완료 기준 대조", reviewer.model),
+        );
+        let prompt = review_prompt(task, dod, &outcome.changed_files);
+        let review = match run_review_once(
+            cfg,
+            &reviewer,
+            &prompt,
+            yes,
+            remote.clone(),
+            local_ask.clone(),
+            run_context.clone(),
+        )
+        .await
+        {
+            Ok(review) => review,
+            Err(e) => {
+                crate::ui::live_warn_in(
+                    &run_context,
+                    &format!("검증자 게이트 실패(통과 처리): {e}"),
+                );
+                crate::graph::node_in(
+                    &run_context,
+                    "critic",
+                    "error",
+                    &e.to_string(),
+                    Some("verify"),
+                );
+                return outcome;
+            }
+        };
+        outcome.input_tokens = outcome.input_tokens.saturating_add(review.input_tokens);
+        outcome.output_tokens = outcome.output_tokens.saturating_add(review.output_tokens);
+
+        let verdict = parse_review_verdict(&agent::assistant_text(&review.messages));
+        let summary = match gate_action(verdict, attempt) {
+            GateAction::Accept => {
+                crate::graph::node_in(&run_context, "critic", "pass", "", Some("verify"));
+                crate::ui::live_line_in(&run_context, "[검증자] 완료 기준 충족 — 통과");
+                return outcome;
+            }
+            GateAction::Report(summary) => {
+                let headline = verdict_headline(&summary);
+                crate::graph::node_in(&run_context, "critic", "fail", &headline, Some("verify"));
+                crate::ui::live_warn_in(
+                    &run_context,
+                    &format!("[검증자] 2회 미통과 — 상태를 보고하고 종료합니다: {headline}"),
+                );
+                outcome.error = Some(format!("검증자 미통과: {headline}"));
+                return outcome;
+            }
+            GateAction::Resume(summary) => summary,
+        };
+        let headline = verdict_headline(&summary);
+        crate::graph::node_in(&run_context, "critic", "fail", &headline, Some("verify"));
+        crate::ui::live_line_in(
+            &run_context,
+            &format!("[검증자] 미통과 — 지적을 되먹여 1회 재개합니다: {headline}"),
+        );
+
+        // 재개는 goal 루프를 다시 돌리지 않고 본 작업 바인딩으로 1회만 이어 실행한다.
+        let mut messages = outcome.messages.clone();
+        if messages.is_empty() {
+            messages.push(Message::user_text(task));
+        }
+        messages.push(Message::user_text(format!(
+            "독립 검증자가 완료 기준 대조에서 미통과로 판정했다. 아래 지적을 실제 파일 수정으로 \
+             해소하라. 재설명·변명은 금지(NEVER)다. 고친 뒤 스스로 확인하고 무엇을 바꿨는지 보고하라.\n{summary}"
+        )));
+        let resumed = agent::run_agent_with_context(
+            AgentRun {
+                cfg,
+                provider_name: &binding.provider_name,
+                model: &binding.model,
+                task,
+                yes,
+                max_iterations: binding.max_iterations,
+                system: system.to_string(),
+                registry: ToolRegistry::with_names(&binding.tools),
+                resume: Some(messages),
+                remote: remote.clone(),
+                local_ask: local_ask.clone(),
+                context_window: binding.context_window,
+            },
+            run_context.clone(),
+        )
+        .await;
+        match resumed {
+            Ok(mut next) => {
+                next.input_tokens = outcome.input_tokens.saturating_add(next.input_tokens);
+                next.output_tokens = outcome.output_tokens.saturating_add(next.output_tokens);
+                next.iterations = outcome.iterations.saturating_add(next.iterations);
+                let mut changed = outcome.changed_files.clone();
+                for path in &next.changed_files {
+                    if !changed.contains(path) {
+                        changed.push(path.clone());
+                    }
+                }
+                next.changed_files = changed;
+                let mut tool_errors = outcome.tool_errors.clone();
+                tool_errors.extend(next.tool_errors.clone());
+                next.tool_errors = tool_errors;
+                let mut denials = outcome.deny_reasons.clone();
+                denials.extend(next.deny_reasons.clone());
+                next.deny_reasons = denials;
+                outcome = next;
+                // 재개가 정상 종료하지 못했으면 재검증 없이 그 상태를 그대로 보고한다.
+                if outcome.status != "ok" || run_context.is_cancelled() {
+                    crate::ui::live_warn_in(
+                        &run_context,
+                        &format!(
+                            "[검증자] 재개가 완료되지 않아 재검증을 생략합니다 (status={})",
+                            outcome.status
+                        ),
+                    );
+                    return outcome;
+                }
+            }
+            Err(e) => {
+                crate::ui::live_warn_in(
+                    &run_context,
+                    &format!("검증자 재개 실패(직전 상태 유지): {e}"),
+                );
+                outcome.error = Some(format!("검증자 미통과: {headline}"));
+                return outcome;
+            }
+        }
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// 그래프 분야 (discipline = graph) — PEV 상태 그래프를 위상순으로 순차 실행한다.
+// 노드마다 신선한 컨텍스트로 돌고, 선행 노드에서는 결론(산출물 요약)만 넘겨받는다
+// (서브에이전트 격리 원칙). 병렬 실행은 이번 범위 밖이다.
+// ---------------------------------------------------------------------------
+
+/// 선행 노드 산출물 요약 상한 — 다음 노드로 결론만 넘긴다.
+const GRAPH_SUMMARY_CAP: usize = 500;
+/// 노드 하나의 최소 반복 상한.
+const GRAPH_NODE_MIN_ITER: u32 = 8;
+
+/// 계획이 산출한 DAG 노드 하나.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct DagNode {
+    id: String,
+    goal: String,
+    #[serde(default)]
+    deps: Vec<String>,
+    #[serde(default)]
+    produces: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DagPlan {
+    nodes: Vec<DagNode>,
+}
+
+/// deps 에 순환이 있어 위상 정렬이 불가능함 — 그래프 폴백 사유.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CycleError {
+    /// 정렬되지 못하고 남은 노드 id 들.
+    remaining: Vec<String>,
+}
+
+impl std::fmt::Display for CycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "노드 순환: {}", self.remaining.join(" → "))
+    }
+}
+
+/// 계획 텍스트에서 DAG JSON 앞의 산문만 — [완료 기준] 추출이 JSON 을 빨아들이지 않게.
+/// 코드 펜스와 첫 `{` 중 먼저 오는 지점에서 자른다.
+fn plan_prose(plan: &str) -> &str {
+    let cut = [plan.find("```"), plan.find('{')]
+        .into_iter()
+        .flatten()
+        .min();
+    match cut {
+        Some(i) => &plan[..i],
+        None => plan,
+    }
+}
+
+/// 첫 `{` 부터 짝이 맞는 지점까지. 문자열 리터럴 안의 중괄호·이스케이프는 건너뛴다.
+fn balanced_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 응답에서 JSON 객체를 꺼낸다 — ```json 펜스 우선, 없으면 첫 `{` 부터 균형 매칭.
+fn extract_json_object(text: &str) -> Option<&str> {
+    if let Some(at) = text.find("```json")
+        && let Some(rest) = text.get(at + "```json".len()..)
+        && let Some(end) = rest.find("```")
+        && let Some(obj) = balanced_object(&rest[..end])
+    {
+        return Some(obj);
+    }
+    balanced_object(text)
+}
+
+/// 계획 응답 → DAG 노드 목록. 형식이 조금이라도 어긋나면 None 을 돌려 harness 로 폴백한다.
+fn parse_dag(text: &str) -> Option<Vec<DagNode>> {
+    let json = extract_json_object(text)?;
+    let plan: DagPlan = serde_json::from_str(json).ok()?;
+    if plan.nodes.is_empty() {
+        return None;
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(plan.nodes.len());
+    for node in &plan.nodes {
+        let id = node.id.trim();
+        // 빈 id·빈 goal·중복 id 는 실행 순서를 정의할 수 없다 — 형식 오류로 본다.
+        if id.is_empty() || node.goal.trim().is_empty() || seen.contains(&id) {
+            return None;
+        }
+        seen.push(id);
+    }
+    Some(plan.nodes)
+}
+
+/// Kahn 위상 정렬 → 실행 순서(노드 인덱스). 모르는 id 를 가리키는 deps 는 간선이 없다.
+fn topo_order(nodes: &[DagNode]) -> Result<Vec<usize>, CycleError> {
+    let index: std::collections::HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.trim(), i))
+        .collect();
+    let mut indegree = vec![0usize; nodes.len()];
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, node) in nodes.iter().enumerate() {
+        let mut linked: Vec<usize> = Vec::new();
+        for dep in &node.deps {
+            let Some(&j) = index.get(dep.trim()) else {
+                continue;
+            };
+            if linked.contains(&j) {
+                continue; // 같은 deps 가 두 번 적혀도 진입차수를 두 번 세지 않는다.
+            }
+            linked.push(j);
+            edges[j].push(i);
+            indegree[i] += 1;
+        }
+    }
+    let mut queue: std::collections::VecDeque<usize> =
+        (0..nodes.len()).filter(|i| indegree[*i] == 0).collect();
+    let mut order = Vec::with_capacity(nodes.len());
+    while let Some(i) = queue.pop_front() {
+        order.push(i);
+        for &next in &edges[i] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                queue.push_back(next);
+            }
+        }
+    }
+    if order.len() != nodes.len() {
+        return Err(CycleError {
+            remaining: nodes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !order.contains(i))
+                .map(|(_, n)| n.id.trim().to_string())
+                .collect(),
+        });
+    }
+    Ok(order)
+}
+
+/// 노드 성공 판정 — 등록한 todo 를 모두 끝내고 반복 상한에 닿은 경우는 구제한다
+/// (전역 goal 루프와 같은 규칙).
+fn graph_node_ok(status: &str, completed: usize, total: usize) -> bool {
+    status == "ok" || (status == "limit" && total > 0 && completed == total)
+}
+
+/// 마지막 assistant 텍스트 — 노드 산출물 요약의 원문.
+fn last_assistant_text(messages: &[Message]) -> String {
+    for m in messages.iter().rev() {
+        if m.role != crate::provider::Role::Assistant {
+            continue;
+        }
+        let text = m
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.trim()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// 다음 노드로 넘길 결론 — 마지막 답변 앞 500자 + 이 노드가 바꾼 파일 목록.
+fn graph_node_summary(outcome: &AgentOutcome) -> String {
+    let mut s: String = last_assistant_text(&outcome.messages)
+        .chars()
+        .take(GRAPH_SUMMARY_CAP)
+        .collect();
+    if !outcome.changed_files.is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str("변경 파일: ");
+        s.push_str(&outcome.changed_files.join(", "));
+    }
+    if s.is_empty() {
+        s.push_str("(보고된 산출물 없음)");
+    }
+    s
+}
+
+/// 노드 실행용 시스템 프롬프트 — 메인 조립 결과 + 이 노드의 좌표 + 선행 산출물.
+fn graph_node_system(
+    system: &str,
+    step: usize,
+    total: usize,
+    node: &DagNode,
+    produced: &[(String, String)],
+) -> String {
+    let mut s = String::with_capacity(system.len() + 512);
+    s.push_str(system);
+    s.push_str(&format!(
+        "\n\n[그래프 노드 {step}/{total}] 목표: {}\n",
+        node.goal.trim()
+    ));
+    let produces = node.produces.trim();
+    if !produces.is_empty() {
+        s.push_str(&format!("이 노드의 산출물: {produces}\n"));
+    }
+    for dep in &node.deps {
+        let Some((_, summary)) = produced.iter().find(|(id, _)| id == dep.trim()) else {
+            continue;
+        };
+        s.push_str(&format!("\n[선행 산출물 {}]\n{summary}\n", dep.trim()));
+    }
+    s.push_str(
+        "\n이 노드의 목표만 수행한다. 다른 노드가 맡은 범위는 건드리지 않는다(NEVER). \
+         끝내면 무엇을 만들었는지 한 문단으로 보고한다.",
+    );
+    s
+}
+
+/// 노드 실행용 사용자 프롬프트 — 원 작업 + 이 노드의 목표.
+fn graph_node_prompt(task: &str, node: &DagNode) -> String {
+    format!(
+        "{task}\n\n[이번 노드] {}\n이 노드의 목표만 수행하라. 나머지는 다른 노드가 처리한다.",
+        node.goal.trim()
+    )
+}
+
+/// 노드 하나의 실행 결과를 그래프 합산본에 누적한다 (실패한 시도도 보존).
+fn merge_node_outcome(agg: &mut AgentOutcome, node: &AgentOutcome) {
+    agg.input_tokens = agg.input_tokens.saturating_add(node.input_tokens);
+    agg.output_tokens = agg.output_tokens.saturating_add(node.output_tokens);
+    agg.iterations = agg.iterations.saturating_add(node.iterations);
+    agg.context_tokens = node.context_tokens;
+    agg.cached_tokens = agg.cached_tokens.saturating_add(node.cached_tokens);
+    agg.cache_reported = agg.cache_reported || node.cache_reported;
+    for path in &node.changed_files {
+        if !agg.changed_files.contains(path) {
+            agg.changed_files.push(path.clone());
+        }
+    }
+    agg.tool_errors.extend(node.tool_errors.clone());
+    agg.deny_reasons.extend(node.deny_reasons.clone());
+    if node.verify_fail.is_some() {
+        agg.verify_fail = node.verify_fail.clone();
+    }
+    agg.messages = node.messages.clone();
+}
+
+/// 위상순 노드 실행. 노드는 신선한 messages 로 돌고, 실패하면 사유를 덧붙여 1회만
+/// 재시도한다. 재실패면 그래프를 중단하고 그때까지의 산출물을 합산해 돌려준다.
+#[allow(clippy::too_many_arguments)]
+async fn run_graph_discipline(
+    cfg: &Config,
+    binding: &Binding,
+    task: &str,
+    nodes: &[DagNode],
+    order: &[usize],
+    system: &str,
+    yes: bool,
+    remote: Option<agent::RemoteApproval>,
+    local_ask: Option<agent::LocalAsk>,
+    run_context: RunContext,
+) -> Result<AgentOutcome> {
+    let total = order.len();
+    let node_iter = (binding.max_iterations / 2).max(GRAPH_NODE_MIN_ITER);
+    let mut produced: Vec<(String, String)> = Vec::with_capacity(total);
+    let mut agg = AgentOutcome::default();
+    for (step, &i) in order.iter().enumerate() {
+        if run_context.is_cancelled() {
+            return Ok(cancelled_outcome());
+        }
+        let node = &nodes[i];
+        let id = node.id.trim();
+        let goal_head: String = node.goal.trim().chars().take(120).collect();
+        crate::graph::node_in(
+            &run_context,
+            "graph_node",
+            id,
+            &goal_head,
+            Some("plan_first"),
+        );
+        crate::ui::live_line_in(
+            &run_context,
+            &format!("[그래프] 노드 {}/{} {id} — {goal_head}", step + 1, total),
+        );
+        crate::spinner::set_label_in(
+            &run_context,
+            &format!("그래프 노드 {}/{}: {id}", step + 1, total),
+        );
+        // 노드마다 todo 를 비운다 — 앞 노드가 남긴 항목이 이 노드의 완료 판정을 흐리지 않게.
+        crate::tools_more::clear_todos_in(&run_context);
+        let node_system = graph_node_system(system, step + 1, total, node, &produced);
+        let mut prompt = graph_node_prompt(task, node);
+        for attempt in 0..2u8 {
+            let outcome = agent::run_agent_with_context(
+                AgentRun {
+                    cfg,
+                    provider_name: &binding.provider_name,
+                    model: &binding.model,
+                    task: &prompt,
+                    yes,
+                    max_iterations: node_iter,
+                    system: node_system.clone(),
+                    registry: ToolRegistry::with_names(&binding.tools),
+                    // 신선한 컨텍스트: 앞 노드의 대화를 물려받지 않는다.
+                    resume: None,
+                    remote: remote.clone(),
+                    local_ask: local_ask.clone(),
+                    context_window: binding.context_window,
+                },
+                run_context.clone(),
+            )
+            .await?;
+            let progress = crate::tools_more::todo_progress(&crate::tools_more::current_todos_in(
+                &run_context,
+            ));
+            let ok = graph_node_ok(&outcome.status, progress.completed, progress.total);
+            let reason = outcome
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("status={}", outcome.status));
+            merge_node_outcome(&mut agg, &outcome);
+            // 취소는 실패가 아니다 — 재시도하지 않고 그대로 끝낸다.
+            if outcome.status == "cancelled" || run_context.is_cancelled() {
+                return Ok(cancelled_outcome());
+            }
+            if ok {
+                produced.push((id.to_string(), graph_node_summary(&outcome)));
+                crate::graph::node_in(&run_context, "graph_node", id, "ok", Some("plan_first"));
+                break;
+            }
+            if attempt == 0 {
+                crate::ui::live_warn_in(
+                    &run_context,
+                    &format!("[그래프] 노드 {id} 실패 — 1회 재시도합니다: {reason}"),
+                );
+                prompt = format!(
+                    "{prompt}\n\n[직전 시도 실패] {reason}\n같은 접근을 반복하지 마라. \
+                     막힌 지점을 먼저 확인하고 다른 경로로 이 노드의 목표를 완수하라."
+                );
+                continue;
+            }
+            crate::graph::node_in(&run_context, "graph_node", id, "fail", Some("plan_first"));
+            crate::ui::live_warn_in(
+                &run_context,
+                &format!("[그래프] 노드 {id} 재실패 — 그래프를 중단합니다: {reason}"),
+            );
+            agg.status = outcome.status.clone();
+            agg.error = Some(format!(
+                "그래프 중단: 노드 {id} 실패 ({}/{total} 노드 완료)",
+                produced.len()
+            ));
+            return Ok(agg);
+        }
+    }
+    agg.status = "ok".into();
+    agg.error = None;
+    crate::ui::live_line_in(
+        &run_context,
+        &format!("[그래프] {total}개 노드 완료 — 검증으로 넘어갑니다"),
+    );
+    Ok(agg)
 }
 
 fn auto_verify_command(cfg: &Config, changed: &[String]) -> String {
@@ -2253,10 +3305,409 @@ mod tests {
 
     #[test]
     fn goal_continues_only_while_open_todos_make_progress() {
-        assert!(goal_should_continue(1, 3, 0, 0));
-        assert!(goal_should_continue(2, 3, 1, 1));
-        assert!(!goal_should_continue(3, 3, 1, 2));
-        assert!(!goal_should_continue(1, 1, 0, 0));
+        assert!(goal_should_continue(1, 3, 0, 0, 8));
+        assert!(goal_should_continue(2, 3, 1, 1, 8));
+        assert!(!goal_should_continue(3, 3, 1, 2, 8));
+        assert!(!goal_should_continue(1, 1, 0, 0, 8));
+        // 한도는 엔진 사양(EngineSpec.max_continuations)이 정한다.
+        assert!(!goal_should_continue(1, 3, 0, 3, 3));
+        assert!(goal_should_continue(1, 3, 0, 3, 4));
+    }
+
+    #[test]
+    fn contract_plan_prompt_keeps_main_system_context() {
+        // 회귀 방지: 계획 호출이 system 을 통째로 교체하면 lessons·system_extra·
+        // 프로젝트 규칙이 계획에서 사라진다 (v1 결함).
+        let dir = std::env::temp_dir().join(format!("rafikx-plan-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cfg = Config::load(Some(&dir.join("config.toml"))).expect("config");
+        let extra = "신중한 시니어 개발자다. 최소 diff 로 고친다.";
+        let lessons = "[프로젝트 교훈]\n- 회귀 테스트 없이 고치지 말 것";
+        let system = system_prompt(&cfg, extra, lessons);
+
+        let contract = plan_system_prompt(&system, crate::engine::PlanDepth::Contract, "");
+        assert!(contract.contains(extra), "system_extra 유실");
+        assert!(contract.contains("[프로젝트 교훈]"), "lessons 유실");
+        assert!(contract.contains("[계획 모드]"));
+        // Contract 는 3부 산출물을 강제한다.
+        assert!(contract.contains("[해석]"));
+        assert!(contract.contains("[완료 기준]"));
+        assert!(contract.contains("[작업 분해]"));
+
+        let brief = plan_system_prompt(&system, crate::engine::PlanDepth::Brief, "");
+        assert!(brief.contains(extra), "system_extra 유실");
+        assert!(brief.contains("[프로젝트 교훈]"), "lessons 유실");
+        assert!(brief.contains("3~7개 항목"));
+        assert!(!brief.contains("[완료 기준]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_harness_plan_instruction_is_plan_only() {
+        let dir = std::env::temp_dir().join(format!("rafikx-planface-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cfg = Config::load(Some(&dir.join("config.toml"))).expect("config");
+        let system = system_prompt(&cfg, "", "");
+
+        // 메타 레이어가 꺼져 있으면(빈 문자열) 계획 프롬프트에 아무것도 붙지 않는다.
+        let off = plan_system_prompt(&system, crate::engine::PlanDepth::Brief, "");
+        assert!(!off.contains("[Self-Harness 계획 지침]"));
+
+        let on = plan_system_prompt(
+            &system,
+            crate::engine::PlanDepth::Contract,
+            "  완료 기준을 검증 가능한 형태로 쓴다.  ",
+        );
+        assert!(on.contains("[Self-Harness 계획 지침] 완료 기준을 검증 가능한 형태로 쓴다."));
+        // 계획 전용 면이므로 메인 시스템 프롬프트에는 없어야 한다.
+        assert!(!system.contains("[Self-Harness 계획 지침]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_line_shows_only_non_default_axes() {
+        let dir = std::env::temp_dir().join(format!("rafikx-suffix-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = Config::load(Some(&dir.join("config.toml"))).expect("config");
+
+        // 기본값(rafikx · harness)이면 표시를 늘리지 않는다.
+        assert!(engine_suffix(&cfg).is_empty());
+
+        cfg.file.general.engine = "claude".into();
+        assert_eq!(engine_suffix(&cfg), "  ·  engine=claude");
+
+        cfg.file.general.discipline = "graph".into();
+        assert_eq!(engine_suffix(&cfg), "  ·  engine=claude  ·  graph");
+
+        // legacy engine="self" 는 rafikx 로 정규화되므로 엔진 표시가 빠진다.
+        cfg.file.general.engine = "self".into();
+        cfg.file.general.discipline = "loop".into();
+        assert_eq!(engine_suffix(&cfg), "  ·  loop");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bind_falls_back_to_builtin_expert_profiles() {
+        let dir = std::env::temp_dir().join(format!("rafikx-profile-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = Config::load(Some(&dir.join("config.toml"))).expect("config");
+
+        // 기본 config 에는 전문가 프로파일이 없다 — 내장 프리셋으로 폴백해야 한다.
+        assert!(!cfg.file.subagents.contains_key("planner"));
+        let planner = resolve_profile(&cfg, "planner").expect("planner 프리셋");
+        assert!(planner.tools.iter().any(|t| t == "todo_write"));
+        assert!(!planner.tools.iter().any(|t| t == "write_file"));
+        assert!(!planner.plan_first && !planner.verify);
+        assert!(planner.system_extra.contains("[완료 기준]"));
+
+        let reviewer = resolve_profile(&cfg, "reviewer").expect("reviewer 프리셋");
+        assert_eq!(reviewer.max_iterations, REVIEW_GATE_MAX_ITER);
+        assert!(reviewer.tools.iter().any(|t| t == "bash"));
+        assert!(!reviewer.tools.iter().any(|t| t == "write_file"));
+        assert!(reviewer.system_extra.contains("[판정]"));
+        assert!(reviewer.system_extra.contains("[미충족 항목]"));
+
+        for role in ["frontend", "backend"] {
+            let sub = resolve_profile(&cfg, role).expect(role);
+            assert_eq!(sub.tools, vec!["*".to_string()]);
+            assert!(sub.plan_first && sub.verify);
+            assert!(sub.system_extra.contains("[변경 요약]"));
+        }
+
+        // config 정의가 있으면 사용자 정의가 이긴다.
+        let mut custom = crate::config::builtin_profile("planner").expect("preset");
+        custom.system_extra = "사내 기획 규칙만 따른다".into();
+        custom.max_iterations = 3;
+        cfg.file.subagents.insert("planner".into(), custom);
+        let planner = resolve_profile(&cfg, "planner").expect("사용자 정의 planner");
+        assert_eq!(planner.system_extra, "사내 기획 규칙만 따른다");
+        assert_eq!(planner.max_iterations, 3);
+
+        // 등록되지 않은 이름은 폴백 대상이 아니다.
+        assert!(resolve_profile(&cfg, "없는프로파일").is_none());
+        assert!(resolve_profile(&cfg, "  ").is_none());
+        assert!(profile_exists(&cfg, "coder")); // config 정의
+        assert!(profile_exists(&cfg, "frontend")); // 내장 프리셋
+        assert!(!profile_exists(&cfg, "없는역할"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_verdict_parsing_and_gate_transitions() {
+        // 통과 판정.
+        assert_eq!(
+            parse_review_verdict("[판정] pass\n[미충족 항목] 없음\n[결함] 없음"),
+            ReviewVerdict::Pass
+        );
+        assert_eq!(parse_review_verdict("[판정] 통과"), ReviewVerdict::Pass);
+        // 판정 줄이 없으면 통과로 본다 — 게이트가 가용성을 해치면 안 된다.
+        assert_eq!(
+            parse_review_verdict("리뷰 도중 파일을 열지 못했습니다."),
+            ReviewVerdict::Pass
+        );
+        assert_eq!(parse_review_verdict(""), ReviewVerdict::Pass);
+
+        // 미통과 — 미충족 항목과 결함이 사유로 모인다.
+        let text = "[판정] fail\n\
+                    [미충족 항목]\n\
+                    2. 캐시 히트율 로그 — 로그 출력이 없음\n\
+                    [결함]\n\
+                    src/cache.rs:42 — unwrap 사용 — 빈 키에서 패닉";
+        let ReviewVerdict::Fail { summary } = parse_review_verdict(text) else {
+            panic!("fail 판정이어야 한다");
+        };
+        assert!(summary.contains("캐시 히트율"));
+        assert!(summary.contains("src/cache.rs:42"));
+        assert!(!summary.contains("[판정]"));
+        // '미통과'는 '통과'를 부분 문자열로 포함한다 — 실패 표지를 먼저 봐야 한다.
+        assert!(matches!(
+            parse_review_verdict("[판정] 미통과\n[결함] 테스트 없음"),
+            ReviewVerdict::Fail { .. }
+        ));
+        // 구조를 지키지 않은 fail 출력은 본문 전체를 사유로 쓴다.
+        let ReviewVerdict::Fail { summary } = parse_review_verdict("[판정] fail\n그냥 부족합니다")
+        else {
+            panic!("fail 판정이어야 한다");
+        };
+        assert!(summary.contains("그냥 부족합니다"));
+
+        // 상태 전이: 1회차 미통과 → 재개, 재개 후에도 미통과 → 보고 후 종료.
+        let fail = || ReviewVerdict::Fail {
+            summary: "[결함] 테스트 없음".into(),
+        };
+        assert_eq!(gate_action(ReviewVerdict::Pass, 0), GateAction::Accept);
+        assert_eq!(gate_action(ReviewVerdict::Pass, 1), GateAction::Accept);
+        assert_eq!(
+            gate_action(fail(), 0),
+            GateAction::Resume("[결함] 테스트 없음".into())
+        );
+        assert_eq!(
+            gate_action(fail(), 1),
+            GateAction::Report("[결함] 테스트 없음".into())
+        );
+        assert_eq!(
+            verdict_headline("[결함] 테스트 없음\n둘째 줄"),
+            "[결함] 테스트 없음"
+        );
+        assert_eq!(verdict_headline("   "), "사유 미상");
+    }
+
+    #[test]
+    fn review_prompt_sends_dod_and_files_but_not_diffs() {
+        let changed = vec!["src/cache.rs".to_string(), "src/main.rs".to_string()];
+        let p = review_prompt("캐시를 추가하라", "1. cargo test 통과", &changed);
+        assert!(p.contains("캐시를 추가하라"));
+        assert!(p.contains("[완료 기준]\n1. cargo test 통과"));
+        assert!(p.contains("- src/cache.rs"));
+        assert!(p.contains("- src/main.rs"));
+        // 신선한 시각: diff 를 첨부하지 않고 리뷰어가 직접 읽게 한다.
+        assert!(p.contains("read_file"));
+
+        // DoD 가 없으면 그 절은 통째로 빠진다.
+        let p = review_prompt("캐시를 추가하라", "   ", &[]);
+        assert!(!p.contains("[완료 기준]"));
+        assert!(p.contains("변경 파일 없음"));
+    }
+
+    #[test]
+    fn plan_sections_are_extracted_for_the_verifier_gate() {
+        let plan = "[해석] 캐시 계층을 추가한다.\n\
+                    가정: 기존 저장소는 그대로 둔다.\n\
+                    [완료 기준]\n\
+                    1. cargo test 통과 — `cargo test` 실행\n\
+                    2. 캐시 히트율 로그 — 실행 후 로그 확인\n\
+                    [작업 분해]\n\
+                    1. 인터페이스 정의\n\
+                    2. 구현";
+        let dod = extract_plan_section(plan, "[완료 기준]");
+        assert!(dod.starts_with("1. cargo test 통과"));
+        assert!(dod.contains("캐시 히트율"));
+        assert!(!dod.contains("작업 분해"));
+        assert!(!dod.contains("캐시 계층을 추가한다"));
+
+        let interp = extract_plan_section(plan, "[해석]");
+        assert!(interp.starts_with("캐시 계층을 추가한다."));
+        assert!(interp.contains("가정: 기존 저장소는"));
+
+        assert!(extract_plan_section(plan, "[없는 절]").is_empty());
+        assert!(extract_plan_section("자유 형식 계획 3줄", "[완료 기준]").is_empty());
+    }
+
+    fn dag(spec: &[(&str, &[&str])]) -> Vec<DagNode> {
+        spec.iter()
+            .map(|(id, deps)| DagNode {
+                id: (*id).into(),
+                goal: format!("{id} 목표"),
+                deps: deps.iter().map(|d| (*d).to_string()).collect(),
+                produces: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_dag_reads_fenced_and_bare_json() {
+        let fenced = "[완료 기준]\n1. cargo test 통과 — `cargo test`\n\n\
+             ```json\n\
+             {\"nodes\":[{\"id\":\"n1\",\"goal\":\"스키마 정의\",\"deps\":[],\"produces\":\"타입 3종\"},\
+             {\"id\":\"n2\",\"goal\":\"구현\",\"deps\":[\"n1\"],\"produces\":\"모듈\"}]}\n\
+             ```";
+        let nodes = parse_dag(fenced).expect("펜스 JSON");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].id, "n1");
+        assert_eq!(nodes[0].goal, "스키마 정의");
+        assert_eq!(nodes[1].deps, vec!["n1".to_string()]);
+        // 완료 기준은 JSON 앞 산문에서만 뽑는다 — JSON 을 빨아들이지 않는다.
+        let dod = extract_plan_section(plan_prose(fenced), "[완료 기준]");
+        assert_eq!(dod, "1. cargo test 통과 — `cargo test`");
+        assert!(!dod.contains("nodes"));
+
+        // 펜스가 없어도 첫 `{` 부터 균형 매칭으로 찾는다. 뒤에 산문이 붙어도 된다.
+        let bare = "계획입니다.\n{\"nodes\":[{\"id\":\"a\",\"goal\":\"조사 {중괄호} 포함\",\
+                    \"deps\":[]}]}\n이상.";
+        let nodes = parse_dag(bare).expect("맨 JSON");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].goal, "조사 {중괄호} 포함");
+        assert!(nodes[0].deps.is_empty());
+        assert!(nodes[0].produces.is_empty());
+    }
+
+    #[test]
+    fn parse_dag_rejects_malformed_plans() {
+        // JSON 자체가 없다 → harness 폴백.
+        assert!(parse_dag("1. 스키마\n2. 구현\n3. 테스트").is_none());
+        // 깨진 JSON.
+        assert!(parse_dag("{\"nodes\":[{\"id\":\"n1\",").is_none());
+        // nodes 키가 없다.
+        assert!(parse_dag("{\"steps\":[{\"id\":\"n1\",\"goal\":\"x\"}]}").is_none());
+        // 빈 목록.
+        assert!(parse_dag("{\"nodes\":[]}").is_none());
+        // id·goal 이 비었거나 id 가 중복이면 실행 순서를 정의할 수 없다.
+        assert!(parse_dag("{\"nodes\":[{\"id\":\" \",\"goal\":\"x\"}]}").is_none());
+        assert!(parse_dag("{\"nodes\":[{\"id\":\"n1\",\"goal\":\"  \"}]}").is_none());
+        assert!(
+            parse_dag(
+                "{\"nodes\":[{\"id\":\"n1\",\"goal\":\"a\"},{\"id\":\"n1\",\"goal\":\"b\"}]}"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn topo_order_sorts_dependencies_and_detects_cycles() {
+        // n3 ← n2 ← n1 역순으로 적혀 있어도 위상순으로 되돌린다.
+        let nodes = dag(&[("n3", &["n2"]), ("n1", &[]), ("n2", &["n1"])]);
+        let order = topo_order(&nodes).expect("정렬");
+        let ids: Vec<&str> = order.iter().map(|i| nodes[*i].id.as_str()).collect();
+        assert_eq!(ids, vec!["n1", "n2", "n3"]);
+
+        // 병렬 가지도 전부 한 번씩 나온다 (순차 실행이므로 순서만 유효하면 된다).
+        let nodes = dag(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])]);
+        let order = topo_order(&nodes).expect("정렬");
+        assert_eq!(order.len(), 4);
+        let pos = |id: &str| {
+            order
+                .iter()
+                .position(|i| nodes[*i].id == id)
+                .expect("노드 위치")
+        };
+        assert!(pos("a") < pos("b") && pos("a") < pos("c"));
+        assert!(pos("b") < pos("d") && pos("c") < pos("d"));
+
+        // 같은 deps 가 두 번 적혀도 진입차수를 중복으로 세지 않는다.
+        let nodes = dag(&[("a", &[]), ("b", &["a", "a"])]);
+        assert_eq!(topo_order(&nodes).expect("중복 deps").len(), 2);
+
+        // 모르는 id 를 가리키는 deps 는 간선이 없다 (계획의 오타로 실행이 막히지 않게).
+        let nodes = dag(&[("a", &["없음"])]);
+        assert_eq!(topo_order(&nodes).expect("미상 deps"), vec![0]);
+
+        // 순환·자기참조는 폴백 사유로 보고한다.
+        let cycle = topo_order(&dag(&[("n1", &["n2"]), ("n2", &["n1"])])).expect_err("순환");
+        assert_eq!(cycle.remaining, vec!["n1".to_string(), "n2".to_string()]);
+        assert!(cycle.to_string().contains("순환"));
+        assert!(topo_order(&dag(&[("n1", &["n1"])])).is_err());
+    }
+
+    #[test]
+    fn graph_node_prompts_carry_only_dependency_conclusions() {
+        let nodes = dag(&[("n1", &[]), ("n2", &[]), ("n3", &["n1"])]);
+        let produced = vec![
+            ("n1".to_string(), "타입 3종을 정의했다".to_string()),
+            ("n2".to_string(), "무관한 노드 산출물".to_string()),
+        ];
+        let system = graph_node_system("메인 시스템", 3, 3, &nodes[2], &produced);
+        assert!(system.starts_with("메인 시스템"));
+        assert!(system.contains("[그래프 노드 3/3] 목표: n3 목표"));
+        assert!(system.contains("[선행 산출물 n1]\n타입 3종을 정의했다"));
+        // deps 에 없는 노드의 산출물은 넘기지 않는다 (컨텍스트 격리).
+        assert!(!system.contains("무관한 노드 산출물"));
+
+        let prompt = graph_node_prompt("전체 작업", &nodes[2]);
+        assert!(prompt.starts_with("전체 작업"));
+        assert!(prompt.contains("[이번 노드] n3 목표"));
+        assert!(prompt.contains("이 노드의 목표만 수행하라"));
+    }
+
+    #[test]
+    fn graph_node_success_rescues_completed_todo_limit() {
+        assert!(graph_node_ok("ok", 0, 0));
+        // 등록한 todo 를 모두 끝내고 반복 상한에 닿았으면 성공으로 구제한다.
+        assert!(graph_node_ok("limit", 3, 3));
+        assert!(!graph_node_ok("limit", 2, 3));
+        assert!(!graph_node_ok("limit", 0, 0));
+        assert!(!graph_node_ok("fail", 3, 3));
+        assert!(!graph_node_ok("incomplete", 1, 2));
+    }
+
+    #[test]
+    fn graph_node_summary_keeps_conclusion_and_changed_files() {
+        let mut outcome = AgentOutcome {
+            changed_files: vec!["src/a.rs".into()],
+            ..Default::default()
+        };
+        outcome
+            .messages
+            .push(Message::user_text("무시할 사용자 글"));
+        outcome.messages.push(Message {
+            role: crate::provider::Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "앞 노드 답변".into(),
+            }],
+        });
+        outcome.messages.push(Message {
+            role: crate::provider::Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "마".repeat(700),
+            }],
+        });
+        let s = graph_node_summary(&outcome);
+        // 마지막 답변만, 500자까지.
+        assert!(!s.contains("앞 노드 답변"));
+        assert!(!s.contains("무시할 사용자 글"));
+        assert_eq!(s.matches('마').count(), GRAPH_SUMMARY_CAP);
+        assert!(s.contains("변경 파일: src/a.rs"));
+
+        let empty = graph_node_summary(&AgentOutcome::default());
+        assert_eq!(empty, "(보고된 산출물 없음)");
+    }
+
+    #[test]
+    fn loop_discipline_prompts_are_wired_to_the_rule_and_the_switch() {
+        // 루프 규율은 종료 조건을, 정체 지시는 접근 전환을 못 박는다.
+        assert!(LOOP_DISCIPLINE_RULE.contains("완료를 선언하지 마라"));
+        assert!(LOOP_STALE_SWITCH.contains("진전이 없었다"));
+        assert!(LOOP_STALE_SWITCH.contains("같은 접근의 반복을 금지한다"));
+        // 그래프 계획은 [완료 기준] 절을 JSON 앞에 요구한다 (게이트 입력 보존).
+        assert!(PLAN_GRAPH_INSTRUCTION.contains("[완료 기준]"));
+        assert!(PLAN_GRAPH_INSTRUCTION.contains("\"nodes\""));
+        let sys = plan_system_prompt_with("메인", PLAN_GRAPH_INSTRUCTION, "계획 면");
+        assert!(sys.starts_with("메인"));
+        assert!(sys.contains(PLAN_MODE_HEADER));
+        assert!(sys.contains("[Self-Harness 계획 지침] 계획 면"));
     }
 
     #[test]

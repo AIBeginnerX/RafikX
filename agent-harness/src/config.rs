@@ -15,6 +15,8 @@ max_tokens = 32768                 # 응답 출력 상한 — 큰 단일 파일 
 max_context_chars = 200000
 approval = "ask"                   # ask | auto-safe | yolo
 classifier = "rules"               # rules | llm
+# engine = "rafikx"                # rafikx | claude | deepseek | qwen | kimi | pi (/engine 으로 변경)
+# discipline = "harness"           # harness | loop | graph (/discipline 으로 변경)
 
 [providers.anthropic]
 kind = "anthropic"
@@ -209,11 +211,14 @@ fallback = ["anthropic", "openai", "gemini", "opencode_zen", "opencode_go", "loc
 selection = "auto"             # auto | manual  (수동이면 아래 모델 ID)
 strategy = "single"            # single | multi  (한 모델 고정 | 역할별 자동 배치)
 # manual_design = ""           # 설계·구성 (advanced)
-# manual_verify = ""           # 검증
+# manual_verify = ""           # 검증 · 독립 검증자 게이트가 쓰는 모델
 # manual_debug = ""            # 디버깅 (dev)
 # manual_model = ""            # 전역 수동 모델 (provider:model)
+# strict_gate = true           # 독립 검증자 게이트 (claude/kimi 엔진 · dev|advanced 에서 동작)
 
 
+# 프로파일은 config 정의가 내장 프리셋을 이깁니다.
+# planner/frontend/backend/reviewer 는 내장 — [subagents.<이름>] 으로 덮어쓸 수 있습니다.
 [subagents.quick]
 provider = "local"
 model_role = "small"
@@ -256,9 +261,21 @@ enabled = true
 max_lessons = 500
 inject_limit_chars = 2000
 
-# Self-Harness 엔진(/engine self) — 하네스가 자기 실행 실패를 채굴해 스스로 개선 (arXiv:2606.09498)
+# 엔진 사양 오버라이드 — 내장 카탈로그의 문구·플래그를 코드 수정 없이 튜닝한다.
+# 적은 필드만 덮어쓰고 나머지는 내장값을 유지한다.
+# [engines.claude]
+# prompt_block = "우리 팀 규칙: 완료 전 반드시 cargo test 를 돌린다."
+# plan_depth = "contract"          # off | brief | contract
+# verify_policy = "strict"         # inherit | auto | strict
+# force_staged = true
+# max_continuations = 10
+
+# Self-Harness — 하네스가 자기 실행 실패를 채굴해 스스로 개선 (arXiv:2606.09498).
+# meta = true 면 엔진과 무관하게 모든 실행 위에 자기개선 루프를 겹칩니다 (/selfharness on|off).
+# enabled = false 면 meta 를 켜도 루프는 돌지 않습니다.
 [self_harness]
-enabled = true
+enabled = true             # 자기개선 루프 전체 스위치
+# meta = false             # 모든 엔진 위에 겹치기 (legacy engine = "self" 는 자동으로 on)
 proposal_threshold = 2     # 같은 실패 시그니처 누적 시 하네스 수정 제안
 trial_min_episodes = 3     # trial 판정에 필요한 최소 에피소드
 baseline_window = 20       # 기준선 성공률 계산 구간
@@ -295,6 +312,9 @@ pub struct ConfigFile {
     pub harness: HarnessConfig,
     pub subagents: HashMap<String, SubAgentConfig>,
     pub memory: MemoryConfig,
+    /// `[engines.<name>]` 엔진 사양 오버라이드 — 없으면 내장 카탈로그 그대로.
+    #[serde(default)]
+    pub engines: HashMap<String, crate::engine::EngineOverride>,
     /// 옛 설정에 없으면 기본값 (Self-Harness 루프 on, 임계 2/3/20/K=3).
     #[serde(default)]
     pub self_harness: SelfHarnessConfig,
@@ -318,10 +338,14 @@ pub struct GeneralConfig {
     /// 첫 실행 마법사를 이미 지났으면 true. 옛 설정에는 없음 → false.
     #[serde(default)]
     pub setup_done: bool,
-    /// 하네스 엔진: rafikx (기본) | deepseek (단계별 실행) | pi | self (Self-Harness
-    /// 자기개선 루프, arXiv:2606.09498). 옛 설정엔 없음 → rafikx.
+    /// 하네스 엔진: rafikx (기본) | claude | deepseek | qwen | kimi | pi.
+    /// 옛 값 `self`(Self-Harness 자기개선 루프, arXiv:2606.09498)와 `dk` 는
+    /// engine::normalize 가 흡수한다. 옛 설정엔 없음 → rafikx.
     #[serde(default)]
     pub engine: String,
+    /// 실행 분야: harness (기본) | loop | graph. Phase 3 에서 동작한다.
+    #[serde(default = "default_discipline")]
+    pub discipline: String,
     /// 마지막으로 성공/선택한 연결 — 재시작 후에도 같은 모델로 이어지게 하는 영속 선택.
     #[serde(default)]
     pub last_provider: String,
@@ -366,6 +390,10 @@ fn default_harness_strategy() -> String {
     "single".into()
 }
 
+fn default_discipline() -> String {
+    "harness".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct HarnessConfig {
     pub simple: String,
@@ -390,6 +418,10 @@ pub struct HarnessConfig {
     pub manual_debug: Option<String>,
     #[serde(default)]
     pub manual_model: Option<String>,
+    /// false 면 독립 검증자 게이트(VerifyPolicy::Strict)를 전역으로 끈다.
+    /// 옛 설정에 없으면 켜짐.
+    #[serde(default = "default_true")]
+    pub strict_gate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -407,6 +439,88 @@ pub struct SubAgentConfig {
     pub verify_command: String,
     #[serde(default)]
     pub system_extra: String,
+}
+
+/// 내장 전문가 프로파일 이름 — task 도구의 role 인자와 bind 폴백이 함께 쓴다.
+pub const BUILTIN_PROFILES: &[&str] = &["planner", "frontend", "backend", "reviewer"];
+
+/// 내장 전문가 프로파일 프리셋 (MetaGPT 산출물 계약: 역할 간 통신은 자유 대화가
+/// 아니라 구조화 산출물이다). config `[subagents.<name>]` 에 같은 이름이 있으면
+/// 사용자 정의가 이기고, 없을 때만 bind 가 이 프리셋으로 폴백한다.
+pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
+    let n = name.trim().to_ascii_lowercase();
+    let (tools, max_iterations, plan_first, verify, system_extra): (
+        &[&str],
+        u32,
+        bool,
+        bool,
+        &str,
+    ) = match n.as_str() {
+        "planner" => (
+            &[
+                "read_file",
+                "list_dir",
+                "grep",
+                "obsidian_search",
+                "todo_write",
+            ],
+            12,
+            false,
+            false,
+            "20년 경력 PM 겸 아키텍트다. 요구사항을 해석해 스펙·완료 기준·작업 분해를 산출한다. \
+                 코드를 작성하지 않는다(NEVER) — 구현은 다음 역할이 맡는다.\n\
+                 착수 전 기존 코드·파일 구조를 실제로 읽어 가정을 확인하고, 위험(호환성·회귀·엣지케이스)을 한 줄씩 짚는다.\n\
+                 출력은 반드시 아래 구조를 지킨다. 머리표는 대괄호 그대로 쓴다.\n\
+                 [해석] 요구사항 재진술 한 문단 + 모호한 점과 채택한 해석.\n\
+                 [완료 기준] 검증 가능한 체크리스트 3~10항목. 각 항목에 '어떻게 확인하는가(명령·파일·관찰 대상)'를 함께 적는다.\n\
+                 [작업 분해] 실행 순서 3~9단계. 각 단계는 한 줄 + 결과물 명시.",
+        ),
+        "frontend" => (
+            &["*"],
+            25,
+            true,
+            true,
+            "20년 경력 프론트엔드 전문가다. 접근성(키보드·대비·의미 태그), 반응형, 상태 관리, \
+                 성능(불필요한 렌더 방지)을 기본 품질로 삼는다.\n\
+                 기존 코드 스타일과 컴포넌트 관례를 따른다(MUST). 옆에 두 번째 관례를 만들지 않는다(NEVER).\n\
+                 작업을 마치면 [변경 요약] 머리표 아래에 바꾼 파일과 이유를 한 줄씩 남긴다 — 다음 역할은 이 요약만 받는다.",
+        ),
+        "backend" => (
+            &["*"],
+            25,
+            true,
+            true,
+            "20년 경력 백엔드 전문가다. 입력 검증, 오류 처리, 트랜잭션 경계, \
+                 보안(주입·권한·비밀값 노출)을 기본 품질로 삼는다.\n\
+                 기존 코드 스타일과 계층 구조를 따른다(MUST). 스키마·계약을 바꾸면 호출부를 모두 옮긴다.\n\
+                 작업을 마치면 [변경 요약] 머리표 아래에 바꾼 파일과 이유를 한 줄씩 남긴다 — 다음 역할은 이 요약만 받는다.",
+        ),
+        "reviewer" => (
+            &["read_file", "list_dir", "grep", "bash"],
+            6,
+            false,
+            false,
+            "20년 경력 수석 리뷰어다. 신선한 시각으로 산출물을 완료 기준과 대조하고 결함을 찾는다. \
+                 우선순위는 정확성 > 보안 > 성능이다.\n\
+                 주장하기 전에 도구로 실제 파일을 읽어 확인한다(MUST). 읽지 않은 파일에 대해 판단하지 않는다(NEVER).\n\
+                 코드를 수정하지 않는다(NEVER) — 판정과 근거만 낸다. 칭찬·요약·격려는 쓰지 않고 사실만 적는다.\n\
+                 출력은 반드시 아래 구조로만 낸다. 머리표는 대괄호 그대로 쓴다.\n\
+                 [판정] pass 또는 fail 한 단어.\n\
+                 [미충족 항목] 완료 기준 중 충족되지 않은 항목을 그대로 인용하고 왜 미충족인지 한 줄씩. 없으면 '없음'.\n\
+                 [결함] 파일:줄 — 문제 — 근거 형식으로 한 줄씩. 없으면 '없음'.",
+        ),
+        _ => return None,
+    };
+    Some(SubAgentConfig {
+        provider: "anthropic".into(),
+        model_role: "main".into(),
+        tools: tools.iter().map(|t| (*t).to_string()).collect(),
+        max_iterations,
+        plan_first,
+        verify,
+        verify_command: String::new(),
+        system_extra: system_extra.into(),
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -435,6 +549,9 @@ pub struct SelfHarnessConfig {
     /// 한 번에 생성하는 후보 수 (논문의 K).
     #[serde(default = "default_sh_width")]
     pub proposal_width: u32,
+    /// true 면 엔진과 무관하게 자기개선 루프를 겹친다 (메타 레이어). Phase 2 에서 동작한다.
+    #[serde(default)]
+    pub meta: bool,
 }
 
 fn default_sh_threshold() -> u32 {
@@ -461,6 +578,7 @@ impl Default for SelfHarnessConfig {
             trial_min_episodes: default_sh_trial_min(),
             baseline_window: default_sh_baseline(),
             proposal_width: default_sh_width(),
+            meta: false,
         }
     }
 }
@@ -852,6 +970,39 @@ mod tests {
         assert_eq!(file.harness.selection, "auto");
         assert!(!file.general.setup_done);
         assert!(file.obsidian.enabled);
+    }
+
+    #[test]
+    fn builtin_expert_profiles_cover_the_four_roles() {
+        for name in BUILTIN_PROFILES {
+            let sub = builtin_profile(name).unwrap_or_else(|| panic!("{name} 프리셋 없음"));
+            assert_eq!(sub.model_role, "main");
+            assert!(!sub.tools.is_empty());
+            assert!(sub.system_extra.contains("20년 경력"));
+        }
+        assert!(builtin_profile("PLANNER").is_some(), "대소문자 무시");
+        assert!(
+            builtin_profile("coder").is_none(),
+            "config 프로파일은 프리셋이 아니다"
+        );
+        assert!(builtin_profile("").is_none());
+    }
+
+    #[test]
+    fn old_config_without_strict_gate_defaults_on() {
+        // 키가 없는 옛 설정에서도 독립 검증자 게이트는 기본 켜짐 · 메타 레이어는 꺼짐.
+        let stripped = DEFAULT_CONFIG
+            .lines()
+            .filter(|l| !l.contains("strict_gate"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file: ConfigFile = toml::from_str(&stripped).expect("parse");
+        assert!(file.harness.strict_gate);
+        assert!(!file.self_harness.meta);
+
+        let raw = DEFAULT_CONFIG.replace("[harness]\n", "[harness]\nstrict_gate = false\n");
+        let file: ConfigFile = toml::from_str(&raw).expect("parse");
+        assert!(!file.harness.strict_gate);
     }
 
     #[test]

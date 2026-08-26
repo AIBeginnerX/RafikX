@@ -43,7 +43,14 @@ impl TaskTool {
         local_ask: Option<crate::agent::LocalAsk>,
     ) -> Result<String> {
         let task_class = Self::resolve_class(&prompt, class.as_deref());
-        let binding = crate::harness::bind(&cfg, task_class, None, model.as_deref())?;
+        // role 이 유효한 프로파일 이름(config 정의 또는 내장 전문가 프리셋)이면 그 프로파일로
+        // 바인딩한다. 아니면 예전처럼 화면 표시용 라벨로만 쓴다.
+        let profile = role
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| crate::harness::profile_exists(&cfg, r));
+        let binding =
+            crate::harness::bind_profile(&cfg, task_class, profile, None, model.as_deref())?;
         let nonce = crate::db::Db::new_id();
         let agent_id = AgentId::new(format!("agent-{nonce}"));
         let child_run_id = parent
@@ -182,7 +189,7 @@ impl Tool for TaskTool {
             "properties": {
                 "prompt": {"type": "string", "description": "위임할 작업 지시"},
                 "class": {"type": "string", "enum": ["simple", "medium", "advanced", "dev"], "description": "강제 분류. 생략 시 규칙 분류"},
-                "role": {"type": "string", "description": "화면에 표시할 짧은 역할 이름"},
+                "role": {"type": "string", "description": "전문가 역할. planner(스펙·완료기준·작업분해) | frontend | backend | reviewer(DoD 대조 리뷰) 중 하나면 해당 전문가 프로파일(도구·품질 기준)로 실행된다. 그 밖의 값은 화면 표시용 라벨"},
                 "model": {"type": "string", "description": "등록된 모델 ID. 생략하면 하네스가 능력과 비용에 따라 선택"}
             },
             "required": ["prompt"]

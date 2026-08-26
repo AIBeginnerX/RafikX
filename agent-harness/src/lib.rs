@@ -8,6 +8,7 @@ pub mod chat;
 pub mod config;
 pub mod context;
 pub mod db;
+pub mod engine;
 pub mod graph;
 pub mod harness;
 pub mod inspector;

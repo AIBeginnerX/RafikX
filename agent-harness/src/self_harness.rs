@@ -55,6 +55,7 @@ pub const SURFACES: &[&str] = &[
     "execution_instruction",
     "verification_instruction",
     "failure_recovery_instruction",
+    "plan_instruction",
     "runtime_policy",
 ];
 
@@ -68,6 +69,14 @@ pub struct Surfaces {
     pub execution_instruction: String,
     pub verification_instruction: String,
     pub failure_recovery_instruction: String,
+    /// 계획 호출 전용 면 — decorate_system 이 아니라 계획 프롬프트에만 주입된다.
+    /// 옛 self_harness.json(v2)에는 없으므로 serde default 로 채운다.
+    #[serde(default = "default_plan_instruction")]
+    pub plan_instruction: String,
+}
+
+fn default_plan_instruction() -> String {
+    "계획을 세울 때 완료 기준을 검증 가능한 형태로 명시한다.".into()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -126,6 +135,7 @@ impl Default for SelfHarnessState {
                 execution_instruction: "일반적인 조언 대신 구체적인 저장소 변경을 우선하고, 수정 범위를 작업에 필요한 최소로 유지한다.".into(),
                 verification_instruction: "결론을 내리기 전에 실행 가능한 가장 표적화된 명령·파일 확인·테스트로 결과를 검증한다.".into(),
                 failure_recovery_instruction: "도구 호출이 실패하면 오류를 살펴 접근을 바꾼다. 같은 행동을 그대로 재시도하지 않는다.".into(),
+                plan_instruction: default_plan_instruction(),
             },
             runtime_policy: RuntimePolicy::default(),
             trial: None,
@@ -172,6 +182,7 @@ impl SelfHarnessState {
             "execution_instruction" => self.surfaces.execution_instruction.clone(),
             "verification_instruction" => self.surfaces.verification_instruction.clone(),
             "failure_recovery_instruction" => self.surfaces.failure_recovery_instruction.clone(),
+            "plan_instruction" => self.surfaces.plan_instruction.clone(),
             "runtime_policy" => serde_json::to_string(&self.runtime_policy).unwrap_or_default(),
             _ => String::new(),
         }
@@ -187,6 +198,7 @@ impl SelfHarnessState {
             "failure_recovery_instruction" => {
                 self.surfaces.failure_recovery_instruction = value.to_string()
             }
+            "plan_instruction" => self.surfaces.plan_instruction = value.to_string(),
             "runtime_policy" => {
                 self.runtime_policy = serde_json::from_str(value)
                     .map_err(|e| anyhow!("runtime_policy JSON 이 아닙니다: {e}"))?;
@@ -235,6 +247,16 @@ impl SelfHarnessState {
         }
     }
 
+    /// 계획 호출 전용 지침 (trial 포함 유효값). decorate_system 에는 들어가지 않는다 —
+    /// 계획 프롬프트에서만 `[Self-Harness 계획 지침]` 으로 붙는다.
+    pub fn plan_instruction(&self) -> String {
+        self.effective()
+            .surfaces
+            .plan_instruction
+            .trim()
+            .to_string()
+    }
+
     /// runtime_policy 의 반복 상한 재정의 (trial 포함 유효값).
     pub fn effective_iter_cap(&self) -> Option<u32> {
         let eff = self.effective();
@@ -275,10 +297,26 @@ impl SelfHarnessState {
 // Weakness Mining — verifier-grounded 실패 시그니처
 // ---------------------------------------------------------------------------
 
+/// 독립 검증자 게이트 미통과 — status 는 ok 로 남고 사유만 error 에 실린다(설계 §5).
+/// 상태가 아니라 error 접두로 판정하는 이유: 게이트는 산출물을 되돌리지 않고
+/// "완료 기준 미충족"만 기록하기 때문이다.
+fn gate_failed(outcome: &AgentOutcome) -> bool {
+    outcome
+        .error
+        .as_deref()
+        .is_some_and(|e| e.starts_with(GATE_FAIL_PREFIX))
+}
+
+/// harness::run_review_gate 가 outcome.error 에 남기는 접두어.
+const GATE_FAIL_PREFIX: &str = "검증자 미통과";
+
 /// c: 터미널 verifier-레벨 원인. AgentOutcome 에서 결정적으로 추출한다.
 fn terminal_cause(outcome: &AgentOutcome) -> Option<&'static str> {
     if outcome.verify_fail.is_some() {
         return Some("verify_fail");
+    }
+    if gate_failed(outcome) {
+        return Some("gate_fail");
     }
     match outcome.status.as_str() {
         "limit" => {
@@ -295,7 +333,7 @@ fn terminal_cause(outcome: &AgentOutcome) -> Option<&'static str> {
 }
 
 fn is_success(outcome: &AgentOutcome) -> bool {
-    outcome.status == "ok" && outcome.verify_fail.is_none()
+    outcome.status == "ok" && outcome.verify_fail.is_none() && !gate_failed(outcome)
 }
 
 /// 트레이스 요약 — 도구 호출 시퀀스와 오류를 (q, m) 추론 입력으로 압축한다.
@@ -537,13 +575,18 @@ async fn propose_candidates(
 static OBSERVE_TASKS: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
     std::sync::Mutex::new(Vec::new());
 
-/// run_pipeline 종료 시 호출. engine=self 가 아니면 아무것도 하지 않는다.
+/// 자기개선 메타 레이어가 켜져 있는가 — legacy `engine = "self"` 또는
+/// `[self_harness] meta = true`. run_pipeline_inner 의 게이트와 같은 조건이라
+/// 관찰(observe)이 메타 레이어에서 빠지지 않는다.
+pub fn meta_active(cfg: &Config) -> bool {
+    let (_, legacy_self) = crate::engine::normalize(&cfg.file.general.engine);
+    cfg.file.self_harness.enabled && (legacy_self || cfg.file.self_harness.meta)
+}
+
+/// run_pipeline 종료 시 호출. 메타 레이어가 꺼져 있으면 아무것도 하지 않는다.
 /// 메인 흐름을 막지 않도록 백그라운드로 돈다 (lessons::maybe_spawn 과 동일 패턴).
 pub fn maybe_observe(cfg: &Config, task: &str, outcome: &AgentOutcome) {
-    if cfg.file.general.engine.to_ascii_lowercase() != "self" {
-        return;
-    }
-    if !cfg.file.self_harness.enabled {
+    if !meta_active(cfg) {
         return;
     }
     // denied 는 사용자 판단이지 하네스 실패가 아니다 — 논문의 addressability
@@ -955,6 +998,27 @@ mod tests {
     }
 
     #[test]
+    fn review_gate_failure_is_mined_as_gate_fail_and_not_a_success() {
+        // 게이트 미통과는 status 를 ok 로 남기고 error 에만 사유를 적는다 —
+        // status 만 보면 성공으로 오집계되므로 error 접두로 판정한다.
+        let gated = failed_outcome("ok", Some("검증자 미통과: [미충족 항목] 3번 미구현"));
+        assert_eq!(terminal_cause(&gated), Some("gate_fail"));
+        assert!(!is_success(&gated));
+
+        // 일반 성공·다른 사유의 error 는 영향을 받지 않는다.
+        assert!(is_success(&failed_outcome("ok", None)));
+        let other = failed_outcome("ok", Some("검증 생략: 빌드 없음"));
+        assert_eq!(terminal_cause(&other), None);
+        assert!(is_success(&other));
+
+        // 검증 명령 실패가 함께 있으면 verify_fail 이 우선한다 (더 구체적인 원인).
+        let mut both = failed_outcome("ok", Some("검증자 미통과: 회귀"));
+        both.verify_fail = Some("cargo test 실패".into());
+        assert_eq!(terminal_cause(&both), Some("verify_fail"));
+        assert!(!is_success(&both));
+    }
+
+    #[test]
     fn state_roundtrip_and_surface_edit() {
         let mut s = SelfHarnessState::default();
         assert_eq!(s.version, 0);
@@ -973,6 +1037,50 @@ mod tests {
         let back: SelfHarnessState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.surfaces.verification_instruction, "새 검증 규칙");
         assert!(back.runtime_policy.enabled);
+    }
+
+    #[test]
+    fn plan_instruction_surface_loads_from_v2_files_and_stays_out_of_system() {
+        // 기존 self_harness.json(v2)에는 plan_instruction 이 없다 — serde default 로 채워야 한다.
+        let v2 = r#"{
+            "version": 2,
+            "surfaces": {
+                "bootstrap_instruction": "b",
+                "execution_instruction": "e",
+                "verification_instruction": "v",
+                "failure_recovery_instruction": "f"
+            },
+            "runtime_policy": {"enabled": false},
+            "trial": null,
+            "lineage": []
+        }"#;
+        let mut s: SelfHarnessState = serde_json::from_str(v2).expect("v2 파일 로드");
+        assert_eq!(s.version, 2);
+        assert_eq!(s.surfaces.plan_instruction, default_plan_instruction());
+        assert!(s.plan_instruction().contains("완료 기준"));
+
+        // 계획 전용 면이므로 시스템 프롬프트 장식에는 들어가지 않는다.
+        let mut sys = String::from("base");
+        s.decorate_system(&mut sys);
+        assert!(!sys.contains(&s.surfaces.plan_instruction));
+
+        // 자기개선 루프의 편집 대상이다 (SURFACES 등록 + set/get 왕복).
+        assert!(SURFACES.contains(&"plan_instruction"));
+        s.set_surface("plan_instruction", "계획에 위험을 한 줄씩 적는다")
+            .unwrap();
+        assert_eq!(
+            s.surface_value("plan_instruction"),
+            "계획에 위험을 한 줄씩 적는다"
+        );
+        // trial 겹침도 계획 면에 적용된다.
+        s.trial = Some(TrialEdit {
+            candidate_id: 7,
+            surface: "plan_instruction".into(),
+            new_value: "trial 계획 지시".into(),
+            target_signature: "todo_incomplete|direct|other".into(),
+            started_at: 0,
+        });
+        assert_eq!(s.plan_instruction(), "trial 계획 지시");
     }
 
     #[test]

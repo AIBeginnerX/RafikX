@@ -132,9 +132,17 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "모델 선택"),
     (
         "/engine",
-        "하네스 엔진 rafikx|deepseek|pi|self · provider mode single|multi",
+        "하네스 엔진 rafikx|claude|deepseek|qwen|kimi|pi · provider mode single|multi",
+    ),
+    (
+        "/discipline",
+        "실행 분야 harness|loop|graph — 루프 강화 · 노드 DAG 실행",
     ),
     ("/harness", "Harness strategy single|multi"),
+    (
+        "/selfharness",
+        "Self-Harness 메타 레이어 on|off — 모든 엔진 위 자기개선 루프",
+    ),
     ("/mode", "plan(읽기전용)/build 전환"),
     ("/yolo", "권한무시 on|off — 도구 자동 승인 (영속)"),
     ("/class", "분류 고정 simple|medium|advanced|dev"),
@@ -414,9 +422,10 @@ pub enum Slash {
     AssignRoles,
 }
 
-/// /engine 에서 선택 가능한 엔진인지 판정한다.
+/// /engine 에서 선택 가능한 엔진인지 판정한다 — 카탈로그 6종 + legacy `self`.
+/// 제거된 값(`dk` 등)은 여기서 거부하고 engine::normalize 만 흡수한다.
 pub fn is_valid_engine(e: &str) -> bool {
-    matches!(e, "rafikx" | "deepseek" | "pi" | "self")
+    crate::engine::is_selectable(e)
 }
 
 pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Result<Slash> {
@@ -455,7 +464,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
         }
         "/engine" => {
             let arg = rest.trim().to_ascii_lowercase();
-            const ENGINES: &str = "rafikx|deepseek|pi|self";
+            let engines = crate::engine::names_joined();
             // provider 모드 서브커맨드 — 하네스 선택 뒤의 두 번째 단계.
             if arg == "multi" {
                 return Ok(Slash::AssignRoles);
@@ -467,8 +476,20 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 let cur = session.cfg.file.general.engine.clone();
                 let strategy = session.cfg.file.harness.strategy.clone();
                 let mut notes = vec![format!(
-                    "현재 하네스 엔진: {cur} · provider mode: {strategy}   ·   변경: /engine {ENGINES}"
+                    "현재 하네스 엔진: {cur} · provider mode: {strategy}   ·   변경: /engine {engines}"
                 )];
+                for spec in crate::engine::catalog() {
+                    notes.push(format!("  {:<9} {}", spec.name, spec.summary));
+                }
+                notes.push("  self      (legacy) rafikx + Self-Harness 자기개선 루프".into());
+                notes.push(format!(
+                    "self 메타: {}   ·   변경: /selfharness on|off",
+                    if session.cfg.file.self_harness.meta {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ));
                 if cur.eq_ignore_ascii_case("self") {
                     notes.extend(crate::self_harness::status_lines(&db));
                 }
@@ -479,9 +500,11 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 Ok(Slash::Continue(notes))
             } else if is_valid_engine(&arg) {
                 let label = match arg.as_str() {
-                    "pi" => "pi-harness (oh-my-pi 스타일)".into(),
                     "self" => "self-harness (자기개선 루프 · arXiv:2606.09498)".into(),
-                    other => other.to_string(),
+                    other => match crate::engine::resolve(other) {
+                        Some(spec) => format!("{} — {}", spec.name, spec.summary),
+                        None => other.to_string(),
+                    },
                 };
                 session.cfg.file.general.engine = arg.clone();
                 match crate::api::set_engine_for(&session.cfg, &arg) {
@@ -523,8 +546,85 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 }
             } else {
                 Ok(Slash::Continue(vec![format!(
-                    "/engine {ENGINES} 중에서 고르거나, /engine single|multi 로 provider mode 를 정하세요."
+                    "/engine {engines}|self 중에서 고르거나, /engine single|multi 로 provider mode 를 정하세요."
                 )]))
+            }
+        }
+        "/discipline" => {
+            // 실행 분야 — 엔진(품질 장치)과 직교하는 축. 제어 전략만 바꾼다.
+            let arg = rest.trim().to_ascii_lowercase();
+            let names = crate::engine::discipline_names_joined();
+            if arg.is_empty() {
+                let cur = crate::engine::normalize_discipline(&session.cfg.file.general.discipline);
+                let mut notes = vec![format!(
+                    "현재 실행 분야: {}   ·   변경: /discipline {names}",
+                    cur.as_str()
+                )];
+                for d in crate::engine::DISCIPLINES {
+                    notes.push(format!("  {:<8} {}", d.as_str(), d.summary()));
+                }
+                return Ok(Slash::Continue(notes));
+            }
+            match crate::api::set_discipline_for(&session.cfg, &arg) {
+                Ok(msg) => {
+                    session.cfg.file.general.discipline = arg;
+                    Ok(Slash::Continue(vec![msg]))
+                }
+                Err(err) => Ok(Slash::Continue(vec![format!("{err}")])),
+            }
+        }
+        "/selfharness" => {
+            // Self-Harness 메타 레이어 — 엔진과 무관하게 자기개선 루프를 겹친다.
+            let arg = rest.trim().to_ascii_lowercase();
+            let legacy = session
+                .cfg
+                .file
+                .general
+                .engine
+                .trim()
+                .eq_ignore_ascii_case("self");
+            if arg.is_empty() {
+                let state = crate::self_harness::SelfHarnessState::load();
+                let mut notes = vec![format!(
+                    "Self-Harness 메타: {} · legacy engine=self: {} · 하네스 v{}   ·   변경: /selfharness on|off",
+                    if session.cfg.file.self_harness.meta {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    if legacy { "예" } else { "아니오" },
+                    state.version
+                )];
+                if !session.cfg.file.self_harness.enabled {
+                    notes.push(
+                        "[self_harness] enabled = false 이므로 메타를 켜도 루프는 돌지 않습니다."
+                            .into(),
+                    );
+                }
+                notes.extend(crate::self_harness::status_lines(&db));
+                return Ok(Slash::Continue(notes));
+            }
+            let on = match arg.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Ok(Slash::Continue(vec!["/selfharness on|off".into()])),
+            };
+            session.cfg.file.self_harness.meta = on;
+            match crate::api::set_self_meta_for(&session.cfg, on) {
+                Ok(msg) => {
+                    let mut notes = vec![msg];
+                    if on && !session.cfg.file.self_harness.enabled {
+                        notes.push(
+                            "[self_harness] enabled = false 이므로 루프는 아직 돌지 않습니다."
+                                .into(),
+                        );
+                    }
+                    if on {
+                        notes.extend(crate::self_harness::status_lines(&db));
+                    }
+                    Ok(Slash::Continue(notes))
+                }
+                Err(err) => Ok(Slash::Continue(vec![format!("저장 실패: {err}")])),
             }
         }
         "/harness" => {
@@ -1326,7 +1426,7 @@ pub async fn run_turn_observed(
             .tools
             .retain(|t| crate::tools::ToolRegistry::READ_ONLY.contains(&t.as_str()));
     }
-    print_binding(&binding);
+    print_binding(&session.cfg, &binding);
     if plan {
         crate::ui::live_line("[모드] plan — 읽기 전용");
     }
@@ -1714,6 +1814,152 @@ mod tests {
     }
 
     #[test]
+    fn selfharness_slash_toggles_meta_and_persists() {
+        let dir = std::env::temp_dir().join(format!("rafikx-shmeta-{}", Db::new_id()));
+        let config_path = dir.join("config.toml");
+        let cfg = Config::load(Some(&config_path)).expect("config");
+        // 새 config 기본값은 off.
+        assert!(!cfg.file.self_harness.meta);
+        let mut s = Session {
+            cfg,
+            yes: true,
+            provider: None,
+            model: None,
+            class: None,
+            mode: "build".into(),
+            session_id: None,
+            messages: vec![],
+            last_context_tokens: 0,
+            obsidian_on: false,
+            attachments: vec![],
+            dirty: false,
+            sticky: None,
+        };
+
+        // 인자 없음 — 현재 상태를 보여주고 아무것도 바꾸지 않는다.
+        let out = handle_slash(&mut s, "/selfharness", false).expect("ok");
+        match out {
+            Slash::Continue(notes) => {
+                assert!(notes.iter().any(|n| n.contains("Self-Harness 메타: off")));
+                assert!(notes.iter().any(|n| n.contains("legacy engine=self")));
+            }
+            _ => panic!("expected Continue"),
+        }
+        assert!(!s.cfg.file.self_harness.meta);
+
+        // on — 세션과 config 양쪽에 반영된다 ([self_harness] 섹션 생성 포함).
+        handle_slash(&mut s, "/selfharness on", false).expect("ok");
+        assert!(s.cfg.file.self_harness.meta);
+        assert!(
+            Config::load(Some(&config_path))
+                .expect("reload meta on")
+                .file
+                .self_harness
+                .meta
+        );
+
+        // off — 되돌린다.
+        handle_slash(&mut s, "/selfharness off", false).expect("ok");
+        assert!(!s.cfg.file.self_harness.meta);
+        assert!(
+            !Config::load(Some(&config_path))
+                .expect("reload meta off")
+                .file
+                .self_harness
+                .meta
+        );
+
+        // 잘못된 인자는 사용법만 안내한다.
+        match handle_slash(&mut s, "/selfharness maybe", false).expect("ok") {
+            Slash::Continue(notes) => {
+                assert!(notes.iter().any(|n| n.contains("/selfharness on|off")))
+            }
+            _ => panic!("expected Continue"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discipline_slash_switches_and_persists() {
+        let dir = std::env::temp_dir().join(format!("rafikx-discipline-{}", Db::new_id()));
+        let config_path = dir.join("config.toml");
+        let cfg = Config::load(Some(&config_path)).expect("config");
+        // 새 config 기본값은 harness.
+        assert_eq!(
+            crate::engine::normalize_discipline(&cfg.file.general.discipline),
+            crate::engine::Discipline::Harness
+        );
+        let mut s = Session {
+            cfg,
+            yes: true,
+            provider: None,
+            model: None,
+            class: None,
+            mode: "build".into(),
+            session_id: None,
+            messages: vec![],
+            last_context_tokens: 0,
+            obsidian_on: false,
+            attachments: vec![],
+            dirty: false,
+            sticky: None,
+        };
+
+        // 인자 없음 — 현재 값과 3종 설명만 보여주고 아무것도 바꾸지 않는다.
+        match handle_slash(&mut s, "/discipline", false).expect("ok") {
+            Slash::Continue(notes) => {
+                assert!(notes.iter().any(|n| n.contains("현재 실행 분야: harness")));
+                for name in ["harness", "loop", "graph"] {
+                    assert!(
+                        notes.iter().any(|n| n.trim_start().starts_with(name)),
+                        "{name} 설명 없음"
+                    );
+                }
+            }
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(s.cfg.file.general.discipline, "harness");
+
+        // 값 지정 — 세션과 config 양쪽에 반영된다.
+        handle_slash(&mut s, "/discipline graph", false).expect("ok");
+        assert_eq!(s.cfg.file.general.discipline, "graph");
+        assert_eq!(
+            Config::load(Some(&config_path))
+                .expect("reload graph")
+                .file
+                .general
+                .discipline,
+            "graph"
+        );
+
+        handle_slash(&mut s, "/discipline LOOP", false).expect("ok");
+        assert_eq!(s.cfg.file.general.discipline, "loop");
+        assert_eq!(
+            Config::load(Some(&config_path))
+                .expect("reload loop")
+                .file
+                .general
+                .discipline,
+            "loop"
+        );
+
+        // 미지원 값은 저장하지 않고 사용법만 안내한다.
+        match handle_slash(&mut s, "/discipline dag", false).expect("ok") {
+            Slash::Continue(notes) => {
+                assert!(notes.iter().any(|n| n.contains("harness|loop|graph")))
+            }
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(s.cfg.file.general.discipline, "loop");
+
+        // 팔레트에 등록되어 있어야 TUI 자동완성에 뜬다.
+        assert!(SLASH_COMMANDS.iter().any(|(c, _)| *c == "/discipline"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn engine_slash_end_to_end() {
         let dir = std::env::temp_dir().join(format!("rafikx-engine-{}", Db::new_id()));
         let config_path = dir.join("config.toml");
@@ -1771,11 +2017,15 @@ mod tests {
             "self"
         );
 
-        // 미지원 값 — 거부 안내를 반환한다.
+        // 미지원 값 — 카탈로그 목록을 담은 거부 안내를 반환한다.
         let out = handle_slash(&mut s, "/engine nope", false).expect("ok");
         match out {
             Slash::Continue(notes) => {
-                assert!(notes.iter().any(|n| n.contains("rafikx|deepseek|pi|self")));
+                assert!(
+                    notes
+                        .iter()
+                        .any(|n| n.contains(&format!("{}|self", crate::engine::names_joined())))
+                );
             }
             _ => panic!("expected Continue"),
         }
@@ -1797,7 +2047,10 @@ mod tests {
     #[test]
     fn engine_slash_accepts_known_engines_only() {
         assert!(is_valid_engine("rafikx"));
+        assert!(is_valid_engine("claude"));
         assert!(is_valid_engine("deepseek"));
+        assert!(is_valid_engine("qwen"));
+        assert!(is_valid_engine("kimi"));
         assert!(is_valid_engine("pi"));
         assert!(is_valid_engine("self"));
         // 오타·미지원·제거된 값은 거부해야 한다.

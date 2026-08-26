@@ -494,6 +494,24 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     }
 
     ui::section("하네스");
+    let (engine_name, _) = rafikx::engine::normalize(&cfg.file.general.engine);
+    let engine_spec = rafikx::engine::resolve_with(&cfg.file.engines, &engine_name);
+    let discipline = rafikx::engine::normalize_discipline(&cfg.file.general.discipline);
+    println!("  엔진: {engine_name} ({})", engine_spec.summary);
+    println!(
+        "  분야: {}  ·  self 메타: {}  ·  독립 검증자 게이트: {}",
+        discipline.as_str(),
+        if rafikx::self_harness::meta_active(&cfg) {
+            "on"
+        } else {
+            "off"
+        },
+        if cfg.file.harness.strict_gate {
+            "on (strict 엔진에서)"
+        } else {
+            "off"
+        }
+    );
     println!(
         "  선정 모드: {}",
         if cfg.file.harness.selection.eq_ignore_ascii_case("manual") {
@@ -767,7 +785,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
     };
     let class = classify(&cfg, prompt, obsidian, forced).await?;
     let binding = bind(&cfg, class, cli.provider.as_deref(), cli.model.as_deref())?;
-    print_binding(&binding);
+    print_binding(&cfg, &binding);
 
     let mut task = prompt.to_string();
     if obsidian {
