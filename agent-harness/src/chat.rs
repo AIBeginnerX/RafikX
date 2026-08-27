@@ -1415,6 +1415,22 @@ pub async fn compact_session(session: &mut Session) -> Result<usize> {
 // 턴 실행
 // ---------------------------------------------------------------------------
 
+/// 다른 세션·에디터가 config.toml 을 바꿨으면 이 세션에도 즉시 반영한다.
+/// 설정형 슬래시(/team 등)는 메모리를 직접 갱신하지만, 병렬로 띄운 다른 rafikx
+/// 인스턴스의 변경은 파일로만 오므로 턴 시작마다 mtime 을 비교해 다시 읽는다.
+pub fn reload_cfg_if_changed(session: &mut Session) {
+    let Ok(meta) = std::fs::metadata(&session.cfg.path) else {
+        return;
+    };
+    let Ok(mtime) = meta.modified() else { return };
+    if session.cfg.loaded_at.is_some_and(|t| mtime <= t) {
+        return;
+    }
+    if let Ok(fresh) = crate::config::Config::load(Some(&session.cfg.path.clone())) {
+        session.cfg = fresh;
+    }
+}
+
 pub async fn run_turn(
     session: &mut Session,
     prompt: &str,
@@ -1439,6 +1455,7 @@ pub async fn run_turn_observed(
     let mut obsidian_tokens = 0u32;
     let mut auto_compacted = false;
     crate::spinner::set_label("질문 확인 중…");
+    reload_cfg_if_changed(session);
     let class = classify(&session.cfg, prompt, obsidian_on, forced_class).await?;
     // 연속성: 사용자가 직접 고르지 않았으면 마지막 성공 조합(provider, model)을 재사용해
     // 매 턴마다 다른 모델이 추첨되어 인증·리밋 오류가 나는 일을 막는다.
@@ -2235,6 +2252,7 @@ mod tests {
             data_dir: cfg_path.data_dir.clone(),
             workspace: dir.clone(),
             file,
+            loaded_at: None,
         };
 
         let out = expand_mentions(&cfg, "@src/lib.rs 요약해줘 me@example.com 은 유지");

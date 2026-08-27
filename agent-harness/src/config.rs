@@ -669,6 +669,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub workspace: PathBuf,
     pub file: ConfigFile,
+    /// 로드 시점의 config.toml mtime — 다른 세션의 변경을 턴 시작마다 감지하는 기준.
+    pub loaded_at: Option<std::time::SystemTime>,
 }
 
 impl Config {
@@ -714,10 +716,12 @@ impl Config {
             .with_context(|| format!("{} 형식이 올바르지 않습니다", path.display()))?;
         let workspace = expand_tilde(&file.general.workspace);
 
+        let loaded_at = fs::metadata(&path).and_then(|m| m.modified()).ok();
         Ok(Self {
             path,
             data_dir,
             workspace,
+            loaded_at,
             file,
         })
     }

@@ -874,6 +874,12 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
                     push(app, EntryKind::System, n);
                 }
                 app.binding = binding_label(&app.session);
+                // 설정형 슬래시(/team·/engine·/discipline·/selfharness)가 세션 설정을
+                // 바꿨을 수 있다 — working 패널의 mode 줄이 떠 있으면 즉시 재계산해
+                // "바꿨는데 화면은 그대로"라는 스냅샷 혼란을 없앤다.
+                if !app.mode_line.is_empty() {
+                    app.mode_line = crate::harness::mode_line(&app.session.cfg);
+                }
             }
             Ok(Slash::New(notes)) => {
                 reset_screen_for_new_session(app);
