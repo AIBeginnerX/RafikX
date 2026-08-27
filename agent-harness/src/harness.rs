@@ -1490,8 +1490,15 @@ pub fn engine_suffix(cfg: &Config) -> String {
 /// working 패널 마지막 줄에 상시 표시하는 실행 축 요약 (§16.2).
 /// 기본값도 생략하지 않는다 — "지금 무엇으로 도는가"를 매 턴 한 줄로 못 박는 자리다.
 pub fn mode_line(cfg: &Config) -> String {
-    let (engine, _) = crate::engine::normalize(&cfg.file.general.engine);
+    let (engine, legacy_self) = crate::engine::normalize(&cfg.file.general.engine);
     let spec = crate::engine::resolve_with(&cfg.file.engines, &engine);
+    // legacy `engine = "self"` 는 rafikx+self 메타로 실행된다 — 설정 원값을 함께
+    // 보여줘야 사용자가 "내가 고른 self 가 왜 rafikx 로 보이나" 혼란이 없다.
+    let engine = if legacy_self {
+        format!("self(={engine}+self)")
+    } else {
+        engine
+    };
     let pin = if spec.pin().is_some() { "(고정)" } else { "" };
     let self_layer = if crate::self_harness::meta_active(cfg) {
         format!(
@@ -1987,9 +1994,13 @@ async fn run_pipeline_inner(
     let mut system = system_prompt(cfg, &binding.system_extra, &lessons_block);
     crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
     system.push_str(&format!(
-        "\n\n[현재 실행 정보]\nProvider: {}\nModel: {}\nContext window: {} tokens\n\
-         사용자가 현재 provider, model, context window를 물으면 이 값을 그대로 답한다.",
-        binding.provider_name, binding.model, binding.context_window
+        "\n\n[현재 실행 정보]\nProvider: {}\nModel: {}\nContext window: {} tokens\nHarness: {}\n\
+         사용자가 현재 provider·model·context window·엔진·팀 모드·분야 등 하네스 설정을 물으면 \
+         도구를 쓰지 말고 이 값을 그대로 답한다.",
+        binding.provider_name,
+        binding.model,
+        binding.context_window,
+        mode_line(cfg)
     ));
 
     // 난이도 기반 단계별 실행 (dsh ctx.goals 영향 수용):
@@ -2275,6 +2286,38 @@ async fn run_pipeline_inner(
             role: crate::provider::Role::Assistant,
             content: resp.content.clone(),
         });
+        // 도구 없는 프로파일의 응답에 tool-call 문법이 텍스트로 새어 있으면 —
+        // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이다. 오염 응답을 걷어내고
+        // coder 로 1회 승격해 다시 실행한다. (아래 본 경로의 승격과 같은 규칙 —
+        // 이 조기 반환 경로는 그 검사에 도달하지 못해 v1.0 부터 누출이 그대로
+        // 화면에 노출됐다: 2026-08-27 실측.)
+        if leaked_tool_call(&agent::assistant_text(&messages)) {
+            crate::ui::live_line_in(
+                &run_context,
+                "도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.",
+            );
+            if let Ok(dev) = bind(cfg, TaskClass::Dev, cli_provider, None)
+                && !dev.tools.is_empty()
+            {
+                let mut clean = messages.clone();
+                while matches!(clean.last(), Some(m) if m.role == crate::provider::Role::Assistant)
+                {
+                    clean.pop();
+                }
+                return Box::pin(run_pipeline_inner(
+                    cfg,
+                    &dev,
+                    task,
+                    yes,
+                    cli_provider,
+                    Some(clean),
+                    remote,
+                    local_ask,
+                    run_context.clone(),
+                ))
+                .await;
+            }
+        }
         let _ =
             run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted);
         let hit_token_limit = resp.stop_reason == StopReason::MaxTokens;
