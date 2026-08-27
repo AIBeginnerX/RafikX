@@ -26,12 +26,58 @@ struct GhRelease {
     html_url: String,
 }
 
+/// REPO_API 에서 저장소 소유자(계정명)를 추출한다.
+pub(super) fn repo_owner() -> Option<&'static str> {
+    REPO_API.split("/repos/").nth(1)?.split('/').next()
+}
+
+/// 저장소 소유자 계정의 PAT 를 gh 에서 직접 얻는다.
+/// 다른(활성) 계정으로 로그인돼 있어도 비공개 소유자 저장소 조회가 가능하도록 한다.
+pub(super) fn owner_token() -> Option<String> {
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token", "--user", repo_owner()?])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// git 하위명령에 소유자 자격 인라인 credential helper 를 건다.
+/// 기존 helper(osxkeychain/gh 등)를 끄고 env 의 토큰만 쓴다.
+/// 토큰은 argv 가 아니라 env 로만 흘러 프로세스 목록에 노출되지 않는다.
+fn apply_git_credentials(cmd: &mut std::process::Command) {
+    let Some(token) = owner_token() else {
+        return;
+    };
+    cmd.args([
+        "-c",
+        "credential.helper=",
+        "-c",
+        r#"credential.helper=!f(){ printf 'protocol=https\nhost=github.com\nusername=%s\npassword=%s\n\n' "$GIT_UPD_USER" "$GIT_UPD_TOKEN"; };f"#,
+    ]);
+    cmd.env(GIT_UPD_USER_ENV, repo_owner().unwrap_or_default());
+    cmd.env(GIT_UPD_TOKEN_ENV, token);
+}
+
+/// git 프로세스에 주입할 자격증명 환경변수 이름. install 쪽 스크립트와 공유한다.
+pub(super) const GIT_UPD_USER_ENV: &str = "GIT_UPD_USER";
+pub(super) const GIT_UPD_TOKEN_ENV: &str = "GIT_UPD_TOKEN";
+
 /// 최신 릴리스를 조회한다 (동기).
-/// 비공개 저장소 대응: 먼저 gh CLI 로 releases/latest 를 시도하고,
-/// 없으면 git 자격증명으로 `git ls-remote --tags` 에서 최신 semver 태그를 고른다.
+/// 비공개 저장소 대응: 소유자 계정 토큰으로 gh CLI releases/latest 를 시도하고,
+/// 없으면 같은 토큰을 넣어 `git ls-remote --tags` 에서 최신 semver 태그를 고른다.
 pub fn latest_release() -> Result<Release> {
     use std::process::Command;
-    if let Ok(out) = Command::new("gh").args(["api", REPO_API]).output()
+    let mut api_cmd = Command::new("gh");
+    api_cmd.args(["api", REPO_API]);
+    if let Some(token) = owner_token() {
+        // 활성 계정과 무관하게 소유자 자격으로 조회한다.
+        api_cmd.env("GH_TOKEN", token);
+    }
+    if let Ok(out) = api_cmd.output()
         && out.status.success()
         && let Ok(gh) = serde_json::from_slice::<GhRelease>(&out.stdout)
     {
@@ -42,8 +88,11 @@ pub fn latest_release() -> Result<Release> {
             url: gh.html_url,
         });
     }
-    let out = Command::new("git")
-        .args(["ls-remote", "--tags", GIT_URL])
+    let mut cmd = Command::new("git");
+    cmd.arg("ls-remote");
+    apply_git_credentials(&mut cmd);
+    let out = cmd
+        .args(["--tags", GIT_URL])
         .output()
         .map_err(|e| anyhow!("git ls-remote 실패: {e}"))?;
     if !out.status.success() {
@@ -218,6 +267,41 @@ pub fn run_update_flow() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_owner_parsed_from_api_url() {
+        assert_eq!(repo_owner(), Some("AIBeginnerX"));
+    }
+
+    #[test]
+    fn git_credentials_go_through_env_not_argv() {
+        let mut cmd = std::process::Command::new("git");
+        apply_git_credentials(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        match owner_token() {
+            // 토큰이 있으면: -c 플래그로 기존 helper 를 끄고 교체하되,
+            // 토큰 자체는 argv 에 절대 노출되지 않고 env 이름으로만 참조된다.
+            Some(token) => {
+                assert!(
+                    args.windows(2)
+                        .any(|w| w[0] == "-c" && w[1] == "credential.helper=")
+                );
+                let helper = args
+                    .iter()
+                    .find(|a| a.starts_with("credential.helper=!f()"))
+                    .expect("inline credential helper present");
+                assert!(!args.iter().any(|a| a.contains(token.as_str())));
+                assert!(helper.contains("$GIT_UPD_USER") && helper.contains("$GIT_UPD_TOKEN"));
+            }
+            // 토큰을 못 얻으면 기존 동작(ambient helper) 유지.
+            None => {
+                assert!(args.iter().all(|a| !a.starts_with("credential.helper")));
+            }
+        }
+    }
 
     #[test]
     fn semver_compare() {
