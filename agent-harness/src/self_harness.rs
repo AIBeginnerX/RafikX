@@ -14,11 +14,11 @@
 //! 3. Proposal Validation (3.4) — 후보를 순차 trial 로 활성화하고, 이후
 //!    에피소드에서 (a) 타깃 시그니처 재발 없음(Δ_in ≥ 0 대응), (b) 전체
 //!    성공률 비저하(Δ_ho ≥ 0 대응)를 모두 만족할 때만 승격(merge)한다.
-//!    거부되면 하네스는 그대로 유지된다 (h_{t+1} = h_t).
+//!    거부되면 Harness는 그대로 유지된다 (h_{t+1} = h_t).
 //!
 //! editable surfaces 는 논문 Figure 3 의 build_* 함수에 대응한다:
 //! bootstrap/execution/verification/failure_recovery 지시문 + runtime_policy.
-//! 하네스 상태(h_t)는 ~/.rafikx/self_harness.json 에 버전·계보와 함께
+//! Harness 상태(h_t)는 ~/.rafikx/self_harness.json 에 버전·계보와 함께
 //! 저장되어 모든 전이가 감사(audit) 가능하다.
 
 use std::path::PathBuf;
@@ -60,7 +60,7 @@ pub const SURFACES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// 하네스 상태 h_t
+// Harness 상태 h_t
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +91,7 @@ pub struct RuntimePolicy {
     pub loop_break_instruction: Option<String>,
 }
 
-/// 검증 중인 후보 수정 — 활성 하네스에 임시로 겹쳐 적용된다 (h_t^(j) = Δ_j(h_t)).
+/// 검증 중인 후보 수정 — 활성 Harness에 임시로 겹쳐 적용된다 (h_t^(j) = Δ_j(h_t)).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrialEdit {
     pub candidate_id: i64,
@@ -126,7 +126,7 @@ pub struct SelfHarnessState {
 }
 
 impl Default for SelfHarnessState {
-    /// h_0 — 논문 Figure 3 의 최소 초기 하네스를 한국어로 옮긴 것.
+    /// h_0 — 논문 Figure 3 의 최소 초기 Harness를 한국어로 옮긴 것.
     fn default() -> Self {
         Self {
             version: 0,
@@ -149,7 +149,7 @@ impl SelfHarnessState {
         Ok(Config::data_dir()?.join("self_harness.json"))
     }
 
-    /// 상태 로드 — 없거나 깨졌으면 초기 하네스 h_0.
+    /// 상태 로드 — 없거나 깨졌으면 초기 Harness h_0.
     pub fn load() -> Self {
         let Ok(path) = Self::path() else {
             return Self::default();
@@ -217,7 +217,7 @@ impl SelfHarnessState {
         s
     }
 
-    /// 시스템 프롬프트에 하네스 surface 를 주입한다 (engine=self 전용).
+    /// 시스템 프롬프트에 Harness surface 를 주입한다 (engine=self 전용).
     pub fn decorate_system(&self, system: &mut String) {
         let eff = self.effective();
         let trial_mark = self
@@ -238,12 +238,11 @@ impl SelfHarnessState {
             eff.surfaces.verification_instruction,
             eff.surfaces.failure_recovery_instruction,
         ));
-        if eff.runtime_policy.enabled {
-            if let Some(instr) = &eff.runtime_policy.loop_break_instruction {
-                if !instr.trim().is_empty() {
-                    system.push_str(&format!("\n[루프 개입] {}", instr.trim()));
-                }
-            }
+        if eff.runtime_policy.enabled
+            && let Some(instr) = &eff.runtime_policy.loop_break_instruction
+            && !instr.trim().is_empty()
+        {
+            system.push_str(&format!("\n[루프 개입] {}", instr.trim()));
         }
     }
 
@@ -513,8 +512,8 @@ async fn propose_candidates(
         .collect::<Vec<_>>()
         .join("\n");
     let system = format!(
-        "너는 이 에이전트 자신의 하네스를 개선하는 proposer 다. 아래 증거에 근거해 \
-         하네스 수정 후보를 {k}개 생성하라.\n\
+        "너는 이 에이전트 자신의 Harness를 개선하는 proposer 다. 아래 증거에 근거해 \
+         Harness 수정 후보를 {k}개 생성하라.\n\
          규칙 (모두 필수):\n\
          1. 각 후보는 editable surface 중 정확히 하나만 수정한다 (최소성).\n\
          2. 후보끼리는 서로 실질적으로 달라야 한다 — 같은 문구의 재표현 금지 (다양성).\n\
@@ -527,7 +526,7 @@ async fn propose_candidates(
          [{{\"surface\":\"...\",\"new_value\":...,\"expected_effect\":\"...\",\"regression_risk\":\"...\"}}]"
     );
     let user = format!(
-        "[편집 가능 surface — 현재 하네스 v{}]\n{surfaces_ctx}\n\n\
+        "[편집 가능 surface — 현재 Harness v{}]\n{surfaces_ctx}\n\n\
          [타깃 실패 패턴 (verifier-grounded, 지지도 {})]\n\
          시그니처: {}\n터미널 원인: {} · 인과: {} · 메커니즘: {}\n\
          대표 작업: {}\n증상 노트: {}\n\n\
@@ -593,8 +592,8 @@ pub fn maybe_observe(cfg: &Config, task: &str, outcome: &AgentOutcome) {
     if !meta_active(cfg) {
         return;
     }
-    // denied 는 사용자 판단이지 하네스 실패가 아니다 — 논문의 addressability
-    // 기준(하네스 수정으로 해결 가능한 패턴만)에 따라 관찰에서 제외한다.
+    // denied 는 사용자 판단이지 Harness 실패가 아니다 — 논문의 addressability
+    // 기준(Harness 수정으로 해결 가능한 패턴만)에 따라 관찰에서 제외한다.
     if outcome.status == "denied" {
         return;
     }
@@ -1131,14 +1130,16 @@ mod tests {
 
     #[test]
     fn trial_overlay_applies_without_mutating_base() {
-        let mut s = SelfHarnessState::default();
-        s.trial = Some(TrialEdit {
-            candidate_id: 1,
-            surface: "bootstrap_instruction".into(),
-            new_value: "trial 지시문".into(),
-            target_signature: "verify_fail|direct|missing_artifact".into(),
-            started_at: 0,
-        });
+        let s = SelfHarnessState {
+            trial: Some(TrialEdit {
+                candidate_id: 1,
+                surface: "bootstrap_instruction".into(),
+                new_value: "trial 지시문".into(),
+                target_signature: "verify_fail|direct|missing_artifact".into(),
+                started_at: 0,
+            }),
+            ..SelfHarnessState::default()
+        };
         let mut sys = String::from("base");
         s.decorate_system(&mut sys);
         assert!(sys.contains("trial 지시문"));

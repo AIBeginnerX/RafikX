@@ -19,7 +19,7 @@ pub async fn maybe_first_run(cfg: Config, interactive: bool) -> Result<Config> {
     crate::ui::note("키는 secrets.toml 또는 환경변수. config.toml 에는 적지 마세요.");
     let cfg = run_quick_setup(cfg).await?;
     mark_setup_done(&cfg)?;
-    Ok(cfg.reload()?)
+    cfg.reload()
 }
 
 pub async fn cmd_login(cfg: Config) -> Result<()> {
@@ -62,14 +62,14 @@ async fn admin_loop(cfg: &mut Config) -> Result<()> {
         let items = vec![
             "서비스·계정 연결/추가/해제".into(),
             "모델 (등록된 것만)".into(),
-            "하네스 모드 (자동/수동)".into(),
+            "Harness 모드 (자동/수동)".into(),
             "텔레그램".into(),
             "옵시디언".into(),
             "모델 순위 보기·갱신".into(),
         ];
         let connected = auth::connected_names(cfg);
         let extra = format!(
-            "연결: {}  |  하네스: {}  |  {}",
+            "연결: {}  |  Harness: {}  |  {}",
             if connected.is_empty() {
                 "없음".into()
             } else {
@@ -168,7 +168,7 @@ async fn run_quick_setup(mut cfg: Config) -> Result<Config> {
             break;
         }
     }
-    Ok(cfg.reload()?)
+    cfg.reload()
 }
 
 fn format_provider_choice(cfg: &Config, name: &str) -> String {
@@ -479,7 +479,7 @@ async fn pick_provider_model(cfg: &Config, name: &str) -> Result<()> {
     if models.len() > 24 {
         models.truncate(24);
     }
-    let mut items = vec!["자동 (하네스)".to_string()];
+    let mut items = vec!["자동 (Harness)".to_string()];
     items.extend(models.iter().cloned());
     let extra = format!("'{name}' 기본 모델을 고르세요.");
     let choice = menu::prompt_choice("모델", &items, false, &extra)?;
@@ -490,7 +490,7 @@ async fn pick_provider_model(cfg: &Config, name: &str) -> Result<()> {
     let header = format!("[providers.{name}]");
     if n == 1 {
         config::write_toml_key(&cfg.path, &header, "model_auto", "true")?;
-        println!("기본: 자동 (하네스가 고릅니다).");
+        println!("기본: 자동 (Harness가 고릅니다).");
     } else if let Some(id) = models.get(n - 2) {
         config::write_toml_key(&cfg.path, &header, "model_auto", "false")?;
         config::write_toml_key(&cfg.path, &header, "model", &config::toml_string(id))?;
@@ -540,12 +540,12 @@ fn menu_harness(cfg: &mut Config) -> Result<()> {
             "자동"
         }
     );
-    let choice = menu::prompt_choice("하네스 모드", &items, false, &extra)?;
+    let choice = menu::prompt_choice("Harness 모드", &items, false, &extra)?;
     match choice.first().copied().unwrap_or(0) {
         0 => return Ok(()),
         1 => {
             config::write_toml_key(&cfg.path, "[harness]", "selection", "\"auto\"")?;
-            println!("하네스: 자동");
+            println!("Harness: 자동");
         }
         2 => {
             config::write_toml_key(&cfg.path, "[harness]", "selection", "\"manual\"")?;

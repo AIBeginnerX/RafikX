@@ -34,13 +34,13 @@ pub struct BootInfo {
     pub harness_manual: Vec<HarnessManual>,
     /// 순위표 기준일·교차검증 표기
     pub ranks_status: String,
-    /// 사이드바 하네스 요약 (분류 → 프로파일 → 모델)
+    /// 사이드바 Harness 요약 (분류 → 프로파일 → 모델)
     pub harness_rows: Vec<HarnessRow>,
     /// 컴포저 칩용 기본 모델 표기
     pub default_model: String,
     /// 데스크탑 배경 모드: light | dark | auto
     pub appearance: String,
-    /// 하네스 엔진: rafikx (기본) | claude | deepseek | qwen | kimi | pi (legacy self)
+    /// Harness 엔진: rafikx (기본) | claude | deepseek | qwen | kimi | pi (legacy self)
     pub engine: String,
     pub obsidian: ObsidianInfo,
     pub providers: Vec<ProviderInfo>,
@@ -573,7 +573,7 @@ pub async fn remote_models(provider: &str) -> Result<Vec<String>> {
     auth::list_remote_models(&cfg, provider).await
 }
 
-/// 하네스 엔진 저장 (rafikx | claude | deepseek | qwen | kimi | pi | minimax, legacy self).
+/// Harness 엔진 저장 (rafikx | claude | deepseek | qwen | kimi | pi | minimax, legacy self).
 pub fn set_engine(name: &str) -> Result<String> {
     let cfg = Config::load(None)?;
     set_engine_for(&cfg, name)
@@ -594,13 +594,13 @@ pub(crate) fn set_engine_for(cfg: &Config, name: &str) -> Result<String> {
         &crate::config::toml_string(&e),
     )?;
     let note = match e.as_str() {
-        "self" => " — Self-Harness 자기개선 루프 (실패 채굴→하네스 수정 제안→회귀 검증 후 승격)"
+        "self" => " — Self-Harness 자기개선 루프 (실패 채굴→Harness 수정 제안→회귀 검증 후 승격)"
             .to_string(),
         other => crate::engine::resolve(other)
             .map(|spec| format!(" — {}", spec.summary))
             .unwrap_or_default(),
     };
-    Ok(format!("하네스 엔진: {e}{note}"))
+    Ok(format!("Harness 엔진: {e}{note}"))
 }
 
 /// 실행 분야 저장 (harness | loop | graph). 미지원 값은 거부한다.
@@ -672,7 +672,7 @@ pub(crate) fn set_self_meta_for(cfg: &Config, on: bool) -> Result<String> {
     })
 }
 
-/// 하네스 선정 모드 저장 (auto | manual).
+/// Harness 선정 모드 저장 (auto | manual).
 pub fn set_harness_selection(mode: &str) -> Result<String> {
     let cfg = Config::load(None)?;
     crate::harness::set_selection_mode(&cfg, mode)?;

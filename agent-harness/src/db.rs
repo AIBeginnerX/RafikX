@@ -473,7 +473,7 @@ impl Db {
 
     /// 오늘(로컬 자정 이후) 실행 통계 — rafikx status /chat /status 용.
     pub fn usage_today(&self) -> Result<(i64, i64, i64)> {
-        let now = now_secs() as i64;
+        let now = now_secs();
         // KST/로컬 자정 근사: UTC 기준 당일 00:00 (운영 참고용 정확도로 충분)
         let midnight = now - (now % 86_400);
         let (count, tin, tout): (i64, i64, i64) = self.conn.query_row(
@@ -491,7 +491,7 @@ impl Db {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let pat = format!("%{}%", query.replace('%', "").replace('_', ""));
+        let pat = format!("%{}%", query.replace(['%', '_'], ""));
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, updated_at, title, messages_json FROM sessions \
              WHERE title LIKE ?1 OR messages_json LIKE ?1 ORDER BY updated_at DESC LIMIT ?2",
@@ -954,7 +954,7 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// 이 증거에 대해 이번 하네스 세대에서 이미 후보를 만들었는지.
+    /// 이 증거에 대해 이번 Harness 세대에서 이미 후보를 만들었는지.
     pub fn sh_has_candidates_for(&self, evidence_id: i64, base_version: i64) -> Result<bool> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sh_candidates WHERE evidence_id = ?1 AND base_version = ?2",
@@ -966,7 +966,7 @@ impl Db {
 
     /// 기준선 — trial 이 아닌 최근 window 개 에피소드의
     /// (성공률, 타깃 원인 발생 수, 표본 수).
-    /// 버전 경계로 자르지 않는다: 하네스가 한 번 승격될 때마다 기준선이 0에서 다시
+    /// 버전 경계로 자르지 않는다: Harness가 한 번 승격될 때마다 기준선이 0에서 다시
     /// 시작하면 표본이 늘 부족해 수락 판정이 신뢰를 잃는다(설계 §15.4).
     pub fn sh_baseline(&self, target_signature: &str, window: i64) -> Result<(f64, i64, u32)> {
         let mut stmt = self.conn.prepare(
@@ -1139,11 +1139,11 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// 하네스 승격으로 세대가 지난 후보 폐기 — 병렬 후보 평가의 순차 번역.
+    /// Harness 승격으로 세대가 지난 후보 폐기 — 병렬 후보 평가의 순차 번역.
     pub fn sh_stale_proposed(&self, current_version: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE sh_candidates SET state = 'stale', decided_at = ?1,
-             decision_note = 'base_version 경과 (하네스 승격)'
+             decision_note = 'base_version 경과 (Harness 승격)'
              WHERE state = 'proposed' AND base_version < ?2",
             rusqlite::params![now_secs(), current_version],
         )?;
@@ -1547,7 +1547,7 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(target, 2);
         assert!((rate - 0.5).abs() < 1e-9);
-        // 기준선은 하네스 버전 경계로 잘리지 않는다 (§15.4) — 다른 버전 에피소드도 표본이다.
+        // 기준선은 Harness 버전 경계로 잘리지 않는다 (§15.4) — 다른 버전 에피소드도 표본이다.
         db.sh_add_episode(3, None, false, sig).unwrap();
         let (_, target_v3, n_v3) = db.sh_baseline(sig, 20).unwrap();
         assert_eq!((n_v3, target_v3), (5, 3));

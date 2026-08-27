@@ -12,6 +12,7 @@ use rafikx::ui::{AgentProgress, Live};
 use serde_json::{Value, json};
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // 레거시 공개 계약 시그니처 고정 검증용
 fn legacy_run_pipeline_call<'a>(
     cfg: &'a Config,
     binding: &'a Binding,

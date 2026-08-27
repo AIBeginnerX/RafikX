@@ -31,17 +31,16 @@ struct GhRelease {
 /// 없으면 git 자격증명으로 `git ls-remote --tags` 에서 최신 semver 태그를 고른다.
 pub fn latest_release() -> Result<Release> {
     use std::process::Command;
-    if let Ok(out) = Command::new("gh").args(["api", REPO_API]).output() {
-        if out.status.success() {
-            if let Ok(gh) = serde_json::from_slice::<GhRelease>(&out.stdout) {
-                return Ok(Release {
-                    tag: gh.tag_name,
-                    name: gh.name.unwrap_or_default(),
-                    notes: gh.body.unwrap_or_default(),
-                    url: gh.html_url,
-                });
-            }
-        }
+    if let Ok(out) = Command::new("gh").args(["api", REPO_API]).output()
+        && out.status.success()
+        && let Ok(gh) = serde_json::from_slice::<GhRelease>(&out.stdout)
+    {
+        return Ok(Release {
+            tag: gh.tag_name,
+            name: gh.name.unwrap_or_default(),
+            notes: gh.body.unwrap_or_default(),
+            url: gh.html_url,
+        });
     }
     let out = Command::new("git")
         .args(["ls-remote", "--tags", GIT_URL])

@@ -47,10 +47,8 @@ pub fn index_vault(cfg: &Config) -> Result<IndexStats> {
 
     let mut deleted = 0usize;
     for old in db.all_note_paths()? {
-        if !seen.contains(&old) {
-            if db.delete_note(&old)? {
-                deleted += 1;
-            }
+        if !seen.contains(&old) && db.delete_note(&old)? {
+            deleted += 1;
         }
     }
 
@@ -431,10 +429,7 @@ fn hash_tags(body: &str) -> Vec<String> {
     let re = Regex::new(r"(?:^|[\s(])#([^\s#\[\]]+)").expect("hash tag regex");
     re.captures_iter(body)
         .filter_map(|c| c.get(1))
-        .map(|m| {
-            m.as_str()
-                .trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | ':' | ';'))
-        })
+        .map(|m| m.as_str().trim_end_matches(['.', ',', '!', '?', ':', ';']))
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()

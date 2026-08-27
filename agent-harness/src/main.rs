@@ -117,7 +117,7 @@ enum Commands {
     /// 서비스 연결 (키·로그인)
     #[command(alias = "연결")]
     Login,
-    /// 설정 (연결·모델·하네스·텔레그램·옵시디언·순위)
+    /// 설정 (연결·모델·Harness·텔레그램·옵시디언·순위)
     #[command(alias = "설정")]
     Settings,
     /// 모델 순위표
@@ -138,7 +138,7 @@ enum Commands {
         /// 새 프로젝트 폴더 (생략 시 현재값)
         path: Option<String>,
     },
-    /// 하네스 선정 모드·분류별 모델 지정 (기본 자동, 수동 선택 가능)
+    /// Harness 선정 모드·분류별 모델 지정 (기본 자동, 수동 선택 가능)
     Harness {
         /// 분류 simple|medium|advanced|dev — 모델 지정 시 필요
         class: Option<String>,
@@ -164,7 +164,7 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ModelCmd>,
     },
-    /// 현재 상태 요약 (연결·하네스·오늘 사용량)
+    /// 현재 상태 요약 (연결·Harness·오늘 사용량)
     Status,
     /// 텔레그램 봇 + Inspector 스케줄
     Telegram {
@@ -212,6 +212,8 @@ enum ModelCmd {
 #[tokio::main]
 async fn main() -> ExitCode {
     ui::init();
+    // MCP 외부 도구 서버 연결 — 설정 없으면 즉시 no-op, 실패해도 계속.
+    rafikx::mcp::init_default();
     // 주 1회 모델 순위 갱신 — 백그라운드, 실패 무음.
     rafikx::ranks::spawn_weekly_refresh();
     let cli = Cli::parse();
@@ -369,7 +371,7 @@ fn cmd_harness(
         } else {
             "auto"
         };
-        ui::ok(&format!("하네스 선정 모드: {applied}"));
+        ui::ok(&format!("Harness 선정 모드: {applied}"));
     }
     if clear || model.is_some() {
         let Some(c) = class else {
@@ -451,7 +453,7 @@ async fn cmd_models(cli: &Cli, provider: &str) -> Result<()> {
         println!("  {m}");
     }
     println!();
-    println!("하네스에 지정: rafikx harness <분류> <모델ID>");
+    println!("Harness에 지정: rafikx harness <분류> <모델ID>");
     Ok(())
 }
 
@@ -493,7 +495,7 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
         }
     }
 
-    ui::section("하네스");
+    ui::section("Harness");
     let (engine_name, _) = rafikx::engine::normalize(&cfg.file.general.engine);
     let engine_spec = rafikx::engine::resolve_with(&cfg.file.engines, &engine_name);
     let discipline = rafikx::engine::normalize_discipline(&cfg.file.general.discipline);
@@ -626,7 +628,7 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
         cfg.file.obsidian.tokenizer, cfg.file.obsidian.enabled
     ));
     ui::ok(&format!(
-        "하네스  {}",
+        "Harness  {}",
         if cfg.file.harness.selection.eq_ignore_ascii_case("manual") {
             "수동"
         } else {

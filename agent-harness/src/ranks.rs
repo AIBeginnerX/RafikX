@@ -74,14 +74,12 @@ fn ranks_path() -> Result<PathBuf> {
 }
 
 pub fn load() -> RankTable {
-    if let Ok(path) = ranks_path() {
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(t) = serde_json::from_str::<RankTable>(&raw) {
-                if !t.models.is_empty() {
-                    return t;
-                }
-            }
-        }
+    if let Ok(path) = ranks_path()
+        && let Ok(raw) = fs::read_to_string(&path)
+        && let Ok(t) = serde_json::from_str::<RankTable>(&raw)
+        && !t.models.is_empty()
+    {
+        return t;
     }
     bundled()
 }
@@ -282,10 +280,10 @@ async fn fetch_artificial_analysis(
     url: &str,
 ) -> Option<Vec<(String, i32)>> {
     let mut req = client.get(url).header("accept", "application/json");
-    if let Ok(key) = std::env::var("AA_API_KEY") {
-        if !key.trim().is_empty() {
-            req = req.header("x-api-key", key.trim());
-        }
+    if let Ok(key) = std::env::var("AA_API_KEY")
+        && !key.trim().is_empty()
+    {
+        req = req.header("x-api-key", key.trim());
     }
     let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
@@ -432,7 +430,7 @@ fn merge_scored(table: &mut RankTable, aa: &[(String, i32)], elo: &[(String, i32
         .collect();
     if verified.len() >= 5 {
         let mut sorted = verified.clone();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
         let top: Vec<usize> = sorted.iter().take(5).map(|(i, _)| *i).collect();
         for (i, e) in table.models.iter_mut().enumerate() {
             if e.sources_count < 2 {

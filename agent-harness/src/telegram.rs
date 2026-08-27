@@ -29,7 +29,7 @@ const START_MSG: &str = "작업 시작…";
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "RafikX 원격 명령")]
 enum Command {
-    #[command(description = "질문 (하네스)")]
+    #[command(description = "질문 (Harness)")]
     Ask(String),
     #[command(description = "노트 검색")]
     Obsidian(String),
@@ -47,9 +47,12 @@ enum Command {
     Help,
 }
 
+/** 대기 중 원격 승인: 질의 ID → (채팅, 승인 응답 송신 채널). */
+type PendingApprovals = Arc<Mutex<HashMap<String, (ChatId, oneshot::Sender<bool>)>>>;
+
 struct App {
     cfg: Config,
-    pending: Arc<Mutex<HashMap<String, (ChatId, oneshot::Sender<bool>)>>>,
+    pending: PendingApprovals,
     active: Arc<Mutex<HashMap<ChatId, RunContext>>>,
     seq: AtomicU32,
 }

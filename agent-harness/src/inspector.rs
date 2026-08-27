@@ -162,7 +162,7 @@ fn compute_stats(runs: &[RunRow]) -> Stats {
         }
     }
     let mut top_errors: Vec<(String, usize)> = err_counts.into_iter().collect();
-    top_errors.sort_by(|a, b| b.1.cmp(&a.1));
+    top_errors.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     top_errors.truncate(5);
     let n = runs.len() as f64;
     Stats {
@@ -270,7 +270,7 @@ fn error_log_tail(max_lines: usize) -> String {
     };
     let lines: Vec<String> = BufReader::new(file)
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(Result::ok)
         .filter(|l| l.contains("\"error\"") || l.to_lowercase().contains("error"))
         .map(|l| redact(&l))
         .collect();

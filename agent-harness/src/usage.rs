@@ -74,8 +74,8 @@ fn today() -> String {
     let days = secs / 86400;
     // UTC 날짜. 하단 표시용으로 충분.
     let z = days * 86400;
-    let ymd = unix_ymd(z);
-    ymd
+
+    unix_ymd(z)
 }
 
 fn unix_ymd(secs: i64) -> String {

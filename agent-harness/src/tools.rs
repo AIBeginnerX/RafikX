@@ -111,6 +111,10 @@ impl ToolRegistry {
                 Box::new(TodoRead),
                 Box::new(ObsidianSearch),
                 Box::new(TaskTool),
+                Box::new(crate::skills::LoadSkill),
+                Box::new(crate::skills::SaveSkill),
+                Box::new(crate::mcp::McpList),
+                Box::new(crate::mcp::McpCall),
             ],
         }
     }
@@ -128,6 +132,8 @@ impl ToolRegistry {
         "todo_read",
         "todo_write",
         "obsidian_search",
+        "load_skill",
+        "mcp_list",
     ];
 
     pub fn with_names(names: &[String]) -> Self {
@@ -595,9 +601,9 @@ impl Tool for Grep {
                     if hits.len() >= MAX_GREP_LINES {
                         break;
                     }
-                    for i in s..=e {
+                    for (i, line) in lines.iter().enumerate().take(e + 1).skip(s) {
                         let mark = if matched.contains(&i) { ":" } else { "-" };
-                        hits.push(format!("{}{}{}:{}", rel.display(), mark, i + 1, lines[i]));
+                        hits.push(format!("{}{}{}:{}", rel.display(), mark, i + 1, line));
                     }
                     hits.push("--".to_string());
                 }
@@ -789,7 +795,7 @@ fn bash_blocked(cmd: &str) -> Option<&'static str> {
     let lower = cmd.to_lowercase();
     let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
     let words: Vec<&str> = lower.split_whitespace().collect();
-    if words.iter().any(|w| *w == "sudo") {
+    if words.contains(&"sudo") {
         return Some("sudo");
     }
     if compact.contains("rm-rf/") || compact.contains("rm-rf~") {
@@ -798,13 +804,13 @@ fn bash_blocked(cmd: &str) -> Option<&'static str> {
     if words.iter().any(|w| *w == "mkfs" || w.starts_with("mkfs.")) {
         return Some("mkfs");
     }
-    if words.iter().any(|w| *w == "dd") {
+    if words.contains(&"dd") {
         return Some("dd");
     }
-    if words.iter().any(|w| *w == "shutdown") {
+    if words.contains(&"shutdown") {
         return Some("shutdown");
     }
-    if words.iter().any(|w| *w == "reboot") {
+    if words.contains(&"reboot") {
         return Some("reboot");
     }
     if compact.contains("chmod-r777") || compact.contains("chmod-rf777") {

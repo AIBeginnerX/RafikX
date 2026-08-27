@@ -11,7 +11,7 @@ pub const fn needs_auto_compaction(used: u32, window: u32) -> bool {
 
 /// 대략적인 토큰 수 (문자/4). 정밀 토크나이저는 쓰지 않는다.
 pub fn estimate_tokens(s: &str) -> usize {
-    (s.chars().count() + 3) / 4
+    s.chars().count().div_ceil(4)
 }
 
 fn block_tokens(b: &ContentBlock) -> usize {
@@ -82,19 +82,19 @@ fn insert_notice(msgs: &mut Vec<Message>) {
     msgs.insert(0, Message::user_text("[이전 대화 일부 생략]"));
 }
 
-fn truncate_oldest_text(msgs: &mut Vec<Message>, budget: usize) {
+fn truncate_oldest_text(msgs: &mut [Message], budget: usize) {
     for m in msgs.iter_mut() {
         if is_tool_use(m) || is_tool_result(m) {
             continue;
         }
         for b in &mut m.content {
-            if let ContentBlock::Text { text } = b {
-                if estimate_tokens(text) > 32 {
-                    let keep = (budget / 8).max(24);
-                    let cut: String = text.chars().take(keep * 4).collect();
-                    *text = format!("{cut}\n[이전 대화 일부 생략]");
-                    return;
-                }
+            if let ContentBlock::Text { text } = b
+                && estimate_tokens(text) > 32
+            {
+                let keep = (budget / 8).max(24);
+                let cut: String = text.chars().take(keep * 4).collect();
+                *text = format!("{cut}\n[이전 대화 일부 생략]");
+                return;
             }
         }
     }
@@ -127,11 +127,9 @@ pub fn pack_messages(
     let mut omitted = false;
     while total(&msgs) > budget && msgs.len() > 1 {
         let min_keep = KEEP_TAIL.min(msgs.len());
-        if msgs.len() > min_keep {
-            if drop_oldest_unit(&mut msgs) {
-                omitted = true;
-                continue;
-            }
+        if msgs.len() > min_keep && drop_oldest_unit(&mut msgs) {
+            omitted = true;
+            continue;
         }
         if drop_oldest_unit(&mut msgs) {
             omitted = true;
@@ -219,12 +217,11 @@ fn model_context_from_catalog(model: &str) -> Option<u32> {
 
 pub fn context_window_for(provider: &str, model: &str, p: Option<&ProviderConfig>) -> u32 {
     // 1) config 명시값 최우선
-    if let Some(p) = p {
-        if let Some(n) = p.context_window {
-            if n > 0 {
-                return n;
-            }
-        }
+    if let Some(p) = p
+        && let Some(n) = p.context_window
+        && n > 0
+    {
+        return n;
     }
     // 2) 모델 카탈로그 (opencode/omp 방식)
     if let Some(ctx) = model_context_from_catalog(model) {

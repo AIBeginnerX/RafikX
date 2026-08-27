@@ -41,7 +41,7 @@ impl CompletionSummary {
         memory_enabled: bool,
         memory_sources: usize,
     ) -> Self {
-        let progress = crate::tools_more::todo_progress(&todos);
+        let progress = crate::tools_more::todo_progress(todos);
         Self {
             changed_files: outcome.changed_files.clone(),
             iterations: outcome.iterations,
@@ -86,10 +86,7 @@ fn strip_thinking_blocks(text: &str) -> String {
     ];
     let mut current = text.to_string();
     for (open, close) in TAGS {
-        loop {
-            let Some(start) = current.find(open) else {
-                break;
-            };
+        while let Some(start) = current.find(open) {
             let after_open = start + open.len();
             let Some(relative_end) = current[after_open..].find(close) else {
                 current.truncate(start);
@@ -132,7 +129,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "모델 선택 · refresh 로 원격 목록 갱신"),
     (
         "/engine",
-        "하네스 엔진 rafikx|claude|deepseek|qwen|kimi|pi · provider mode single|multi",
+        "Harness 엔진 rafikx|claude|deepseek|qwen|kimi|pi · provider mode single|multi",
     ),
     (
         "/discipline",
@@ -305,11 +302,11 @@ pub fn open_session(
             let _ = tx.send(crate::update::latest_release());
         });
         let checked = rx.recv_timeout(std::time::Duration::from_secs(6)).ok();
-        if let Some(Ok(rel)) = checked {
-            if let Some(notice) = crate::update::upgrade_notice(&rel, env!("CARGO_PKG_VERSION")) {
-                for line in notice.lines() {
-                    crate::ui::note(&format!("⚠ {line}"));
-                }
+        if let Some(Ok(rel)) = checked
+            && let Some(notice) = crate::update::upgrade_notice(&rel, env!("CARGO_PKG_VERSION"))
+        {
+            for line in notice.lines() {
+                crate::ui::note(&format!("⚠ {line}"));
             }
         }
     }
@@ -499,7 +496,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
         "/engine" => {
             let arg = rest.trim().to_ascii_lowercase();
             let engines = crate::engine::names_joined();
-            // provider 모드 서브커맨드 — 하네스 선택 뒤의 두 번째 단계.
+            // provider 모드 서브커맨드 — Harness 선택 뒤의 두 번째 단계.
             if arg == "multi" {
                 return Ok(Slash::AssignRoles);
             }
@@ -510,7 +507,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 let cur = session.cfg.file.general.engine.clone();
                 let strategy = session.cfg.file.harness.strategy.clone();
                 let mut notes = vec![format!(
-                    "현재 하네스 엔진: {cur} · provider mode: {strategy}   ·   변경: /engine {engines}"
+                    "현재 Harness 엔진: {cur} · provider mode: {strategy}   ·   변경: /engine {engines}"
                 )];
                 for spec in crate::engine::catalog() {
                     notes.push(format!("  {:<9} {}", spec.name, spec.summary));
@@ -543,7 +540,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 session.cfg.file.general.engine = arg.clone();
                 match crate::api::set_engine_for(&session.cfg, &arg) {
                     Ok(msg) => {
-                        let mut notes = vec![format!("하네스 엔진: {label}\n{msg}")];
+                        let mut notes = vec![format!("Harness 엔진: {label}\n{msg}")];
                         if arg == "self" {
                             notes.extend(crate::self_harness::status_lines(&db));
                         }
@@ -643,7 +640,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             if arg.is_empty() {
                 let state = crate::self_harness::SelfHarnessState::load();
                 let mut notes = vec![format!(
-                    "Self-Harness 메타: {} · legacy engine=self: {} · 하네스 v{}   ·   변경: /selfharness on|off",
+                    "Self-Harness 메타: {} · legacy engine=self: {} · Harness v{}   ·   변경: /selfharness on|off",
                     if session.cfg.file.self_harness.meta {
                         "on"
                     } else {
@@ -1103,10 +1100,10 @@ fn engine_single(session: &mut Session, arg: &str, read_stdin: bool) -> Result<S
         }
     };
     let resolve = |names: &[String], token: &str| -> Option<String> {
-        if let Some(nums) = crate::menu::parse_numbers(token, names.len(), false, false) {
-            if let Some(i) = nums.first() {
-                return names.get(i.saturating_sub(1)).cloned();
-            }
+        if let Some(nums) = crate::menu::parse_numbers(token, names.len(), false, false)
+            && let Some(i) = nums.first()
+        {
+            return names.get(i.saturating_sub(1)).cloned();
         }
         let alias = crate::auth::resolve_provider_alias(token).unwrap_or_else(|| token.to_string());
         names.iter().find(|n| **n == alias).cloned()
@@ -1143,7 +1140,7 @@ fn engine_single(session: &mut Session, arg: &str, read_stdin: bool) -> Result<S
 pub(crate) fn help_text() -> String {
     "/mode plan|build      계획(읽기 전용)/실행 모드 전환\n\
      /tools                현재 모드에서 쓸 수 있는 도구\n\
-     /status               연결·하네스·오늘 사용량 요약\n\
+     /status               연결·Harness·오늘 사용량 요약\n\
      /todo                 작업 목록 보기\n\
      /goal                 장기 목표·자동 연속 실행 상태\n\
      /file <경로>          다음 질문에 파일 첨부 (@src/main.rs 멘션도 가능)\n\
@@ -1272,22 +1269,25 @@ fn apply_model_choice(
 ) -> String {
     let model = &mut session.model;
     if rest.is_empty() {
-        return format!("현재 모델: {}", model.as_deref().unwrap_or("(하네스 자동)"));
+        return format!(
+            "현재 모델: {}",
+            model.as_deref().unwrap_or("(Harness 자동)")
+        );
     }
     if let Some(nums) = crate::menu::parse_numbers(rest, regs.len(), false, true) {
         if nums.first() == Some(&0) {
             session.provider = None;
             *model = None;
-            return "모델을 하네스 자동으로 돌렸습니다.".into();
+            return "모델을 Harness 자동으로 돌렸습니다.".into();
         }
-        if let Some(i) = nums.first() {
-            if let Some(r) = regs.get(i - 1) {
-                session.provider = Some(r.provider.clone());
-                *model = Some(r.id.clone());
-                // 영속화: 프로바이더 기본 모델로도 저장
-                let _ = crate::accounts_ui::write_provider_model(&session.cfg, &r.provider, &r.id);
-                return format!("모델: {} / {} (기본 저장)", r.provider, r.id);
-            }
+        if let Some(i) = nums.first()
+            && let Some(r) = regs.get(i - 1)
+        {
+            session.provider = Some(r.provider.clone());
+            *model = Some(r.id.clone());
+            // 영속화: 프로바이더 기본 모델로도 저장
+            let _ = crate::accounts_ui::write_provider_model(&session.cfg, &r.provider, &r.id);
+            return format!("모델: {} / {} (기본 저장)", r.provider, r.id);
         }
     }
     // 직접 입력 — 등록 목록에서 역방향 매칭되면 영속화
@@ -1313,12 +1313,12 @@ fn apply_provider_choice(session: &mut Session, names: &[String], rest: &str) ->
             *provider = None;
             return "프로바이더를 기본으로 돌렸습니다.".into();
         }
-        if let Some(i) = nums.first() {
-            if let Some(n) = names.get(i - 1) {
-                *provider = Some(n.clone());
-                let _ = crate::accounts_ui::set_default_provider(&session.cfg, n);
-                return format!("프로바이더: {n} (기본 저장)");
-            }
+        if let Some(i) = nums.first()
+            && let Some(n) = names.get(i - 1)
+        {
+            *provider = Some(n.clone());
+            let _ = crate::accounts_ui::set_default_provider(&session.cfg, n);
+            return format!("프로바이더: {n} (기본 저장)");
         }
     }
     let alias = crate::auth::resolve_provider_alias(rest).unwrap_or_else(|| rest.to_string());
@@ -1332,12 +1332,12 @@ fn apply_provider_choice(session: &mut Session, names: &[String], rest: &str) ->
         .map(|n| crate::auth::provider_label(n))
         .collect();
     let hits = crate::menu::match_items(rest, &labels);
-    if hits.len() == 1 {
-        if let Some(n) = names.get(hits[0] - 1) {
-            *provider = Some(n.clone());
-            let _ = crate::accounts_ui::set_default_provider(&session.cfg, n);
-            return format!("프로바이더: {n} (기본 저장)");
-        }
+    if hits.len() == 1
+        && let Some(n) = names.get(hits[0] - 1)
+    {
+        *provider = Some(n.clone());
+        let _ = crate::accounts_ui::set_default_provider(&session.cfg, n);
+        return format!("프로바이더: {n} (기본 저장)");
     }
     *provider = Some(rest.to_string());
     format!("프로바이더: {rest}")
@@ -1384,7 +1384,7 @@ pub fn expand_mentions(cfg: &Config, prompt: &str) -> String {
                 budget -= taken.chars().count();
                 out.push_str(&format!("[파일: {token}]\n```\n{taken}\n```\n"));
                 i = end;
-                if budget <= 0 {
+                if budget == 0 {
                     break;
                 }
             }
@@ -1557,7 +1557,7 @@ pub async fn run_turn_observed(
     ) {
         crate::ui::live_warn(&w);
     }
-    // opencode 스타일 plan 모드 — 하네스 분류·모델 자동선택은 그대로 두고 도구만 제한.
+    // opencode 스타일 plan 모드 — Harness 분류·모델 자동선택은 그대로 두고 도구만 제한.
     let plan = session.is_plan_mode();
     if plan {
         binding
@@ -1899,7 +1899,7 @@ mod tests {
     fn new_session_keeps_last_choice_instead_of_hardcoded_model() {
         let cfg = Config::load(None).expect("config");
         let pair = default_new_session_pair(&cfg);
-        // last_provider/last_model 이 있으면 그 조합, 없으면 None (하네스 자동).
+        // last_provider/last_model 이 있으면 그 조합, 없으면 None (Harness 자동).
         let lp = cfg.file.general.last_provider.trim();
         if lp.is_empty() || !cfg.file.providers.contains_key(lp) {
             assert!(pair.is_none());

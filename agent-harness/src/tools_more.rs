@@ -1,5 +1,5 @@
 //! opencode 대응 확장 도구: glob · webfetch · multi_edit · todo · task(서브에이전트 위임).
-//! 하네스 분류·모델 자동선택·계정 로테이션은 그대로 재사용한다.
+//! Harness 분류·모델 자동선택·계정 로테이션은 그대로 재사용한다.
 
 use std::fs;
 use std::sync::{Mutex, OnceLock};
@@ -588,12 +588,13 @@ fn decode_ddg_href(href: &str) -> String {
         let cs = enc.as_bytes();
         let mut i = 0;
         while i < cs.len() {
-            if cs[i] == b'%' && i + 2 < cs.len() {
-                if let Ok(v) = u8::from_str_radix(&enc[i + 1..i + 3], 16) {
-                    bytes.push(v);
-                    i += 3;
-                    continue;
-                }
+            if cs[i] == b'%'
+                && i + 2 < cs.len()
+                && let Ok(v) = u8::from_str_radix(&enc[i + 1..i + 3], 16)
+            {
+                bytes.push(v);
+                i += 3;
+                continue;
             }
             bytes.push(cs[i]);
             i += 1;
@@ -672,7 +673,15 @@ impl WebSearch {
         if out.is_empty() {
             return Err(anyhow!("검색 결과가 없습니다"));
         }
-        Ok(out.join("\n"))
+        let mut joined = format!(
+            "검색 결과 (검색 시각: {})\n\n{}",
+            crate::dateutil::today_string(),
+            out.join("\n")
+        );
+        joined.push_str(
+            "\n\n[신선도] 각 항목의 발행/갱신 시점을 확인하고 답변에서 URL+날짜로 인용하라. 현재 연도와 맞지 않는 오래된 정보는 재검색 후 최신 상태를 확인해 반영하라.",
+        );
+        Ok(joined)
     }
 }
 
@@ -1072,7 +1081,7 @@ mod tests {
 
     #[test]
     fn task_excludes_itself_from_inner_tools() {
-        let tools = vec!["*".to_string()];
+        let tools = ["*".to_string()];
         let filtered: Vec<String> = tools
             .iter()
             .filter(|t| t.as_str() != TaskTool::NAME)

@@ -301,7 +301,7 @@ impl Spinner {
             f.store(true, Ordering::Relaxed);
         }
         if let Some(h) = self.handle.take() {
-            let _ = h.await_ok();
+            h.await_ok();
         }
         let notes = self
             .run

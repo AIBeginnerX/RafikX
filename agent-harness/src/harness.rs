@@ -593,10 +593,12 @@ fn provider_for_model(cfg: &Config, model: &str) -> Option<String> {
 
 fn parse_manual_spec(spec: &str) -> (Option<String>, String) {
     let t = spec.trim();
-    if let Some((p, m)) = t.split_once(':') {
-        if !p.is_empty() && !m.is_empty() && !p.contains('/') {
-            return (Some(p.to_string()), m.to_string());
-        }
+    if let Some((p, m)) = t.split_once(':')
+        && !p.is_empty()
+        && !m.is_empty()
+        && !p.contains('/')
+    {
+        return (Some(p.to_string()), m.to_string());
     }
     (None, t.to_string())
 }
@@ -660,7 +662,7 @@ pub fn manual_key_for(class: TaskClass) -> &'static str {
     }
 }
 
-/// 하네스 선정 모드 저장 ("auto" | "manual").
+/// Harness 선정 모드 저장 ("auto" | "manual").
 pub fn set_selection_mode(cfg: &Config, mode: &str) -> Result<()> {
     let m = if mode.eq_ignore_ascii_case("manual") {
         "manual"
@@ -865,7 +867,7 @@ pub async fn auto_assign_roles(cfg: &Config) -> Result<Vec<String>> {
 
 /// 연결된(등록된) 모델만. 미연결 프로바이더는 절대 고르지 않는다.
 /// 사용자가 기본 연결(default_provider)을 지정했다면 그 안에서 자동 선택한다 —
-/// 기본 연결·기본 모델 설정이 자동 하네스보다 우선한다.
+/// 기본 연결·기본 모델 설정이 자동 Harness보다 우선한다.
 pub fn pick_auto(
     cfg: &Config,
     class: TaskClass,
@@ -901,26 +903,21 @@ pub fn pick_auto(
     let prefer_strong = matches!(class, TaskClass::Advanced | TaskClass::Dev);
     let prefer_cheap = matches!(class, TaskClass::Simple | TaskClass::Medium);
 
-    if prefer_cheap {
-        if let Some(hit) = pick_cheap(&regs, &table, &sub.provider) {
-            return Ok((hit.provider, hit.id, None));
-        }
+    if prefer_cheap && let Some(hit) = pick_cheap(&regs, &table, &sub.provider) {
+        return Ok((hit.provider, hit.id, None));
     }
 
-    if prefer_strong {
-        if let Some(hit) = pick_strongest(&regs, &table) {
-            return Ok((hit.provider, hit.id.clone(), Some(hit.id)));
-        }
+    if prefer_strong && let Some(hit) = pick_strongest(&regs, &table) {
+        return Ok((hit.provider, hit.id.clone(), Some(hit.id)));
     }
 
     // 순위 모르면 프로파일 기본 (그 프로바이더가 연결된 경우만)
-    if crate::auth::is_usable(cfg, &sub.provider) {
-        if let Ok(p) = cfg.provider(&sub.provider) {
-            if !needs_tools || p.supports_tools {
-                let model = model_for_role(p, &sub.model_role);
-                return Ok((sub.provider.clone(), model, None));
-            }
-        }
+    if crate::auth::is_usable(cfg, &sub.provider)
+        && let Ok(p) = cfg.provider(&sub.provider)
+        && (!needs_tools || p.supports_tools)
+    {
+        let model = model_for_role(p, &sub.model_role);
+        return Ok((sub.provider.clone(), model, None));
     }
     let first = regs.remove(0);
     Ok((first.provider, first.id, None))
@@ -996,10 +993,10 @@ fn pick_for_provider(
             .filter(|r| r.provider == name)
             .collect();
         let table = crate::ranks::load();
-        if matches!(class, TaskClass::Simple | TaskClass::Medium) {
-            if let Some(h) = pick_cheap(&regs, &table, name) {
-                return Some(h.id);
-            }
+        if matches!(class, TaskClass::Simple | TaskClass::Medium)
+            && let Some(h) = pick_cheap(&regs, &table, name)
+        {
+            return Some(h.id);
         }
         if let Some(h) = pick_strongest(&regs, &table) {
             return Some(h.id);
@@ -1039,15 +1036,14 @@ pub fn build_provider_account(cfg: &Config, name: &str, account_id: &str) -> Res
             }
         }
         "openai_compat" => {
-            if name == "openai" {
-                if let Some(c) = &cred {
-                    if c.oauth {
-                        return Ok(DynProvider::OpenAi(OpenAiCompatProvider::with_codex_oauth(
-                            c.token.clone(),
-                            c.account_id.clone(),
-                        )?));
-                    }
-                }
+            if name == "openai"
+                && let Some(c) = &cred
+                && c.oauth
+            {
+                return Ok(DynProvider::OpenAi(OpenAiCompatProvider::with_codex_oauth(
+                    c.token.clone(),
+                    c.account_id.clone(),
+                )?));
             }
             let base = p
                 .base_url
@@ -1146,10 +1142,10 @@ fn is_auth_failure(e: &anyhow::Error) -> bool {
 
 pub fn fallback_order(cfg: &Config, primary: &str, cli_provider: Option<&str>) -> Vec<String> {
     let mut order = Vec::new();
-    if let Some(p) = cli_provider {
-        if crate::auth::is_usable(cfg, p) {
-            order.push(p.to_string());
-        }
+    if let Some(p) = cli_provider
+        && crate::auth::is_usable(cfg, p)
+    {
+        order.push(p.to_string());
     }
     if crate::auth::is_usable(cfg, primary) && !order.iter().any(|x| x == primary) {
         order.push(primary.to_string());
@@ -1421,11 +1417,10 @@ pub async fn classify(
         return TaskClass::parse(s)
             .ok_or_else(|| anyhow!("--class 값은 simple|medium|advanced|dev 여야 합니다"));
     }
-    if cfg.file.general.classifier == "llm" {
-        match classify_llm(cfg, text).await {
-            Ok(c) => return Ok(c),
-            Err(_) => {}
-        }
+    if cfg.file.general.classifier == "llm"
+        && let Ok(c) = classify_llm(cfg, text).await
+    {
+        return Ok(c);
     }
     Ok(classify_rules(text, obsidian))
 }
@@ -1456,7 +1451,7 @@ async fn classify_llm(cfg: &Config, text: &str) -> Result<TaskClass> {
 
 pub fn print_binding(cfg: &Config, b: &Binding) {
     crate::ui::note(&format!(
-        "하네스  {} → {}  ·  {}/{}{}",
+        "Harness  {} → {}  ·  {}/{}{}",
         b.class.as_str(),
         b.profile_name,
         b.provider_name,
@@ -1643,11 +1638,53 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          [워크플로]\n\
          1 Scope — 요청을 파악한다. 다중 파일 작업은 파일보다 계획이 먼저다.\n\
          2 Research — 편집 전에 조각이 아니라 구획을 읽는다. 기존 패턴을 재사용한다(MUST); 기존 관례 옆에 두 번째 관례를 만드는 것은 금지다. 도구 실패나 읽은 뒤 바뀐 파일은 다시 읽고 행동한다.\n\
-         3 Decompose — todo 를 갱신한다. 하네스가 단계별 실행(todo)을 지시하면 반드시 따른다(MUST); 그 지시가 없는 사소한 요청만 건너뛴다.\n\
+         3 Decompose — todo 를 갱신한다. Harness가 단계별 실행(todo)을 지시하면 반드시 따른다(MUST); 그 지시가 없는 사소한 요청만 건너뛴다.\n\
          4 Implement — 원인을 고친다. 요청 없이 증상 억제·입력 특수케이스 처리 금지(NEVER). 이관은 깨끗하게: 모든 호출부를 옮기고 낡은 코드·별칭·재수출·주석을 제거한다. 새 파일보다 기존 파일 갱신을 선호한다.\n\
          5 Verify — 검증 없는 산출물 전달 금지(NEVER). 버그 수정은 재현→수정→재현 소멸 확인. 스모크는 테스트 파일이 아니라 실제 실행이다: 실행하고, 바뀐 경로를 통과시키고, 결과를 관찰한다.\n\
          6 Cleanup — 스모크가 작업을 증명한 뒤의 마지막 단계다. 실험·일회성 조사에는 테스트·문서 정리를 만들지 않는다.\n\
          \n\
+         [의도 게이트]
+         매 요청 시작에서 의도를 분류해 라우팅한다(MUST): 조사·설명 / 구현·생성 /
+         조사보고 / 평가·제안 / 수정·디버깅 / 리팩터·개선 / 모호. 조사류는 파일을 읽고 답하고 편집하지 않는다.
+         모호하면 맥락으로 해석 가능한 한 결정하고, 남은 분기점만 짧게 물어본다.
+         진행 중 사용자 정정이 오면 옛 계획을 버리고 새 방향부터 다시 잡는다.
+         
+         [선임 엔지니어 사고관]
+         복잡한 과제는 아래 6단계 역할 순환으로 풀고, 각 단계 성립을 확인하고 다음으로 넘어간다(MUST):
+         1 업무분석 — 문제의 실체와 성공 기준을 한 문장으로 고정한다.
+         2 설계 — 해법 구조와 트레이드오프를 결정하고, 더 우아한 대안이 없었는지 자문한다.
+         3 작업 — 설계 그대로 최소 변화로 구현한다.
+         4 리뷰 — 내 산출물을 타인 시각으로 비판한다: 누수·경계값·오류처리·보안·단순성.
+         5 검증 — 실제 표면으로 직접 실행/테스트해 동작을 증명한다.
+         6 최종판단 — 모든 수락 기준 충족 여부를 스스로 심사하고, 미통과면 돌아가 고친다.
+         타입 에러·lint 경고·실패 테스트를 억제해서 통과시키는 것은 금지(NEVER)다. 검증 등급으로 정직하게 보고한다:
+         V1=단일파일 비동작 변경(진단), V2=도메인 동작 변경(진단+관련 테스트+엔트리포인트 1회 실행),
+         V3=복수파일·횡단 변경(진단+빌드+테스트+사용자 표면 수동 훈련).
+         '통과할 것이다'는 검증이 아니다(NEVER): 실제 출력과 종료 코드로 증명한다.
+         
+         [증거·지식 신선도]
+         검색 정보(web_search·webfetch)를 답변·계획·코드에 쓸 때 MUST:
+         (a) 출처 URL을 밝힌다. (b) 발행/갱신 날짜를 확인해 함께 밝힌다.
+         (c) 현재 연도와 어긋나는 오래된 정보는 그대로 쓰지 않고 최신 상태를 재검색해 확인한다.
+         (d) 같은 사실이 두 개 독립 출처에 겹치면 신뢰도를 올린다. 학습 컷오프 이후 바뀌었을
+         가능성이 있는 API·버전·요금·정책 주장은 검색 없이 하지 않는다(NEVER).
+         
+         [수학적 계획법]
+         여러 후보 과제를 배열할 때 감이 아니라 수치로 정렬한다(SHOULD):
+         · 우선순위 점수 = I×C×E: 영향도(Impact 1-10) × 확신도(Confidence 0-1) × 용이성(Ease 1-3),
+           내림차순으로 todo 분해 순서를 정한다.
+         · 리스크 기댓값 = P(실패) × 손실비용 — 높은 순서로 완화책을 먼저 준비한다.
+         · 의존성은 DAG로 모델링한다: 순환 의존 금지(NEVER), 위상순서 배치, 동급 항목은 병렬화한다.
+         · 자원 배분은 기대효과 순: 토큰·시간 예산을 점수 상위 단계에 두고
+           (잔여예산/남은단계) 수렴을 유지하며 소모를 점검한다.
+         · 새 증거가 기존 가설을 반박하면 확신도와 계획을 갱신한다.
+         
+         [스킬·MCP]
+         · 스킬: 같은 절차를 2회 이상 반복하게 될 흐름(배포 절차, QA 순서 등)은 save_skill 로
+           ~/.rafikx/skills/ 스킬로 저장하고, 이후 같은 절차는 load_skill 로 불러 일관되게 수행한다.
+         · MCP 도구(mcp__<server>__<tool> 접두사)는 외부 서비스 연동 대상이다: 적합한 MCP 도구가
+           있으면 내장 도구보다 우선 검토하고, 실패하면 근거와 함께 대안을 고른다.
+         
          [전달 계약]\n\
          - 완전한 산출물 전에 멈추지 않는다(NEVER). 단계 경계·todo 전환·중간 단계는 멈출 이유가 아니다: 같은 턴에서 계속한다.\n\
          - 출력을 지어내지 않는다(NEVER): 코드·도구·테스트·문서에 대한 주장은 근거가 있어야 한다.\n\
@@ -1661,7 +1698,7 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          - 내가 만들지 않은 무관한 코드 삭제·파괴적 git 명령 전에는 확인을 받는다. 이관이 낡게 만든 코드는 범위 안이다.\n\
          - task 위임은 사용자가 병렬을 요청했거나 진짜 독립 슬라이스가 있을 때만 쓴다. 최상위 계획을 위임하지 않는다.\n\
          \n\
-         [하네스 표기]\n\
+         [Harness 표기]\n\
          - 수치 비교는 ```chart 블록(한 줄에 '라벨: 수치')으로 — 터미널이 실제 막대그래프로 렌더링한다. ASCII 아트 도표(+---+, ->, 문자 박스)는 금지.\n\
          - 항목 나열은 마크다운 표를 쓴다.\n\
          {extra}",
@@ -1682,9 +1719,15 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
         s.push('\n');
         s.push_str(lessons.trim_end());
     }
+    // 스킬 인젝션: 반복 절차의 재사용 목록(없으면 생략).
+    if let Some(sec) = crate::skills::prompt_section(&cfg.workspace) {
+        s.push_str("\n\n");
+        s.push_str(&sec);
+    }
     s
 }
 
+#[allow(clippy::too_many_arguments)] // 공개 파이프라인 API: 호출부 호환을 위해 시그니처 유지
 pub async fn run_pipeline(
     cfg: &Config,
     binding: &Binding,
@@ -1713,6 +1756,7 @@ pub async fn run_pipeline(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // 공개 파이프라인 API: 호출부 호환을 위해 시그니처 유지
 pub async fn run_pipeline_with_context(
     cfg: &Config,
     binding: &Binding,
@@ -1940,6 +1984,7 @@ fn extract_plan_section(plan: &str, header: &str) -> String {
     out.join("\n").trim().to_string()
 }
 
+#[allow(clippy::too_many_arguments)] // 공개 파이프라인 API: 호출부 호환을 위해 시그니처 유지
 async fn run_pipeline_inner(
     cfg: &Config,
     binding: &Binding,
@@ -1995,7 +2040,7 @@ async fn run_pipeline_inner(
     crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
     system.push_str(&format!(
         "\n\n[현재 실행 정보]\nProvider: {}\nModel: {}\nContext window: {} tokens\nHarness: {}\n\
-         사용자가 현재 provider·model·context window·엔진·팀 모드·분야 등 하네스 설정을 물으면 \
+         사용자가 현재 provider·model·context window·엔진·팀 모드·분야 등 Harness 설정을 물으면 \
          도구를 쓰지 말고 이 값을 그대로 답한다.",
         binding.provider_name,
         binding.model,
@@ -2033,7 +2078,6 @@ async fn run_pipeline_inner(
         other => other,
     };
     let contract_plan = plan_depth == crate::engine::PlanDepth::Contract;
-    let mut system = system;
     if staged {
         // 배너 없이 조용히 — 단계 진행은 Todo 패널이 보여준다 (pi 저소음).
         crate::tools_more::clear_todos_in(&run_context);
@@ -2050,7 +2094,7 @@ async fn run_pipeline_inner(
         );
         system.push_str(staged_block(contract_plan));
     }
-    // 엔진 프롬프트 블록 — 각 하네스의 품질 장치를 한 지점에서 주입한다.
+    // 엔진 프롬프트 블록 — 각 Harness의 품질 장치를 한 지점에서 주입한다.
     if !spec.prompt_block.is_empty() {
         system.push_str(&spec.prompt_block);
     }
@@ -2070,7 +2114,7 @@ async fn run_pipeline_inner(
             Some("bind"),
         );
     }
-    // Self-Harness (arXiv:2606.09498) — 자기개선 루프가 유지하는 하네스 상태를
+    // Self-Harness (arXiv:2606.09498) — 자기개선 루프가 유지하는 Harness 상태를
     // 시스템 프롬프트와 런타임 제어에 반영한다. 상태는 에피소드 관찰이 갱신한다.
     // 엔진 지시 뒤에 붙어 학습된 지시가 우선하게 한다.
     let mut effective_max_iter = binding.max_iterations;
@@ -2081,7 +2125,7 @@ async fn run_pipeline_inner(
         crate::ui::live_line_in(
             &run_context,
             &format!(
-                "[하네스] self-harness v{} — 자기개선 루프 활성{}",
+                "[Harness] self-harness v{} — 자기개선 루프 활성{}",
                 sh.version,
                 sh.trial
                     .as_ref()
@@ -2855,6 +2899,7 @@ async fn approve_bash_command(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // 검증 파이프라인: 각 인자가 독립적 실행 축이라 유지
 async fn run_verify(
     cfg: &Config,
     binding: &Binding,
@@ -3162,7 +3207,7 @@ async fn run_review_once(
             model: &reviewer.model,
             task: prompt,
             yes,
-            max_iterations: reviewer.max_iterations.min(REVIEW_GATE_MAX_ITER).max(1),
+            max_iterations: reviewer.max_iterations.clamp(1, REVIEW_GATE_MAX_ITER),
             system,
             registry: ToolRegistry::with_names(&reviewer.tools),
             resume,

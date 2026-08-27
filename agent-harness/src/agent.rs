@@ -108,8 +108,11 @@ pub struct AgentRun<'a> {
 #[derive(Clone)]
 pub struct RemoteApproval {
     pub timeout: Duration,
-    pub ask: Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>,
+    pub ask: AskFn,
 }
+
+/** 원격 승인 콜백: 질의 문자열을 받아 승인 여부를 비동기로 반환한다. */
+pub type AskFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalChoice {
@@ -873,10 +876,10 @@ fn committed_files(run: &RunContext) -> Vec<String> {
 
 fn print_text_blocks(run: &RunContext, resp: &ChatResponse) {
     for b in &resp.content {
-        if let ContentBlock::Text { text } = b {
-            if !text.trim().is_empty() {
-                crate::ui::live_assistant_in(run, text);
-            }
+        if let ContentBlock::Text { text } = b
+            && !text.trim().is_empty()
+        {
+            crate::ui::live_assistant_in(run, text);
         }
     }
 }
@@ -1003,10 +1006,10 @@ pub fn assistant_text(messages: &[Message]) -> String {
             continue;
         }
         for b in &m.content {
-            if let ContentBlock::Text { text } = b {
-                if !text.trim().is_empty() {
-                    parts.push(text.as_str());
-                }
+            if let ContentBlock::Text { text } = b
+                && !text.trim().is_empty()
+            {
+                parts.push(text.as_str());
             }
         }
     }

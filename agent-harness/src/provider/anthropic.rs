@@ -147,30 +147,26 @@ impl AnthropicProvider {
                             {
                                 if let Some(piece) =
                                     v.pointer("/delta/text").and_then(|x| x.as_str())
+                                    && !piece.is_empty()
                                 {
-                                    if !piece.is_empty() {
-                                        if thinking_started {
-                                            on_event(StreamEvent::Text("\n[/모델 작업]\n"));
-                                            thinking_started = false;
-                                        }
-                                        on_event(StreamEvent::Text(piece));
-                                        full_text.push_str(piece);
+                                    if thinking_started {
+                                        on_event(StreamEvent::Text("\n[/모델 작업]\n"));
+                                        thinking_started = false;
                                     }
+                                    on_event(StreamEvent::Text(piece));
+                                    full_text.push_str(piece);
                                 }
                             } else if v.pointer("/delta/type").and_then(|x| x.as_str())
                                 == Some("thinking_delta")
-                            {
-                                if let Some(piece) =
+                                && let Some(piece) =
                                     v.pointer("/delta/thinking").and_then(|x| x.as_str())
-                                {
-                                    if !piece.is_empty() {
-                                        if !thinking_started {
-                                            on_event(StreamEvent::Text("\n[모델 작업]\n"));
-                                            thinking_started = true;
-                                        }
-                                        on_event(StreamEvent::Text(piece));
-                                    }
+                                && !piece.is_empty()
+                            {
+                                if !thinking_started {
+                                    on_event(StreamEvent::Text("\n[모델 작업]\n"));
+                                    thinking_started = true;
                                 }
+                                on_event(StreamEvent::Text(piece));
                             }
                         }
                         Some("message_delta") => {
@@ -261,10 +257,8 @@ fn build_body(req: &ChatRequest) -> Value {
             })
             .collect();
         // 도구 목록도 시스템 다음 캐시 경계 — 마지막 도구에 두 번째 브레이크포인트.
-        if caching {
-            if let Some(last) = tools.last_mut() {
-                last["cache_control"] = json!({"type": "ephemeral"});
-            }
+        if caching && let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
         }
         body["tools"] = Value::Array(tools);
     }
@@ -387,30 +381,6 @@ fn take_stream_input_usage(
     }
 }
 
-#[cfg(test)]
-mod streaming_usage_tests {
-    use super::*;
-
-    #[test]
-    fn message_start_keeps_cache_read_tokens_until_stop() {
-        let event = json!({
-            "type": "message_start",
-            "message": {
-                "usage": {
-                    "input_tokens": 200,
-                    "cache_read_input_tokens": 800
-                }
-            }
-        });
-        let mut input = 0;
-        let mut cached = 0;
-        let mut reported = false;
-        take_stream_input_usage(&event, &mut input, &mut cached, &mut reported);
-        assert_eq!((input, cached), (200, 800));
-        assert!(reported);
-    }
-}
-
 fn api_error(status: u16, body: &str, hint: &LimitHint) -> anyhow::Error {
     let safe = redact_secrets(body);
     if status == 429 {
@@ -435,4 +405,28 @@ fn redact_secrets(s: &str) -> String {
         out.replace_range(i..i + prefix.len() + n, "[redacted]");
     }
     out
+}
+
+#[cfg(test)]
+mod streaming_usage_tests {
+    use super::*;
+
+    #[test]
+    fn message_start_keeps_cache_read_tokens_until_stop() {
+        let event = json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 200,
+                    "cache_read_input_tokens": 800
+                }
+            }
+        });
+        let mut input = 0;
+        let mut cached = 0;
+        let mut reported = false;
+        take_stream_input_usage(&event, &mut input, &mut cached, &mut reported);
+        assert_eq!((input, cached), (200, 800));
+        assert!(reported);
+    }
 }

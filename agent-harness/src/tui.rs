@@ -734,7 +734,7 @@ fn handle_key(
             }
         }
         KeyCode::Tab | KeyCode::BackTab => {
-            // opencode 스타일 — Tab 으로 plan/build 하네스 모드를 전환한다.
+            // opencode 스타일 — Tab 으로 plan/build Harness 모드를 전환한다.
             let next = if app.session.is_plan_mode() {
                 "build"
             } else {
@@ -1275,23 +1275,22 @@ fn apply_live(app: &mut App, ev: Live) {
                 });
                 app.streaming = true;
             }
-            if let Some(last) = app.transcript.last_mut() {
-                if last.kind == EntryKind::Assistant {
-                    last.text.push_str(&s);
-                }
+            if let Some(last) = app.transcript.last_mut()
+                && last.kind == EntryKind::Assistant
+            {
+                last.text.push_str(&s);
             }
         }
         Live::Assistant(s) => {
-            if app.streaming {
-                if let Some(last) = app.transcript.last_mut() {
-                    if last.kind == EntryKind::Assistant {
-                        if !last.text.ends_with('\n') && !last.text.is_empty() {
-                            last.text.push('\n');
-                        }
-                        last.text.push_str(&s);
-                        return;
-                    }
+            if app.streaming
+                && let Some(last) = app.transcript.last_mut()
+                && last.kind == EntryKind::Assistant
+            {
+                if !last.text.ends_with('\n') && !last.text.is_empty() {
+                    last.text.push('\n');
                 }
+                last.text.push_str(&s);
+                return;
             }
             push(app, EntryKind::Assistant, s);
         }
@@ -1749,7 +1748,7 @@ fn open_model_picker(app: &mut App, query: &str) {
     }
     let mut items = Vec::new();
     let mut ids = Vec::new();
-    items.push("하네스 자동".into());
+    items.push("Harness 자동".into());
     ids.push(String::new());
     for r in &regs {
         items.push(format!("{} / {}", r.provider, r.id));
@@ -1927,7 +1926,11 @@ fn apply_picker(app: &mut App, picker: Picker) {
                 app.session.model = None;
                 // 자동 전환 시 영속 선택도 초기화
                 crate::chat::persist_last_choice(&app.session.cfg.clone(), "", "");
-                push(app, EntryKind::System, "모델을 하네스 자동으로 돌렸습니다.");
+                push(
+                    app,
+                    EntryKind::System,
+                    "모델을 Harness 자동으로 돌렸습니다.",
+                );
             } else {
                 let (selected_provider, selected_model) =
                     id.split_once('\t').unwrap_or(("", id.as_str()));
@@ -2191,10 +2194,10 @@ fn finish_secret(app: &mut App, secret: SecretPrompt) {
                             crate::auth::provider_label(&pname),
                             models.len()
                         );
-                        if let Some(m) = main_m {
-                            if crate::api::set_provider_model(&pname, &m).is_ok() {
-                                note.push_str(&format!(" · 기본 모델 {m} 저장"));
-                            }
+                        if let Some(m) = main_m
+                            && crate::api::set_provider_model(&pname, &m).is_ok()
+                        {
+                            note.push_str(&format!(" · 기본 모델 {m} 저장"));
                         }
                         crate::ui::live_line(&note);
                     }

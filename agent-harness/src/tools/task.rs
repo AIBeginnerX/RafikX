@@ -266,7 +266,7 @@ impl Tool for TaskTool {
                 "prompt": {"type": "string", "description": "위임할 작업 지시"},
                 "class": {"type": "string", "enum": ["simple", "medium", "advanced", "dev"], "description": "강제 분류. 생략 시 규칙 분류"},
                 "role": {"type": "string", "description": "전문가 역할. planner(스펙·완료기준·작업분해) | frontend | backend | reviewer(DoD 대조 리뷰) 중 하나면 해당 전문가 프로파일(도구·품질 기준)로 실행된다. 그 밖의 값은 화면 표시용 라벨"},
-                "model": {"type": "string", "description": "등록된 모델 ID. 생략하면 하네스가 능력과 비용에 따라 선택"}
+                "model": {"type": "string", "description": "등록된 모델 ID. 생략하면 Harness가 능력과 비용에 따라 선택"}
             },
             "required": ["prompt"]
         })

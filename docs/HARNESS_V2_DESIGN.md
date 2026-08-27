@@ -6,7 +6,7 @@
 ## 0. 목표와 비목표
 
 **목표**
-1. 엔진 카탈로그 확장: `rafikx | claude | deepseek | qwen | kimi | pi` — 각 엔진은 해당 하네스의 **검증된 품질 장치**를 구현한다 (이름 차용이 아님).
+1. 엔진 카탈로그 확장: `rafikx | claude | deepseek | qwen | kimi | pi` — 각 엔진은 해당 Harness의 **검증된 품질 장치**를 구현한다 (이름 차용이 아님).
 2. Self-Harness를 "엔진 중 하나"에서 **엔진 독립 메타 레이어**로 승격 — 어떤 엔진 위에도 자기개선 루프가 겹쳐진다.
 3. 실행 분야(discipline) 선택: `harness | loop | graph` — 같은 엔진이라도 실행 제어 전략을 바꿀 수 있다.
 4. 전문가 역할 파이프라인: 기획(planner) → 구현(frontend/backend/coder) → 독립 리뷰(reviewer). 역할 간 통신은 자유 대화가 아니라 **구조화 산출물**(스펙/DoD → diff → 리뷰 리포트).
@@ -170,7 +170,7 @@ run_verify 성공 **후** (또는 검증 생략 시 그 자리에서), spec.veri
 - `/discipline [harness|loop|graph]` — 신설.
 - `/selfharness [on|off]` — meta 토글 신설.
 - `rafikx status` / doctor 출력에 engine·discipline·self-meta 표시 추가 (기존 표시 지점에 필드 추가 수준).
-- 실행 시작 1줄 표시 확장: `[하네스] dev → coder (minimax:MiniMax-M3) · engine=claude · graph` 형식.
+- 실행 시작 1줄 표시 확장: `[Harness] dev → coder (minimax:MiniMax-M3) · engine=claude · graph` 형식.
 
 ## 8. 하위호환·마이그레이션
 
@@ -202,9 +202,9 @@ run_verify 성공 **후** (또는 검증 생략 시 그 자리에서), spec.veri
 
 각 Phase 종료 조건: `cargo test` 전체 통과 + `cargo build --release` 성공.
 
-## 11. minimax 엔진 — 단일 프로바이더 고정 하네스 (Phase 4)
+## 11. minimax 엔진 — 단일 프로바이더 고정 Harness (Phase 4)
 
-목표: **MiniMax 모델만으로** 높은 품질을 내는 전용 엔진. 근거: Self-Harness(arXiv 2606.09498) 실증에서 MiniMax 계열이 하네스 개선 이득이 가장 큼(M2.5 기준 상대 +53%) — 모델 교체 없이 하네스가 품질을 견인한다.
+목표: **MiniMax 모델만으로** 높은 품질을 내는 전용 엔진. 근거: Self-Harness(arXiv 2606.09498) 실증에서 MiniMax 계열이 Harness 개선 이득이 가장 큼(M2.5 기준 상대 +53%) — 모델 교체 없이 Harness가 품질을 견인한다.
 
 ### 11.1 EngineSpec 확장 — pin_provider
 
@@ -275,12 +275,12 @@ summary: "MiniMax 전용 — 프로바이더 고정 + 약점 보정 + 계약형 
 
 ## 14. paperthin 패턴 흡수 (Phase 5에 포함)
 
-LilMGenius/paperthin(MIT)의 저수준 에이전트 패턴 중 실측 실패와 맞물리는 것만 하네스에 반사신경으로 내장:
+LilMGenius/paperthin(MIT)의 저수준 에이전트 패턴 중 실측 실패와 맞물리는 것만 Harness에 반사신경으로 내장:
 
 1. **re0 (패치 대신 재작성)**: 공통 시스템 프롬프트 [엔지니어링] 절에 추가 — "같은 파일에서 edit_file/apply_patch 가 2회 연속 실패하면 부분 패치를 멈추고 그 파일을 읽어 전체를 write_file 로 재작성하라." (2026-08-26 21:33 edit_file old_str 불일치 3연속 실측 대응)
 2. **hate (계획을 죽일 유일한 이의)**: Contract 계획 산출물에 `[반박]` 절 추가 — "이 계획을 실패시킬 가장 유력한 위험 1개와 그것을 조기 확인할 최소 테스트 1개." DoD와 함께 검증자 게이트 입력에 포함.
 3. **mandela/shower (자체 확인 편향 감시)**: reviewer 프리셋 system_extra 에 추가 — "직접 읽고 실행해 얻은 외부 근거 없이 pass 를 주지 마라. 작성 맥락을 모르는 낯선 눈으로 본다."
-4. 도입하지 않는 것: 나머지 스킬들은 대화형 슬래시 워크플로라 RafikX 하네스 자동 반사에 부적합 — 필요 시 사용자가 paperthin 을 Claude Code 쪽에서 직접 쓴다.
+4. 도입하지 않는 것: 나머지 스킬들은 대화형 슬래시 워크플로라 RafikX Harness 자동 반사에 부적합 — 필요 시 사용자가 paperthin 을 Claude Code 쪽에서 직접 쓴다.
 
 ## 15. 하드닝 (Phase 7) — paperthin 점검(2026-08-26) 발견 반영
 

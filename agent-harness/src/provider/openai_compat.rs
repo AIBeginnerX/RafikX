@@ -80,10 +80,10 @@ impl OpenAiCompatProvider {
     }
 
     fn apply_auth(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(key) = &self.api_key {
-            if !key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {key}"));
-            }
+        if let Some(key) = &self.api_key
+            && !key.is_empty()
+        {
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
         if matches!(self.mode, CompatMode::CodexResponses) {
             req = req
@@ -210,34 +210,34 @@ impl OpenAiCompatProvider {
                 else {
                     continue;
                 };
-                if let Some(fr) = choice.get("finish_reason").and_then(|x| x.as_str()) {
-                    if !fr.is_empty() && fr != "null" {
-                        finish = Some(fr.to_string());
-                    }
+                if let Some(fr) = choice.get("finish_reason").and_then(|x| x.as_str())
+                    && !fr.is_empty()
+                    && fr != "null"
+                {
+                    finish = Some(fr.to_string());
                 }
                 if let Some(delta) = choice.get("delta") {
-                    if let Some(piece) = delta.get("content").and_then(|x| x.as_str()) {
-                        if !piece.is_empty() {
-                            if reasoning_started {
-                                on_event(StreamEvent::Text("\n[/모델 작업]\n"));
-                                reasoning_started = false;
-                            }
-                            on_event(StreamEvent::Text(piece));
-                            full_text.push_str(piece);
+                    if let Some(piece) = delta.get("content").and_then(|x| x.as_str())
+                        && !piece.is_empty()
+                    {
+                        if reasoning_started {
+                            on_event(StreamEvent::Text("\n[/모델 작업]\n"));
+                            reasoning_started = false;
                         }
+                        on_event(StreamEvent::Text(piece));
+                        full_text.push_str(piece);
                     }
                     if let Some(piece) = delta
                         .get("reasoning_content")
                         .or_else(|| delta.get("reasoning"))
                         .and_then(|x| x.as_str())
+                        && !piece.is_empty()
                     {
-                        if !piece.is_empty() {
-                            if !reasoning_started {
-                                on_event(StreamEvent::Text("\n[모델 작업]\n"));
-                                reasoning_started = true;
-                            }
-                            on_event(StreamEvent::Text(piece));
+                        if !reasoning_started {
+                            on_event(StreamEvent::Text("\n[모델 작업]\n"));
+                            reasoning_started = true;
                         }
+                        on_event(StreamEvent::Text(piece));
                     }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                         for tc in tcs {
@@ -428,6 +428,7 @@ fn parse_tool_args(args: &str) -> Option<Value> {
     serde_json::from_str(trimmed).ok()
 }
 
+#[allow(clippy::too_many_arguments)] // 스트림 종결 축이 인자별로 독립적이라 유지
 fn finish_stream(
     full_text: String,
     tool_acc: Vec<(String, String, String)>,
@@ -586,12 +587,12 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
         .ok_or_else(|| anyhow!("choices 가 없습니다"))?;
     let message = choice.get("message").cloned().unwrap_or(json!({}));
     let mut content = Vec::new();
-    if let Some(t) = message.get("content").and_then(|x| x.as_str()) {
-        if !t.is_empty() {
-            content.push(ContentBlock::Text {
-                text: t.to_string(),
-            });
-        }
+    if let Some(t) = message.get("content").and_then(|x| x.as_str())
+        && !t.is_empty()
+    {
+        content.push(ContentBlock::Text {
+            text: t.to_string(),
+        });
     }
     if let Some(tcs) = message.get("tool_calls").and_then(|x| x.as_array()) {
         for tc in tcs {
@@ -796,6 +797,7 @@ fn parse_codex_response(text: &str) -> Result<ChatResponse> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // codex 이벤트 필드가 그대로 인자로 대응된다
 fn apply_codex_event<F>(
     v: &Value,
     full_text: &mut String,
@@ -810,20 +812,19 @@ fn apply_codex_event<F>(
     F: FnMut(StreamEvent),
 {
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    if kind.ends_with("output_text.delta") || kind == "response.output_text.delta" {
-        if let Some(delta) = v.get("delta").and_then(|x| x.as_str()) {
-            if !delta.is_empty() {
-                full_text.push_str(delta);
-                if let Some(cb) = on_event.as_mut() {
-                    cb(StreamEvent::Text(delta));
-                }
-            }
+    if (kind.ends_with("output_text.delta") || kind == "response.output_text.delta")
+        && let Some(delta) = v.get("delta").and_then(|x| x.as_str())
+        && !delta.is_empty()
+    {
+        full_text.push_str(delta);
+        if let Some(cb) = on_event.as_mut() {
+            cb(StreamEvent::Text(delta));
         }
     }
-    if kind.ends_with("output_item.done") || kind == "response.output_item.done" {
-        if let Some(item) = v.get("item") {
-            collect_codex_item(item, full_text, tools);
-        }
+    if (kind.ends_with("output_item.done") || kind == "response.output_item.done")
+        && let Some(item) = v.get("item")
+    {
+        collect_codex_item(item, full_text, tools);
     }
     if kind.ends_with("completed") || kind == "response.completed" {
         *finish = Some("completed".into());
@@ -894,10 +895,11 @@ fn collect_codex_item(
     }
     if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
         for part in content {
-            if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
-                if !t.is_empty() && !full_text.contains(t) {
-                    full_text.push_str(t);
-                }
+            if let Some(t) = part.get("text").and_then(|x| x.as_str())
+                && !t.is_empty()
+                && !full_text.contains(t)
+            {
+                full_text.push_str(t);
             }
         }
     }

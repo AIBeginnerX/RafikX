@@ -276,13 +276,13 @@ inject_limit_chars = 2000
 # pin_provider = "minimax"         # 실행 경로를 이 연결로 고정 (빈 문자열이면 고정 해제)
 # pin_strict = false               # true 면 고정 연결이 전면 장애여도 폴백하지 않는다
 
-# Self-Harness — 하네스가 자기 실행 실패를 채굴해 스스로 개선 (arXiv:2606.09498).
+# Self-Harness — Harness가 자기 실행 실패를 채굴해 스스로 개선 (arXiv:2606.09498).
 # meta = true 면 엔진과 무관하게 모든 실행 위에 자기개선 루프를 겹칩니다 (/selfharness on|off).
 # enabled = false 면 meta 를 켜도 루프는 돌지 않습니다.
 [self_harness]
 enabled = true             # 자기개선 루프 전체 스위치
 # meta = false             # 모든 엔진 위에 겹치기 (legacy engine = "self" 는 자동으로 on)
-proposal_threshold = 2     # 같은 실패 시그니처 누적 시 하네스 수정 제안
+proposal_threshold = 2     # 같은 실패 시그니처 누적 시 Harness 수정 제안
 trial_min_episodes = 5     # trial 판정에 필요한 최소 에피소드
 baseline_window = 20       # 기준선 성공률 계산 구간 (버전 경계 없이 최근 N개)
 proposal_width = 3         # 한 번에 생성하는 후보 수 (논문의 K)
@@ -327,6 +327,9 @@ pub struct ConfigFile {
     pub inspector: InspectorConfig,
     pub obsidian: ObsidianConfig,
     pub telegram: TelegramConfig,
+    /// `[mcp_servers.<이름>]` — MCP stdio 외부 도구 서버. 없으면 비어 비활성.
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, crate::mcp::McpServerCfg>,
     /// 옛 설정에 없으면 기본값 (테마 rafikx).
     #[serde(default)]
     pub ui: UiConfig,
@@ -344,7 +347,7 @@ pub struct GeneralConfig {
     /// 첫 실행 마법사를 이미 지났으면 true. 옛 설정에는 없음 → false.
     #[serde(default)]
     pub setup_done: bool,
-    /// 하네스 엔진: rafikx (기본) | claude | deepseek | qwen | kimi | pi.
+    /// Harness 엔진: rafikx (기본) | claude | deepseek | qwen | kimi | pi.
     /// 옛 값 `self`(Self-Harness 자기개선 루프, arXiv:2606.09498)와 `dk` 는
     /// engine::normalize 가 흡수한다. 옛 설정엔 없음 → rafikx.
     #[serde(default)]
@@ -373,7 +376,7 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub supports_tools: bool,
-    /// true면 이 프로바이더 기본은 「자동 (하네스)」.
+    /// true면 이 프로바이더 기본은 「자동 (Harness)」.
     #[serde(default)]
     pub model_auto: bool,
     /// 있으면 팩커가 이 값을 우선한다.
@@ -558,7 +561,7 @@ pub struct SelfHarnessConfig {
     /// engine=self 일 때 약점 채굴→제안→검증 루프 동작 여부.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 같은 실패 시그니처가 이만큼 쌓이면 하네스 수정을 제안한다.
+    /// 같은 실패 시그니처가 이만큼 쌓이면 Harness 수정을 제안한다.
     #[serde(default = "default_sh_threshold")]
     pub proposal_threshold: u32,
     /// trial 판정에 필요한 최소 에피소드 수.

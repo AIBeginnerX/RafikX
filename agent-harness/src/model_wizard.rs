@@ -53,10 +53,11 @@ pub fn parse_model_arg(s: &str) -> (Option<String>, String) {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     };
     let t = s.trim();
-    if let Some((p, m)) = t.split_once(':') {
-        if ident(p) && ident(m) {
-            return (Some(p.to_string()), m.to_string());
-        }
+    if let Some((p, m)) = t.split_once(':')
+        && ident(p)
+        && ident(m)
+    {
+        return (Some(p.to_string()), m.to_string());
     }
     (None, t.to_string())
 }
@@ -83,7 +84,7 @@ pub async fn cmd_list(cfg: &Config) -> Result<()> {
     }
     println!();
     println!("* = 기본 연결 · 변경: rafikx model use <번호|provider:model>");
-    println!("하네스 분류별 지정: rafikx harness <simple|medium|advanced|dev> <provider:model>");
+    println!("Harness 분류별 지정: rafikx harness <simple|medium|advanced|dev> <provider:model>");
     Ok(())
 }
 
@@ -152,7 +153,7 @@ pub async fn cmd_use(cfg: &Config, arg: &str) -> Result<()> {
     let msg = apply_default(cfg, &name, &model).await?;
     println!("{msg}");
     println!();
-    println!("하네스 반영: selection=auto 면 즉시 적용됩니다. rafikx harness 로 확인.");
+    println!("Harness 반영: selection=auto 면 즉시 적용됩니다. rafikx harness 로 확인.");
     Ok(())
 }
 
@@ -238,10 +239,10 @@ pub async fn run_wizard(cfg: Config) -> Result<()> {
     let msg = apply_default(&cfg2, &row.id, &model).await?;
     println!("{msg}");
 
-    // 마침 후 하네스 요약 (자동 모드면 그대로 반영됨)
+    // 마침 후 Harness 요약 (자동 모드면 그대로 반영됨)
     let cfg3 = cfg2.reload()?;
     println!();
-    println!("하네스 바인딩:");
+    println!("Harness 바인딩:");
     for c in [
         crate::harness::TaskClass::Simple,
         crate::harness::TaskClass::Medium,

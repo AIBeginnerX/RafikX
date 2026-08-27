@@ -110,12 +110,11 @@ impl LifecycleRuntime {
             state,
             event: data,
         };
-        if let Some(store) = &self.store {
-            if let Err(error) = store.append(&event) {
-                if let Ok(mut slot) = self.persistence_error.lock() {
-                    *slot = Some(error.to_string());
-                }
-            }
+        if let Some(store) = &self.store
+            && let Err(error) = store.append(&event)
+            && let Ok(mut slot) = self.persistence_error.lock()
+        {
+            *slot = Some(error.to_string());
         }
         self.bus.publish(event.clone());
         Ok(event)

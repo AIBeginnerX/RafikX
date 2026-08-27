@@ -152,10 +152,10 @@ pub fn pick_preferred(available: &[String], name: &str) -> (Option<String>, Opti
     let pref = preferred_models(name);
     let mut hits = Vec::new();
     for want in pref {
-        if let Some(found) = available.iter().find(|id| model_matches(id, want)) {
-            if !hits.iter().any(|h: &String| h == found) {
-                hits.push(found.clone());
-            }
+        if let Some(found) = available.iter().find(|id| model_matches(id, want))
+            && !hits.iter().any(|h: &String| h == found)
+        {
+            hits.push(found.clone());
         }
     }
     if hits.is_empty() {
@@ -216,31 +216,31 @@ pub fn resolve_account_credential(
     account_id: &str,
 ) -> Result<Option<Credential>> {
     let p = cfg.provider(provider)?;
-    if account_id == provider {
-        if let Some(v) = env_key_for(provider, &p.api_key_env) {
-            return Ok(Some(key_cred(v)));
-        }
+    if account_id == provider
+        && let Some(v) = env_key_for(provider, &p.api_key_env)
+    {
+        return Ok(Some(key_cred(v)));
     }
-    if let Some(v) = secret_value(account_id)? {
-        if !v.trim().is_empty() {
-            return Ok(Some(key_cred(v)));
-        }
+    if let Some(v) = secret_value(account_id)?
+        && !v.trim().is_empty()
+    {
+        return Ok(Some(key_cred(v)));
     }
-    if account_id != provider {
-        if let Some(v) = secret_value(provider)? {
-            if !v.trim().is_empty() && crate::accounts::for_provider(provider).len() == 1 {
-                return Ok(Some(key_cred(v)));
-            }
-        }
+    if account_id != provider
+        && let Some(v) = secret_value(provider)?
+        && !v.trim().is_empty()
+        && crate::accounts::for_provider(provider).len() == 1
+    {
+        return Ok(Some(key_cred(v)));
     }
     if auth_mode(provider, p) == "oauth" {
         if let Some(set) = load_valid_set(account_id)? {
             return Ok(Some(oauth_cred(set)));
         }
-        if account_id != provider {
-            if let Some(set) = load_valid_set(provider)? {
-                return Ok(Some(oauth_cred(set)));
-            }
+        if account_id != provider
+            && let Some(set) = load_valid_set(provider)?
+        {
+            return Ok(Some(oauth_cred(set)));
         }
     }
     Ok(None)
@@ -468,16 +468,16 @@ pub async fn add_account(cfg: &Config, name: &str) -> Result<()> {
     };
     match result {
         Ok(()) => {
-            if let Some(dup) = duplicate_account_for(cfg, name, &id)? {
-                if dup != id {
-                    let _ = disconnect_account(&id);
-                    println!(
-                        "같은 {} 계정이 이미 '{}' 로 등록되어 있습니다. 중복 등록은 하지 않았습니다.",
-                        provider_label(name),
-                        dup
-                    );
-                    return Ok(());
-                }
+            if let Some(dup) = duplicate_account_for(cfg, name, &id)?
+                && dup != id
+            {
+                let _ = disconnect_account(&id);
+                println!(
+                    "같은 {} 계정이 이미 '{}' 로 등록되어 있습니다. 중복 등록은 하지 않았습니다.",
+                    provider_label(name),
+                    dup
+                );
+                return Ok(());
             }
             crate::accounts::upsert(crate::accounts::Account {
                 id: id.clone(),
@@ -530,26 +530,26 @@ pub fn account_has_stored_credential(
     account_id: &str,
 ) -> Result<bool> {
     let p = cfg.provider(provider)?;
-    if let Some(set) = load_token_set(account_id)? {
-        if !set.access_token.is_empty() {
-            return Ok(true);
-        }
+    if let Some(set) = load_token_set(account_id)?
+        && !set.access_token.is_empty()
+    {
+        return Ok(true);
     }
-    if let Some(v) = secret_value(account_id)? {
-        if !v.trim().is_empty() {
-            return Ok(true);
-        }
+    if let Some(v) = secret_value(account_id)?
+        && !v.trim().is_empty()
+    {
+        return Ok(true);
     }
     if account_id == provider {
-        if let Some(v) = env_only(&p.api_key_env) {
-            if !v.is_empty() {
-                return Ok(true);
-            }
+        if let Some(v) = env_only(&p.api_key_env)
+            && !v.is_empty()
+        {
+            return Ok(true);
         }
-        if let Some(v) = secret_value(provider)? {
-            if !v.trim().is_empty() {
-                return Ok(true);
-            }
+        if let Some(v) = secret_value(provider)?
+            && !v.trim().is_empty()
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -948,7 +948,7 @@ pub fn replace_or_save_key(name: &str, key: &str) -> Result<String> {
 }
 
 pub fn resolve_provider_alias(s: &str) -> Option<String> {
-    let t = s.trim().to_lowercase().replace('-', "_").replace(' ', "_");
+    let t = s.trim().to_lowercase().replace(['-', ' '], "_");
     let mapped = match t.as_str() {
         "zen" | "opencode" | "opencode_zen" | "opencodezen" => "opencode_zen",
         "opencode_go" | "opencodego" | "ocgo" => "opencode_go",
@@ -1057,10 +1057,10 @@ fn parse_query_param(req: &str, key: &str) -> Option<String> {
     let q = line.split('?').nth(1)?;
     let q = q.split(' ').next()?;
     for pair in q.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return Some(url_decode(v));
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            return Some(url_decode(v));
         }
     }
     None
@@ -1074,12 +1074,13 @@ fn load_valid_set(name: &str) -> Result<Option<TokenSet>> {
     if set.access_token.is_empty() {
         return Ok(None);
     }
-    if set.expires_at > 0 && now_secs() > set.expires_at {
-        if let Ok(Some(fresh)) = refresh_token_sync(provider_of_account(name), &set) {
-            file.providers.insert(name.to_string(), fresh.clone());
-            save_auth(&file)?;
-            return Ok(Some(fresh));
-        }
+    if set.expires_at > 0
+        && now_secs() > set.expires_at
+        && let Ok(Some(fresh)) = refresh_token_sync(provider_of_account(name), &set)
+    {
+        file.providers.insert(name.to_string(), fresh.clone());
+        save_auth(&file)?;
+        return Ok(Some(fresh));
     }
     Ok(Some(set))
 }
@@ -1217,10 +1218,10 @@ fn load_secrets() -> Result<HashMap<String, String>> {
     let mut out = HashMap::new();
     if let Some(table) = v.as_table() {
         for (k, val) in table {
-            if let Some(s) = val.as_str() {
-                if !s.trim().is_empty() {
-                    out.insert(k.clone(), s.to_string());
-                }
+            if let Some(s) = val.as_str()
+                && !s.trim().is_empty()
+            {
+                out.insert(k.clone(), s.to_string());
             }
         }
     }
@@ -1629,10 +1630,11 @@ pub fn catalog_models(cfg: &Config, name: &str) -> Vec<String> {
         if !p.model.is_empty() {
             out.push(p.model.clone());
         }
-        if let Some(s) = &p.small_model {
-            if !s.is_empty() && !out.iter().any(|x| x == s) {
-                out.push(s.clone());
-            }
+        if let Some(s) = &p.small_model
+            && !s.is_empty()
+            && !out.iter().any(|x| x == s)
+        {
+            out.push(s.clone());
         }
     }
     for m in preferred_models(name) {
@@ -1653,7 +1655,7 @@ fn catalogs_file(cfg: &Config) -> std::path::PathBuf {
     cfg.data_dir.join("catalogs.json")
 }
 
-/// 원격 모델 목록을 캐시에 저장한다 (/model · 하네스 선택이 이 목록을 쓴다).
+/// 원격 모델 목록을 캐시에 저장한다 (/model · Harness 선택이 이 목록을 쓴다).
 pub fn save_catalog(cfg: &Config, name: &str, list: &[String]) -> Result<()> {
     #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct Catalogs(std::collections::BTreeMap<String, Vec<String>>);
@@ -1834,12 +1836,11 @@ pub fn secret_value(name: &str) -> Result<Option<String>> {
 
 pub fn telegram_token(cfg: &Config) -> Result<Option<String>> {
     let env_name = cfg.file.telegram.token_env.trim();
-    if !env_name.is_empty() {
-        if let Ok(v) = std::env::var(env_name) {
-            if !v.trim().is_empty() {
-                return Ok(Some(v));
-            }
-        }
+    if !env_name.is_empty()
+        && let Ok(v) = std::env::var(env_name)
+        && !v.trim().is_empty()
+    {
+        return Ok(Some(v));
     }
     secret_value("telegram")
 }
@@ -2111,10 +2112,10 @@ fn parse_cli_tokens(name: &str, v: &serde_json::Value) -> Option<TokenSet> {
 }
 
 fn chatgpt_account_id(access: &str, id_token: Option<&str>, explicit: Option<&str>) -> String {
-    if let Some(s) = explicit {
-        if !s.is_empty() {
-            return s.to_string();
-        }
+    if let Some(s) = explicit
+        && !s.is_empty()
+    {
+        return s.to_string();
     }
     for t in [Some(access), id_token].into_iter().flatten() {
         if let Some(id) = jwt_chatgpt_account(t) {
@@ -2130,10 +2131,9 @@ fn jwt_chatgpt_account(token: &str) -> Option<String> {
         .get("https://api.openai.com/auth")
         .and_then(|x| x.get("chatgpt_account_id"))
         .and_then(|x| x.as_str())
+        && !id.is_empty()
     {
-        if !id.is_empty() {
-            return Some(id.to_string());
-        }
+        return Some(id.to_string());
     }
     v.get("chatgpt_account_id")
         .and_then(|x| x.as_str())
@@ -2157,7 +2157,7 @@ fn jwt_payload(token: &str) -> Option<serde_json::Value> {
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut t = s.replace('-', "+").replace('_', "/");
-    while t.len() % 4 != 0 {
+    while !t.len().is_multiple_of(4) {
         t.push('=');
     }
     let b = t.as_bytes();

@@ -388,7 +388,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         ),
         Span::styled(format!(" v{version} "), Style::default().fg(th.mute)),
         Span::raw(" "),
-        // 하네스 정보 (모델명 제외 — 자동/수동 + 엔진)
+        // Harness 정보 (모델명 제외 — 자동/수동 + 엔진)
         Span::styled(
             harness_header_label(
                 app.session
@@ -1572,8 +1572,7 @@ fn draw_picker(f: &mut Frame, area: Rect, picker: &super::Picker, th: &Pal) {
             Span::styled(format!("  ({total}개 일치)"), Style::default().fg(th.mute)),
         ]));
     }
-    for i in start..end {
-        let orig = idxs[i];
+    for (i, &orig) in idxs.iter().enumerate().take(end).skip(start) {
         let mark = if i == sel { "> " } else { "  " };
         lines.push(Line::from(Span::styled(
             format!("{mark}{}", picker.items[orig]),

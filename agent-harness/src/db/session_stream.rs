@@ -78,10 +78,7 @@ pub(super) fn load(connection: &Connection, id: &str) -> Result<Option<SessionRo
         return Ok(Some(row));
     }
     let snapshots = snapshots(connection, id)?;
-    let recovered = snapshots
-        .into_iter()
-        .rev()
-        .find(|snapshot| valid_snapshot(snapshot));
+    let recovered = snapshots.into_iter().rev().find(valid_snapshot);
     let Some(recovered) = recovered else {
         return Err(anyhow!("session '{id}' has no valid recoverable snapshot"));
     };
