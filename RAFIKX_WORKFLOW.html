@@ -210,7 +210,7 @@
         <p class="lead">클라우드 모델은 빌려 쓰고, 결정과 기억과 안전장치는 내 컴퓨터에 둡니다. 첫 연결은 번호만 고르면 됩니다.</p>
         <div class="pills">
           <div class="pill"><b>번호로 연결</b><p>서비스·모델 이름을 외울 필요 없습니다. 키와 토큰만 붙여넣습니다.</p></div>
-          <div class="pill"><b>자동 하네스</b><p>설계·검증·디버깅은 등록한 모델 중 추론이 센 쪽을 고릅니다.</p></div>
+          <div class="pill"><b>자동 Harness</b><p>설계·검증·디버깅은 등록한 모델 중 추론이 센 쪽을 고릅니다.</p></div>
           <div class="pill"><b>계정 항로</b><p>같은 모델에 계정을 여러 개 두면, 리밋이 먼저 끝난 쪽을 쓰고 막히면 전환합니다.</p></div>
           <div class="pill"><b>침묵하는 문</b><p>텔레그램 허용 목록 밖에는 답하지 않습니다. 원격 무조건 승인은 코드가 막습니다.</p></div>
         </div>
@@ -246,7 +246,7 @@
                 <g data-st="0"><rect class="st" x="30" y="42" width="120" height="56" rx="12"/><text class="lbl" x="90" y="66" text-anchor="middle">01 지시</text><text class="sub" x="90" y="84" text-anchor="middle">ask / chat / 폰</text></g>
                 <g data-st="1"><rect class="st" x="190" y="42" width="120" height="56" rx="12"/><text class="lbl" x="250" y="66" text-anchor="middle">02 첫 연결?</text><text class="sub" x="250" y="84" text-anchor="middle">없으면 번호 마법사</text></g>
                 <g data-st="2"><rect class="st" x="360" y="132" width="120" height="56" rx="12"/><text class="lbl" x="420" y="156" text-anchor="middle">03 분류</text><text class="sub" x="420" y="174" text-anchor="middle">simple→dev</text></g>
-                <g data-st="3"><rect class="st" x="580" y="42" width="130" height="56" rx="12"/><text class="lbl" x="645" y="66" text-anchor="middle">04 하네스</text><text class="sub" x="645" y="84" text-anchor="middle">자동 모델 선택</text></g>
+                <g data-st="3"><rect class="st" x="580" y="42" width="130" height="56" rx="12"/><text class="lbl" x="645" y="66" text-anchor="middle">04 Harness</text><text class="sub" x="645" y="84" text-anchor="middle">자동 모델 선택</text></g>
                 <g data-st="4"><rect class="st" x="580" y="222" width="130" height="56" rx="12"/><text class="lbl" x="645" y="246" text-anchor="middle">05 계정 항로</text><text class="sub" x="645" y="264" text-anchor="middle">리밋 시 전환</text></g>
                 <g data-st="5"><rect class="st" x="360" y="312" width="120" height="56" rx="12"/><text class="lbl" x="420" y="336" text-anchor="middle">06 팩커</text><text class="sub" x="420" y="354" text-anchor="middle">한도에 맞게 줄임</text></g>
                 <g data-st="6"><rect class="st" x="190" y="402" width="120" height="56" rx="12"/><text class="lbl" x="250" y="426" text-anchor="middle">07 도구</text><text class="sub" x="250" y="444" text-anchor="middle">감옥 · 승인</text></g>
@@ -393,7 +393,7 @@
       { log: "수신 <em>rafikx agent \"hello.txt 만들어줘\"</em>", now: "<strong>01 지시.</strong> 터미널 또는 텔레그램에서 한 줄이 들어옵니다. agent 는 분류를 개발(dev)로 고정합니다." },
       { log: "게이트 <em>연결 확인</em>", now: "<strong>02 첫 연결.</strong> 클라우드 계정이 없으면 번호 마법사가 열립니다. 있으면 바로 항해에 들어갑니다." },
       { log: "분류 <em>dev → coder</em>", now: "<strong>03 분류.</strong> 설계·구성은 advanced, 검증·디버깅은 dev. 짧은 인사는 simple 입니다." },
-      { log: "하네스 <em>자동 · 등록 모델 중 상위 추론</em>", now: "<strong>04 하네스.</strong> 연결하지 않은 모델은 부르지 않습니다. 상위권이 없으면 등록분 중 가장 나은 것을 씁니다." },
+      { log: "Harness <em>자동 · 등록 모델 중 상위 추론</em>", now: "<strong>04 Harness.</strong> 연결하지 않은 모델은 부르지 않습니다. 상위권이 없으면 등록분 중 가장 나은 것을 씁니다." },
       { log: "계정 <em>리밋이 먼저 끝난 쪽</em>", now: "<strong>05 계정 항로.</strong> 바로 쓸 수 있는 계정을 고릅니다. 429가 오면 다음 계정으로 갈아탑니다." },
       { log: "팩커 <em>컨텍스트 한도 맞춤</em>", now: "<strong>06 팩커.</strong> 모델마다 창 크기가 다릅니다. 최근 대화와 도구 쌍은 남기고 오래된 것만 줄입니다." },
       { log: "도구 <em>write_file · 승인 대기</em>", now: "<strong>07 도구.</strong> 워크스페이스 밖은 차단합니다. 로컬은 y/n/a, 텔레그램은 버튼입니다." },

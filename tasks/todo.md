@@ -83,7 +83,7 @@ earendil-works/pi 와 code-yeongyu/oh-my-openagent 분석 후, pi 의 핵심 장
 - [x] 상태 스트립+푸터 2줄 → 단일 푸터 통합 (모드·상태·모델·토큰·Todo·ctx)
       — 중복 표시(모델 2회·상태 2회·Todo 2회·스피너 2개 위상 어긋남) 해소
 - [x] 도구 출력 원문 전량 투척 → 요약 한 줄 (원문은 모델에게만)
-- [x] "[모델 작업] 반복 N" 매 반복 배너, "[하네스] …" 매 턴 배너, 검증 성공
+- [x] "[모델 작업] 반복 N" 매 반복 배너, "[Harness] …" 매 턴 배너, 검증 성공
       원문 출력 제거 · 슬래시 팔레트 오타 시 26개 전체 재표시 → 숨김
 - [x] 버전 확인: 새 버전 있을 때만 표시 (최신/실패 시 매번 붉은 경고 제거)
 - [x] 80ms 무조건 전체 리드로우 → busy 일 때만 (유휴 CPU 0.0% 실측)
@@ -178,7 +178,7 @@ lessons+obsidian 과 중복이라 도입하지 않음.
   - held-in 대응 = trial 중 타깃 실패 시그니처 재발 여부 (Δ_in ≥ 0)
   - held-out 대응 = trial 중 전체 성공률이 기준선 대비 비저하 (Δ_ho ≥ 0)
   - 논문의 K개 병렬 후보 평가 → 후보 K개 생성 후 순차 trial (동시에 활성
-    하네스는 하나뿐이므로)
+    Harness는 하나뿐이므로)
 - failure signature φ=(c,q,m): c는 AgentOutcome에서 결정적 추출,
   m은 고정 어휘(controlled vocabulary)에서 소형 모델이 선택 → 논문의
   "정확 일치 클러스터링" 유지
@@ -202,7 +202,7 @@ lessons+obsidian 과 중복이라 도입하지 않음.
 
 ## 리뷰 (2026-08-25)
 
-- 신규: `agent-harness/src/self_harness.rs` — 하네스 상태(h_t) 로드/저장(원자적),
+- 신규: `agent-harness/src/self_harness.rs` — Harness 상태(h_t) 로드/저장(원자적),
   φ=(c,q,m) 추출(c 결정적 + q,m 소형모델·고정어휘), proposer 호출(K후보,
   최소성·no-op 거부 검증), trial 판정(재발 0 && 성공률 비저하 → promote,
   version+1·lineage 기록), /engine 상태 표시.
@@ -210,7 +210,7 @@ lessons+obsidian 과 중복이라 도입하지 않음.
   (await proposer) → (동기 DB 저장) 4단계로 분리 — lessons.rs와 같은 패턴.
 - runtime_policy.max_iterations_override는 메인 에이전트 루프에만 적용,
   verify 수리 루프는 기존 예산 유지 (의도된 선택).
-- denied 에피소드는 관찰 제외 — 사용자 판단이지 하네스 실패가 아님
+- denied 에피소드는 관찰 제외 — 사용자 판단이지 Harness 실패가 아님
   (논문 3.3 addressability 기준).
 - lessons(단문 교훈 주입)와 별개 레이어로 공존: lessons는 응답 전략 메모리,
   self-harness는 선언된 surface의 검증된 상태 전이.

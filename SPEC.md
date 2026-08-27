@@ -1,5 +1,5 @@
 🛠 RafikX v3.0 — AI 구현 지시서 (SPEC.md)
-목적: Rust 기반 초경량 개인용 AI 코딩 에이전트 CLI (Claude Code류) v3 핵심: ① 작업 난이도별 자동 하네스(서브에이전트) 시스템 ② 자기학습 메모리(같은 실수 반복 방지) ③ Inspector 자가 점검 에이전트(오류 로그 분석 → 개선 리포트) ④ 모바일 원격 접속 필수화(텔레그램) 사용법: 이 파일을 프로젝트 루트에 SPEC.md로 저장 → AI(Claude Code / Cursor)에게 "SPEC.md의 Phase N을 구현해라"라고 지시
+목적: Rust 기반 초경량 개인용 AI 코딩 에이전트 CLI (Claude Code류) v3 핵심: ① 작업 난이도별 자동 Harness(서브에이전트) 시스템 ② 자기학습 메모리(같은 실수 반복 방지) ③ Inspector 자가 점검 에이전트(오류 로그 분석 → 개선 리포트) ④ 모바일 원격 접속 필수화(텔레그램) 사용법: 이 파일을 프로젝트 루트에 SPEC.md로 저장 → AI(Claude Code / Cursor)에게 "SPEC.md의 Phase N을 구현해라"라고 지시
 
 0. 사람(운영자)이 지켜야 할 운영 규칙 — 먼저 읽기
 Phase 순서대로만 진행. 한 AI 세션에 한 Phase(또는 그 절반)만.
@@ -27,7 +27,7 @@ v2 → v3 (이번 개정):
 
 | # | 추가/변경 | 내용 |
 | --- | --- | --- |
-| 1 | 4단계 작업 분류 하네스 | 사용자 지시를 simple(단순) / medium(중급) / advanced(고급) / dev(개발)로 자동 분류. 개발 작업은 전용 dev 하네스가 계획→실행→검증 루프로 처리 |
+| 1 | 4단계 작업 분류 Harness | 사용자 지시를 simple(단순) / medium(중급) / advanced(고급) / dev(개발)로 자동 분류. 개발 작업은 전용 dev Harness가 계획→실행→검증 루프로 처리 |
 | 2 | 서브에이전트 = 실행 프로파일 | 별도 프로세스가 아니라 "모델 + 도구 목록 + 반복 상한 + 역할 프롬프트" 묶음. 같은 Agent Loop 코드가 프로파일만 바꿔 실행 → 초경량 유지의 핵심 |
 | 3 | 등록 모델 능력 자동 적응 | 사용자가 config에 등록한 모델들의 능력(도구 지원 여부 등)을 검사해 서브에이전트를 자동 바인딩. 능력 부족 시 자동 대체 또는 정중한 거부 |
 | 4 | 자기학습 메모리 | runs(실행 이력)·lessons(교훈) 테이블 + 자동 리플렉션. 실패·거부·검증 실패에서 교훈을 추출해 다음 실행의 시스템 프롬프트에 주입 → 같은 실수 반복 방지 |
@@ -36,7 +36,7 @@ v2 → v3 (이번 개정):
 | 7 | 동시성 안전 | 데몬(텔레그램)과 CLI가 같은 DB를 동시 사용 → SQLite WAL 모드 + busy_timeout 의무화 |
 
 2. 제품 정의와 성능 목표
-한 줄 정의: 터미널이나 폰(텔레그램)에서 일을 시키면, 도구가 작업 난이도를 스스로 분류해 알맞은 하네스(서브에이전트)로 실행하고, 파일을 읽고·수정하고·명령을 실행하되 매번 승인을 받으며, 실수에서 배운 교훈을 기억해 반복하지 않고, 점검 에이전트가 주기적으로 자기 상태를 진단해 개선안을 보고하는 개인용 초경량 CLI 에이전트.
+한 줄 정의: 터미널이나 폰(텔레그램)에서 일을 시키면, 도구가 작업 난이도를 스스로 분류해 알맞은 Harness(서브에이전트)로 실행하고, 파일을 읽고·수정하고·명령을 실행하되 매번 승인을 받으며, 실수에서 배운 교훈을 기억해 반복하지 않고, 점검 에이전트가 주기적으로 자기 상태를 진단해 개선안을 보고하는 개인용 초경량 CLI 에이전트.
 
 범위 제외: GUI/IDE, 벡터 DB·임베딩, 멀티유저, 자율 코드 자기수정(Inspector는 제안만).
 
@@ -97,7 +97,7 @@ v2 → v3 (이번 개정):
 
 │              tool_result 재투입 → 반복 (상한)           │
 
-│  dev 하네스: 계획 → 실행 → 검증(빌드/테스트) → 실패 시   │
+│  dev Harness: 계획 → 실행 → 검증(빌드/테스트) → 실패 시   │
 
 │              오류 되먹임 재시도(최대 2회)                │
 
@@ -130,7 +130,7 @@ v2 → v3 (이번 개정):
      + logs/agent.log + reports/*.md
 
 4. 기술 스택 (확정 크레이트 목록)
-원칙: 이 표에 없는 크레이트는 AI가 임의로 추가할 수 없다. 추가 필요 시 사유·크기·대안을 보고하고 운영자 승인을 받는다. v3의 신규 기능(하네스·메모리·Inspector)은 새 크레이트 없이 기존 스택 + std로 구현한다.
+원칙: 이 표에 없는 크레이트는 AI가 임의로 추가할 수 없다. 추가 필요 시 사유·크기·대안을 보고하고 운영자 승인을 받는다. v3의 신규 기능(Harness·메모리·Inspector)은 새 크레이트 없이 기존 스택 + std로 구현한다.
 
 | 용도 | 크레이트 | feature / 비고 |
 | --- | --- | --- |
@@ -169,9 +169,9 @@ rafikx ask --class dev "지시"  # 분류 강제 (simple|medium|advanced|dev)
 
 rafikx ask --obsidian "질문"   # Vault 컨텍스트 강제 주입
 
-rafikx agent "작업 지시"       # = ask --class dev 별칭 (개발 하네스 강제)
+rafikx agent "작업 지시"       # = ask --class dev 별칭 (개발 Harness 강제)
 
-rafikx chat                    # 대화 TUI (하네스 규칙 동일). --list 세션 목록, --resume <id>
+rafikx chat                    # 대화 TUI (Harness 규칙 동일). --list 세션 목록, --resume <id>
 
 rafikx index / search "키워드" / watch     # Obsidian
 
@@ -233,7 +233,7 @@ model = "qwen3:8b"                       # 설치한 로컬 모델명으로 교�
 
 api_key_env = ""
 
-supports_tools = false                   # 도구 미지원 → 하네스가 자동으로 도구 작업에서 제외
+supports_tools = false                   # 도구 미지원 → Harness가 자동으로 도구 작업에서 제외
 
 # OpenRouter / Z.ai / Gemini(OpenAI 호환 엔드포인트)도 같은 형식으로 추가
 
@@ -297,7 +297,7 @@ verify = false
 
 system_extra = "복잡한 문제를 구조화하는 분석가다. 결론 전에 근거를 제시한다."
 
-[subagents.coder]                  # 개발 작업 전용 하네스
+[subagents.coder]                  # 개발 작업 전용 Harness
 
 provider = "anthropic"
 
@@ -426,7 +426,7 @@ pub struct ToolCtx { pub workspace: PathBuf, /* config·db 핸들 등 */ }
 | obsidian_search | query, limit=5 | 불필요 | FTS5 검색, 제목+경로+발췌 (Phase 4 등록) |
 
 도구 오류는 패닉이 아니라 ToolResult{is_error:true}로 모델에 반환. 서브에이전트 프로파일의 tools 목록에 없는 도구는 해당 실행에서 아예 모델에 노출하지 않는다.
-5.5 하네스 실행 파이프라인 (v3 핵심 계약)
+5.5 Harness 실행 파이프라인 (v3 핵심 계약)
 서브에이전트 프로파일 구조체:
 
 pub struct SubAgentProfile {
@@ -458,9 +458,9 @@ advanced — 길이 > 600자, 또는 목록형 다단계 지시(줄바꿈 항목
 medium — --obsidian 지정, 또는 길이 150~600자, 또는 키워드: 요약·정리·번역·초안·검색·찾아·노트·문서
 simple — 그 외 전부 (인사·단답·짧은 변환)
 
-classifier = "llm"이면: small 모델에 "다음 지시를 simple/medium/advanced/dev 중 한 단어로만 분류하라" 호출(max_tokens=8). 실패·모호 시 규칙 폴백. 분류 결과는 항상 실행 전에 1줄 표시: [하네스] dev → coder (claude-sonnet-4-6)
+classifier = "llm"이면: small 모델에 "다음 지시를 simple/medium/advanced/dev 중 한 단어로만 분류하라" 호출(max_tokens=8). 실패·모호 시 규칙 폴백. 분류 결과는 항상 실행 전에 1줄 표시: [Harness] dev → coder (claude-sonnet-4-6)
 
-능력 검사(Capability Binding) — "등록한 모델에 맞는 하네스" 보장:
+능력 검사(Capability Binding) — "등록한 모델에 맞는 Harness" 보장:
 
 시작 시 config의 모든 프로바이더에서 능력표 구성: supports_tools, 스트리밍 가능 여부.
 프로파일이 도구를 요구하는데(tools 비어있지 않음) 바인딩된 프로바이더가 supports_tools=false면 → [harness].fallback 순서에서 도구 지원 프로바이더로 자동 재바인딩 + 경고 1줄.
@@ -477,7 +477,7 @@ doctor는 분류→프로파일→실제 바인딩 모델을 표로 출력한다
 
 → Agent Loop 실행 (프로파일의 tools/max_iterations 적용, 승인 게이트 5.4/6장)
 
-→ (verify) 검증 단계 — dev 하네스 전용:
+→ (verify) 검증 단계 — dev Harness 전용:
 
      verify_command 실행(bash 도구 경유 → 기존 승인·차단·타임아웃 그대로 적용)
 
@@ -680,7 +680,7 @@ bash 제한: 승인 필수 + 타임아웃 60초 + 차단목록 — sudo, rm -rf 
 
 SPEC.md에 따라 초경량 Rust CLI 에이전트 RafikX(`rafikx`)를 Phase 순서대로 구현한다.
 
-v3의 핵심은 ① 작업 분류 하네스(서브에이전트 프로파일) ② 자기학습 메모리(lessons)
+v3의 핵심은 ① 작업 분류 Harness(서브에이전트 프로파일) ② 자기학습 메모리(lessons)
 
 ③ Inspector 점검 에이전트 ④ 텔레그램 모바일 원격이다.
 
@@ -753,12 +753,12 @@ sqlite3 ~/.rafikx/data.db "select mode,status from runs" → 기록 확인
 
 문제 예방: 400 최다 원인 = tool_result 규격 위반(5.5) / input_schema required 누락 → 빈 인자 / 무한루프 → 상한 동작 테스트 / agent 모드는 비스트리밍 유지.
 
-🟠 Phase 3 — 프로바이더 + 하네스 오케스트레이터 (난이도 ★★★ / AI 세션 2회)
-목표: 4단계 자동 분류 → 서브에이전트 프로파일 실행. 등록 모델 능력에 자동 적응. dev 하네스의 검증 루프 동작.
+🟠 Phase 3 — 프로바이더 + Harness 오케스트레이터 (난이도 ★★★ / AI 세션 2회)
+목표: 4단계 자동 분류 → 서브에이전트 프로파일 실행. 등록 모델 능력에 자동 적응. dev Harness의 검증 루프 동작.
 
 OpenAiCompatProvider (function calling 매핑, data: [DONE])
 provider registry + --provider / 폴백(타임아웃 120초·429·5xx → fallback 순서, 백오프 1s→2s→4s 최대 3회)
-분류기 v1 (5.5 규칙) + --class 강제 + classifier="llm" 옵션(small 모델, 실패 시 규칙 폴백) + 실행 전 [하네스] dev → coder (...) 1줄 표시
+분류기 v1 (5.5 규칙) + --class 강제 + classifier="llm" 옵션(small 모델, 실패 시 규칙 폴백) + 실행 전 [Harness] dev → coder (...) 1줄 표시
 SubAgentProfile 로딩 ([subagents.*]) + 프로파일별 tools 필터·max_iterations·system_extra 적용
 능력 검사: supports_tools 기반 자동 재바인딩 + 경고 / 전무 시 dev·advanced 정중 거부
 dev 검증 루프: verify_command(빈값=자동 감지) → bash 도구 경유 실행 → 실패 시 오류 되먹임 재시도(최대 2회)
@@ -767,7 +767,7 @@ runs 확장(class·subagent·provider·model·iterations·tokens) / doctor 확�
 
 검증:
 
-rafikx ask "안녕" → [하네스] simple → quick / rafikx ask "이 저장소 구조 분석해서 개선 전략 보고서 써줘" → advanced
+rafikx ask "안녕" → [Harness] simple → quick / rafikx ask "이 저장소 구조 분석해서 개선 전략 보고서 써줘" → advanced
 rafikx ask "buggy.py 만들어서 일부러 문법 오류 넣고, 고친 뒤 검증까지 해줘" → dev 분류 → 계획 → 실행 → py_compile 검증 → 재시도 성공
 rafikx ask --class simple "..." 강제 동작
 config에서 anthropic을 잠시 지우고 local(도구 미지원)만 남김 → dev 지시 → 정중 거부 메시지 → 원복
@@ -793,7 +793,7 @@ watch: notify-debouncer-mini(1초), upsert, 삭제 반영
 🔵 Phase 5 — 세션 + 자기학습 메모리 (난이도 ★★ / AI 세션 2회)
 목표: chat 맥락 유지·저장·재개 + lessons 시스템 가동(같은 실수 반복 방지).
 
-chat REPL(stdin 기본, rustyline은 승인 후): /save /quit /model /provider /class /clear /obsidian on|off /agent <지시> — 매 턴 하네스 분류 적용
+chat REPL(stdin 기본, rustyline은 승인 후): /save /quit /model /provider /class /clear /obsidian on|off /agent <지시> — 매 턴 Harness 분류 적용
 sessions 저장/--resume/--list + 히스토리 상한(tool 쌍 정합성 유지) + 턴별 누적 토큰 표시
 lessons 파이프라인: 트리거 5종 감지 → 리플렉션(small 모델, 고정 프롬프트, tokio spawn 비동기·실패 무시) → 중복 검사(weight+1) → 저장
 주입기: 작업 키워드 FTS 상위 5 + weight 상위 2, inject_limit_chars 상한, [과거 교훈] 블록 조립
@@ -833,7 +833,7 @@ Inspector가 파일을 쓰거나 명령을 실행하는 경로가 코드상 존�
 [features] default=["telegram"], telegram=["dep:teloxide"] 구성 — 코어 빌드(--no-default-features)와 분리 유지
 telegram 데몬: 봇 폴링 + Inspector 스케줄러(tokio interval, auto_interval_hours, 0=끔) + --with-watch 옵션(Obsidian watch 동시 구동)
 화이트리스트: allowed_user_ids 외 완전 무응답 미들웨어
-명령: /ask <질문>(하네스 경유) /obsidian <검색어> /status(최근 run 5건+오늘 토큰) /report(마지막 리포트 요약) /lesson <문장>(수동 교훈 등록) — 응답 4,096자 분할 전송
+명령: /ask <질문>(Harness 경유) /obsidian <검색어> /status(최근 run 5건+오늘 토큰) /report(마지막 리포트 요약) /lesson <문장>(수동 교훈 등록) — 응답 4,096자 분할 전송
 원격 승인 흐름(allow_agent=true일 때만): 도구 요청 → "도구: bash / 명령: …" + 인라인 버튼 ✅승인/❌거부 → callback 처리(tokio oneshot) → approval_timeout_secs 초과 시 자동 거부. 원격 yolo는 코드 수준 금지
 Inspector 자동 실행 결과 → notify_telegram=true면 요약 푸시(전문은 reports/*.md 안내)
 
@@ -872,8 +872,8 @@ Inspector에 파일쓰기/bash 도구를 주는 실수 금지 — 자기수정 �
 
 10. 전체 인수 테스트 (모두 통과하면 v1.0 완성)
 doctor 전 항목 OK (키·경로·FTS5·프로바이더 ping·분류→프로파일→모델 바인딩 표)
-하네스 분류 4종 각 1건: simple/medium/advanced/dev가 의도한 프로파일·모델로 실행됨
-dev 하네스 실전 1건: "숫자 맞추기 게임 파이썬 스크립트 작성→실행→오류 수정→검증까지" 완수 (계획→실행→verify 루프 확인)
+Harness 분류 4종 각 1건: simple/medium/advanced/dev가 의도한 프로파일·모델로 실행됨
+dev Harness 실전 1건: "숫자 맞추기 게임 파이썬 스크립트 작성→실행→오류 수정→검증까지" 완수 (계획→실행→verify 루프 확인)
 능력 적응: 도구 미지원 모델만 남기면 dev 정중 거부, simple/medium은 계속 동작
 승인 n 거부 시 무변경 / 경로 jail / bash 차단목록 동작
 폴백 시나리오(주 프로바이더 차단 → 자동 전환) 통과

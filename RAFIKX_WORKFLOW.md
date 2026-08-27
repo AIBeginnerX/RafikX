@@ -24,7 +24,7 @@ flowchart TB
     CMD --> MEM["lessons / inspect / report"]
     CMD --> TG["telegram"]
 
-    ASK --> PIPE[하네스 파이프라인]
+    ASK --> PIPE[Harness 파이프라인]
     ADM --> SET
     NOTE --> VAULT[(Obsidian + FTS5)]
     MEM --> DB[(data.db)]
@@ -60,14 +60,14 @@ flowchart TD
     K --> L
 
     L --> M[모델 번호 목록]
-    M --> N{"자동 하네스  또는  특정 모델"}
+    M --> N{"자동 Harness  또는  특정 모델"}
     N --> O[config.toml 기록]
     O --> D
 
     D --> P[설정 메뉴]
     P --> P1[서비스·계정 연결/추가/해제]
     P --> P2[모델]
-    P --> P3[하네스 자동/수동]
+    P --> P3[Harness 자동/수동]
     P --> P4[텔레그램]
     P --> P5[옵시디언]
     P --> P6[모델 순위 보기·갱신]
@@ -89,7 +89,7 @@ flowchart TD
     C1 -->|규칙 또는 LLM| C2[simple / medium / advanced / dev]
     C2 --> B1[프로파일 바인딩]
 
-    B1 --> B2{하네스 모드}
+    B1 --> B2{Harness 모드}
     B2 -->|자동 기본| B3[연결한 모델 중 순위표로 고름]
     B2 -->|수동| B4[역할별 지정 모델]
 
@@ -219,7 +219,7 @@ flowchart TD
     ASK --> START[작업 시작…]
     START --> AG{allow_agent?}
     AG -->|아니오| QA[도구 없이 답만]
-    AG -->|예| PIPE[하네스 파이프라인]
+    AG -->|예| PIPE[Harness 파이프라인]
     PIPE --> BTN{도구 승인?}
     BTN --> YES[인라인 승인/거부]
     YES -->|시간 초과| NO[자동 거부]
@@ -274,7 +274,7 @@ flowchart TD
     AGE -->|아니오| USE[로컬 표 사용]
     FET -->|실패| KEEP[번들/로컬 유지]
     FET -->|성공| USE
-    USE --> AUTO[자동 하네스가 연결 모델과 별칭 매칭]
+    USE --> AUTO[자동 Harness가 연결 모델과 별칭 매칭]
 ```
 
 웹페이지 HTML을 긁지 않습니다. 설정 메뉴의 **지금 갱신** 또는 `rafikx ranks update`로 수동 갱신할 수 있습니다.
@@ -303,7 +303,7 @@ flowchart TD
 | --- | --- |
 | `rafikx settings` | 2. 설정 메뉴 |
 | `rafikx doctor` | 상태 점검 → 2. 설정 메뉴 |
-| `rafikx ask "…"` | 3. 하네스 파이프라인 |
+| `rafikx ask "…"` | 3. Harness 파이프라인 |
 | `rafikx agent "…"` | 3. 파이프라인 (분류 고정 `dev`) |
 | `rafikx` | 3. TTY 대화 TUI (파이프면 사용법) |
 | `rafikx chat` | 3. 같은 TUI · 세션 저장 |

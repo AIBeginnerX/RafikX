@@ -13,13 +13,13 @@ Windows · macOS · Linux. 명령 이름은 `rafikx` 입니다.
 
 터미널 표현: Kitty 키보드 프로토콜(지원 터미널에서 Shift+Enter 등 변형키 정확 인식, 미지원은 xterm 폴백) · syntect 코드블록 문법 하이라이트(oh-my-pi 스타일 어두운 패널) · 24bit 트루컬러 진행바.
 
-하네스 v2: 실행 방식을 두 축으로 고릅니다.
+Harness v2: 실행 방식을 두 축으로 고릅니다.
 
-- 엔진 6종 — `/engine rafikx|claude|deepseek|qwen|kimi|pi`. 각 하네스의 품질 장치(계획 가시화·단계별 보고·ReAct 사이클·성공 루브릭)를 프롬프트와 실행 플래그로 옮겨 담았습니다. `[engines.<이름>]` 으로 문구까지 바꿀 수 있습니다.
+- 엔진 6종 — `/engine rafikx|claude|deepseek|qwen|kimi|pi`. 각 Harness의 품질 장치(계획 가시화·단계별 보고·ReAct 사이클·성공 루브릭)를 프롬프트와 실행 플래그로 옮겨 담았습니다. `[engines.<이름>]` 으로 문구까지 바꿀 수 있습니다.
 - 분야 3종 — `/discipline harness|loop|graph`. 기본 파이프라인, 정체를 감지하면 전략을 바꾸는 루프 강화, 계획이 낳은 노드 DAG를 위상순으로 따로 실행하는 그래프.
 - 전문가 프로파일 — `planner · frontend · backend · reviewer` 가 내장되어, 큰 작업은 기획 → 구현 → 리뷰로 나눠 맡깁니다.
 - 독립 검증자 게이트 — claude·kimi 엔진은 완료를 선언하기 전에 신선한 컨텍스트의 리뷰어가 완료 기준과 대조합니다 (`[harness] strict_gate`).
-- 자기개선 — `/selfharness on` 이면 어떤 엔진 위에서도 실패를 채굴해 하네스 자신을 고칩니다.
+- 자기개선 — `/selfharness on` 이면 어떤 엔진 위에서도 실패를 채굴해 Harness 자신을 고칩니다.
 
 [설치](docs/INSTALL.md) · [보안](SECURITY.md) · [기여](CONTRIBUTING.md) · [운영 흐름](RAFIKX_WORKFLOW.html)
 
@@ -130,7 +130,7 @@ anthropic · openai · gemini · grok(xAI) · openrouter · opencode_zen · open
 | 코딩 | `rafikx agent "…"` |
 | 텔레그램 | `rafikx telegram` |
 | 노트 인덱스 | `rafikx index` |
-| 하네스 모드·분류별 모델 | `rafikx harness` (`--mode auto\|manual`, `<분류> <모델>`) |
+| Harness 모드·분류별 모델 | `rafikx harness` (`--mode auto\|manual`, `<분류> <모델>`) |
 | 사용 가능한 원격 모델 | `rafikx models <서비스>` |
 | 지난 세션 검색 | `rafikx find <검색어>` |
 | 화면 테마·배경 | `rafikx theme` / `rafikx workspace <경로>` |
@@ -143,7 +143,7 @@ anthropic · openai · gemini · grok(xAI) · openrouter · opencode_zen · open
 
 - **프로바이더·모델 선택**: 대화에서 `/model` `/provider` `/connect`. 팝업은 **타이핑으로 바로 검색**되고 ↑↓·Enter 로 고릅니다.
 - **모델 자동 조회**: 새 서비스를 연결해 키가 정상이면 사용 가능한 모델을 자동으로 불러와 저장하고, 순위 기준 기본 모델까지 골라 저장합니다. 이후 `/model` 에서 목록이 바로 보입니다.
-- **자동 하네스**: 설계·검증·디버깅은 등록한 모델 중 추론 순위가 높은 것을 씁니다. 수동으로 바꿀 수 있습니다.
+- **자동 Harness**: 설계·검증·디버깅은 등록한 모델 중 추론 순위가 높은 것을 씁니다. 수동으로 바꿀 수 있습니다.
 - **계정 전환**: 리밋이 먼저 끝난 계정을 쓰고, 429면 다음 계정으로 갑니다. 하단에서 사용량을 봅니다.
 - **안전**: 워크스페이스 밖 파일 차단, 위험한 bash 차단, 텔레그램 허용 목록 밖은 무응답, 원격 `--yes` 금지.
 - **기억**: 교훈 주입, Obsidian 검색. Inspector는 코드를 자동으로 고치지 않습니다.
@@ -155,14 +155,14 @@ anthropic · openai · gemini · grok(xAI) · openrouter · opencode_zen · open
   - `apply_patch` 는 여러 파일의 추가/수정/삭제를 codex 스타일 패치 한 번으로 적용합니다.
   - `bash` 는 `timeout_secs`(5~600초), `grep` 은 `context`(앞뒤 문맥 줄) 파라미터를 지원합니다.
 - **plan / build 모드**: `/mode plan` 은 읽기 전용으로 계획만 세우고, `/mode build` 로 실행합니다.
-- **하네스 엔진 선택**: `/engine rafikx|deepseek|pi|self` — 기본은 **rafikx harness**. **deepseek harness** 는 DeepSeek Harness(dsh)의 단계별 실행 방식을 본뜬 것으로, 모든 도구 작업을 todo 단계로 쪼개 실행하고 단계 상태와 검증 결과를 보고합니다. **pi harness** 는 oh-my-pi 스타일로 진행 상황을 실시간 표기합니다. **self harness** 는 논문 "Self-Harness: Harnesses That Improve Themselves"(arXiv:2606.09498)의 자기개선 루프 구현으로, 실행 실패를 verifier 근거 시그니처로 클러스터링(Weakness Mining)하고, 모델 스스로 하네스 수정 후보를 제안(Harness Proposal)한 뒤, 이후 에피소드에서 타깃 실패 재발 없음·전체 성공률 비저하를 확인한 후보만 승격(Proposal Validation)합니다. 하네스 상태·계보는 `~/.rafikx/self_harness.json`, 임계값은 `config.toml [self_harness]` 에 있습니다. 데스크탑은 관리자 › 하네스 탭에서 고릅니다.
+- **Harness 엔진 선택**: `/engine rafikx|deepseek|pi|self` — 기본은 **rafikx harness**. **deepseek harness** 는 DeepSeek Harness(dsh)의 단계별 실행 방식을 본뜬 것으로, 모든 도구 작업을 todo 단계로 쪼개 실행하고 단계 상태와 검증 결과를 보고합니다. **pi harness** 는 oh-my-pi 스타일로 진행 상황을 실시간 표기합니다. **self harness** 는 논문 "Self-Harness: Harnesses That Improve Themselves"(arXiv:2606.09498)의 자기개선 루프 구현으로, 실행 실패를 verifier 근거 시그니처로 클러스터링(Weakness Mining)하고, 모델 스스로 Harness 수정 후보를 제안(Harness Proposal)한 뒤, 이후 에피소드에서 타깃 실패 재발 없음·전체 성공률 비저하를 확인한 후보만 승격(Proposal Validation)합니다. Harness 상태·계보는 `~/.rafikx/self_harness.json`, 임계값은 `config.toml [self_harness]` 에 있습니다. 데스크탑은 관리자 › Harness 탭에서 고릅니다.
 - **난이도 기반 단계 실행**: 단순 업무는 즉답하고, medium 이상은 자동으로 todo 단계(2~6개)를 등록해 순서대로 처리합니다.
 - **TUI 진행바**: 실행 중 파란 그라데이션 디지털 바가 현재 단계(모델 호출 · 도구 실행 · 반복 횟수)를 실시간 표시합니다.
 - **명령 팔레트**: 입력창에 `/` 를 치면 하단에 일치하는 명령 최대 5개와 총 개수가 나타납니다.
 - **세션 명령**: `/sessions` `/resume <id>` `/compact`(대화 요약 압축) `/undo` `/tools` `/todo`.
 - **파일 첨부**: `@src/main.rs` 멘션 또는 `/file <경로>` 로 다음 질문에 파일을 붙입니다.
 - **테마**: `/theme rafikx|opal|synth` — config `[ui] theme` 에 저장됩니다.
-- `task` 도구와 plan 모드도 같은 하네스 분류·모델 자동선택을 그대로 통과합니다.
+- `task` 도구와 plan 모드도 같은 Harness 분류·모델 자동선택을 그대로 통과합니다.
 
 상세 흐름: [RAFIKX_WORKFLOW.html](RAFIKX_WORKFLOW.html) (브라우저에서 열기).
 
@@ -185,7 +185,7 @@ cargo install --path agent-harness --force
 
 ## 데스크탑 앱
 
-CLI와 **같은 하네스**를 쓰는 가벼운 창입니다 (Tauri 2, Electron 아님). 채팅, 연결/설정, 세션, Obsidian, 실행 그래프. 코드펜스 하이라이트, 메시지 복사 버튼, 파일 드래그&드롭(@경로 첨부)을 지원합니다.
+CLI와 **같은 Harness**를 쓰는 가벼운 창입니다 (Tauri 2, Electron 아님). 채팅, 연결/설정, 세션, Obsidian, 실행 그래프. 코드펜스 하이라이트, 메시지 복사 버튼, 파일 드래그&드롭(@경로 첨부)을 지원합니다.
 
 자세한 설치·빌드: [docs/INSTALL.md](docs/INSTALL.md#데스크탑-앱).
 
