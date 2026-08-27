@@ -79,6 +79,8 @@ pub struct App {
     pub upgrade: Option<String>,
     /// 업그레이드 진행 중 플래그
     pub upgrading: bool,
+    /// /model refresh 조회가 끝나면 이 검색어로 모델 피커를 연다.
+    pub model_pick_after: Option<String>,
 }
 
 pub struct ApprovalPrompt {
@@ -247,6 +249,7 @@ pub async fn run(
         motion_tick: if reduced_motion { 16 } else { 0 },
         upgrade: None,
         upgrading: false,
+        model_pick_after: None,
     };
     // 연결이 하나도 없을 때만 시작 안내 — 이미 쓰던 사용자에게는 빈 화면
     // 기본 문구("할 일을 말하면 실행합니다")로 충분하다.
@@ -724,6 +727,8 @@ fn handle_key(
                 {
                     run.cancel("TUI Esc");
                 }
+                // 취소했으면 조회 완료 후 피커를 띄우지 않는다.
+                app.model_pick_after = None;
                 app.status = "취소 요청 중…".into();
                 push(app, EntryKind::Warn, "실행 취소를 요청했습니다. (Esc)");
             }
@@ -829,7 +834,7 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
         let rest = parts.next().unwrap_or("").trim();
         match cmd {
             "/model" | "/models" if rest.is_empty() => {
-                open_model_picker(app);
+                open_model_picker(app, "");
                 return;
             }
             "/provider" | "/accounts" => {
@@ -904,6 +909,14 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
             }
             Ok(Slash::AssignRoles) => {
                 start_assign(app, done_tx);
+            }
+            Ok(Slash::ModelFetch { query, fetch }) => {
+                if fetch {
+                    start_model_fetch(app, done_tx, query);
+                } else {
+                    // 검색어만 온 경우 — 조회 없이 피커를 검색어와 함께 연다.
+                    open_model_picker(app, &query);
+                }
             }
             Err(e) => push(app, EntryKind::Warn, format!("{e:#}")),
         }
@@ -1077,6 +1090,11 @@ fn finish_turn(
         }
     }
 
+    // /model refresh 로 갱신된 목록은 바로 고를 수 있어야 한다 — 피커를 자동으로 연다.
+    if let Some(query) = app.model_pick_after.take() {
+        open_model_picker(app, &query);
+    }
+
     if !app.queue.is_empty() && !app.quit_after {
         let next = app.queue.remove(0);
         let class = app.session.class.clone();
@@ -1190,6 +1208,49 @@ fn start_assign(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>) {
             }
             Err(e) => Err(e),
         };
+        let _ = done_tx.send(TurnDone { result, session });
+    });
+}
+
+/// /model refresh — 연결된 서비스의 모델 목록을 원격에서 다시 조회해 캐시에 저장한다.
+/// 네트워크 조회라 start_assign 과 같은 백그라운드 턴으로 돌고, 끝나면 finish_turn 이
+/// 모델 피커를 자동으로 연다 (검색어가 있으면 그 검색어를 채운 채로).
+fn start_model_fetch(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>, query: String) {
+    if app.busy {
+        return;
+    }
+    // 시작 화면이 떠 있으면 트랜스크립트를 덮어 요약이 보이지 않는다 — 먼저 닫는다.
+    app.show_start = false;
+    push(app, EntryKind::System, "모델 목록 조회 중…");
+    app.busy = true;
+    app.status = "모델 목록 조회 중…".into();
+    app.model_pick_after = Some(query);
+    let session = app.session.clone();
+    let done_tx = done_tx.clone();
+    tokio::spawn(async move {
+        let rows = crate::auth::refresh_catalogs(&session.cfg).await;
+        for n in crate::auth::refresh_summary(&rows) {
+            push_live_system(n);
+        }
+        // 카탈로그는 config 가 아니라 catalogs.json 이고 조회할 때마다 파일에서
+        // 읽으므로 cfg.reload() 는 필요 없다.
+        let result = Ok(chat::TurnInfo {
+            run_id: String::new(),
+            label: "모델 목록 갱신 완료".into(),
+            status: "ok".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            ctx_used: 0,
+            ctx_window: 0,
+            cached_in: 0,
+            cache_reported: false,
+            elapsed_ms: 0,
+            answer: String::new(),
+            summary: chat::CompletionSummary::default(),
+            lifecycle_state: None,
+            lifecycle: Vec::new(),
+            context_sources: Vec::new(),
+        });
         let _ = done_tx.send(TurnDone { result, session });
     });
 }
@@ -1674,7 +1735,9 @@ fn start_upgrade(app: &mut App) {
     );
 }
 
-fn open_model_picker(app: &mut App) {
+/// 모델 피커를 연다. `query` 가 비어 있지 않으면 검색어를 미리 채운 채 연다
+/// (`/model <검색어>` — 피커에서 직접 타이핑한 것과 같은 결과).
+fn open_model_picker(app: &mut App, query: &str) {
     let regs = crate::auth::registered_models(&app.session.cfg);
     if regs.is_empty() {
         push(
@@ -1693,13 +1756,13 @@ fn open_model_picker(app: &mut App) {
         ids.push(format!("{}\t{}", r.provider, r.id));
     }
     app.picker = Some(Picker {
-        title: "모델".into(),
+        title: format!("모델 ({}개)", regs.len()),
         items,
         ids,
         selected: 0,
         kind: PickerKind::Model,
         target: None,
-        query: String::new(),
+        query: query.trim().to_string(),
     });
 }
 

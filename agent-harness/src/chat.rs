@@ -129,7 +129,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/connect", "서비스 연결·키 등록"),
     ("/login", "연결 마법사"),
     ("/provider", "기본 연결 변경"),
-    ("/model", "모델 선택"),
+    ("/model", "모델 선택 · refresh 로 원격 목록 갱신"),
     (
         "/engine",
         "하네스 엔진 rafikx|claude|deepseek|qwen|kimi|pi · provider mode single|multi",
@@ -251,6 +251,20 @@ pub async fn cmd_chat(
                     }
                     Err(e) => println!("역할 배정 실패: {e:#}"),
                 },
+                Slash::ModelFetch { query, fetch } => {
+                    if fetch {
+                        println!("모델 목록 조회 중…");
+                        let rows = crate::auth::refresh_catalogs(&session.cfg).await;
+                        for n in crate::auth::refresh_summary(&rows) {
+                            println!("{n}");
+                        }
+                    }
+                    // CLI 에는 피커가 없으니 (검색어로 걸러진) 번호 목록을 그대로 보여준다.
+                    let regs = crate::auth::registered_models(&session.cfg);
+                    for n in model_list_notes(&regs, &query) {
+                        println!("{n}");
+                    }
+                }
             }
             continue;
         }
@@ -434,6 +448,12 @@ pub enum Slash {
     Compact,
     /// /engine multi — 등록 모델 원격 조회 후 역할별 자동 배정 (비동기)
     AssignRoles,
+    /// /model refresh — 원격 모델 목록 갱신(fetch=true, 비동기) 후 선택 UI.
+    /// `/model <검색어>` 는 fetch=false 로 조회 없이 검색어만 넘긴다.
+    ModelFetch {
+        query: String,
+        fetch: bool,
+    },
 }
 
 /// /engine 에서 선택 가능한 엔진인지 판정한다 — 카탈로그 6종 + legacy `self`.
@@ -960,7 +980,14 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 resolved.display()
             )]))
         }
-        "/model" => {
+        "/model" | "/models" => {
+            // 원격 조회는 비동기라 여기서 못 돈다 — 호출자(TUI·CLI)에게 위임한다.
+            if is_model_refresh_arg(rest) {
+                return Ok(Slash::ModelFetch {
+                    query: String::new(),
+                    fetch: true,
+                });
+            }
             let regs = crate::auth::registered_models(&session.cfg);
             if regs.is_empty() {
                 return Ok(Slash::Continue(vec![
@@ -968,11 +995,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 ]));
             }
             if rest.is_empty() {
-                let mut notes = vec!["등록된 모델:".into()];
-                for (i, r) in regs.iter().enumerate() {
-                    notes.push(format!("  [{}] {} / {}", i + 1, r.provider, r.id));
-                }
-                notes.push("예: /model 2".into());
+                let mut notes = model_list_notes(&regs, "");
                 if read_stdin {
                     print!("번호> ");
                     io::stdout().flush()?;
@@ -981,6 +1004,11 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                     notes.push(apply_model_choice(session, &regs, line.trim()));
                 }
                 Ok(Slash::Continue(notes))
+            } else if model_arg_is_query(&regs, rest) {
+                Ok(Slash::ModelFetch {
+                    query: rest.to_string(),
+                    fetch: false,
+                })
             } else {
                 Ok(Slash::Continue(vec![apply_model_choice(
                     session, &regs, rest,
@@ -1188,6 +1216,53 @@ fn connect_slash(cfg: &crate::config::Config, rest: &str, read_stdin: bool) -> R
         }
         Err(e) => Ok(Slash::Continue(vec![format!("연결 실패: {e:#}")])),
     }
+}
+
+/// `/model refresh` 별칭인지 — 원격 카탈로그를 다시 조회하라는 뜻.
+pub fn is_model_refresh_arg(rest: &str) -> bool {
+    matches!(
+        rest.trim().to_ascii_lowercase().as_str(),
+        "refresh" | "fetch" | "새로고침" | "-r"
+    )
+}
+
+/// `/model <인자>` 를 검색어로 볼지 판정한다.
+/// 번호·목록에 정확히 있는 id·목록에 없는 직접 지정은 기존 선택 경로를 그대로 타고,
+/// 목록에 부분 일치하는 자유 텍스트만 검색어(피커 타이핑 검색과 같은 뜻)로 본다.
+pub fn model_arg_is_query(regs: &[crate::auth::RegisteredModel], rest: &str) -> bool {
+    let rest = rest.trim();
+    if rest.is_empty() || crate::menu::parse_numbers(rest, regs.len(), false, true).is_some() {
+        return false;
+    }
+    if regs.iter().any(|r| r.id == rest) {
+        return false;
+    }
+    let q = rest.to_lowercase();
+    regs.iter()
+        .any(|r| r.id.to_lowercase().contains(&q) || r.provider.to_lowercase().contains(&q))
+}
+
+/// 등록 모델 목록 줄 — 검색어가 있으면 부분 일치로 거른다.
+/// 번호는 전체 목록 기준이라 걸러진 화면에서도 그대로 `/model <번호>` 로 쓸 수 있다.
+pub fn model_list_notes(regs: &[crate::auth::RegisteredModel], query: &str) -> Vec<String> {
+    let q = query.trim().to_lowercase();
+    let mut notes = vec![if q.is_empty() {
+        "등록된 모델:".to_string()
+    } else {
+        format!("등록된 모델 — '{}' 검색:", query.trim())
+    }];
+    for (i, r) in regs.iter().enumerate() {
+        let label = format!("{} / {}", r.provider, r.id);
+        if !q.is_empty() && !label.to_lowercase().contains(&q) {
+            continue;
+        }
+        notes.push(format!("  [{}] {}", i + 1, label));
+    }
+    if notes.len() == 1 {
+        notes.push("  (일치하는 모델이 없습니다)".into());
+    }
+    notes.push("예: /model 2".into());
+    notes
 }
 
 fn apply_model_choice(
@@ -2293,5 +2368,104 @@ mod tests {
         }
         session_msgs.truncate(cut.unwrap());
         assert_eq!(session_msgs.len(), 2);
+    }
+
+    fn sample_regs() -> Vec<crate::auth::RegisteredModel> {
+        vec![
+            crate::auth::RegisteredModel {
+                provider: "anthropic".into(),
+                id: "claude-sonnet-4-6".into(),
+                small: false,
+            },
+            crate::auth::RegisteredModel {
+                provider: "minimax".into(),
+                id: "minimax-m3".into(),
+                small: false,
+            },
+            crate::auth::RegisteredModel {
+                provider: "minimax".into(),
+                id: "minimax-m2".into(),
+                small: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn model_refresh_aliases_route_to_remote_fetch() {
+        let dir = std::env::temp_dir().join(format!("rafikx-modelfetch-{}", Db::new_id()));
+        let config_path = dir.join("config.toml");
+        let cfg = Config::load(Some(&config_path)).expect("config");
+        let mut s = Session {
+            cfg,
+            yes: true,
+            provider: None,
+            model: None,
+            class: None,
+            mode: "build".into(),
+            session_id: None,
+            messages: vec![],
+            last_context_tokens: 0,
+            obsidian_on: false,
+            attachments: vec![],
+            dirty: false,
+            sticky: None,
+        };
+
+        for line in [
+            "/model refresh",
+            "/models fetch",
+            "/model 새로고침",
+            "/model -r",
+            "/model REFRESH",
+        ] {
+            match handle_slash(&mut s, line, false).expect("ok") {
+                Slash::ModelFetch { query, fetch } => {
+                    assert!(fetch, "{line} 는 원격 조회여야 한다");
+                    assert!(query.is_empty(), "{line} 에는 검색어가 없다");
+                }
+                other => panic!("{line}: ModelFetch 를 기대했는데 {other:?}"),
+            }
+        }
+
+        // 번호 선택은 조회 경로로 새지 않는다 — 기존 apply_model_choice 그대로.
+        let out = handle_slash(&mut s, "/model 3", false).expect("ok");
+        assert!(!matches!(out, Slash::ModelFetch { .. }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_arg_is_query_only_for_partial_matches() {
+        let regs = sample_regs();
+        // 목록에 부분 일치하는 자유 텍스트만 검색어다.
+        assert!(model_arg_is_query(&regs, "claude"));
+        assert!(model_arg_is_query(&regs, "MINIMAX"), "대소문자 무시");
+        // 번호·정확한 id·목록에 없는 직접 지정은 기존 선택 경로.
+        assert!(!model_arg_is_query(&regs, "2"));
+        assert!(!model_arg_is_query(&regs, "claude-sonnet-4-6"));
+        assert!(!model_arg_is_query(&regs, "gpt-9-preview"));
+        assert!(!model_arg_is_query(&regs, ""));
+        // refresh 별칭은 검색어보다 먼저 걸린다.
+        assert!(is_model_refresh_arg("refresh"));
+        assert!(is_model_refresh_arg("새로고침"));
+        assert!(!is_model_refresh_arg("claude"));
+    }
+
+    #[test]
+    fn model_list_notes_filters_but_keeps_original_numbers() {
+        let regs = sample_regs();
+        let all = model_list_notes(&regs, "");
+        assert_eq!(all[0], "등록된 모델:");
+        assert_eq!(all[1], "  [1] anthropic / claude-sonnet-4-6");
+        assert_eq!(all.len(), 5); // 머리 + 3줄 + 안내
+
+        let hit = model_list_notes(&regs, "minimax-m2");
+        assert!(hit[0].contains("검색"));
+        // 걸러도 번호는 전체 목록 기준이라 그대로 /model 3 으로 고를 수 있다.
+        assert!(hit.iter().any(|l| l == "  [3] minimax / minimax-m2"));
+        assert!(!hit.iter().any(|l| l.contains("claude")));
+
+        let miss = model_list_notes(&regs, "없는모델");
+        assert!(miss.iter().any(|l| l.contains("일치하는 모델이 없습니다")));
     }
 }

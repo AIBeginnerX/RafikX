@@ -89,11 +89,19 @@ fn legacy_api_contracts_keep_required_json_fields() {
         agent_task: None,
         compact: false,
         assign: false,
+        model_fetch: false,
     };
     let slash_json = serde_json::to_value(slash).expect("SlashResult serializes");
     assert_required_keys(
         &slash_json,
-        &["notes", "quit", "agent_task", "compact", "assign"],
+        &[
+            "notes",
+            "quit",
+            "agent_task",
+            "compact",
+            "assign",
+            "model_fetch",
+        ],
     );
 }
 

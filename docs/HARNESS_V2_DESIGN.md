@@ -341,3 +341,26 @@ mandela·hate·prism·shower 렌즈 점검의 확인된 발견만 반영한다. 
 
 ### 16.3 테스트 (기존 관행: 순수 함수 단위)
 - `render_working_rows` 행 조립(working 접두·역할·모델·활동, 한국어 폭), 높이 함수, responsive_rows 확장 회귀, Live::Agent 직렬화 하위호환(구 필드만 있는 JSON 역직렬화), 루트 run 필터.
+
+## 17. /model 원격 조회·선택 (Phase 9)
+
+현황(조사 완료): `auth::list_remote_models(cfg, name)`가 프로바이더 API(`/v1/models`)에서 모델 목록을 가져오고, `auth::save_catalog`가 `~/.rafikx/catalogs.json`에 캐시하며, `auth::catalog_models`(→`registered_models`)가 config 등록분 + 선호 목록 + **캐시**를 합쳐 돌려준다. TUI `/model`은 이미 검색 가능한 피커(`PickerKind::Model`)로 그 목록을 고르고 선택을 영속화한다.
+**빠진 것은 단 하나 — 카탈로그를 사용자가 원할 때 갱신하는 경로.** 지금은 서비스 연결 직후 자동 조회 때만 채워져, 그 뒤 프로바이더가 새 모델을 내도 목록에 영영 안 뜬다.
+
+### 17.1 수동 조회 — `/model refresh`
+- `auth.rs`: `pub async fn refresh_catalogs(cfg: &Config) -> Vec<CatalogRefresh>` 신설. `usable_names(cfg)`의 모든 연결을 **동시에**(futures_util::future::join_all — 기존 의존성) 조회하고, 성공분만 `save_catalog`. 반환: `CatalogRefresh { provider: String, result: Result<usize, String> }` (개수 또는 오류 메시지 요약).
+- 요약 문자열 조립은 **순수 함수** `pub fn refresh_summary(&[CatalogRefresh]) -> Vec<String>`로 분리(테스트 대상): 프로바이더별 `minimax  12개` / `anthropic  실패: HTTP 401` 한 줄씩 + 총계 한 줄.
+- `handle_slash`는 동기이므로 새 variant `Slash::ModelFetch { query: String }`를 반환한다 (기존 `Slash::AssignRoles`가 쓰는 비동기 위임 패턴 그대로). 트리거: `/model refresh|fetch|새로고침|-r` (`/models`도 동일 별칭).
+
+### 17.2 소비자
+- **TUI**(`tui.rs`): `start_model_fetch(app, done_tx)` — `start_assign`(1150행대)을 본떠 busy 설정·`tokio::spawn`·완료 시 `session.cfg.reload()`. 완료 후 **모델 피커를 자동으로 열고**, `Slash::ModelFetch.query`가 비어 있지 않으면 `picker.query`에 미리 채운다.
+- **CLI 대화 루프**(`chat.rs` 219행대): `.await`로 직접 실행하고 요약을 출력.
+- **api.rs**(RPC/데스크탑): `SlashResult`에 `model_fetch: bool` 추가 — `assign` 필드와 같은 취급.
+
+### 17.3 선택 UX 보강
+- `/model <검색어>`(숫자가 아닌 인자): TUI는 피커를 열고 `query`를 그 값으로 채운다(타이핑 검색과 동일 경로). 숫자 인자는 기존 `apply_model_choice` 유지.
+- 피커 제목에 총 개수 표시(`모델 (N개)`), 항목 라벨은 기존 `{provider} / {id}` 유지.
+- 등록분과 조회분을 구분할 필요는 없다 — `registered_models`가 이미 합쳐 주고, 선택 시 config 등록분이면 영속 저장, 아니면 "세션 한정"으로 기존 코드가 갈라 처리한다.
+
+### 17.4 테스트
+`refresh_summary` 포맷(성공·실패 혼재·빈 목록), `/model refresh` 별칭이 `Slash::ModelFetch`를 반환하고 `/model 3`은 기존 선택 경로를 타는 라우팅, `/model <검색어>`의 query 전달, 기존 전체 테스트 통과.

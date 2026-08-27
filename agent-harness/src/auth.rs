@@ -1678,6 +1678,80 @@ fn cached_catalog(cfg: &Config, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 연결 하나의 카탈로그 갱신 결과 — 저장한 모델 수, 또는 실패 사유 요약.
+#[derive(Debug, Clone)]
+pub struct CatalogRefresh {
+    pub provider: String,
+    pub result: Result<usize, String>,
+}
+
+/// 오류 메시지는 한 줄 요약으로만 남긴다 (전체 체인은 화면을 덮는다).
+fn short_error(e: &anyhow::Error) -> String {
+    let msg = format!("{e:#}");
+    let one = msg.split('\n').next().unwrap_or("").trim().to_string();
+    if one.chars().count() > 120 {
+        one.chars().take(120).collect()
+    } else {
+        one
+    }
+}
+
+/// 연결된 모든 서비스의 모델 목록을 동시에 다시 조회해 캐시에 저장한다.
+/// 빈 목록은 저장하지 않는다 — 일시적 실패로 기존 캐시를 지워 버리면 퇴보다.
+pub async fn refresh_catalogs(cfg: &Config) -> Vec<CatalogRefresh> {
+    let names = usable_names(cfg);
+    let jobs = names.iter().map(|name| async move {
+        // auto_assign_roles 와 같은 12초 상한 — 한 연결이 늦어도 전체가 잠기지 않는다.
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(12),
+            list_remote_models(cfg, name.as_str()),
+        )
+        .await;
+        let result = match fetched {
+            Err(_) => Err("시간 초과 (12초)".to_string()),
+            Ok(Err(e)) => Err(short_error(&e)),
+            Ok(Ok(list)) if list.is_empty() => Ok(0),
+            Ok(Ok(list)) => match save_catalog(cfg, name.as_str(), &list) {
+                Ok(()) => Ok(list.len()),
+                Err(e) => Err(short_error(&e)),
+            },
+        };
+        CatalogRefresh {
+            provider: name.clone(),
+            result,
+        }
+    });
+    futures_util::future::join_all(jobs).await
+}
+
+/// 갱신 결과를 사람이 읽는 줄로 조립한다 (프로바이더별 한 줄 + 총계 한 줄).
+pub fn refresh_summary(rows: &[CatalogRefresh]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["연결된 서비스가 없습니다. /connect 로 먼저 연결하세요.".into()];
+    }
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    let mut failed = 0usize;
+    for r in rows {
+        match &r.result {
+            Ok(n) => {
+                total += n;
+                out.push(format!("{}  {}개", r.provider, n));
+            }
+            Err(e) => {
+                failed += 1;
+                out.push(format!("{}  실패: {}", r.provider, e));
+            }
+        }
+    }
+    let mut tail = format!("총 {}곳 · 모델 {}개", rows.len(), total);
+    if failed > 0 {
+        tail.push_str(&format!(" · 실패 {failed}곳"));
+    }
+    out.push(tail);
+    out
+}
+
 pub fn registered_models(cfg: &Config) -> Vec<RegisteredModel> {
     let mut out = Vec::new();
     for name in usable_names(cfg) {
@@ -2205,5 +2279,56 @@ mod tests {
         let go = api_key_env_names("opencode_go", "OPENCODE_GO_API_KEY");
         assert!(go.iter().any(|n| n == "OPENCODE_GO_API_KEY"));
         assert!(go.iter().any(|n| n == "OPENCODE_API_KEY"));
+    }
+
+    #[test]
+    fn refresh_summary_lists_counts_failures_and_total() {
+        let rows = vec![
+            CatalogRefresh {
+                provider: "minimax".into(),
+                result: Ok(12),
+            },
+            CatalogRefresh {
+                provider: "anthropic".into(),
+                result: Err("HTTP 401".into()),
+            },
+            // 조회는 됐지만 목록이 비면 0개 — 캐시는 건드리지 않는다.
+            CatalogRefresh {
+                provider: "openai".into(),
+                result: Ok(0),
+            },
+        ];
+        let out = refresh_summary(&rows);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], "minimax  12개");
+        assert_eq!(out[1], "anthropic  실패: HTTP 401");
+        assert_eq!(out[2], "openai  0개");
+        assert_eq!(out[3], "총 3곳 · 모델 12개 · 실패 1곳");
+    }
+
+    #[test]
+    fn refresh_summary_without_failures_omits_failure_tail() {
+        let rows = vec![CatalogRefresh {
+            provider: "glm".into(),
+            result: Ok(3),
+        }];
+        let out = refresh_summary(&rows);
+        assert_eq!(out, vec!["glm  3개", "총 1곳 · 모델 3개"]);
+    }
+
+    #[test]
+    fn refresh_summary_empty_input_guides_connect() {
+        let out = refresh_summary(&[]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("/connect"));
+    }
+
+    #[test]
+    fn short_error_trims_to_one_line_within_120_chars() {
+        let long = "x".repeat(300);
+        let e = anyhow::anyhow!("{long}\n두 번째 줄");
+        let s = short_error(&e);
+        assert_eq!(s.chars().count(), 120);
+        assert!(!s.contains('\n'));
     }
 }

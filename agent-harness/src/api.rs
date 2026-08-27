@@ -127,6 +127,8 @@ pub struct SlashResult {
     pub compact: bool,
     /// true 면 호출자가 assign_roles 를 실행해야 한다 (/engine multi).
     pub assign: bool,
+    /// true 면 호출자가 refresh_models 를 실행해야 한다 (/model refresh).
+    pub model_fetch: bool,
 }
 
 pub fn boot() -> Result<BootInfo> {
@@ -379,6 +381,7 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             agent_task: None,
             compact: false,
             assign: false,
+            model_fetch: false,
         }),
         Slash::Quit => Ok(SlashResult {
             notes: "세션을 닫습니다.".into(),
@@ -386,6 +389,7 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             agent_task: None,
             compact: false,
             assign: false,
+            model_fetch: false,
         }),
         Slash::Agent(task) => Ok(SlashResult {
             notes: String::new(),
@@ -393,6 +397,7 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             agent_task: Some(task),
             compact: false,
             assign: false,
+            model_fetch: false,
         }),
         Slash::Compact => Ok(SlashResult {
             notes: String::new(),
@@ -400,6 +405,7 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             agent_task: None,
             compact: true,
             assign: false,
+            model_fetch: false,
         }),
         Slash::AssignRoles => Ok(SlashResult {
             notes: String::new(),
@@ -407,7 +413,26 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             agent_task: None,
             compact: false,
             assign: true,
+            model_fetch: false,
         }),
+        // 조회(fetch)는 비동기라 호출자에게 넘기고, 검색어만 온 경우는
+        // 여기서 걸러진 목록을 바로 돌려준다 (RPC 쪽엔 피커가 없다).
+        Slash::ModelFetch { query, fetch } => {
+            let notes = if fetch {
+                String::new()
+            } else {
+                let regs = crate::auth::registered_models(&session.cfg);
+                chat::model_list_notes(&regs, &query).join("\n")
+            };
+            Ok(SlashResult {
+                notes,
+                quit: false,
+                agent_task: None,
+                compact: false,
+                assign: false,
+                model_fetch: fetch,
+            })
+        }
     }
 }
 
@@ -419,6 +444,16 @@ pub async fn assign_roles(session: &mut Session) -> Result<String> {
     }
     session.sticky = None;
     Ok(notes.join("\n"))
+}
+
+/// /model refresh 공용 실행 — 연결된 서비스의 원격 모델 목록을 다시 조회해 캐시에 저장한다.
+/// 요약과 갱신된 모델 목록을 함께 돌려준다.
+pub async fn refresh_models(session: &Session) -> Result<String> {
+    let rows = auth::refresh_catalogs(&session.cfg).await;
+    let mut lines = auth::refresh_summary(&rows);
+    let regs = auth::registered_models(&session.cfg);
+    lines.extend(chat::model_list_notes(&regs, ""));
+    Ok(lines.join("\n"))
 }
 
 /// /compact 공용 실행 — 세션 메시지를 요약 하나로 압축한다.
