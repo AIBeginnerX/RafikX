@@ -1,0 +1,208 @@
+/* ── Splash (로그인 첫 화면) ─────────────────────────────────────────────
+   왼쪽: 페르시아 기리(girih) 명상판 + 디지털 다트 애니메이션 로고
+   오른쪽: 제품 소개 · RafikX 기본 설정 요약 · 세션 히스토리 5개
+   body[data-splash="open"] 동안 #app 을 가리고 첫 화면으로 띄운다. */
+
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  grid-template-columns: minmax(360px, 44%) 1fr;
+  background:
+    radial-gradient(120% 90% at 18% 8%, rgba(38, 108, 122, 0.30), transparent 60%),
+    radial-gradient(110% 90% at 85% 92%, rgba(24, 82, 118, 0.25), transparent 62%),
+    var(--bg, #101418);
+  color: var(--fg, #e8ecef);
+  opacity: 1;
+  transition: opacity 280ms ease;
+}
+.splash.closing { opacity: 0; pointer-events: none; }
+body:not([data-splash="open"]) .splash { display: none; }
+body[data-splash="open"] > #app { visibility: hidden; }
+
+/* ── 좌측: 다트 로고 무대 ── */
+.splash__stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-right: 1px solid var(--line, rgba(255,255,255,0.08));
+}
+.splash__stage::before {
+  /* 배경 그리드(디지털 질감) */
+  content: "";
+  position: absolute;
+  inset: -2%;
+  background-image:
+    linear-gradient(rgba(103, 197, 208, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(103, 197, 208, 0.055) 1px, transparent 1px);
+  background-size: 34px 34px;
+  mask-image: radial-gradient(75% 65% at 50% 46%, #000 42%, transparent 78%);
+}
+.dartboard { position: relative; width: min(58%, 430px); aspect-ratio: 1; }
+.dartboard svg { width: 100%; height: 100%; display: block; }
+
+.girih-ring {
+  transform-origin: 130px 130px;
+  animation: girih-spin 64s linear infinite;
+}
+.girih-ring--inner { animation-direction: reverse; animation-duration: 46s; }
+@keyframes girih-spin { to { transform: rotate(360deg); } }
+
+.board-glow {
+  filter: drop-shadow(0 0 16px rgba(56, 189, 204, 0.35));
+  animation: board-breathe 5.6s ease-in-out infinite;
+}
+@keyframes board-breathe {
+  0%, 100% { filter: drop-shadow(0 0 10px rgba(56,189,204,0.28)); }
+  50%      { filter: drop-shadow(0 0 22px rgba(56,189,204,0.50)); }
+}
+
+.hit-rings { opacity: 0; transform-origin: 130px 130px; }
+.dartboard.is-hit .hit-rings { animation: hit-pulse 700ms ease-out forwards; }
+@keyframes hit-pulse {
+  0%   { opacity: 1; transform: scale(0.35); stroke-width: 3; }
+  70%  { opacity: 0.9; }
+  100% { opacity: 0; transform: scale(1.45); stroke-width: 0.6; }
+}
+.bull-core { transition: fill 220ms ease; }
+.dartboard.is-hit .bull-core { fill: var(--bull-hit, #ffd166); }
+
+/* 다트 본체 — 명중 후 잔류 */
+.dart { opacity: 0; transform-origin: 130px 130px; }
+.dartboard.is-hit .dart { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .girih-ring, .board-glow, .hit-rings { animation: none !important; }
+  .dartboard.is-hit .dart { opacity: 1; }
+}
+
+.splash__brand {
+  position: absolute;
+  bottom: clamp(20px, 6vh, 52px);
+  left: 0; right: 0;
+  text-align: center;
+}
+.splash__brand h1 {
+  margin: 0;
+  font-size: clamp(26px, 3.4vw, 40px);
+  letter-spacing: 0.35em;
+  text-indent: 0.35em;
+  font-weight: 800;
+  color: #eef3f5;
+}
+.splash__brand p {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  letter-spacing: 0.14em;
+  color: rgba(232, 239, 242, 0.55);
+}
+
+/* ── 우측: 정보 패널 ── */
+.splash__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: clamp(20px, 4.2vh, 40px) clamp(22px, 4vw, 48px);
+  overflow-y: auto;
+}
+.splash-card {
+  border: 1px solid var(--line, rgba(255,255,255,0.09));
+  border-radius: 14px;
+  background: var(--card-bg, rgba(255,255,255,0.035));
+  padding: 15px 17px;
+}
+.splash-card h2 {
+  margin: 0 0 9px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: rgba(168, 213, 222, 0.92);
+  text-transform: uppercase;
+}
+.splash-intro p {
+  margin: 0 0 7px;
+  font-size: 13.5px;
+  line-height: 1.62;
+  color: var(--fg-soft, #cfd8dc);
+}
+.splash-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+.splash-tag {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(103, 197, 208, 0.32);
+  color: #a9dade;
+  background: rgba(56, 130, 144, 0.10);
+}
+
+.cfg-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  padding: 5px 0;
+}
+.cfg-row + .cfg-row { border-top: 1px dashed var(--line-soft, rgba(255,255,255,0.07)); }
+.cfg-key { color: var(--fg-dim, #93a1a8); flex-shrink: 0; }
+.cfg-val { text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cfg-actions { display: flex; gap: 8px; margin-top: 10px; }
+.splash-btn {
+  appearance: none;
+  cursor: pointer;
+  border-radius: 9px;
+  border: 1px solid rgba(103, 197, 208, 0.38);
+  background: rgba(45, 116, 130, 0.16);
+  color: #cdeff3;
+  font-size: 12.5px;
+  padding: 7px 13px;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.splash-btn:hover { background: rgba(45, 116, 130, 0.30); border-color: rgba(103, 197, 208, 0.66); }
+.splash-btn--primary {
+  background: linear-gradient(135deg, #20748a, #17607d);
+  border-color: rgba(140, 222, 235, 0.55);
+  color: #f2fbfc;
+  font-weight: 600;
+}
+.splash-btn--primary:hover { background: linear-gradient(135deg, #27869e, #1b7093); }
+
+.hist-list { display: flex; flex-direction: column; gap: 6px; }
+.hist-item {
+  appearance: none;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.03);
+  color: inherit;
+  padding: 9px 12px;
+  font-size: 13px;
+  transition: background 130ms ease, border-color 130ms ease;
+}
+.hist-item:hover { background: rgba(103, 197, 208, 0.10); border-color: rgba(103, 197, 208, 0.35); }
+.hist-item b {
+  display: block;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-weight: 600; color: #e7eff1;
+}
+.hist-item span { font-size: 11.5px; color: var(--fg-dim, #93a1a8); }
+.hist-empty { margin: 2px 0; font-size: 12.5px; color: var(--fg-dim, #93a1a8); }
+
+.splash-enter {
+  position: sticky;
+  bottom: 0;
+  margin-top: auto;
+  padding-top: 12px;
+  display: flex;
+  justify-content: flex-end;
+  background: linear-gradient(to top, var(--bg, #101418) 68%, transparent);
+}
+
+@media (max-width: 760px) {
+  .splash { grid-template-columns: 1fr; grid-template-rows: 34vh 1fr; }
+  .splash__stage { border-right: 0; border-bottom: 1px solid var(--line, rgba(255,255,255,0.08)); }
+}

@@ -213,7 +213,7 @@ try {
   assert.equal(await test.page.evaluate(() => document.activeElement?.dataset.tab), "screen");
   await test.page.keyboard.press("Shift+Tab");
   assert.equal(await test.page.evaluate(() => document.getElementById("settings").contains(document.activeElement)), true);
-  await test.page.getByRole("button", { name: "하네스" }).click();
+  await test.page.getByRole("button", { name: "Harness" }).click();
   assert.equal(await test.page.locator('input[name="engine"][value="self"]').isChecked(), true);
   assert.equal(await test.page.locator('input[name="engine"][value="dk"]').count(), 0);
   await test.page.click("#btn-engine-save");

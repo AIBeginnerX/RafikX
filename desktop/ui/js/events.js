@@ -4,6 +4,7 @@ import { applyLifecycle, showConversation } from "./lifecycle.js";
 import { compact, newChat, openSession, sendTurn, showTodos } from "./chat.js";
 import { closeAdmin, openAdmin, refreshBoot } from "./settings.js";
 import { bindSettingsEvents } from "./settings-events.js";
+import { setupPasteBlocks } from "./paste-blocks.js";
 import { activeModal, hideModal, showModal, trapModalTab } from "./modal.js";
 
 const on = (id, event, handler) => $(id)?.addEventListener(event, handler);
@@ -39,6 +40,7 @@ function bindDragAndDrop() {
 }
 
 export function bindUiEvents() {
+  setupPasteBlocks();
   on("btn-new", "click", () => newChat().catch((error) => addMessage("system", String(error), "warn")));
   on("btn-gear", "click", () => openAdmin());
   on("model-chip", "click", () => openAdmin("conn"));

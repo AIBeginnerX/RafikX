@@ -1,4 +1,5 @@
 import { $, esc, projectName, runtime } from "./state.js";
+import { isLarge } from "./paste-blocks.js";
 
 export function setConversationVisible(visible) {
   $("start-stage").hidden = visible;
@@ -69,7 +70,19 @@ export function addMessage(role, text, extra = "") {
   message.className = `msg ${role}${extra ? ` ${extra}` : ""}`;
   message.innerHTML = `<div class="msg__role"><span>${esc(role)}</span></div><div class="msg__body"></div>`;
   const body = message.querySelector(".msg__body");
-  body.textContent = text;
+  const lines = text.split("\n").length;
+  if (role === "user" && isLarge(text)) {
+    const details = document.createElement("details");
+    details.className = "msg__longtext";
+    const summary = document.createElement("summary");
+    summary.textContent = `큰 텍스트 · ${lines}줄 · ${text.length.toLocaleString()}자`;
+    const pre = document.createElement("pre");
+    pre.textContent = text;
+    details.append(summary, pre);
+    body.appendChild(details);
+  } else {
+    body.textContent = text;
+  }
   $("transcript").append(message);
   $("transcript").scrollTop = $("transcript").scrollHeight;
   return body;

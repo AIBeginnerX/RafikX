@@ -97,7 +97,7 @@ export function bindSettingsEvents() {
     const mode = $("harness-mode-manual").checked ? "manual" : "auto";
     try {
       await invoke("set_harness_selection", { mode });
-      addMessage("system", `하네스 모드: ${mode === "manual" ? "수동" : "자동"}`);
+      addMessage("system", `Harness 모드: ${mode === "manual" ? "수동" : "자동"}`);
       await refreshBoot();
     } catch (error) {
       addMessage("system", String(error), "warn");

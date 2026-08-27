@@ -117,9 +117,17 @@ fn install_live(app: AppHandle) {
                 "agent",
                 format!(
                     "{}:{}:{}:{}",
-                    agent.id, agent.role, agent.model, agent.status
+                    agent.id,
+                    agent.role,
+                    agent.model,
+                    if agent.done {
+                        "done"
+                    } else {
+                        agent.activity.as_str()
+                    }
                 ),
             ),
+            Live::Mode(mode) => ("mode", mode),
         };
         let _ = app.emit(
             "live",

@@ -1,4 +1,5 @@
 import { $, invoke, runtime, setStatus } from "./state.js";
+import { consumeBlocksText } from "./paste-blocks.js";
 import { addMessage, attachCopy, clearConversation, renderGraph, renderRichInto, renderSessions } from "./render.js";
 import { applyLifecycle, setBusy, showConversation, showStart } from "./lifecycle.js";
 
@@ -66,7 +67,9 @@ export async function requestCancel() {
 export async function sendTurn() {
   if (runtime.busy) return requestCancel();
   if (!runtime.sid) await newChat();
-  const prompt = $("prompt").value.trim();
+  const typed = $("prompt").value.trim();
+  const pasted = consumeBlocksText();
+  const prompt = [pasted, typed].filter(Boolean).join("\n\n");
   if (!prompt) return;
   $("prompt").value = "";
   showConversation();
