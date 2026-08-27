@@ -74,6 +74,7 @@ pub struct App {
     pub cancel_requested: Arc<AtomicBool>,
     pub lifecycle_state: Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
     pub show_start: bool,
+    pub recent_sessions: Vec<String>,
     pub motion_tick: u16,
     /// 새 릴리스 태그 — 있으면 U 키로 업그레이드 진행 가능
     pub upgrade: Option<String>,
@@ -246,6 +247,7 @@ pub async fn run(
         cancel_requested: Arc::new(AtomicBool::new(false)),
         lifecycle_state: Arc::new(Mutex::new(None)),
         show_start,
+        recent_sessions: recent_session_hints(),
         motion_tick: if reduced_motion { 16 } else { 0 },
         upgrade: None,
         upgrading: false,
@@ -1561,10 +1563,30 @@ fn binding_label(session: &Session) -> String {
     format!("{provider} · {model} · {class} · {mode}")
 }
 
+/// 최근 세션 제목 힌트 — 시작 화면의 세션 히스토리 표시용.
+fn recent_session_hints() -> Vec<String> {
+    let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
+        return Vec::new();
+    };
+    db.list_sessions(4)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            row.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or("제목 없음")
+                .to_string()
+        })
+        .collect()
+}
+
 fn collapsed_input(input: &str) -> String {
     let lines = input.lines().count().max(1);
     let chars = input.chars().count();
-    if lines >= 4 || chars > 240 {
+    // 데스크탑 desktop/ui/js/paste-blocks.js의 CHAR/LINE_THRESHOLD(1200/25)와 동일 기준 유지.
+    if chars >= 1200 || lines > 25 {
         format!("[붙여넣기 {lines}줄 · {chars}자]")
     } else {
         input.to_string()
@@ -2408,9 +2430,19 @@ mod upgrade_tests {
 
     #[test]
     fn long_paste_is_collapsed_without_losing_payload() {
-        let pasted = "첫 줄\n둘째 줄\n셋째 줄\n넷째 줄\n다섯째 줄\n여섯째 줄\n일곱째 줄";
-        assert_eq!(collapsed_input(pasted), "[붙여넣기 7줄 · 36자]");
-        assert_eq!(pasted.lines().count(), 7);
+        // 데스크탑 paste-blocks.js와 동일 임계값(1200자 / 25줄 초과)에서 접힌다.
+        let pasted = (1..=26)
+            .map(|line| format!("제{line}줄"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            collapsed_input(&pasted),
+            format!("[붙여넣기 26줄 · {}자]", pasted.chars().count())
+        );
+        let long_single = "가".repeat(1_200);
+        assert_eq!(collapsed_input(&long_single), "[붙여넣기 1줄 · 1200자]");
+        // 임계값 미만의 짧은 멀티라인은 원문이 그대로 유지된다.
+        assert_eq!(collapsed_input("a\nb\nc"), "a\nb\nc");
     }
 
     #[test]

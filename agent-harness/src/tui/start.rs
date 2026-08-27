@@ -45,10 +45,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     lines.push(Line::default());
     lines.push(metadata_line("MODEL", &app.binding, palette));
     lines.push(metadata_line("WORKSPACE", &app.cwd, palette));
+    if area.height >= 16 && !app.recent_sessions.is_empty() {
+        // 데스크탑 splash의 세션 히스토리에 대응하는 CLI 시작 화면 요소.
+        lines.push(metadata_line(
+            "RECENT",
+            &app.recent_sessions.join("  ›  "),
+            palette,
+        ));
+    }
     if area.height >= 14 {
         lines.push(Line::from(Span::styled(
             if configured(app) {
-                "Enter 실행  ·  Tab plan/build  ·  ? 도움말"
+                "Enter 실행  ·  Tab plan/build  ·  /sessions 최근 세션  ·  ? 도움말"
             } else {
                 "/connect 로 모델 연결"
             },
