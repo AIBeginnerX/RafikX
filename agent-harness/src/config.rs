@@ -321,6 +321,9 @@ pub struct ConfigFile {
     pub harness: HarnessConfig,
     pub subagents: HashMap<String, SubAgentConfig>,
     pub memory: MemoryConfig,
+    /// `[fallback]` 폴 fallback 아키텍트 — 옛 설정에 없으면 기본값(on, 기본 신호).
+    #[serde(default)]
+    pub fallback: FallbackConfig,
     /// `[categories]` 카테고리→모델 매핑 (quick|deep|visual|ultrabrain 등).
     /// task(category=...) 가 모델 대신 일의 종류를 고를 때 해석한다. 없으면 미사용.
     #[serde(default)]
@@ -577,6 +580,30 @@ pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
         verify_command: String::new(),
         system_extra: system_extra.into(),
     })
+}
+
+/// `[fallback]` — 거부 감지 → 아키텍트 레인 (F6).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FallbackConfig {
+    /// 거부 후보를 아키텍트 상담으로 되살릴지.
+    #[serde(default = "fallback_enabled_default")]
+    pub enabled: bool,
+    /// 불확실 신호 문구 — 비면 내장 기본 목록(fallback::DEFAULT_SIGNALS).
+    #[serde(default)]
+    pub refusal_signals: Vec<String>,
+}
+
+fn fallback_enabled_default() -> bool {
+    true
+}
+
+impl Default for FallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            refusal_signals: Vec::new(),
+        }
+    }
 }
 
 /// `[edit]` — 편집 도구 동작.

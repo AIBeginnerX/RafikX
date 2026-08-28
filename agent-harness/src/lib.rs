@@ -11,6 +11,7 @@ pub mod dateutil;
 pub mod db;
 pub mod engine;
 pub mod facts;
+pub mod fallback;
 pub mod graph;
 pub mod harness;
 pub mod inspector;

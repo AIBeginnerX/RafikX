@@ -847,6 +847,8 @@ async fn run_pipeline_inner(
     let plan_step_total = plan_step_count(&plan_steps);
     let mut next_resume = resume;
     let mut continuations = 0u8;
+    // 폴 fallback 아키텍트 예산 — 턴당 최대 1회 (무한 루프 금지, F6).
+    let mut fallback_budget: u8 = if cfg.file.fallback.enabled { 1 } else { 0 };
     let mut stale_rounds = 0u8;
     let mut previous_progress: Option<(usize, usize)> = None;
     let mut total_input = 0u32;
@@ -972,6 +974,92 @@ async fn run_pipeline_inner(
                     continuations,
                     max_continuations,
                 ));
+        // 폴 fallback 아키텍트 (F6) — 실행 없이 끝나는 거부 후보를 설계 레인으로 1회 되살린다.
+        // simple/medium 클래스는 여기 도달하지 않는다 (큰 작업 전용 안전장치).
+        if !should_continue
+            && continuation_eligible
+            && fallback_budget > 0
+            && matches!(binding.class, TaskClass::Dev | TaskClass::Advanced)
+        {
+            let answer = agent::last_assistant_text(&current.messages);
+            if crate::fallback::is_refusal_candidate(
+                &answer,
+                current.changed_files.is_empty(),
+                current.iterations <= 1,
+                &crate::fallback::refusal_signals(cfg),
+            ) {
+                match crate::fallback::consult_architect(cfg, task, &answer).await {
+                    Ok(Some(judgment)) => {
+                        fallback_budget -= 1;
+                        crate::ui::live_line_in(
+                            &run_context,
+                            "[폴 fallback] 실행이 거부되어 아키텍트 상담 후 재개합니다.",
+                        );
+                        crate::graph::node_in(
+                            &run_context,
+                            "fallback_architect",
+                            "consult",
+                            &judgment,
+                            Some("goal"),
+                        );
+                        // 판단을 facts·lessons 에 기록 — 같은 설계 질문의 재거부 예방 (F6).
+                        if let Ok(path) = Db::db_path()
+                            && let Ok(db) = Db::open(&path)
+                        {
+                            let qkey: String = judgment
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .chars()
+                                .take(40)
+                                .collect();
+                            let _ = db.upsert_fact(
+                                Some(&cfg.workspace),
+                                "convention",
+                                &format!("architect:{qkey}"),
+                                &judgment.chars().take(200).collect::<String>(),
+                                "agent",
+                            );
+                            let _ = db.add_lesson(
+                                "폴 fallback",
+                                "architect",
+                                &format!(
+                                    "거부 → 아키텍트 상담으로 재개: {}",
+                                    task.chars().take(80).collect::<String>()
+                                ),
+                                200,
+                            );
+                        }
+                        // 막힌 이유가 설계 판단으로 풀렸음을 사용자에게도 알린다 (F6).
+                        #[cfg(feature = "telegram")]
+                        crate::telegram::notify_owner(
+                            cfg,
+                            &format!(
+                                "[폴 fallback] 아키텍트가 판단했습니다\n{}",
+                                judgment.chars().take(300).collect::<String>()
+                            ),
+                        )
+                        .await;
+                        let mut messages = current.messages.clone();
+                        messages.push(Message::user_text(format!(
+                            "[아키텍트 판단]\n{judgment}\n\n위 판단을 바탕으로 원래 작업을 계속 실행하라. \
+                             이번에는 반드시 도구로 실행해 결과물(파일 변경)을 만들어라."
+                        )));
+                        next_resume = Some(messages);
+                        continue;
+                    }
+                    Ok(None) => {
+                        // 추출 결과 진짜 질문이 아님 — 정상 종료 경로로 본다.
+                    }
+                    Err(e) => {
+                        crate::ui::live_warn_in(
+                            &run_context,
+                            &format!("[폴 fallback] 아키텍트 상담 실패(정상 종료로 진행): {e}"),
+                        );
+                    }
+                }
+            }
+        }
         if !should_continue {
             // todo 를 등록하고도 못 끝낸 경우만 미완료다. todo 자체를 만들지 않고
             // ok 로 끝난 턴은 모델이 단계화가 불필요한 작업으로 판단한 것 —
