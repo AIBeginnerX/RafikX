@@ -75,6 +75,8 @@ pub struct App {
     pub lifecycle_state: Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
     pub show_start: bool,
     pub recent_sessions: Vec<String>,
+    /// 시작 화면 팁 1줄 — App 생성 시 한 번만 고른다 (매 프레임 바뀌지 않게, F9).
+    pub start_tip: Option<String>,
     pub motion_tick: u16,
     /// 새 릴리스 태그 — 있으면 U 키로 업그레이드 진행 가능
     pub upgrade: Option<String>,
@@ -207,6 +209,7 @@ pub async fn run(
     }
     enable_utf8();
 
+    let tips_on = cfg.file.ui.tips;
     let session = chat::open_session(cfg, yes, provider, model, class, resume, false)?;
     let cwd = session.cfg.workspace.display().to_string();
     let show_start = session.messages.is_empty();
@@ -248,6 +251,11 @@ pub async fn run(
         lifecycle_state: Arc::new(Mutex::new(None)),
         show_start,
         recent_sessions: recent_session_hints(),
+        start_tip: if tips_on {
+            crate::tips::pick_random().map(|t| t.tip)
+        } else {
+            None
+        },
         motion_tick: if reduced_motion { 16 } else { 0 },
         upgrade: None,
         upgrading: false,

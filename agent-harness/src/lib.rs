@@ -35,6 +35,7 @@ pub mod skills;
 pub mod spinner;
 #[cfg(feature = "telegram")]
 pub mod telegram;
+pub mod tips;
 pub mod tools;
 pub mod tools_more;
 #[cfg(feature = "tui")]

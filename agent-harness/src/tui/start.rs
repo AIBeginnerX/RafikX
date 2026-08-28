@@ -53,6 +53,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
             palette,
         ));
     }
+    if let Some(tip) = &app.start_tip {
+        // 세션당 1줄 — App 생성 시 고정된 팁 (F9). /tips off 로 영구 해제.
+        lines.push(metadata_line("TIP", &format!("{tip}  ·  /tips"), palette));
+    }
     if area.height >= 14 {
         lines.push(Line::from(Span::styled(
             if configured(app) {

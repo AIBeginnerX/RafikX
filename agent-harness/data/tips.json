@@ -1,0 +1,146 @@
+[
+  {
+    "id": "ulw",
+    "tip": "/ulw <목표> — 완료 기준의 증거가 모일 때까지 스스로 계속 실행합니다",
+    "detail": "계획→실행→검증을 반복하는 자율 루프입니다. 진전이 없으면 재촉(최대 3회), 그래도 안 되면 조용히 멈추지 않고 blocked 로 보고합니다. 산출물은 .omo/ulw/<id>/ 에 남습니다.",
+    "code": "src/ulw.rs",
+    "excerpt": "pub const MAX_NUDGES: u32 = 3;\npub const MAX_RUNS: u32 = 1 + MAX_NUDGES;",
+    "since": "1.1.0",
+    "tags": ["ulw", "automation"]
+  },
+  {
+    "id": "ulw-resume",
+    "tip": "/ulw-resume — 멈춘 자율 루프를 미완료 기준부터 이어갑니다",
+    "detail": "루프 상태는 .omo/ulw/<id>/state.json 파일이라 프로세스·머신 재시작 후에도 이어집니다. id를 생략하면 가장 최근 실행을 고릅니다.",
+    "code": "src/ulw.rs",
+    "excerpt": "pub fn load(workspace: &Path, run_id: &str) -> Result<Self>",
+    "since": "1.1.0",
+    "tags": ["ulw"]
+  },
+  {
+    "id": "ulw-telegram",
+    "tip": "텔레그램으로 /ulw 를 본낼 수 있습니다 — 자고 일어나면 완료 보고가 옵니다",
+    "detail": "데몬이 백그라운드로 루프를 돌리고, 승인은 인라인 버튼, 완료·중단은 채팅 알림으로 옵니다. [telegram] allow_agent=true 일 때 동작합니다.",
+    "code": "src/telegram.rs",
+    "excerpt": "fn spawn_ulw(bot: Bot, chat_id: ChatId, app: Arc<App>, goal: Option<String>, resume_id: Option<String>)",
+    "since": "1.1.0",
+    "tags": ["ulw", "telegram"]
+  },
+  {
+    "id": "facts",
+    "tip": "스택·선호를 알려주면 remember 로 기억합니다 — /facts 로 확인하세요",
+    "detail": "\"이 프로젝트는 pnpm 써\" 같은 지속 사실은 에이전트가 remember 도구로 기록하고, 다음 세션부터 [기억하는 사실] 블록으로 자동 주입됩니다. 잘못 기억한 것은 /forget <키>로 지웁니다.",
+    "code": "src/tools/facts.rs",
+    "excerpt": "\"사용자·프로젝트의 지속 사실(스택, 선호, 관습, 환경)을 기억한다.\"",
+    "since": "1.1.0",
+    "tags": ["memory"]
+  },
+  {
+    "id": "hashline",
+    "tip": "편집은 해시 앵커가 정확합니다 — read_file 의 N#HASH 태그를 anchors 로 쓰세요",
+    "detail": "edit_file 에 anchors:{start,end} 를 주면 해시를 검증한 뒤 구간을 교체합니다. 파일이 바뀌었으면 쓰기 전에 거부합니다. [edit] hashline=false 로 끌 수 있습니다.",
+    "code": "src/tools/hashline.rs",
+    "excerpt": "pub fn verify_span(body: &str, start_raw: &str, end_raw: &str) -> Result<(usize, usize)>",
+    "since": "1.1.0",
+    "tags": ["edit", "quality"]
+  },
+  {
+    "id": "combo",
+    "tip": "[combos] 에 체인을 등록하면 모델이 죽어도 다음 모델로 이어집니다",
+    "detail": "chain = [\"claude/opus\", \"kimi/k2\"] 처럼 등록하고 /model 에서 combo 를 고륵세요. 요청 실패 시 체인 다음 후보로 자동 전환되고 \"폴 fallback: ... 사용 중\" 배지가 뜹니다.",
+    "code": "src/harness/binding.rs",
+    "excerpt": "pub const COMBO_MAX_HOPS: usize = 3;",
+    "since": "1.1.0",
+    "tags": ["model", "reliability"]
+  },
+  {
+    "id": "quota",
+    "tip": "/quota — 계정별 리밋 상태와 오늘 사용량을 표로 봅니다",
+    "detail": "프로바이더·계정별로 리밋 남은 시간, 오늘 요청 수, 토큰 in/out 을 보여줍니다. 텔레그램에서도 /quota 로 확인할 수 있습니다.",
+    "code": "src/usage.rs",
+    "excerpt": "pub fn quota_lines(cfg: &crate::config::Config) -> Vec<String>",
+    "since": "1.1.0",
+    "tags": ["model", "ops"]
+  },
+  {
+    "id": "init-deep",
+    "tip": "/init-deep — 프로젝트에 AGENTS.md 규칙 파일을 자동 생성합니다",
+    "detail": "루트와 주요 디렉터리에 역할·관습·금지·검증 규칙 초안을 만듭니다. 기존 파일은 덮어쓰지 않고 diff 제안만 합니다. 규칙은 매 요청 시스템 프롬프트에 자동 주입됩니다.",
+    "code": "src/rules.rs",
+    "excerpt": "pub fn propose_init_deep(workspace: &Path) -> Vec<InitDeepProposal>",
+    "since": "1.1.0",
+    "tags": ["rules", "onboarding"]
+  },
+  {
+    "id": "fallback-architect",
+    "tip": "모델이 막히면 아키텍트가 판단하고 실행은 계속됩니다",
+    "detail": "실행 없이 끝나는 거부(설계 불확실)를 감지하면 미해결 질문을 아키텍트 레인으로 돌려 [아키텍트 판단] 을 주입하고 1회 재시도합니다. [fallback] enabled=false 로 끌 수 있습니다.",
+    "code": "src/fallback.rs",
+    "excerpt": "pub fn is_refusal_candidate(answer: &str, no_changes: bool, single_iteration: bool, signals: &[String]) -> bool",
+    "since": "1.1.0",
+    "tags": ["reliability"]
+  },
+  {
+    "id": "engine",
+    "tip": "/engine — 7종의 Harness 엔진을 상황에 맞게 바꿔 보세요",
+    "detail": "rafikx·claude·deepseek·qwen·kimi·pi·minimax. 각 엔진은 해당 Harness의 품질 장치(계획 가시화·검증 게이트·약점 보정)를 담고 있고, [engines.<이름>] 으로 문구까지 바꿀 수 있습니다.",
+    "code": "src/engine.rs",
+    "excerpt": "pub fn catalog() -> &'static [EngineSpec]",
+    "since": "1.0.0",
+    "tags": ["harness"]
+  },
+  {
+    "id": "team-mode",
+    "tip": "/team multi — 독립 단계를 역할 서브에이전트가 병렬로 실행합니다",
+    "detail": "planner·frontend·backend·reviewer 역할을 task 도구로 위임하고, 독립적인 갈래는 한 응답의 연속 task 호출이 병렬로 돕니다. 역할별로 다른 모델을 배정할 수도 있습니다.",
+    "code": "src/harness/team.rs",
+    "excerpt": "pub(crate) const TEAM_MULTI_BLOCK: &str",
+    "since": "1.0.0",
+    "tags": ["harness", "parallel"]
+  },
+  {
+    "id": "explorer-lane",
+    "tip": "\"이 함수를 호출하는 곳 찾아줘\" — 탐색은 읽기 전용 explorer 가 승인 없이 답합니다",
+    "detail": "코드 탐색 패턴은 explorer 레인(쓰기 도구 0개)으로 배정되어 승인 프롬프트 없이 파일:줄 증거로 답합니다. 외부 정보는 researcher 가 출처와 함께 조사합니다.",
+    "code": "src/harness/classify.rs",
+    "excerpt": "pub fn suggest_lane(text: &str) -> Option<&'static str>",
+    "since": "1.1.0",
+    "tags": ["lane", "speed"]
+  },
+  {
+    "id": "skills",
+    "tip": "~/.rafikx/skills/ 에 SKILL.md 를 두면 절차를 재사용합니다",
+    "detail": "전역(~/.rafikx/skills)과 워크스페이스(.rafikx/skills) 둘 다 검색하고, 같은 이름이면 워크스페이스가 이깁니다. 에이전트가 save_skill 로 직접 저장하기도 합니다.",
+    "code": "src/skills.rs",
+    "excerpt": "// 검색 위치는 전역(`~/.rafikx/skills`)과 워크스페이스(`<ws>/.rafikx/skills`) 둘이며,\n// 같은 이름이면 워크스페이스 스킬이 우선한다.",
+    "since": "1.0.0",
+    "tags": ["skills"]
+  },
+  {
+    "id": "inspector",
+    "tip": "rafikx inspect — 점검 에이전트가 실행 이력을 분석해 개선안을 보고합니다",
+    "detail": "반복 실패 패턴, 제안 교훈, 설정 변경 제안을 만들어 줍니다. 읽기 전용이라 코드를 자동으로 고치지 않습니다. --apply 하면 제안 교훈만 lessons 에 반영합니다.",
+    "code": "src/inspector.rs",
+    "excerpt": "const ANALYZE_PROMPT: &str = \"당신은 RafikX Inspector다.",
+    "since": "0.6.0",
+    "tags": ["ops", "self-improve"]
+  },
+  {
+    "id": "self-harness",
+    "tip": "/selfharness on — 실패를 채굴해 Harness가 스스로를 고칩니다",
+    "detail": "실패 시그니처가 모이면 수정 후보를 만들고, 재발 없음·성공률 비저하를 확인한 후볼만 승격합니다. 상태와 계보는 ~/.rafikx/self_harness.json 에 남습니다.",
+    "code": "src/self_harness.rs",
+    "excerpt": "// 1. Weakness Mining — 매 에피소드 종료 시 verifier-grounded 실패 시그니처 φ=(c,q,m) 를 추출한다.",
+    "since": "0.6.0",
+    "tags": ["self-improve"]
+  },
+  {
+    "id": "yolo",
+    "tip": "/yolo — 승인 없이 자동 실행 (긴 작업 전에 켜두세요)",
+    "detail": "도구 승인을 자동으로 넘깁니다. 푸터에 빨간 YOLO 배지가 상시 표시되고, 텔레그램 원격에서는 자동 승인이 강제 차단됩니다. 설정에 영속됩니다.",
+    "code": "src/chat.rs",
+    "excerpt": "(\"/yolo\", \"권한무시 on|off — 도구 자동 승인 (영속)\"),",
+    "since": "0.7.0",
+    "tags": ["approval", "automation"]
+  }
+]

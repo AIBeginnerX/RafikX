@@ -1,3 +1,3 @@
-완료: v1.0.1 + Phase C1~C4 + F0 + F1 + F2 + F3 + F5 + F4a/b + F6 + F7 + F8(콤보 폴 fallback — [combos] chain 바인딩(3홉 상한)·요청 단위 (provider,model) 쌍 전환·전환 배지·/model 피커 콤보 항목·/quota(프로바이더·계정별 리밋 상태+오늘 사용량, CLI·TUI·텔레그램), 실환경 quota 스모크 확인, 테스트 306개 통과).
-다음: Phase F9(팁 시스템) — v5 마지막 Phase.
+완료: v5 전체 (C1~C4·F0~F9) — 마지막 F9 팁 시스템(tips.json 16종·/tips·/tip 상세(구현 발췌 포함)·시작 화면 팁 1줄(App 생성 시 고정)·/tips off 영속), 테스트 311개 통과, 릴리즈 빌드 성공.
+다음: v5 완료 — 실전 스모크(/ulw 실모델 실행)는 사용자 판단. 이후 후보: Inspector가 ulw evidence 인용, MCP로 facts 노출.
 이슈: 없음.

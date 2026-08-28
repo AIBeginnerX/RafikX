@@ -726,6 +726,13 @@ pub struct UiConfig {
     pub appearance: String,
     #[serde(default)]
     pub reduced_motion: bool,
+    /// 시작 화면 팁 1줄 — /tips off 로 끈다 (영속).
+    #[serde(default = "default_tips_on")]
+    pub tips: bool,
+}
+
+fn default_tips_on() -> bool {
+    true
 }
 
 fn default_theme() -> String {
@@ -742,6 +749,7 @@ impl Default for UiConfig {
             theme: default_theme(),
             appearance: default_appearance(),
             reduced_motion: false,
+            tips: true,
         }
     }
 }

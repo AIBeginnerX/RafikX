@@ -161,6 +161,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/ulw", "자율 완수 루프 — 증거가 모일 때까지"),
     ("/ulw-resume", "중단된 ulw 루프 재개 [id]"),
     ("/quota", "계정·프로바이더 쿼터 상태"),
+    ("/tips", "기능 팁 목록 · off 끄기"),
+    ("/tip", "팁 상세 /tip <id> — 구현 코드 포함"),
     ("/facts", "기억한 지속 사실 목록"),
     ("/forget", "지속 사실 삭제 /forget <key>"),
     ("/status", "연결·사용량 요약"),
@@ -493,6 +495,31 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
         "/quit" | "/exit" => Ok(Slash::Quit),
         "/help" => Ok(Slash::Continue(vec![help_text()])),
         "/quota" => Ok(Slash::Continue(crate::usage::quota_lines(&session.cfg))),
+        "/tips" => {
+            match rest {
+                "off" => {
+                    crate::config::write_toml_key(&session.cfg.path, "[ui]", "tips", "false")?;
+                    Ok(Slash::Continue(vec!["시작 화면 팁을 껐습니다. /tips on 으로 다시 켭니다.".into()]))
+                }
+                "on" => {
+                    crate::config::write_toml_key(&session.cfg.path, "[ui]", "tips", "true")?;
+                    Ok(Slash::Continue(vec!["시작 화면 팁을 켰습니다.".into()]))
+                }
+                "" => Ok(Slash::Continue(crate::tips::list_lines())),
+                _ => Ok(Slash::Continue(vec!["/tips · /tips on|off · /tip <id>".into()])),
+            }
+        }
+        "/tip" => {
+            if rest.is_empty() {
+                return Ok(Slash::Continue(vec!["/tip <id> — 예: /tip ulw".into()]));
+            }
+            match crate::tips::find(rest) {
+                Some(tip) => Ok(Slash::Continue(crate::tips::detail_lines(&tip))),
+                None => Ok(Slash::Continue(vec![format!(
+                    "'{rest}' 팁이 없습니다. /tips 로 목록을 보세요."
+                )])),
+            }
+        }
         "/facts" => {
             let rows = db.list_facts(Some(&session.cfg.workspace))?;
             if rows.is_empty() {
