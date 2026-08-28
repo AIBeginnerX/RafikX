@@ -339,3 +339,75 @@ mod intent_gate_tests {
         assert!(inst.contains("확인 연극 금지"));
     }
 }
+
+/// 일의 성격에 따른 레인 제안 (F5) — TaskClass 와 무관하게 읽기 전용 레인을 우선 배정한다.
+/// dev 신호(파일 생성·수정 요청)가 있으면 제안하지 않는다: 구현 요청을 탐색 레인으로
+/// 본으면 쓰기 도구가 없어 작업이 실패한다.
+pub fn suggest_lane(text: &str) -> Option<&'static str> {
+    // 쓰기 행위 요청이면 레인 제안 금지 — "함수/코드" 같은 명사가 들어간 읽기 전용
+    // 질문("이 함수를 호출하는 곳 찾아줘")까지 차단하지 않도록 행위 동사만 본다.
+    if contains_any(
+        text,
+        &[
+            "수정해", "고쳐", "만들어", "생성해", "작성해", "적용해", "리팩터",
+            "구현해", "바꿔", "추가해", "삭제해", "커밋", "옮겨",
+        ],
+    ) {
+        return None;
+    }
+    // 코드베이스 탐색 패턴 — "어디/찾아/호출/의존/구조" + 코드 맥락.
+    if contains_any(
+        text,
+        &[
+            "호출하는", "호출하는 곳", "어디서", "의존하는", "의존성", "참조하는",
+            "정의로", "레퍼런스", "어느 파일", "코드 구조", "구조를 보여", "구조 알려",
+        ],
+    ) {
+        return Some("explorer");
+    }
+    // 외부 정보 리서치 패턴 — 최신 정보·공식 문서·라이브러리 조사.
+    if contains_any(
+        text,
+        &[
+            "최신", "공식 문서", "라이브러리", "비교해줘", "알아봐", "버전 뭐",
+            "출시", " changelog", "문서 찾아", "스펙 확인",
+        ],
+    ) {
+        return Some("researcher");
+    }
+    None
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    #[test]
+    fn code_exploration_routes_to_explorer() {
+        assert_eq!(suggest_lane("이 함수를 호출하는 곳을 다 찾아줘"), Some("explorer"));
+        assert_eq!(suggest_lane("Db::open 이 어디서 의존하는지 궁금해"), Some("explorer"));
+        assert_eq!(suggest_lane("이 구조체 정의로 이동해줘"), Some("explorer"));
+        assert_eq!(suggest_lane("레퍼런스 검색해줘"), Some("explorer"));
+    }
+
+    #[test]
+    fn external_research_routes_to_researcher() {
+        assert_eq!(suggest_lane("최신 ratatui 버전이 뭐야?"), Some("researcher"));
+        assert_eq!(suggest_lane("tokio 공식 문서에서 select! 사용법 찾아줘"), Some("researcher"));
+        assert_eq!(suggest_lane("이 라이브러리 두 개 비교해줘"), Some("researcher"));
+        assert_eq!(suggest_lane("rust 1.98 출시했는지 알아봐줘"), Some("researcher"));
+    }
+
+    #[test]
+    fn dev_requests_never_route_to_lanes() {
+        // "찾아" 류 표현이 있어도 dev 신호(수정·생성)가 있으면 레인 제안 금지
+        assert_eq!(suggest_lane("호출하는 곳 찾아서 코드 수정해줘"), None);
+        assert_eq!(suggest_lane("최신 방식으로 리팩터해줘"), None);
+    }
+
+    #[test]
+    fn plain_questions_have_no_lane() {
+        assert_eq!(suggest_lane("안녕"), None);
+        assert_eq!(suggest_lane("이 파일 요약해줘"), None);
+    }
+}

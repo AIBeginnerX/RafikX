@@ -30,6 +30,7 @@ pub struct TaskArgs {
     prompt: String,
     class: Option<String>,
     role: Option<String>,
+    category: Option<String>,
     model: Option<String>,
     parent: Option<RunContext>,
     remote: Option<crate::agent::RemoteApproval>,
@@ -69,6 +70,7 @@ impl TaskTool {
             prompt,
             class: string("class"),
             role: string("role"),
+            category: string("category"),
             model: string("model"),
             parent: ctx.run.clone(),
             remote: ctx.remote.clone(),
@@ -88,6 +90,7 @@ impl TaskTool {
             prompt,
             class,
             role,
+            category,
             model,
             parent,
             remote,
@@ -100,8 +103,16 @@ impl TaskTool {
             .as_deref()
             .map(str::trim)
             .filter(|r| crate::harness::profile_exists(&cfg, r));
+        // 카테고리 라우팅 (F5): 모델 대신 일의 종류(quick|deep|visual|ultrabrain…)를
+        // 고륵면 [categories] 매핑이 모델을 정한다. profile 과 동시 지정이면 profile 우선.
+        let category_model = if profile.is_none() {
+            resolve_category_model(&cfg, category.as_deref())
+        } else {
+            None
+        };
+        let effective_model = model.as_deref().or(category_model);
         let mut binding =
-            crate::harness::bind_profile(&cfg, task_class, profile, None, model.as_deref())?;
+            crate::harness::bind_profile(&cfg, task_class, profile, None, effective_model)?;
         // 위임 서브에이전트도 실행 경로다 — 엔진 고정을 같은 규칙으로 적용한다.
         if let Some(w) =
             crate::harness::apply_engine_pin(&cfg, &mut binding, None, model.as_deref())
@@ -266,6 +277,7 @@ impl Tool for TaskTool {
                 "prompt": {"type": "string", "description": "위임할 작업 지시"},
                 "class": {"type": "string", "enum": ["simple", "medium", "advanced", "dev"], "description": "강제 분류. 생략 시 규칙 분류"},
                 "role": {"type": "string", "description": "전문가 역할. planner(스펙·완료기준·작업분해) | frontend | backend | reviewer(DoD 대조 리뷰) 중 하나면 해당 전문가 프로파일(도구·품질 기준)로 실행된다. 그 밖의 값은 화면 표시용 라벨"},
+                "category": {"type": "string", "description": "모델 대신 고르는 일의 종류 (quick|deep|visual|ultrabrain — config [categories] 매핑). role 과 함께 쓰면 role 우선"},
                 "model": {"type": "string", "description": "등록된 모델 ID. 생략하면 Harness가 능력과 비용에 따라 선택"}
             },
             "required": ["prompt"]
@@ -281,5 +293,48 @@ impl Tool for TaskTool {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(Self::delegate(args))
         })
+    }
+}
+
+/// config [categories] 에서 카테고리의 모델 스펙을 찾는다 (미설정 시 None — 기본 경로 회귀 0).
+pub(crate) fn resolve_category_model<'a>(
+    cfg: &'a crate::config::Config,
+    category: Option<&str>,
+) -> Option<&'a str> {
+    let name = category?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    cfg.file.categories.get(name).map(String::as_str)
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+
+    fn cfg_with_categories(tag: &str) -> crate::config::Config {
+        let dir = std::env::temp_dir().join(format!("rafikx-cat-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
+        cfg.file
+            .categories
+            .insert("quick".into(), "minimax:MiniMax-M2".into());
+        cfg.file.categories.insert("deep".into(), "claude:opus".into());
+        cfg
+    }
+
+    #[test]
+    fn category_maps_to_configured_model() {
+        let cfg = cfg_with_categories("maps");
+        assert_eq!(resolve_category_model(&cfg, Some("quick")), Some("minimax:MiniMax-M2"));
+        assert_eq!(resolve_category_model(&cfg, Some("deep")), Some("claude:opus"));
+    }
+
+    #[test]
+    fn unknown_or_empty_category_falls_back_to_none() {
+        let cfg = cfg_with_categories("fallback");
+        assert_eq!(resolve_category_model(&cfg, Some("visual")), None);
+        assert_eq!(resolve_category_model(&cfg, Some("")), None);
+        assert_eq!(resolve_category_model(&cfg, None), None);
     }
 }

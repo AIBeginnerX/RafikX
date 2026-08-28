@@ -123,13 +123,14 @@ pub fn bind_profile(
     }
 
     let window = crate::packer::context_window_for(&provider_name, &model, Some(p));
+    let tools = lane_filtered_tools(&profile_name, &sub.tools);
     Ok(Binding {
         class,
         profile_name,
         provider_name,
         model,
         kind: p.kind.clone(),
-        tools: sub.tools.clone(),
+        tools,
         max_iterations: {
             let n = if sub.max_iterations == 0 {
                 agent::AGENT_MAX_ITER
@@ -145,6 +146,16 @@ pub fn bind_profile(
         context_window: window,
         verify_model,
     })
+}
+
+/// 레인(explorer/researcher)이면 허용목록 외 도구(mutation 등)를 걸러낸다.
+/// config 재정의로 쓰기 도구를 넣어도 레인의 읽기 전용 성질은 유지된다.
+fn lane_filtered_tools(profile_name: &str, tools: &[String]) -> Vec<String> {
+    let mut tools = tools.to_vec();
+    if let Some(allow) = crate::harness::lane_tool_allowlist(profile_name) {
+        tools.retain(|name| allow.contains(&name.as_str()));
+    }
+    tools
 }
 
 /// 프로파일별 모델 해석 (순수 함수 — 배선 없이 우선순위만 정한다).
@@ -1353,5 +1364,43 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
             }
         }
         other => format!("{name}: kind={other} ping 생략"),
+    }
+}
+
+#[cfg(test)]
+mod lane_filter_tests {
+    use super::*;
+
+    #[test]
+    fn explorer_binding_excludes_mutation_tools() {
+        let filtered = lane_filtered_tools(
+            "explorer",
+            &["read_file".into(), "edit_file".into(), "bash".into(), "grep".into()],
+        );
+        assert_eq!(filtered, vec!["read_file", "grep"]);
+    }
+
+    #[test]
+    fn researcher_binding_keeps_only_web_and_read() {
+        let filtered = lane_filtered_tools(
+            "researcher",
+            &["web_search".into(), "write_file".into(), "read_file".into(), "bash".into()],
+        );
+        assert_eq!(filtered, vec!["web_search", "read_file"]);
+    }
+
+    #[test]
+    fn non_lane_profiles_are_untouched() {
+        let tools = vec!["read_file".into(), "write_file".into(), "bash".into()];
+        let filtered = lane_filtered_tools("backend", &tools);
+        assert_eq!(filtered, tools);
+    }
+
+    #[test]
+    fn builtin_lane_presets_exist_with_read_only_tools() {
+        let explorer = crate::config::builtin_profile("explorer").expect("explorer 프리셋");
+        assert!(explorer.tools.iter().all(|t| !["edit_file", "multi_edit", "write_file", "apply_patch", "bash"].contains(&t.as_str())));
+        let researcher = crate::config::builtin_profile("researcher").expect("researcher 프리셋");
+        assert!(researcher.tools.contains(&"web_search".to_string()));
     }
 }

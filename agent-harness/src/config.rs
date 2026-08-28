@@ -321,6 +321,10 @@ pub struct ConfigFile {
     pub harness: HarnessConfig,
     pub subagents: HashMap<String, SubAgentConfig>,
     pub memory: MemoryConfig,
+    /// `[categories]` 카테고리→모델 매핑 (quick|deep|visual|ultrabrain 등).
+    /// task(category=...) 가 모델 대신 일의 종류를 고를 때 해석한다. 없으면 미사용.
+    #[serde(default)]
+    pub categories: std::collections::HashMap<String, String>,
     /// `[edit]` 편집 동작 — 옛 설정에 없으면 기본값(hashline on).
     #[serde(default)]
     pub edit: EditConfig,
@@ -482,6 +486,28 @@ pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
         bool,
         &str,
     ) = match n.as_str() {
+        "explorer" => (
+            &[
+                "read_file",
+                "list_dir",
+                "grep",
+                "glob",
+                "lsp_diagnostics",
+                "lsp_definition",
+                "todo_read",
+            ],
+            8,
+            false,
+            false,
+            "코드베이스 탐색 전문가다. 질문에 증거(파일:줄)를 들어 답한다.                  파일을 절대 수정하지 않는다(NEVER) — 읽기 전용 레인이다.                  답변은 결론 먼저, 근거는 파일:줄 목록으로 남긴다.",
+        ),
+        "researcher" => (
+            &["web_search", "webfetch", "read_file"],
+            6,
+            false,
+            false,
+            "리서치 사서다. 외부 문서·라이브러리·최신 정보를 조사해 출처 URL과 함께 요약한다.                  코드를 수정하지 않는다(NEVER). 확인한 사실과 추론을 구분하고,                  확인 불가한 최신 정보는 그렇다고 명시한다.",
+        ),
         "planner" => (
             &[
                 "read_file",

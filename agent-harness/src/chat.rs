@@ -1590,12 +1590,24 @@ pub async fn run_turn_observed(
     } else {
         (session.provider.clone(), session.model.clone())
     };
-    let mut binding = bind(
-        &session.cfg,
-        class,
-        ov_provider.as_deref(),
-        ov_model.as_deref(),
-    )?;
+    // 레인 라우팅 (F5): 코드 탐색·외부 리서치 패턴이면 읽기 전용 레인 우선 배정.
+    let lane = crate::harness::suggest_lane(prompt);
+    let mut binding = match lane {
+        Some(lane_profile) => crate::harness::bind_profile(
+            &session.cfg,
+            class,
+            Some(lane_profile),
+            ov_provider.as_deref(),
+            ov_model.as_deref(),
+        )?,
+        None => bind(
+            &session.cfg,
+            class,
+            ov_provider.as_deref(),
+            ov_model.as_deref(),
+        )?,
+    };
+
     // 엔진 고정 — sticky 재사용은 "직접 지정"이 아니므로 고정이 이긴다.
     if let Some(w) = crate::harness::apply_engine_pin(
         &session.cfg,
@@ -1698,6 +1710,15 @@ pub async fn run_turn_observed(
             .with_live_sink(live_sink);
     if let Some(observer) = observer {
         observer(run_context.clone());
+    }
+    if let Some(lane_profile) = lane {
+        crate::graph::node_in(
+            &run_context,
+            "bind",
+            "lane",
+            &format!("레인 우선 배정: {lane_profile}"),
+            None,
+        );
     }
     let session_tokens = session
         .messages
