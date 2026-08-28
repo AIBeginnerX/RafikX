@@ -252,6 +252,7 @@ mod tests {
     /// 의존하지 않게 한다.
     fn fake_provider(model: &str, small: &str) -> ProviderConfig {
         ProviderConfig {
+            models_url: None,
             kind: "openai_compat".into(),
             auth: "none".into(),
             api_key_env: String::new(),

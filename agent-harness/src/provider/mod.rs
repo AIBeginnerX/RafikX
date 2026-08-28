@@ -76,6 +76,9 @@ pub struct ChatResponse {
     pub output_tokens: u32,
     /// 프롬프트 캐시 히트 토큰 (제공자가 보고할 때만 0보다 크다).
     pub cached_tokens: u32,
+    /// 공급자가 실제로 답한 모델 — 요청과 다륵면 호출부가 경고한다 (모델 미검증 방지).
+    /// 공급자가 보고하지 않으면 빈 문자열.
+    pub model: String,
     /// 공급자 응답에 캐시 사용량 필드가 실제 포함됐는지 여부.
     pub cache_reported: bool,
     pub limit: LimitHint,

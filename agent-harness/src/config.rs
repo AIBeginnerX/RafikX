@@ -393,6 +393,9 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub supports_tools: bool,
+    /// 모델 목록 엔드포인트 직접 지정 — `/models` 가 없는 프로바이더용 (예: commandcode).
+    #[serde(default)]
+    pub models_url: Option<String>,
     /// true면 이 프로바이더 기본은 「자동 (Harness)」.
     #[serde(default)]
     pub model_auto: bool,

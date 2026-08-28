@@ -645,6 +645,32 @@ fn prune_orphan_auth_tokens() -> Result<Vec<String>> {
     Ok(notes)
 }
 
+/// gemini 네이티브 모델 목록 — OpenAI 호환 엔드포인트가 실패할 때의 폴 fallback.
+async fn list_gemini_native(
+    client: &reqwest::Client,
+    cred: &Option<Credential>,
+) -> Result<Vec<String>> {
+    let mut req = client.get("https://generativelanguage.googleapis.com/v1beta/models");
+    if let Some(c) = cred {
+        req = req.header("Authorization", format!("Bearer {}", c.token));
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status}");
+    }
+    let v = resp.json::<serde_json::Value>().await.unwrap_or_default();
+    let mut ids = Vec::new();
+    if let Some(arr) = v.get("models").and_then(|m| m.as_array()) {
+        for item in arr {
+            if let Some(name) = item.get("name").and_then(|x| x.as_str()) {
+                ids.push(name.strip_prefix("models/").unwrap_or(name).to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
 pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>> {
     let p = cfg.provider(name)?;
     let cred = resolve_credential(cfg, name)?;
@@ -695,6 +721,9 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
             let oauth_openai = name == "openai" && cred.as_ref().is_some_and(|c| c.oauth);
             let url = if oauth_openai {
                 "https://chatgpt.com/backend-api/codex/models".to_string()
+            } else if let Some(custom) = &p.models_url {
+                // /models 가 없는 프로바이더용 직접 지정 엔드포인트 (예: commandcode).
+                custom.clone()
             } else {
                 let Some(base) = &p.base_url else {
                     return Ok(Vec::new());
@@ -719,6 +748,11 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
             };
             let status = resp.status();
             if !status.is_success() {
+                // gemini 는 OpenAI 호환 /models 가 없거나 제한적이다 (실측 400) —
+                // 네이티브 /v1beta/models 로 폴 fallback 한다.
+                if name == "gemini" {
+                    return list_gemini_native(&client, &cred).await;
+                }
                 if oauth_openai && status.as_u16() == 400 {
                     // ChatGPT/Codex OAuth 는 /models 엔드포인트가 없다 — 정적 카탈로그 사용.
                     return Ok(Vec::new());

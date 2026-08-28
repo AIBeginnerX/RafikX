@@ -161,6 +161,7 @@ impl OpenAiCompatProvider {
         let mut cache_reported = false;
         let mut finish = None::<String>;
         let mut tool_acc: Vec<(String, String, String)> = Vec::new();
+    let mut stream_model = String::new();
         // tool call 인덱스별로 마지막 진행 발행 시점의 누적 바이트 수.
         let mut args_marks: Vec<usize> = Vec::new();
         let mut reasoning_started = false;
@@ -191,11 +192,17 @@ impl OpenAiCompatProvider {
                         cached_tokens,
                         cache_reported,
                         hint.clone(),
+                        stream_model.clone(),
                     ));
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                if stream_model.is_empty()
+                    && let Some(m) = v.get("model").and_then(|x| x.as_str())
+                {
+                    stream_model = m.to_string();
+                }
                 take_stream_usage(
                     &v,
                     &mut input_tokens,
@@ -302,6 +309,7 @@ impl OpenAiCompatProvider {
             cached_tokens,
             cache_reported,
             hint,
+            stream_model,
         ))
     }
 
@@ -320,6 +328,7 @@ impl OpenAiCompatProvider {
             .send()
             .await
             .context("Codex API 요청에 실패했습니다")?;
+        let mut stream_model = String::new();
         let status = resp.status();
         let hint = limit_hint(resp.headers());
         if !status.is_success() {
@@ -397,6 +406,7 @@ impl OpenAiCompatProvider {
             cached_tokens,
             cache_reported,
             hint,
+            stream_model,
         ))
     }
 }
@@ -438,6 +448,7 @@ fn finish_stream(
     cached_tokens: u32,
     cache_reported: bool,
     limit: LimitHint,
+    model: String,
 ) -> ChatResponse {
     let mut content = Vec::new();
     if !full_text.is_empty() {
@@ -458,6 +469,7 @@ fn finish_stream(
         .iter()
         .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     ChatResponse {
+        model,
         content,
         stop_reason: if has_tools {
             StopReason::ToolUse
@@ -617,6 +629,7 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
         }
     }
     Ok(ChatResponse {
+        model: v.get("model").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
         content,
         stop_reason: map_openai_finish(choice.get("finish_reason").and_then(|x| x.as_str())),
         input_tokens: v
@@ -794,6 +807,7 @@ fn parse_codex_response(text: &str) -> Result<ChatResponse> {
         cached_tokens,
         cache_reported,
         LimitHint::default(),
+        v.get("model").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
     ))
 }
 
@@ -967,6 +981,7 @@ mod usage_tests {
             0,
             false,
             LimitHint::default(),
+            String::new(),
         )
     }
 

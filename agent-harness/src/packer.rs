@@ -276,6 +276,7 @@ mod tests {
         );
         // config 명시값이 카탈로그보다 우선
         let pc = ProviderConfig {
+            models_url: None,
             kind: "openai_compat".into(),
             auth: "api_key".into(),
             api_key_env: "X".into(),

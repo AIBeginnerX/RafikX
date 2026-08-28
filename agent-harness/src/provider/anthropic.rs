@@ -113,6 +113,7 @@ impl AnthropicProvider {
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut full_text = String::new();
+        let mut stream_model = String::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut cached_tokens = 0u32;
@@ -134,6 +135,12 @@ impl AnthropicProvider {
                     };
                     match v.get("type").and_then(|t| t.as_str()) {
                         Some("message_start") => {
+                            if stream_model.is_empty()
+                                && let Some(m) =
+                                    v.pointer("/message/model").and_then(|x| x.as_str())
+                            {
+                                stream_model = m.to_string();
+                            }
                             take_stream_input_usage(
                                 &v,
                                 &mut input_tokens,
@@ -188,6 +195,7 @@ impl AnthropicProvider {
                                 cache_reported = true;
                             }
                             return Ok(ChatResponse {
+                                model: stream_model.clone(),
                                 content: vec![ContentBlock::Text { text: full_text }],
                                 stop_reason,
                                 input_tokens,
@@ -327,6 +335,7 @@ fn parse_message_json(text: &str) -> Result<ChatResponse> {
         }
     }
     Ok(ChatResponse {
+        model: v.get("model").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
         content: blocks,
         stop_reason: map_stop_reason(v.get("stop_reason").and_then(|s| s.as_str())),
         input_tokens: v

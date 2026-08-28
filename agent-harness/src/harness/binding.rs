@@ -29,6 +29,26 @@ pub fn bind(
     bind_profile(cfg, class, None, provider_override, model_override)
 }
 
+/// 요청 모델과 응답 모델의 일치 판정 — 공급자가 변형 id(날짜 접미 등)로 보고하는
+/// 경우는 허용하고, 완전히 다른 모델이 답했을 때만 경고한다.
+fn model_matches(requested: &str, answered: &str) -> bool {
+    requested.is_empty()
+        || answered.is_empty()
+        || answered.starts_with(requested)
+        || requested.starts_with(answered)
+}
+
+/// 응답 모델 검증 — 공급자가 요청과 다른 모델로 답하면 사용자에게 보인다.
+/// "사용 안 되는 모델을 골랐는데 답이 왔다" 류의 조용한 대체를 드러낸다.
+fn warn_model_mismatch(requested: &str, resp: &ChatResponse) {
+    if !model_matches(requested, &resp.model) {
+        crate::ui::live_warn(&format!(
+            "요청한 모델 '{requested}' 대신 다른 모델 '{}' 이(가) 응답했습니다.",
+            resp.model
+        ));
+    }
+}
+
 /// 콤보 체인 최대 홉 수 — 요청 하나가 체인을 따라갈 수 있는 횟수 상한 (F8).
 pub const COMBO_MAX_HOPS: usize = 3;
 
@@ -1192,7 +1212,10 @@ async fn chat_with_fallback_inner(
         })
         .await
         {
-            Ok(resp) => return Ok((name.clone(), resp)),
+            Ok(resp) => {
+                warn_model_mismatch(&req.model, &resp);
+                return Ok((name.clone(), resp));
+            }
             Err(e) => {
                 fallback_warn(&format!("{name} 호출 실패 ({}) → 다음 연결", short_err(&e)));
                 if Some(name.as_str()) == primary && primary_err.is_none() {
@@ -1316,6 +1339,7 @@ where
                 match client.chat_stream(&req, &mut track).await {
                     Ok(resp) => {
                         crate::usage::record_success(id, &resp);
+                        warn_model_mismatch(&req.model, &resp);
                         return Ok((name.clone(), resp));
                     }
                     Err(e) if is_rate_limited(&e) => {
@@ -1639,5 +1663,29 @@ mod memory_tool_tests {
     fn memory_intent_is_not_simple() {
         assert_ne!(crate::harness::classify_rules("이 프로젝트는 pytest 써. 기억해줘", false), crate::harness::TaskClass::Simple);
         assert_ne!(crate::harness::classify_rules("이전에 뭐라고 했는지 기억나?", false), crate::harness::TaskClass::Simple);
+    }
+}
+
+#[cfg(test)]
+mod model_match_tests {
+    use super::*;
+
+    #[test]
+    fn exact_and_variant_ids_match() {
+        assert!(model_matches("kimi-k2.5", "kimi-k2.5"));
+        assert!(model_matches("kimi-k2.5", "kimi-k2.5-20250901"));
+        assert!(model_matches("gpt-5", "gpt-5.1"));
+    }
+
+    #[test]
+    fn different_models_do_not_match() {
+        assert!(!model_matches("x-preview-f-free", "gpt-5.6"));
+        assert!(!model_matches("MiniMax-M3", "glm-5.2"));
+    }
+
+    #[test]
+    fn empty_sides_are_silent() {
+        assert!(model_matches("", "anything"));
+        assert!(model_matches("anything", ""));
     }
 }
