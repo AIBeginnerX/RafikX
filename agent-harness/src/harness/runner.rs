@@ -419,7 +419,18 @@ async fn run_pipeline_inner(
     } else {
         String::new()
     };
-    let memory_block = format!("{lessons_block}{facts_block}");
+    // 프로젝트 규칙 주입 (F7) — AGENTS.md·.rafikx/rules 를 매 요청 싣는다.
+    let rules_block = crate::rules::collect_rules(&cfg.workspace);
+    if !rules_block.is_empty() {
+        crate::graph::node_in(
+            &run_context,
+            "pre_step",
+            "rules",
+            &format!("프로젝트 규칙 주입 ({}자)", rules_block.chars().count()),
+            None,
+        );
+    }
+    let memory_block = format!("{lessons_block}{facts_block}{rules_block}");
     let mut system = system_prompt(cfg, &binding.system_extra, &memory_block);
     crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
     system.push_str(&format!(

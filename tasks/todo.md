@@ -5,7 +5,6 @@
 
 ## v5 기획 진행
 
-- [ ] (대기) Phase F7 — 규칙 주입 + /init-deep
 - [ ] (대기) Phase F8 — 콤보 폴 fallback + /quota
 - [ ] (대기) Phase F9 — 팁 시스템
 

@@ -75,6 +75,8 @@ enum Commands {
     },
     /// 기억한 지속 사실(전역+프로젝트) 목록
     Facts,
+    /// 디렉터리별 AGENTS.md 초안 생성 (없는 파일만, 기존은 diff 제안)
+    InitDeep,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
     Update,
     /// Vault 노트를 FTS5에 인덱싱
@@ -252,6 +254,7 @@ async fn main() -> ExitCode {
         Some(Commands::Watch) => cmd_watch(&cli).await,
         Some(Commands::Chat { list, resume }) => cmd_chat_entry(&cli, *list, resume.clone()).await,
         Some(Commands::Facts) => cmd_facts(&cli),
+        Some(Commands::InitDeep) => cmd_init_deep(&cli),
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
         Some(Commands::Inspect {
@@ -932,6 +935,14 @@ fn cmd_search(cli: &Cli, query: &str) -> Result<()> {
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let cfg = Config::load(cli.config.as_deref())?;
     obsidian::watch_vault(&cfg).await
+}
+
+fn cmd_init_deep(cli: &Cli) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    for note in chat::init_deep_notes(&cfg.workspace) {
+        println!("{note}");
+    }
+    Ok(())
 }
 
 fn cmd_facts(cli: &Cli) -> Result<()> {

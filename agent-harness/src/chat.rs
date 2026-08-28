@@ -157,6 +157,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "도구 목록"),
     ("/todo", "작업 목록 보기"),
     ("/goal", "장기 목표 상태 · resume 이어가기 · clear 해제"),
+    ("/init-deep", "디렉터리별 AGENTS.md 초안 생성"),
     ("/ulw", "자율 완수 루프 — 증거가 모일 때까지"),
     ("/ulw-resume", "중단된 ulw 루프 재개 [id]"),
     ("/facts", "기억한 지속 사실 목록"),
@@ -504,6 +505,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 .collect();
             Ok(Slash::Continue(notes))
         }
+        "/init-deep" => Ok(Slash::Continue(init_deep_notes(&session.cfg.workspace))),
         "/ulw" => {
             if rest.is_empty() {
                 return Ok(Slash::Continue(vec![
@@ -1197,6 +1199,35 @@ fn engine_single(session: &mut Session, arg: &str, read_stdin: bool) -> Result<S
         notes.push("지정: /engine single <연결이름|번호>".into());
     }
     Ok(Slash::Continue(notes))
+}
+
+/// /init-deep — 루트+1단계 디렉터리에 AGENTS.md 초안을 만든다 (F7).
+/// 기존 파일은 덮어쓰지 않고 diff 제안만 보여준다.
+pub fn init_deep_notes(workspace: &std::path::Path) -> Vec<String> {
+    let proposals = crate::rules::propose_init_deep(workspace);
+    if proposals.is_empty() {
+        return vec!["AGENTS.md 를 만들 대상 디렉터리가 없습니다.".into()];
+    }
+    let (created, proposed) = crate::rules::apply_init_deep(&proposals);
+    let mut notes = Vec::new();
+    for path in &created {
+        notes.push(format!("생성: {}", path.display()));
+    }
+    for p in &proposals {
+        if p.exists
+            && let Some(diff) = &p.diff
+        {
+            notes.push(format!(
+                "기존 파일 있음 — 덮어쓰지 않았습니다: {}\n제안 diff:\n{}",
+                p.path.display(),
+                diff
+            ));
+        }
+    }
+    if created.is_empty() && proposed.is_empty() {
+        notes.push("모든 대상에 AGENTS.md 가 이미 있습니다.".into());
+    }
+    notes
 }
 
 pub(crate) fn help_text() -> String {

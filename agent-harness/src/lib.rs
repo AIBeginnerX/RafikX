@@ -27,6 +27,7 @@ pub mod palette;
 pub mod provider;
 pub mod ranks;
 pub mod rpc;
+pub mod rules;
 pub mod run;
 pub mod self_harness;
 pub mod settings;
