@@ -157,6 +157,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "도구 목록"),
     ("/todo", "작업 목록 보기"),
     ("/goal", "장기 목표 상태 · resume 이어가기 · clear 해제"),
+    ("/ulw", "자율 완수 루프 — 증거가 모일 때까지"),
+    ("/ulw-resume", "중단된 ulw 루프 재개 [id]"),
     ("/facts", "기억한 지속 사실 목록"),
     ("/forget", "지속 사실 삭제 /forget <key>"),
     ("/status", "연결·사용량 요약"),
@@ -231,6 +233,21 @@ pub async fn cmd_chat(
                 Slash::Quit => break,
                 Slash::Agent(task) => {
                     run_turn(&mut session, &task, Some("dev"), false, None).await?;
+                }
+                Slash::Ulw { goal } => {
+                    match crate::ulw::UlwState::start(&session.cfg.workspace, &goal) {
+                        Ok(state) => {
+                            if let Err(e) = ulw_loop(&mut session, &goal, state).await {
+                                println!("[ulw] 오류: {e:#}");
+                            }
+                        }
+                        Err(e) => println!("[ulw] 시작 실패: {e:#}"),
+                    }
+                }
+                Slash::UlwResume { run_id } => {
+                    if let Err(e) = ulw_resume(&mut session, run_id).await {
+                        println!("[ulw] 재개 오류: {e:#}");
+                    }
                 }
                 Slash::Compact => {
                     match compact_session(&mut session).await {
@@ -447,6 +464,10 @@ pub enum Slash {
     Compact,
     /// /engine multi — 등록 모델 원격 조회 후 역할별 자동 배정 (비동기)
     AssignRoles,
+    /// /ulw <목표> — 자율 완수 루프 (비동기, .omo/ulw/ 산출물)
+    Ulw { goal: String },
+    /// /ulw-resume [run-id] — 중단·미완료 루프 재개
+    UlwResume { run_id: Option<String> },
     /// /model refresh — 원격 모델 목록 갱신(fetch=true, 비동기) 후 선택 UI.
     /// `/model <검색어>` 는 fetch=false 로 조회 없이 검색어만 넘긴다.
     ModelFetch {
@@ -483,6 +504,17 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
                 .collect();
             Ok(Slash::Continue(notes))
         }
+        "/ulw" => {
+            if rest.is_empty() {
+                return Ok(Slash::Continue(vec![
+                    "/ulw <목표> — 완료 기준의 증거가 모일 때까지 자율 실행. /ulw-resume [id] 로 재개".into(),
+                ]));
+            }
+            Ok(Slash::Ulw { goal: rest.to_string() })
+        }
+        "/ulw-resume" => Ok(Slash::UlwResume {
+            run_id: if rest.is_empty() { None } else { Some(rest.to_string()) },
+        }),
         "/forget" => {
             if rest.is_empty() {
                 return Ok(Slash::Continue(vec!["/forget <key>".into()]));
@@ -2537,4 +2569,190 @@ mod tests {
         let miss = model_list_notes(&regs, "없는모델");
         assert!(miss.iter().any(|l| l.contains("일치하는 모델이 없습니다")));
     }
+}
+
+// ---------------------------------------------------------------------------
+// /ulw 자율 완수 루프 (F4) — 계획 → 실행 → 증거 판정 → 재촉/완료/중단
+// ---------------------------------------------------------------------------
+
+/// 경량 계획 호출 — 완료 기준 체크리스트만 뽑는다 (실행 계획은 파이프라인이 다시 세운다).
+async fn ulw_plan(cfg: &crate::config::Config, goal: &str) -> Result<String> {
+    let order = crate::harness::fallback_order(cfg, &cfg.file.general.default_provider, None);
+    let req = crate::provider::ChatRequest {
+        model: String::new(),
+        system: "목표 완수에 필요한 완료 기준 체크리스트만 출력하라. 3~7개, 각 항목은 '- '로 시작하는 한 줄, \
+                 관측 가능한 결과(파일·명령·동작)여야 한다. 다른 텍스트는 출력하지 마라."
+            .into(),
+        messages: vec![Message::user_text(goal)],
+        tools: vec![],
+        max_tokens: 800,
+        stream: false,
+    };
+    let (_name, resp) = crate::harness::chat_with_fallback(cfg, &order, "main", req).await?;
+    Ok(resp
+        .content
+        .iter()
+        .find_map(|b| match b {
+            crate::provider::ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default())
+}
+
+/// 목표를 facts(kind='goal')에 기록/갱신 — 세션이 갈려도 목표가 유실되지 않는다.
+fn ulw_record_goal_fact(session: &Session, state: &crate::ulw::UlwState, status: &str) {
+    let Ok(path) = Db::db_path() else { return };
+    if let Ok(db) = Db::open(&path) {
+        let _ = db.upsert_fact(
+            Some(&session.cfg.workspace),
+            "goal",
+            &format!("ulw:{}", state.run_id),
+            &format!("[{status}] {}", state.goal),
+            "agent",
+        );
+    }
+}
+
+fn ulw_summary_of(info: &TurnInfo) -> crate::ulw::RunSummaryLite {
+    crate::ulw::RunSummaryLite {
+        changed_files: info.summary.changed_files.clone(),
+        completed_todos: info.summary.completed_todos,
+        total_todos: info.summary.total_todos,
+        iterations: info.summary.iterations,
+        tool_errors: info.summary.tool_errors,
+        answer_tail: info.answer.chars().take(200).collect(),
+    }
+}
+
+async fn ulw_finish(
+    session: &Session,
+    state: &crate::ulw::UlwState,
+    status: &str,
+    headline: &str,
+) -> Result<()> {
+    ulw_record_goal_fact(session, state, status);
+    #[cfg(feature = "telegram")]
+    crate::telegram::notify_owner(
+        &session.cfg,
+        &format!("[ulw {status}] {}\n{}", state.goal, headline),
+    )
+    .await;
+    Ok(())
+}
+
+async fn ulw_loop(session: &mut Session, goal: &str, state: crate::ulw::UlwState) -> Result<TurnInfo> {
+    ulw_loop_observed(session, goal, state, None, None).await
+}
+
+pub async fn ulw_loop_observed(
+    session: &mut Session,
+    goal: &str,
+    mut state: crate::ulw::UlwState,
+    observer: Option<RunObserver>,
+    local_ask: Option<LocalAsk>,
+) -> Result<TurnInfo> {
+    let workspace = session.cfg.workspace.clone();
+    let fresh = state.runs == 0 && state.criteria.is_empty();
+    if fresh {
+        crate::ui::live_line(&format!("[ulw] {} — 계획 수립 중…", state.run_id));
+        let plan = ulw_plan(&session.cfg, goal).await.unwrap_or_default();
+        let mut items = crate::ulw::UlwState::parse_criteria_lines(&plan);
+        if items.is_empty() {
+            items = vec![goal.trim().to_string()];
+        }
+        state.set_criteria(&workspace, &plan, items)?;
+        ulw_record_goal_fact(session, &state, "running");
+    }
+    crate::ui::live_line(&format!(
+        "[ulw] {} — 완료 기준 {}개 · 실행 상한 {}회",
+        state.run_id,
+        state.criteria.len(),
+        crate::ulw::MAX_RUNS
+    ));
+    let last_info = loop {
+        let prompt = if state.runs == 0 {
+            state.kickoff_task()
+        } else {
+            state.nudge_message()
+        };
+        let info = match run_turn_observed(
+            session,
+            &prompt,
+            Some("dev"),
+            false,
+            local_ask.clone(),
+            observer.clone(),
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                state.status = "blocked".into();
+                state.blocked_reason = format!("실행 오류: {e:#}");
+                state.save(&workspace)?;
+                state.write_report(&workspace, "실행 오류로 중단")?;
+                ulw_finish(session, &state, "blocked", &state.blocked_reason).await?;
+                return Err(e);
+            }
+        };
+        let summary = ulw_summary_of(&info);
+        match state.record_run(&workspace, &summary)? {
+            crate::ulw::UlwVerdict::Done => {
+                state.write_report(&workspace, "")?;
+                crate::ui::live_line(&format!("[ulw] 완료 — .omo/ulw/{}/report.md", state.run_id));
+                ulw_finish(session, &state, "done", "모든 완료 기준 충족").await?;
+                break info;
+            }
+            crate::ulw::UlwVerdict::Continue => {
+                crate::ui::live_line(&format!(
+                    "[ulw] 미완료 기준 {}개 — 재촉 {}/{}",
+                    state.unmet().len(),
+                    state.nudges,
+                    crate::ulw::MAX_NUDGES
+                ));
+            }
+            crate::ulw::UlwVerdict::Blocked(reason) => {
+                state.write_report(&workspace, "미달 기준 있음")?;
+                crate::ui::live_line(&format!("[ulw] 중단: {reason} — .omo/ulw/{}/report.md", state.run_id));
+                ulw_finish(session, &state, "blocked", &reason).await?;
+                break info;
+            }
+        }
+    };
+    Ok(last_info)
+}
+
+async fn ulw_resume(session: &mut Session, run_id: Option<String>) -> Result<TurnInfo> {
+    ulw_resume_observed(session, run_id, None, None).await
+}
+
+pub async fn ulw_resume_observed(
+    session: &mut Session,
+    run_id: Option<String>,
+    observer: Option<RunObserver>,
+    local_ask: Option<LocalAsk>,
+) -> Result<TurnInfo> {
+    let workspace = session.cfg.workspace.clone();
+    let id = match run_id {
+        Some(id) => id,
+        None => crate::ulw::UlwState::latest_id(&workspace)
+            .ok_or_else(|| anyhow::anyhow!("재개할 ulw 실행이 없습니다 (.omo/ulw/ 비어 있음)"))?,
+    };
+    let state = crate::ulw::UlwState::load(&workspace, &id)?;
+    match state.status.as_str() {
+        "done" => {
+            crate::ui::live_line(&format!("[ulw] {id} — 이미 완료된 실행입니다. .omo/ulw/{id}/report.md"));
+            anyhow::bail!("이미 완료된 실행입니다");
+        }
+        "blocked" => {
+            crate::ui::live_line(&format!("[ulw] {id} — 중단된 실행을 재개합니다: {}", state.blocked_reason));
+        }
+        _ => crate::ui::live_line(&format!("[ulw] {id} — 미완료 기준 {}개부터 재개합니다.", state.unmet().len())),
+    }
+    // 재개는 새 활성화로 본다 — 재촉 카운트는 유지하되 상태만 running 으로.
+    let mut state = state;
+    state.status = "running".into();
+    state.save(&workspace)?;
+    let goal = state.goal.clone();
+    ulw_loop_observed(session, &goal, state, observer, local_ask).await
 }

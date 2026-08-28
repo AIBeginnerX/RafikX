@@ -29,7 +29,7 @@ pub fn profile_exists(cfg: &Config, name: &str) -> bool {
 }
 
 /// 레인 프로파일의 도구 허용목록 — mutation 도구를 바인딩 단계에서 강제로 걸러낸다
-/// (프롬프트 경고에 의존하지 않는다, F5). config 로 같은 이름을 재정의핟도 필터는 유효하다.
+/// (프롬프트 경고에 의존하지 않는다, F5). config 로 같은 이름을 재정의해도 필터는 유효하다.
 pub fn lane_tool_allowlist(profile: &str) -> Option<&'static [&'static str]> {
     match profile.trim().to_ascii_lowercase().as_str() {
         "explorer" => Some(&[

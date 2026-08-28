@@ -391,6 +391,15 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             assign: false,
             model_fetch: false,
         }),
+        // ulw 루프는 대화형 오케스트레이션이라 터미널(CLI/TUI) 전용 — 데스크탑은 안내로 강등.
+        Slash::Ulw { .. } | Slash::UlwResume { .. } => Ok(SlashResult {
+            notes: "/ulw 는 터미널(CLI/TUI)에서 실행됩니다. 데스크탑 연결은 F4b 에서 다룹니다.".into(),
+            quit: false,
+            agent_task: None,
+            compact: false,
+            assign: false,
+            model_fetch: false,
+        }),
         Slash::Agent(task) => Ok(SlashResult {
             notes: String::new(),
             quit: false,

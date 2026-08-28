@@ -906,6 +906,12 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
             Ok(Slash::Agent(task)) => {
                 start_turn(app, task, Some("dev".into()), false, local_ask, done_tx);
             }
+            Ok(Slash::Ulw { goal }) => {
+                start_ulw(app, UlwMode::Fresh(goal), local_ask, done_tx);
+            }
+            Ok(Slash::UlwResume { run_id }) => {
+                start_ulw(app, UlwMode::Resume(run_id), local_ask, done_tx);
+            }
             Ok(Slash::Compact) => {
                 start_compact(app, done_tx);
             }
@@ -928,6 +934,42 @@ fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<T
     let class = app.session.class.clone();
     let obsidian = app.session.obsidian_on;
     start_turn(app, line, class, obsidian, local_ask, done_tx);
+}
+
+fn make_turn_observer(
+    cancel_requested: Arc<std::sync::atomic::AtomicBool>,
+    active_run: Arc<std::sync::Mutex<Option<crate::run::RunContext>>>,
+    lifecycle_state: Arc<std::sync::Mutex<Option<crate::lifecycle::LifecycleState>>>,
+) -> chat::RunObserver {
+    Arc::new(move |run: crate::run::RunContext| {
+        if cancel_requested.load(Ordering::Acquire) {
+            run.cancel("TUI Esc");
+        }
+        if let Ok(mut active) = active_run.lock() {
+            *active = Some(run.clone());
+        }
+        let mut events = run.subscribe_lifecycle();
+        let state = Arc::clone(&lifecycle_state);
+        if let Ok(mut current) = state.lock() {
+            *current = run.lifecycle_state();
+        }
+        // 위임 자식은 부모의 lifecycle 버스를 그대로 쓴다 — 필터가 없으면 자식의
+        // 상태가 부모 스테이지 표시를 덮어쓰고, 자식 종료가 부모 구독까지 끊는다 (§16.1).
+        let root_id = run.run_id().clone();
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                if !is_root_lifecycle(&event, &root_id) {
+                    continue;
+                }
+                if let Ok(mut current) = state.lock() {
+                    *current = Some(event.state);
+                }
+                if event.state.is_terminal() {
+                    break;
+                }
+            }
+        });
+    })
 }
 
 fn start_turn(
@@ -961,35 +1003,7 @@ fn start_turn(
     let active_run = Arc::clone(&app.active_run);
     let cancel_requested = Arc::clone(&app.cancel_requested);
     let lifecycle_state = Arc::clone(&app.lifecycle_state);
-    let observer: chat::RunObserver = Arc::new(move |run| {
-        if cancel_requested.load(Ordering::Acquire) {
-            run.cancel("TUI Esc");
-        }
-        if let Ok(mut active) = active_run.lock() {
-            *active = Some(run.clone());
-        }
-        let mut events = run.subscribe_lifecycle();
-        let state = Arc::clone(&lifecycle_state);
-        if let Ok(mut current) = state.lock() {
-            *current = run.lifecycle_state();
-        }
-        // 위임 자식은 부모의 lifecycle 버스를 그대로 쓴다 — 필터가 없으면 자식의
-        // 상태가 부모 스테이지 표시를 덮어쓰고, 자식 종료가 부모 구독까지 끊는다 (§16.1).
-        let root_id = run.run_id().clone();
-        tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                if !is_root_lifecycle(&event, &root_id) {
-                    continue;
-                }
-                if let Ok(mut current) = state.lock() {
-                    *current = Some(event.state);
-                }
-                if event.state.is_terminal() {
-                    break;
-                }
-            }
-        });
-    });
+let observer = make_turn_observer(cancel_requested, active_run, lifecycle_state);
     let handle = tokio::spawn(async move {
         let result = chat::run_turn_observed(
             &mut session,
@@ -1000,6 +1014,65 @@ fn start_turn(
             Some(observer),
         )
         .await;
+        let _ = done_tx.send(TurnDone { result, session });
+    });
+    app.turn_handle = Some(handle);
+}
+
+/// /ulw 드라이버 — 한 "턴" 안에서 ulw 루프(여러 실행)를 통째로 돌린다.
+/// 각 실행은 낶에서 chat::run_turn_observed 로 불리므로 라이브 표시·승인·Esc 취소는
+/// 평소 턴과 같게 동작한다.
+enum UlwMode {
+    Fresh(String),
+    Resume(Option<String>),
+}
+
+fn start_ulw(
+    app: &mut App,
+    mode: UlwMode,
+    local_ask: &LocalAsk,
+    done_tx: &mpsc::UnboundedSender<TurnDone>,
+) {
+    app.final_summary = false;
+    app.show_start = false;
+    let label = match &mode {
+        UlwMode::Fresh(goal) => format!("/ulw {goal}"),
+        UlwMode::Resume(id) => format!("/ulw-resume {}", id.clone().unwrap_or_default()),
+    };
+    promote_queued(app, &label);
+    app.turn_start = app.transcript.len();
+    app.busy = true;
+    app.streaming = false;
+    app.status = "ulw 실행 중…".into();
+    app.binding = binding_label(&app.session);
+    app.cancel_requested.store(false, Ordering::Release);
+    if let Ok(mut active) = app.active_run.lock() {
+        *active = None;
+    }
+    if let Ok(mut state) = app.lifecycle_state.lock() {
+        *state = None;
+    }
+
+    let mut session = app.session.clone();
+    let local_ask = local_ask.clone();
+    let done_tx = done_tx.clone();
+    let observer = make_turn_observer(
+        Arc::clone(&app.cancel_requested),
+        Arc::clone(&app.active_run),
+        Arc::clone(&app.lifecycle_state),
+    );
+    let handle = tokio::spawn(async move {
+        let result = match mode {
+            UlwMode::Resume(id) => {
+                chat::ulw_resume_observed(&mut session, id, Some(observer), Some(local_ask.clone())).await
+            }
+            UlwMode::Fresh(goal) => match crate::ulw::UlwState::start(&session.cfg.workspace, &goal) {
+                Ok(state) => {
+                    chat::ulw_loop_observed(&mut session, &goal, state, Some(observer), Some(local_ask.clone())).await
+                }
+                Err(e) => Err(e),
+            },
+        };
         let _ = done_tx.send(TurnDone { result, session });
     });
     app.turn_handle = Some(handle);

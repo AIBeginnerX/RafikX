@@ -230,6 +230,16 @@ async fn on_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let Some(text) = msg.text() else {
         return Ok(());
     };
+    if text.starts_with("/ulw") {
+        send_chunks(
+            &bot,
+            msg.chat.id,
+            "/ulw 자율 루프는 터미널(CLI/TUI)에서 시작하세요 — 원격 승인 연결은 F4b 에서 다룹니다. \
+             시작되면 완료·중단 시 이 채팅으로 알림이 옵니다.",
+        )
+        .await?;
+        return Ok(());
+    }
     if text.starts_with('/') {
         send_chunks(&bot, msg.chat.id, &help_text()).await?;
         return Ok(());
@@ -637,5 +647,20 @@ mod tests {
         let id = format!("{:x}{:x}", 1_700_000_000_000u64, 99u32);
         assert!(format!("ok:{id}").len() <= 64);
         assert!(format!("no:{id}").len() <= 64);
+    }
+}
+
+/// ulw 루프 종료·중단 알림 (F4) — 허용된 첫 번째 사용자에게 알림을 전달한다.
+/// 알림 실패는 루프를 막지 않는다 (부가 기능이므로 조용히 무시).
+pub async fn notify_owner(cfg: &Config, text: &str) {
+    let Ok(Some(token)) = crate::auth::telegram_token(cfg) else {
+        return;
+    };
+    let Some(chat_id) = cfg.file.telegram.allowed_user_ids.first().copied() else {
+        return;
+    };
+    let bot = Bot::new(token);
+    for chunk in split_telegram_text(text) {
+        let _ = bot.send_message(ChatId(chat_id), chunk).await;
     }
 }

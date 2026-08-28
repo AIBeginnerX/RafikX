@@ -5,12 +5,13 @@
 
 ## v5 기획 진행
 
-- [ ] (대기) Phase F4 — /ulw 자율 완수 루프 (F4a 골격 + F4b 품질 게이트)
-      · .omo/ulw/<run-id>/ 산출물을 제품 기능으로 정식 지원 (C1에서 예약)
 - [ ] (대기) Phase F6 — 폴 fallback 아키텍트
 - [ ] (대기) Phase F7 — 규칙 주입 + /init-deep
 - [ ] (대기) Phase F8 — 콤보 폴 fallback + /quota
 - [ ] (대기) Phase F9 — 팁 시스템
+
+- [ ] (대기) Phase F4b — /ulw 품질 게이트 (자동 테스트·디버그 루프)
+      · 데스크탑·텔레그램의 /ulw 실행 경로 연결 (F4a는 안내로 강등)
 
 ## 잔여 관찰 (수정 보류)
 
