@@ -77,6 +77,8 @@ enum Commands {
     Facts,
     /// 디렉터리별 AGENTS.md 초안 생성 (없는 파일만, 기존은 diff 제안)
     InitDeep,
+    /// 계정·프로바이더 쿼터 상태
+    Quota,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
     Update,
     /// Vault 노트를 FTS5에 인덱싱
@@ -255,6 +257,7 @@ async fn main() -> ExitCode {
         Some(Commands::Chat { list, resume }) => cmd_chat_entry(&cli, *list, resume.clone()).await,
         Some(Commands::Facts) => cmd_facts(&cli),
         Some(Commands::InitDeep) => cmd_init_deep(&cli),
+        Some(Commands::Quota) => cmd_quota(&cli),
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
         Some(Commands::Inspect {
@@ -935,6 +938,14 @@ fn cmd_search(cli: &Cli, query: &str) -> Result<()> {
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let cfg = Config::load(cli.config.as_deref())?;
     obsidian::watch_vault(&cfg).await
+}
+
+fn cmd_quota(cli: &Cli) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    for line in rafikx::usage::quota_lines(&cfg) {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn cmd_init_deep(cli: &Cli) -> Result<()> {

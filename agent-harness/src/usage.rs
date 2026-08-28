@@ -343,3 +343,43 @@ mod tests {
         assert!(pick == Some("a".into()) || pick == Some("b".into()));
     }
 }
+
+/// /quota (F8) — 프로바이더·계정별 리밋 상태와 오늘 사용량 표.
+/// opencodex 대시보드의 최소 유용 부분만 이식.
+pub fn quota_lines(cfg: &crate::config::Config) -> Vec<String> {
+    let mut lines = vec!["[쿼터 상태] (프로바이더 · 계정 — 상태 · 오늘 요청 · 토큰 in/out)".to_string()];
+    let mut count = 0usize;
+    for name in crate::auth::usable_names(cfg) {
+        for acc in crate::accounts::for_provider(&name) {
+            let u = get(&acc.id);
+            let wait = seconds_left(&acc.id);
+            let status = if wait > 0 {
+                format!("리밋 {wait}s 남음")
+            } else {
+                "정상".to_string()
+            };
+            lines.push(format!(
+                "{name} · {} — {status} · {}회 · {}/{}",
+                acc.label, u.requests_today, u.tokens_in_today, u.tokens_out_today
+            ));
+            count += 1;
+        }
+    }
+    if count == 0 {
+        lines.push("등록된 계정이 없습니다. /connect 로 연결하세요.".into());
+    }
+    lines
+}
+
+#[cfg(test)]
+mod quota_tests {
+    #[test]
+    fn empty_accounts_shows_guidance() {
+        let dir = std::env::temp_dir().join(format!("rafikx-quota-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
+        let lines = super::quota_lines(&cfg);
+        assert!(lines.iter().any(|l| l.contains("계정이 없습니다") || l.contains("프로바이더")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -94,6 +94,8 @@ pub struct AgentRun<'a> {
     pub cfg: &'a Config,
     pub provider_name: &'a str,
     pub model: &'a str,
+    /// 콤보 체인 (F8) — 비어 있지 않으면 fallback_order 대신 이 쌍들로 전환한다.
+    pub combo_chain: Vec<(String, String)>,
     pub task: &'a str,
     pub yes: bool,
     pub max_iterations: u32,
@@ -161,6 +163,7 @@ pub async fn run_agent_with_context(
         remote,
         local_ask,
         context_window,
+        combo_chain,
     } = run;
 
     if run_context.lifecycle_state() == Some(LifecycleState::Queued) {
@@ -296,22 +299,39 @@ pub async fn run_agent_with_context(
 
         // 프로바이더 폴백: 주 연결 실패(4xx·5xx·리밋) 시 fallback_order 의 다음 연결로.
         // 주 연결은 원래 모델을 그대로 쓰고, 이후 연결은 role(main) 기준 모델을 쓴다.
-        let order = crate::harness::fallback_order_pinned(cfg, provider_name, None);
+        // 콤보 바인딩이면 체인이 폴 fallback 순서와 모델을 결정한다 (F8).
+        let order = if combo_chain.is_empty() {
+            crate::harness::fallback_order_pinned(cfg, provider_name, None)
+        } else {
+            let mut v: Vec<String> = Vec::new();
+            for (p, _) in &combo_chain {
+                if !v.contains(p) {
+                    v.push(p.clone());
+                }
+            }
+            v
+        };
         let mut streamed = false;
         let (_used, resp) = {
-            let response =
-                crate::harness::stream_with_fallback(cfg, &order, "main", req, |ev| match ev {
-                    StreamEvent::Text(piece) => {
-                        streamed = true;
-                        crate::ui::live_chunk_in(&run_context, piece);
-                    }
-                    // 대형 tool call 인자를 쓰는 동안은 텍스트가 없다 — 진행만 갱신한다.
-                    StreamEvent::ToolArgs { name, total_bytes } => {
-                        let label = crate::harness::tool_args_label(name, total_bytes);
-                        crate::ui::live_status_in(&run_context, &label);
-                        worker_activity(&run_context, &label);
-                    }
-                });
+            let on_event = |ev: crate::provider::StreamEvent| match ev {
+                StreamEvent::Text(piece) => {
+                    streamed = true;
+                    crate::ui::live_chunk_in(&run_context, piece);
+                }
+                // 대형 tool call 인자를 쓰는 동안은 텍스트가 없다 — 진행만 갱신한다.
+                StreamEvent::ToolArgs { name, total_bytes } => {
+                    let label = crate::harness::tool_args_label(name, total_bytes);
+                    crate::ui::live_status_in(&run_context, &label);
+                    worker_activity(&run_context, &label);
+                }
+            };
+            let response = if combo_chain.is_empty() {
+                Box::pin(crate::harness::stream_with_fallback(cfg, &order, "main", req, on_event))
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, crate::provider::ChatResponse)>> + Send + '_>>
+            } else {
+                Box::pin(crate::harness::stream_with_fallback_combo(cfg, &combo_chain, "main", req, on_event))
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, crate::provider::ChatResponse)>> + Send + '_>>
+            };
             tokio::pin!(response);
             tokio::select! {
                 result = &mut response => result?,

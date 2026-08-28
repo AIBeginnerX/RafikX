@@ -324,6 +324,10 @@ pub struct ConfigFile {
     /// `[fallback]` 폴 fallback 아키텍트 — 옛 설정에 없으면 기본값(on, 기본 신호).
     #[serde(default)]
     pub fallback: FallbackConfig,
+    /// `[combos.<이름>] chain` — 가상 모델의 폴 fallback 체인 ("provider/model" 목록).
+    /// 콤보를 고륵면 실패 시 체인 다음 후보로 요청 단위 전환한다 (F8, opencodex combo 이식).
+    #[serde(default)]
+    pub combos: std::collections::HashMap<String, Vec<String>>,
     /// `[categories]` 카테고리→모델 매핑 (quick|deep|visual|ultrabrain 등).
     /// task(category=...) 가 모델 대신 일의 종류를 고를 때 해석한다. 없으면 미사용.
     #[serde(default)]

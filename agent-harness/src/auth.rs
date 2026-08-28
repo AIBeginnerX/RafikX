@@ -1773,7 +1773,16 @@ pub fn registered_models(cfg: &Config) -> Vec<RegisteredModel> {
             }
         }
     }
+    // 콤보 (F8) — [combos] 를 "combo" 가상 프로바이더 항목으로 노출한다.
+    for name in cfg.file.combos.keys() {
+        out.push(RegisteredModel {
+            provider: "combo".into(),
+            id: name.clone(),
+            small: false,
+        });
+    }
     out
+
 }
 
 pub fn disconnect_provider(name: &str) -> Result<()> {

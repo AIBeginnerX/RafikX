@@ -160,6 +160,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init-deep", "디렉터리별 AGENTS.md 초안 생성"),
     ("/ulw", "자율 완수 루프 — 증거가 모일 때까지"),
     ("/ulw-resume", "중단된 ulw 루프 재개 [id]"),
+    ("/quota", "계정·프로바이더 쿼터 상태"),
     ("/facts", "기억한 지속 사실 목록"),
     ("/forget", "지속 사실 삭제 /forget <key>"),
     ("/status", "연결·사용량 요약"),
@@ -491,6 +492,7 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
     match cmd {
         "/quit" | "/exit" => Ok(Slash::Quit),
         "/help" => Ok(Slash::Continue(vec![help_text()])),
+        "/quota" => Ok(Slash::Continue(crate::usage::quota_lines(&session.cfg))),
         "/facts" => {
             let rows = db.list_facts(Some(&session.cfg.workspace))?;
             if rows.is_empty() {
@@ -1377,6 +1379,13 @@ fn apply_model_choice(
         if let Some(i) = nums.first()
             && let Some(r) = regs.get(i - 1)
         {
+            if r.provider == "combo" {
+                // 콤보 선택 (F8) — 프로바이더는 비우고 모델에 combo:<이름> 을 담는다.
+                // 바인딩이 체인 첫 쌍으로 결정하고 combo_chain 을 단다. 세션 한정.
+                session.provider = None;
+                *model = Some(format!("combo:{}", r.id));
+                return format!("콤보: {} — 체인 폴 fallback 적용 (세션 한정)", r.id);
+            }
             session.provider = Some(r.provider.clone());
             *model = Some(r.id.clone());
             // 영속화: 프로바이더 기본 모델로도 저장

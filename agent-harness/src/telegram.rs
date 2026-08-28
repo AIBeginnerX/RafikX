@@ -245,6 +245,11 @@ async fn on_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
         spawn_ulw(bot.clone(), msg.chat.id, app.clone(), Some(goal.to_string()), None);
         return Ok(());
     }
+    if text.starts_with("/quota") {
+        let lines = crate::usage::quota_lines(&app.cfg);
+        send_chunks(&bot, msg.chat.id, &lines.join("\n")).await?;
+        return Ok(());
+    }
     if text.starts_with('/') {
         send_chunks(&bot, msg.chat.id, &help_text()).await?;
         return Ok(());

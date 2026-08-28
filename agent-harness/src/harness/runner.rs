@@ -377,7 +377,17 @@ async fn run_pipeline_inner(
         .get(&binding.profile_name)
         .map(|s| s.model_role.as_str())
         .unwrap_or("main");
-    let order = fallback_order_pinned(cfg, &binding.provider_name, cli_provider);
+    let order = if binding.combo_chain.is_empty() {
+        fallback_order_pinned(cfg, &binding.provider_name, cli_provider)
+    } else {
+        let mut v: Vec<String> = Vec::new();
+        for (p, _) in &binding.combo_chain {
+            if !v.contains(p) {
+                v.push(p.clone());
+            }
+        }
+        v
+    };
     let lessons_block = if cfg.file.memory.enabled {
         Db::open(&Db::db_path()?)
             .ok()
@@ -575,7 +585,7 @@ async fn run_pipeline_inner(
         };
         crate::ui::live_line_in(&run_context, &format!("[계획 수립 중 · {}]", binding.model));
         let mut plan_streamed = false;
-        let plan_call = stream_with_fallback(cfg, &order, role, req, |ev| match ev {
+        let on_plan_event = |ev: StreamEvent| match ev {
             StreamEvent::Text(piece) => {
                 plan_streamed = true;
                 crate::ui::live_chunk_in(&run_context, piece);
@@ -583,8 +593,12 @@ async fn run_pipeline_inner(
             StreamEvent::ToolArgs { name, total_bytes } => {
                 crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
             }
-        })
-        .await;
+        };
+        let plan_call = if binding.combo_chain.is_empty() {
+            stream_with_fallback(cfg, &order, role, req, on_plan_event).await
+        } else {
+            stream_with_fallback_combo(cfg, &binding.combo_chain, role, req, on_plan_event).await
+        };
         match plan_call {
             Ok((_n, resp)) => {
                 crate::graph::node_in(&run_context, "plan", "plan_first", "", Some("pre_step"));
@@ -700,12 +714,20 @@ async fn run_pipeline_inner(
             max_tokens: cfg.file.general.max_tokens,
             stream: true,
         };
-        let response = stream_with_fallback(cfg, &order, role, req, |ev| match ev {
+        let on_main_event = |ev: StreamEvent| match ev {
             StreamEvent::Text(piece) => crate::ui::live_chunk_in(&run_context, piece),
             StreamEvent::ToolArgs { name, total_bytes } => {
                 crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
             }
-        });
+        };
+        type MainFuture<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(String, ChatResponse)>> + Send + 'a>,
+        >;
+        let response: MainFuture<'_> = if binding.combo_chain.is_empty() {
+            Box::pin(stream_with_fallback(cfg, &order, role, req, on_main_event))
+        } else {
+            Box::pin(stream_with_fallback_combo(cfg, &binding.combo_chain, role, req, on_main_event))
+        };
         tokio::pin!(response);
         let (_name, resp) = tokio::select! {
             result = &mut response => result?,
@@ -887,6 +909,7 @@ async fn run_pipeline_inner(
             AgentRun {
                 cfg,
                 provider_name: &binding.provider_name,
+                    combo_chain: binding.combo_chain.clone(),
                 model: &binding.model,
                 task: &agent_task,
                 yes,
@@ -1485,6 +1508,7 @@ async fn run_verify(
                     AgentRun {
                         cfg,
                         provider_name: &binding.provider_name,
+                    combo_chain: binding.combo_chain.clone(),
                         model: binding.verify_model.as_deref().unwrap_or(&binding.model),
                         task,
                         yes,
@@ -1698,6 +1722,7 @@ async fn run_review_once(
         AgentRun {
             cfg,
             provider_name: &reviewer.provider_name,
+            combo_chain: reviewer.combo_chain.clone(),
             model: &reviewer.model,
             task: prompt,
             yes,
@@ -1901,6 +1926,7 @@ async fn run_review_gate(
             AgentRun {
                 cfg,
                 provider_name: &binding.provider_name,
+                    combo_chain: binding.combo_chain.clone(),
                 model: &binding.model,
                 task,
                 yes,
@@ -2363,6 +2389,7 @@ async fn run_graph_discipline(
                 AgentRun {
                     cfg,
                     provider_name: &binding.provider_name,
+                    combo_chain: binding.combo_chain.clone(),
                     model: &binding.model,
                     task: &prompt,
                     yes,

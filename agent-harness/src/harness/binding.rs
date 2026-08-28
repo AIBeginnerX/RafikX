@@ -2,6 +2,9 @@ use super::*;
 
 #[derive(Clone)]
 pub struct Binding {
+    /// 콤보 체인 (provider, model) — 비어 있으면 일반 바인딩 (F8).
+    /// 있으면 주 연결 실패 시 체인 다음 (provider, model) 쌍으로 요청 단위 전환한다.
+    pub combo_chain: Vec<(String, String)>,
     pub class: TaskClass,
     pub profile_name: String,
     pub provider_name: String,
@@ -26,6 +29,45 @@ pub fn bind(
     bind_profile(cfg, class, None, provider_override, model_override)
 }
 
+/// 콤보 체인 최대 홉 수 — 요청 하나가 체인을 따라갈 수 있는 횟수 상한 (F8).
+pub const COMBO_MAX_HOPS: usize = 3;
+
+/// 콤보 바인딩 — [combos.<이름>] chain 을 해석해 첫 쌍은 주 연결로, 전체 쌍은
+/// combo_chain 으로 Binding 에 담는다. config 에 없는 이름·빈 체인은 오류.
+/// 콤보의 체인 스펙 — COMBO_MAX_HOPS 로 자른다 (순수 조회, F8).
+pub(crate) fn combo_chain_specs(cfg: &Config, combo_name: &str) -> Result<Vec<String>> {
+    let specs = cfg
+        .file
+        .combos
+        .get(combo_name)
+        .ok_or_else(|| anyhow!("콤보 '{combo_name}' 이(가) config [combos] 에 없습니다"))?;
+    if specs.is_empty() {
+        anyhow::bail!("콤보 '{combo_name}' 의 chain 이 비어 있습니다");
+    }
+    Ok(specs.iter().take(COMBO_MAX_HOPS).cloned().collect())
+}
+
+fn bind_combo(cfg: &Config, class: TaskClass, profile_override: Option<&str>, combo_name: &str) -> Result<Binding> {
+    let specs = combo_chain_specs(cfg, combo_name)?;
+    let profile_name = profile_override
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| profile_name_for(cfg, class).to_string());
+    let sub = resolve_profile(cfg, &profile_name)
+        .ok_or_else(|| anyhow!("서브에이전트 '{profile_name}' 이(가) config에 없습니다"))?;
+    let needs_tools = !sub.tools.is_empty();
+    let mut chain: Vec<(String, String)> = Vec::new();
+    for spec in &specs {
+        let (p, m) = resolve_spec(cfg, spec, needs_tools)
+            .map_err(|e| anyhow!("콤보 '{combo_name}' 의 '{spec}' 해석 실패: {e}"))?;
+        chain.push((p, m));
+    }
+    let (p0, m0) = chain[0].clone();
+    let mut binding = bind_profile(cfg, class, Some(&profile_name), Some(&p0), Some(&m0))?;
+    binding.combo_chain = chain;
+    Ok(binding)
+}
+
 /// 프로파일을 직접 지정하는 bind — 전문가 역할 위임(task role)과 독립 검증자 게이트가 쓴다.
 /// `profile_override` 가 없으면 분류가 가리키는 config 프로파일을 쓴다.
 /// config 에 이름이 없으면 내장 프리셋(planner/frontend/backend/reviewer)으로 폴백한다.
@@ -36,6 +78,11 @@ pub fn bind_profile(
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<Binding> {
+    // 콤보 바인딩 (F8) — model_override 가 "combo:<이름>" 이면 체인 첫 쌍으로 바인딩하고
+    // 나머지 쌍을 combo_chain 에 담는다. 체인은 요청당 최대 COMBO_MAX_HOPS 까지만 따라간다.
+    if let Some(combo_name) = model_override.and_then(|m| m.strip_prefix("combo:")) {
+        return bind_combo(cfg, class, profile_override, combo_name);
+    }
     let profile_name = profile_override
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
@@ -125,6 +172,7 @@ pub fn bind_profile(
     let window = crate::packer::context_window_for(&provider_name, &model, Some(p));
     let tools = lane_filtered_tools(&profile_name, &sub.tools);
     Ok(Binding {
+        combo_chain: Vec::new(),
         class,
         profile_name,
         provider_name,
@@ -1066,7 +1114,33 @@ pub async fn chat_with_fallback(
     cfg: &Config,
     order: &[String],
     model_role: &str,
+    req: ChatRequest,
+) -> Result<(String, ChatResponse)> {
+    chat_with_fallback_inner(cfg, order, model_role, req, None).await
+}
+
+/// 콤보 체인 비스트리밍 호출 (F8) — 계획·상담 등 단발 호출용.
+pub async fn chat_with_fallback_combo(
+    cfg: &Config,
+    combo: &[(String, String)],
+    model_role: &str,
+    req: ChatRequest,
+) -> Result<(String, ChatResponse)> {
+    let mut order: Vec<String> = Vec::new();
+    for (p, _) in combo {
+        if !order.contains(p) {
+            order.push(p.clone());
+        }
+    }
+    chat_with_fallback_inner(cfg, &order, model_role, req, Some(combo)).await
+}
+
+async fn chat_with_fallback_inner(
+    cfg: &Config,
+    order: &[String],
+    model_role: &str,
     mut req: ChatRequest,
+    combo: Option<&[(String, String)]>,
 ) -> Result<(String, ChatResponse)> {
     let original_model = req.model.clone();
     let primary = order.first().map(|s| s.as_str());
@@ -1074,10 +1148,20 @@ pub async fn chat_with_fallback(
     let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err = None;
     for name in order {
-        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary)
+        let combo_model = combo
+            .and_then(|c| c.iter().find(|(p, _)| p == name))
+            .map(|(_, m)| m.clone());
+        let Some(model) = combo_model
+            .or_else(|| model_for_fallback(cfg, name, model_role, &original_model, primary))
         else {
             continue;
         };
+        if let Some(c) = combo
+            && model != original_model
+            && let Some(pair) = c.iter().find(|(_, m)| *m == model)
+        {
+            fallback_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
+        }
         req.model = model;
         match try_accounts(cfg, name, |client| {
             let req = req.clone();
@@ -1115,7 +1199,42 @@ pub async fn stream_with_fallback<F>(
     cfg: &Config,
     order: &[String],
     model_role: &str,
+    req: ChatRequest,
+    on_event: F,
+) -> Result<(String, ChatResponse)>
+where
+    F: FnMut(StreamEvent),
+{
+    stream_with_fallback_inner(cfg, order, model_role, req, None, on_event).await
+}
+
+/// 콤보 체인 스트리밍 (F8) — 체인의 (provider, model) 쌍을 순서대로 시도한다.
+/// 첫 쌍이 아닌 후보로 넘어갈 때 배지를 표시한다 (조용한 전환 금지).
+pub async fn stream_with_fallback_combo<F>(
+    cfg: &Config,
+    combo: &[(String, String)],
+    model_role: &str,
+    req: ChatRequest,
+    on_event: F,
+) -> Result<(String, ChatResponse)>
+where
+    F: FnMut(StreamEvent),
+{
+    let mut order: Vec<String> = Vec::new();
+    for (p, _) in combo {
+        if !order.contains(p) {
+            order.push(p.clone());
+        }
+    }
+    stream_with_fallback_inner(cfg, &order, model_role, req, Some(combo), on_event).await
+}
+
+async fn stream_with_fallback_inner<F>(
+    cfg: &Config,
+    order: &[String],
+    model_role: &str,
     mut req: ChatRequest,
+    combo: Option<&[(String, String)]>,
     mut on_event: F,
 ) -> Result<(String, ChatResponse)>
 where
@@ -1129,10 +1248,20 @@ where
     let emitted = AtomicUsize::new(0);
 
     for name in order {
-        let Some(model) = model_for_fallback(cfg, name, model_role, &original_model, primary)
+        let combo_model = combo
+            .and_then(|c| c.iter().find(|(p, _)| p == name))
+            .map(|(_, m)| m.clone());
+        let Some(model) = combo_model
+            .or_else(|| model_for_fallback(cfg, name, model_role, &original_model, primary))
         else {
             continue;
         };
+        if let Some(c) = combo
+            && model != original_model
+            && let Some(pair) = c.iter().find(|(_, m)| *m == model)
+        {
+            fallback_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
+        }
         req.model = model;
         let ids = account_ids_for(name);
         for (i, id) in ids.iter().enumerate() {
@@ -1402,5 +1531,58 @@ mod lane_filter_tests {
         assert!(explorer.tools.iter().all(|t| !["edit_file", "multi_edit", "write_file", "apply_patch", "bash"].contains(&t.as_str())));
         let researcher = crate::config::builtin_profile("researcher").expect("researcher 프리셋");
         assert!(researcher.tools.contains(&"web_search".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod combo_tests {
+    use super::*;
+
+    fn cfg_with_combos() -> crate::config::Config {
+        let dir = std::env::temp_dir().join(format!("rafikx-combo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
+        cfg.file.combos.insert(
+            "메인".into(),
+            vec![
+                "claude/opus".into(),
+                "kimi/k2".into(),
+                "minimax/m2".into(),
+                "openai/gpt".into(), // 4번째 — COMBO_MAX_HOPS(3)에서 잘려야 한다
+            ],
+        );
+        cfg
+    }
+
+    #[test]
+    fn chain_specs_are_capped_at_max_hops() {
+        let cfg = cfg_with_combos();
+        let specs = combo_chain_specs(&cfg, "메인").unwrap();
+        assert_eq!(specs.len(), COMBO_MAX_HOPS);
+        assert_eq!(specs[0], "claude/opus");
+        assert!(!specs.iter().any(|s| s == "openai/gpt"));
+    }
+
+    #[test]
+    fn unknown_combo_is_error() {
+        let cfg = cfg_with_combos();
+        assert!(combo_chain_specs(&cfg, "없는콤보").is_err());
+    }
+
+    #[test]
+    fn empty_chain_is_error() {
+        let mut cfg = cfg_with_combos();
+        cfg.file.combos.insert("빈콤보".into(), vec![]);
+        assert!(combo_chain_specs(&cfg, "빈콤보").is_err());
+    }
+
+    #[test]
+    fn no_combos_means_no_regression() {
+        let dir = std::env::temp_dir().join(format!("rafikx-nocombo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
+        assert!(cfg.file.combos.is_empty());
+        // 콤보 미설정 시 model_override "combo:x" 만 오류 — 일반 경로는 무영향
+        assert!(combo_chain_specs(&cfg, "x").is_err());
     }
 }
