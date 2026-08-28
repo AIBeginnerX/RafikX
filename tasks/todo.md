@@ -243,3 +243,10 @@ lessons+obsidian 과 중복이라 도입하지 않음.
 - 기존 lessons::maybe_spawn도 같은 단발 CLI 유실 문제 보유 (기존 동작, 미수정)
 - chat 단위테스트가 실제 config를 대상으로 실행됨 — 병렬 실행 시 engine 값이
   테스트 값으로 남을 수 있음 (이번에 실제 발생, 기존 테스트 설계)
+
+---
+
+# .omo/ 디렉토리 정책 (2026-08-27 C1)
+
+- [x] .omo/ 를 .gitignore에 추가 — 개인 작업 증거(plans/evidence/qa)는 레포에 올리지 않음
+- [ ] F4 Phase에서 .omo/ulw/<run-id>/ 산출물을 제품 기능으로 정식 지원 (v5 기획서 참조)

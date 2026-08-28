@@ -21,6 +21,7 @@ accounts.json
 *.log
 *.exe.bak
 .rafikx-src/
+.omo/
 desktop/dist
 desktop/dist/
 scripts/qa/node_modules/

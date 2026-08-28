@@ -35,3 +35,7 @@ cargo install --path agent-harness --force
 ## PR
 
 `.github/PULL_REQUEST_TEMPLATE.md` 체크리스트를 채워 주세요. CI는 Windows, macOS, Linux에서 테스트를 돌립니다.
+
+## 앱 아이콘
+
+앱 아이콘의 유일한 원천은 `desktop/src-tauri/icons/` 입니다. 아이콘 원본 이미지는 레포에 커밋하지 않습니다.
