@@ -692,10 +692,17 @@ impl Default for SelfHarnessConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct InspectorConfig {
     pub subagent: String,
+    /// 이상 감시 주기(분) — 0 이면 끈다. 텔레그램 데몬에서만 동작.
+    #[serde(default = "default_anomaly_minutes")]
+    pub anomaly_minutes: u64,
     #[allow(dead_code)]
     pub auto_interval_hours: f64,
     #[allow(dead_code)]
     pub notify_telegram: bool,
+}
+
+fn default_anomaly_minutes() -> u64 {
+    15
 }
 
 #[derive(Debug, Clone, Deserialize)]

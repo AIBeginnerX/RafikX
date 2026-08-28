@@ -97,6 +97,7 @@ pub async fn run(config_path: Option<&Path>, with_watch: bool) -> Result<()> {
     }
 
     spawn_inspector_scheduler(bot.clone(), cfg.clone());
+    spawn_anomaly_watcher(bot.clone(), cfg.clone());
 
     let handler = dptree::entry()
         .branch(Update::filter_callback_query().endpoint(on_callback))
@@ -114,6 +115,34 @@ pub async fn run(config_path: Option<&Path>, with_watch: bool) -> Result<()> {
         .dispatch()
         .await;
     Ok(())
+}
+
+/// 이상 감시자 (F: Inspector 강화) — 지표 이상을 주기 없이 즉시 알린다.
+/// 코드 계산만 하므로 모델 호출 없이 가볍다. [inspector] anomaly_minutes = 0 이면 끔.
+fn spawn_anomaly_watcher(bot: Bot, cfg: Config) {
+    let minutes = cfg.file.inspector.anomaly_minutes;
+    if minutes == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        // tokio interval 의 첫 tick 은 즉시 발동한다 — 시작 직후가 아니라 첫 주기부터 본다.
+        let mut ticker = tokio::time::interval(Duration::from_secs(minutes * 60));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Ok(path) = Db::db_path() else { continue };
+            let Ok(db) = Db::open(&path) else { continue };
+            match crate::anomaly::check(&cfg, &db) {
+                Ok(report) => {
+                    let msg = crate::anomaly::render_message(&report);
+                    if !msg.is_empty() {
+                        notify_owner(&cfg, &msg).await;
+                    }
+                }
+                Err(e) => applog::error(&format!("anomaly 감시: {e:#}")),
+            }
+        }
+    });
 }
 
 fn spawn_inspector_scheduler(bot: Bot, cfg: Config) {

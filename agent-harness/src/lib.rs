@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod accounts_ui;
 pub mod agent;
+pub mod anomaly;
 pub mod api;
 pub mod applog;
 pub mod auth;
