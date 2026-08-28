@@ -80,10 +80,11 @@ pub fn classify_rules_with_confidence(text: &str, obsidian: bool) -> (TaskClass,
     if (150..=600).contains(&n) {
         return (TaskClass::Medium, (200..=550).contains(&n));
     }
-    if contains_any(text, MEDIUM_KEYWORDS) {
+    let operative = strip_quoted(text);
+    if contains_any(&operative, MEDIUM_KEYWORDS) {
         return (TaskClass::Medium, false);
     }
-    if contains_any(text, TOOL_HINTS) {
+    if contains_any(&operative, TOOL_HINTS) {
         return (TaskClass::Simple, false);
     }
     (TaskClass::Simple, true)
@@ -176,10 +177,36 @@ pub async fn classify_gated(
 }
 
 
+/// 인용 구간("…"·'…'·「…」·`…`) 제거 — 인용 속 동사는 지시가 아니라 인용이다 (G5).
+/// "이 요청을 검토해줘: '…만들어줘'" 같은 입력이 인용 속 생성 동사 때문에
+/// dev 로 오분류되는 것을 막는다. 인용 밖의 파일명·동사는 그대로 남는다.
+pub(crate) fn strip_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    for c in text.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if matches!(c, '"' | '\'' | '「' | '『' | '`') {
+                    quote = Some(match c { '「' => '」', '『' => '』', other => other });
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn looks_like_dev(text: &str) -> bool {
     if text.contains("```") {
         return true;
     }
+    let text = &strip_quoted(text);
     let exts = [
         ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".toml", ".json", ".go", ".java", ".c", ".cpp",
         ".h", ".cs", ".rb", ".php", ".kt", ".swift", ".sh", ".ps1", ".md", ".yml", ".yaml",
@@ -219,6 +246,7 @@ fn looks_like_dev(text: &str) -> bool {
 }
 
 fn looks_like_advanced(text: &str) -> bool {
+    let text = &strip_quoted(text);
     if text.chars().count() > 600 {
         return true;
     }
@@ -429,4 +457,38 @@ mod lane_tests {
 #[test]
 fn t3_actual_input_routes_explorer() {
     assert_eq!(crate::harness::suggest_lane("src 에서 helper 함수를 호출하는 곳을 다 찾아줘"), Some("explorer"));
+}
+
+#[cfg(test)]
+mod quote_strip_tests {
+    use super::*;
+
+    #[test]
+    fn strips_double_single_backtick_korean_quotes() {
+        assert_eq!(strip_quoted("이 파일을 \"지금\" 고쳐줘"), "이 파일을  고쳐줘");
+        assert_eq!(strip_quoted("'이 부분'을 수정해줘"), "을 수정해줘");
+        assert_eq!(strip_quoted("「이 함수」를 만들어줘"), "를 만들어줘");
+        assert_eq!(strip_quoted("`x` 라는 변수"), " 라는 변수");
+    }
+
+    #[test]
+    fn quoted_action_verbs_do_not_trigger_dev() {
+        // G5 — 인용 속 생성 동사는 지시가 아니다
+        let (c, _) = classify_rules_with_confidence(
+            "이 요청을 검토해줘: '내일까지 뭐든 빨리 만들어줘'", false);
+        assert_ne!(c, TaskClass::Dev);
+    }
+
+    #[test]
+    fn real_edit_requests_still_dev() {
+        // 인용 밖 동사는 그대로 유효
+        assert_eq!(classify_rules("notes.txt 의 \"beta\" 를 BETA2 로 바꿔줘", false), TaskClass::Dev);
+        assert_eq!(classify_rules("'fix.py' 만들어줘", false), TaskClass::Dev);
+        assert_eq!(classify_rules("이 파일을 고쳐줘", false), TaskClass::Dev);
+    }
+
+    #[test]
+    fn quoted_sentence_as_content_is_not_dev() {
+        assert_ne!(classify_rules("'이 함수를 고쳐' 라고 쓰여 있는 문장을 번역해줘", false), TaskClass::Dev);
+    }
 }
