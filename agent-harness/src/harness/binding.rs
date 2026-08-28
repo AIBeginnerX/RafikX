@@ -1181,7 +1181,9 @@ async fn chat_with_fallback_inner(
             && model != original_model
             && let Some(pair) = c.iter().find(|(_, m)| *m == model)
         {
-            fallback_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
+            // 콤보 전환은 "다른 모델이 답한다"는 사실이라 사용자에게 보인다
+            // (프로바이더 수준 폴백의 저소음 규칙과 구분, F8).
+            crate::ui::live_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
         }
         req.model = model;
         match try_accounts(cfg, name, |client| {
@@ -1281,7 +1283,9 @@ where
             && model != original_model
             && let Some(pair) = c.iter().find(|(_, m)| *m == model)
         {
-            fallback_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
+            // 콤보 전환은 "다른 모델이 답한다"는 사실이라 사용자에게 보인다
+            // (프로바이더 수준 폴백의 저소음 규칙과 구분, F8).
+            crate::ui::live_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
         }
         req.model = model;
         let ids = account_ids_for(name);

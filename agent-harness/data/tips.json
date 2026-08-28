@@ -47,7 +47,7 @@
   {
     "id": "combo",
     "tip": "[combos] 에 체인을 등록하면 모델이 죽어도 다음 모델로 이어집니다",
-    "detail": "chain = [\"claude/opus\", \"kimi/k2\"] 처럼 등록하고 /model 에서 combo 를 고륵세요. 요청 실패 시 체인 다음 후보로 자동 전환되고 \"폴 fallback: ... 사용 중\" 배지가 뜹니다.",
+    "detail": "chain = [\"claude:opus\", \"kimi:k2\"] 처럼 등록하고 /model 에서 combo 를 고륵세요. 요청 실패 시 체인 다음 후보로 자동 전환되고 \"폴 fallback: ... 사용 중\" 배지가 뜹니다.",
     "code": "src/harness/binding.rs",
     "excerpt": "pub const COMBO_MAX_HOPS: usize = 3;",
     "since": "1.1.0",

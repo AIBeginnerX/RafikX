@@ -131,6 +131,10 @@ async function openPage(viewport, options = {}) {
   page.on("pageerror", (error) => errors.push(error.message));
   await installBridge(page);
   await page.goto(url, { waitUntil: "networkidle" });
+  // v1.0.1 스플래시 대응 — 사용자와 같이 Enter 로 닫고 시작 화면에 진입한다.
+  if (await page.locator("body[data-splash]").count()) {
+    await page.keyboard.press("Enter");
+  }
   await page.waitForSelector("#start-stage:not([hidden])");
   return { context, page, errors };
 }
