@@ -10,6 +10,7 @@ pub mod context;
 pub mod dateutil;
 pub mod db;
 pub mod engine;
+pub mod facts;
 pub mod graph;
 pub mod harness;
 pub mod inspector;

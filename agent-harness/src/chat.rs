@@ -157,6 +157,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "도구 목록"),
     ("/todo", "작업 목록 보기"),
     ("/goal", "장기 목표 상태 · resume 이어가기 · clear 해제"),
+    ("/facts", "기억한 지속 사실 목록"),
+    ("/forget", "지속 사실 삭제 /forget <key>"),
     ("/status", "연결·사용량 요약"),
     ("/theme", "테마 변경"),
     ("/obsidian", "볼트 사용 on|off"),
@@ -467,6 +469,34 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
     match cmd {
         "/quit" | "/exit" => Ok(Slash::Quit),
         "/help" => Ok(Slash::Continue(vec![help_text()])),
+        "/facts" => {
+            let rows = db.list_facts(Some(&session.cfg.workspace))?;
+            if rows.is_empty() {
+                return Ok(Slash::Continue(vec!["기억하는 사실이 없습니다.".into()]));
+            }
+            let notes = rows
+                .iter()
+                .map(|r| {
+                    let scope = if r.project_id.is_empty() { "전역" } else { "프로젝트" };
+                    format!("({}·{}) {}: {}", r.kind, scope, r.key, r.value)
+                })
+                .collect();
+            Ok(Slash::Continue(notes))
+        }
+        "/forget" => {
+            if rest.is_empty() {
+                return Ok(Slash::Continue(vec!["/forget <key>".into()]));
+            }
+            match db.forget_fact(Some(&session.cfg.workspace), rest)? {
+                Some(row) => Ok(Slash::Continue(vec![format!(
+                    "삭제했습니다: {} = {} ({}·{})",
+                    row.key, row.value, row.kind, row.source
+                )])),
+                None => Ok(Slash::Continue(vec![format!(
+                    "해당 키를 찾지 못했습니다: {rest}"
+                )])),
+            }
+        }
         "/save" => {
             let id = persist(&db, session.session_id.as_deref(), &mut session.messages)?;
             session.session_id = Some(id.clone());
@@ -1143,6 +1173,7 @@ pub(crate) fn help_text() -> String {
      /status               연결·Harness·오늘 사용량 요약\n\
      /todo                 작업 목록 보기\n\
      /goal                 장기 목표·자동 연속 실행 상태\n\
+     /facts · /forget <키>  기억한 지속 사실 목록 · 삭제\n\
      /file <경로>          다음 질문에 파일 첨부 (@src/main.rs 멘션도 가능)\n\
      /sessions · /resume <id>   세션 목록 · 이어하기\n\
      /find <검색어>         지난 세션 내용 검색\n\

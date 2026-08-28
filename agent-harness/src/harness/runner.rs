@@ -404,7 +404,22 @@ async fn run_pipeline_inner(
     } else {
         crate::graph::node_in(&run_context, "pre_step", "lessons", "none", Some("bind"));
     }
-    let mut system = system_prompt(cfg, &binding.system_extra, &lessons_block);
+    let facts_block = if cfg.file.memory.enabled {
+        Db::open(&Db::db_path()?)
+            .ok()
+            .map(|db| {
+                crate::facts::inject_block(
+                    &db,
+                    &cfg.workspace,
+                    cfg.file.memory.inject_limit_chars as usize,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let memory_block = format!("{lessons_block}{facts_block}");
+    let mut system = system_prompt(cfg, &binding.system_extra, &memory_block);
     crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
     system.push_str(&format!(
         "\n\n[현재 실행 정보]\nProvider: {}\nModel: {}\nContext window: {} tokens\nHarness: {}\n\

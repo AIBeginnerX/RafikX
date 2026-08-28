@@ -91,6 +91,40 @@ const MIGRATIONS: &[Migration] = &[
           ON lifecycle_events(parent_run_id, timestamp_ms, seq);
         "#,
     },
+    Migration {
+        version: 5,
+        name: "facts_memory",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS facts (
+          id INTEGER PRIMARY KEY,
+          project_id TEXT NOT NULL DEFAULT '',
+          kind TEXT NOT NULL,
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          last_hit INTEGER NOT NULL DEFAULT 0,
+          hits INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(project_id, key)
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+          key, value, fact_id UNINDEXED
+        );
+        "#,
+    },
+    Migration {
+        version: 6,
+        name: "facts_fts_trigram",
+        sql: r#"
+        DROP TABLE IF EXISTS facts_fts;
+        CREATE VIRTUAL TABLE facts_fts USING fts5(
+          key, value, fact_id UNINDEXED, tokenize='trigram'
+        );
+        INSERT INTO facts_fts (key, value, fact_id)
+          SELECT key, value, id FROM facts;
+        "#,
+    },
 ];
 
 pub(super) fn apply(connection: &Connection) -> Result<()> {

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
+mod facts;
 mod lifecycle;
 mod migrations;
 mod project_memory;
@@ -405,6 +406,11 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn into_conn_for_tests(self) -> Connection {
+        self.conn
+    }
+
     fn ensure_lessons_fts(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
@@ -723,6 +729,56 @@ impl Db {
             self.delete_lesson(id)?;
         }
         Ok(())
+    }
+
+    fn fact_project_id(&self, workspace: Option<&Path>) -> Result<String> {
+        match workspace {
+            Some(w) => project_memory::ensure_project(&self.conn, w),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// 지속 사실 upsert — 같은 (스코프, key)는 값 갱신. workspace=None 이면 전역.
+    pub fn upsert_fact(
+        &self,
+        workspace: Option<&Path>,
+        kind: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+    ) -> Result<FactWrite> {
+        let pid = self.fact_project_id(workspace)?;
+        facts::upsert(
+            &self.conn,
+            &pid,
+            facts::normalize_kind(kind),
+            key.trim(),
+            value.trim(),
+            source,
+        )
+    }
+
+    /// 사실 검색 — query 가 비면 스코프 전체(전역+프로젝트) 최신순.
+    pub fn recall_facts(
+        &self,
+        workspace: Option<&Path>,
+        query: &str,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FactRow>> {
+        let pid = self.fact_project_id(workspace)?;
+        facts::recall(&self.conn, &pid, query, kind, limit)
+    }
+
+    /// 삭제된 행을 돌려준다 (호출부가 "무엇을 지웠는지" 보여주기 위함).
+    pub fn forget_fact(&self, workspace: Option<&Path>, key: &str) -> Result<Option<FactRow>> {
+        let pid = self.fact_project_id(workspace)?;
+        facts::forget(&self.conn, &pid, key.trim())
+    }
+
+    pub fn list_facts(&self, workspace: Option<&Path>) -> Result<Vec<FactRow>> {
+        let pid = self.fact_project_id(workspace)?;
+        facts::list(&self.conn, &pid)
     }
 
     pub fn list_lessons(&self) -> Result<Vec<LessonRow>> {
@@ -1255,6 +1311,26 @@ pub enum LessonWrite {
     Bumped { id: i64 },
 }
 
+/// 지속 사실 — lessons(실패 교훈)와 별개 축. 같은 (project_id, key)는 upsert.
+/// project_id 가 "" 이면 전역 사실.
+#[derive(Debug, Clone)]
+pub struct FactRow {
+    pub id: i64,
+    pub project_id: String,
+    pub kind: String,
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub updated_at: i64,
+    pub hits: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactWrite {
+    Inserted { id: i64 },
+    Updated { id: i64 },
+}
+
 /// Self-Harness 실패 클러스터 — 시그니처 φ=(cause, causal, mechanism) 단위.
 #[derive(Debug, Clone)]
 pub struct ShEvidenceRow {
@@ -1362,17 +1438,17 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create migration directory");
         let path = dir.join("data.db");
         let first = Db::open(&path).expect("first database open");
-        assert_eq!(first.schema_version().expect("first schema version"), 4);
+        assert_eq!(first.schema_version().expect("first schema version"), 6);
         drop(first);
         let second = Db::open(&path).expect("second database open");
-        assert_eq!(second.schema_version().expect("second schema version"), 4);
+        assert_eq!(second.schema_version().expect("second schema version"), 6);
         let rows: i64 = second
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .expect("migration row count");
-        assert_eq!(rows, 4);
+        assert_eq!(rows, 6);
         let _ = std::fs::remove_dir_all(dir);
     }
 

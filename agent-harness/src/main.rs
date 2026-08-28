@@ -73,6 +73,8 @@ enum Commands {
         /// 작업 지시
         prompt: String,
     },
+    /// 기억한 지속 사실(전역+프로젝트) 목록
+    Facts,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
     Update,
     /// Vault 노트를 FTS5에 인덱싱
@@ -249,6 +251,7 @@ async fn main() -> ExitCode {
         Some(Commands::Search { query }) => cmd_search(&cli, query),
         Some(Commands::Watch) => cmd_watch(&cli).await,
         Some(Commands::Chat { list, resume }) => cmd_chat_entry(&cli, *list, resume.clone()).await,
+        Some(Commands::Facts) => cmd_facts(&cli),
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
         Some(Commands::Inspect {
@@ -929,6 +932,21 @@ fn cmd_search(cli: &Cli, query: &str) -> Result<()> {
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let cfg = Config::load(cli.config.as_deref())?;
     obsidian::watch_vault(&cfg).await
+}
+
+fn cmd_facts(cli: &Cli) -> Result<()> {
+    let cfg = Config::load(cli.config.as_deref())?;
+    let db = Db::open(&Db::db_path()?)?;
+    let rows = db.list_facts(Some(&cfg.workspace))?;
+    if rows.is_empty() {
+        println!("기억하는 사실이 없습니다.");
+        return Ok(());
+    }
+    for r in rows {
+        let scope = if r.project_id.is_empty() { "전역" } else { "프로젝트" };
+        println!("({}·{}) {}: {}", r.kind, scope, r.key, r.value);
+    }
+    Ok(())
 }
 
 fn cmd_lessons(cli: &Cli, action: &LessonsCmd) -> Result<()> {

@@ -21,6 +21,7 @@ use crate::tools_more::{
     ApplyPatch, GlobTool, MultiEdit, TodoRead, TodoWrite, WebFetch, WebSearch,
 };
 
+mod facts;
 mod lsp_tools;
 pub mod mutation;
 mod task;
@@ -115,6 +116,9 @@ impl ToolRegistry {
                 Box::new(crate::skills::SaveSkill),
                 Box::new(crate::mcp::McpList),
                 Box::new(crate::mcp::McpCall),
+                Box::new(facts::Remember),
+                Box::new(facts::Recall),
+                Box::new(facts::Forget),
             ],
         }
     }

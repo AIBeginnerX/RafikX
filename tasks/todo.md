@@ -5,7 +5,6 @@
 
 ## v5 기획 진행
 
-- [ ] (대기) Phase F1 — 팩트 메모리 (remember/recall/forget)
 - [ ] (대기) Phase F2 — IntentGate (의도 게이트 + 분류 확신도)
 - [ ] (대기) Phase F3 — Hashline 편집 도구
 - [ ] (대기) Phase F5 — 탐색·리서치 레인 + 카테고리 라우팅
