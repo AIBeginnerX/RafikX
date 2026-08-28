@@ -9,6 +9,11 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          Workspace: {}\n\
          If the user writes in Korean, reply in Korean.\n\
          \n\
+         [언어 정책]\n\
+         - 작업 진행 설명은 영어로 쓴다(MUST): 작업 중 생각·중간 점검·단계 서술·도구 호출 앞뒤 안내는 전부 영문으로 출력한다.\n\
+         - 다만 핵심 내용·진행 상황의 제목(헤더·섹션 제목)은 한국어로 쓴다.\n\
+         - 최종 답변(작업 결과 브리핑)은 한국어로 쓴다(MUST).\n\
+         \n\
          [규약]\n\
          RFC 2119 키워드를 쓴다: MUST(반드시), NEVER(절대 금지), SHOULD(권장), AVOID(지양), MAY(허용).\n\
          \n\
@@ -2498,4 +2503,22 @@ pub(crate) fn auto_verify_command(cfg: &Config, changed: &[String]) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_policy_keeps_work_in_english_and_briefing_in_korean() {
+        let dir = std::env::temp_dir().join(format!("rafikx-lang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
+        let s = system_prompt(&cfg, "", "");
+        assert!(s.contains("[언어 정책]"));
+        assert!(s.contains("작업 진행 설명은 영어로 쓴다"));
+        assert!(s.contains("제목(헤더·섹션 제목)은 한국어로 쓴다"));
+        assert!(s.contains("최종 답변(작업 결과 브리핑)은 한국어로 쓴다"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

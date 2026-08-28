@@ -457,11 +457,15 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             visual.extend(render_streaming_tail(&e.text, width, th));
             continue;
         }
-        let h = entry_render_hash(e, width, &theme_name);
+        // 턴 진행 중의 Assistant 엔트리는 전부 모델 작업 출력 — 흐린 기울임으로 그린다.
+        // 턴이 끝나면 collapse_turn_noise 가 작업 엔트리를 걷어내고 최종 답변만 남기므로
+        // 남은 답변은 work=false, 보통 스타일로 그려진다.
+        let work = app.busy && e.kind == EntryKind::Assistant;
+        let h = entry_render_hash(e, width, &theme_name, work);
         if count < cache.len() && cache[count].0 == h {
             visual.extend(cache[count].1.iter().cloned());
         } else {
-            let rows = render_entry(e, width, th);
+            let rows = render_entry(e, width, th, work);
             let slot = (h, rows.clone());
             if count < cache.len() {
                 cache[count] = slot;
@@ -525,11 +529,20 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
 
 /// 스트리밍 중 답변의 경량 렌더 — 마크다운 파싱·코드 하이라이팅 없이
 /// 태그와 줄바꿈만. 완료되면 render_entry 의 풀 렌더로 교체된다.
+/// 작업 중 스트리밍 텍스트 스타일 — 흐린 회색 + 기울임 (모델 작업임을 시각히 구분).
+/// 본문만 흐리게 하고 태그는 그대로 둬 어느 모델 출력인지는 계속 식별된다.
+fn work_body_style(th: &Pal) -> Style {
+    Style::default()
+        .fg(th.thinking)
+        .add_modifier(Modifier::ITALIC)
+}
+
 fn render_streaming_tail(text: &str, width: u16, th: &Pal) -> Vec<Line<'static>> {
     let shown = compact_blank(&display_model_work(text));
     let content_width = width.saturating_sub(8).max(1) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut first = true;
+    let body = work_body_style(th);
     for row in shown.lines() {
         let pieces = super::md::wrap_text(row, content_width);
         let pieces = if pieces.is_empty() {
@@ -544,7 +557,7 @@ fn render_streaming_tail(text: &str, width: u16, th: &Pal) -> Vec<Line<'static>>
                         format!(" {:<6}", "rafikx"),
                         Style::default().fg(th.code).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!(" {piece}"), Style::default().fg(th.text)),
+                    Span::styled(format!(" {piece}"), body),
                 ]));
                 first = false;
             } else {
@@ -553,7 +566,7 @@ fn render_streaming_tail(text: &str, width: u16, th: &Pal) -> Vec<Line<'static>>
                         CONTINUATION_PREFIX.to_string(),
                         Style::default().fg(th.mute),
                     ),
-                    Span::styled(format!(" {piece}"), Style::default().fg(th.text)),
+                    Span::styled(format!(" {piece}"), body),
                 ]));
             }
         }
@@ -561,19 +574,23 @@ fn render_streaming_tail(text: &str, width: u16, th: &Pal) -> Vec<Line<'static>>
     lines
 }
 
-/// 렌더 캐시 키 — 내용·폭·테마가 같으면 렌더 결과도 같다.
-fn entry_render_hash(e: &super::Entry, width: u16, theme: &str) -> u64 {
+/// 렌더 캐시 키 — 내용·폭·테마·작업 여부가 같으면 렌더 결과도 같다.
+/// 작업 여부가 키에 들어가는 이유: 같은 Assistant 텍스트라 턴 진행 중(흐린 기울임)과
+/// 완료 답변(보통 스타일)은 다르게 그려진다.
+fn entry_render_hash(e: &super::Entry, width: u16, theme: &str, work: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (e.kind as u8).hash(&mut h);
     e.text.hash(&mut h);
     width.hash(&mut h);
     theme.hash(&mut h);
+    work.hash(&mut h);
     h.finish()
 }
 
 /// 엔트리 하나를 래핑 완료된 비주얼 행으로 렌더한다 (순수 함수 — 캐시 대상).
-fn render_entry(e: &super::Entry, width: u16, th: &Pal) -> Vec<Line<'static>> {
+/// `work` 는 턴 진행 중인 Assistant 엔트리 — 모델 작업 출력이므로 흐린 기울임으로 그린다.
+fn render_entry(e: &super::Entry, width: u16, th: &Pal, work: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     let text = match e.kind {
@@ -628,11 +645,13 @@ fn render_entry(e: &super::Entry, width: u16, th: &Pal) -> Vec<Line<'static>> {
 
     if e.kind == EntryKind::Assistant {
         let content_width = width.saturating_sub(8).max(1) as usize;
+        let work_heading = Style::default()
+            .fg(th.thinking)
+            .add_modifier(Modifier::ITALIC)
+            .add_modifier(Modifier::BOLD);
         for (is_work, section) in split_model_work(&text) {
             if is_work {
-                let work_style = Style::default()
-                    .fg(th.thinking)
-                    .add_modifier(Modifier::ITALIC);
+                let work_style = work_body_style(th);
                 push_row(&mut lines, "모델 작업", work_style, &mut first);
                 for row in super::md::wrap_text(&section, content_width) {
                     push_row(&mut lines, &row, work_style, &mut first);
@@ -652,16 +671,29 @@ fn render_entry(e: &super::Entry, width: u16, th: &Pal) -> Vec<Line<'static>> {
                     );
                     continue;
                 }
-                let st = match seg.kind {
-                    MdKind::Heading => Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    MdKind::Emphasis => Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    MdKind::Code | MdKind::CodeBlock | MdKind::Table | MdKind::Chart => {
-                        Style::default().fg(th.code).bg(th.panel)
+                // 작업 진행 중이면 본문은 흐린 기울임 한 가지로 통일하고,
+                // 제목(헤더)만 굵게 남겨 한국어 제목이 눈에 걸리게 한다.
+                let st = if work {
+                    match seg.kind {
+                        MdKind::Heading | MdKind::Emphasis => work_heading,
+                        _ => work_body_style(th),
                     }
-                    MdKind::Command => Style::default()
-                        .fg(th.secondary)
-                        .add_modifier(Modifier::BOLD),
-                    MdKind::Text => Style::default().fg(th.text),
+                } else {
+                    match seg.kind {
+                        MdKind::Heading => {
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                        }
+                        MdKind::Emphasis => {
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                        }
+                        MdKind::Code | MdKind::CodeBlock | MdKind::Table | MdKind::Chart => {
+                            Style::default().fg(th.code).bg(th.panel)
+                        }
+                        MdKind::Command => Style::default()
+                            .fg(th.secondary)
+                            .add_modifier(Modifier::BOLD),
+                        MdKind::Text => Style::default().fg(th.text),
+                    }
                 };
                 for piece in seg.text.split('\n') {
                     push_row(&mut lines, piece, st, &mut first);
@@ -1798,6 +1830,56 @@ mod tests {
         let line = Line::from("한글은 두 칸씩".to_string());
         assert_eq!(wrapped_rows(&line, 100), 1);
         assert!(wrapped_rows(&line, 4) >= 3);
+    }
+
+    #[test]
+    fn work_phase_assistant_renders_dim_italic_and_final_normal() {
+        let th = pal_of(&palette::RAFIKX);
+        let e = crate::tui::Entry {
+            kind: EntryKind::Assistant,
+            text: "Reading the fallback logic\n\n## 다음 단계\napply the fix".into(),
+        };
+        let has_italic = |rows: &[Line<'static>]| {
+            rows.iter().any(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(Modifier::ITALIC))
+            })
+        };
+        // 턴 진행 중(work=true) — 모델 작업 출력은 흐린 기울임.
+        assert!(has_italic(&render_entry(&e, 80, &th, true)));
+        // 완료 답변(work=false) — 보통 스타일.
+        assert!(!has_italic(&render_entry(&e, 80, &th, false)));
+    }
+
+    #[test]
+    fn work_heading_stays_bold_while_body_is_dim() {
+        let th = pal_of(&palette::RAFIKX);
+        let e = crate::tui::Entry {
+            kind: EntryKind::Assistant,
+            text: "## 진행 상황\nEnglish narration body".into(),
+        };
+        let rows = render_entry(&e, 80, &th, true);
+        // 제목 줄은 굵게+기울임, 본문 줄은 기울임만.
+        let heading_bold = rows.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content.contains("진행 상황")
+                    && s.style.add_modifier.contains(Modifier::BOLD)
+                    && s.style.add_modifier.contains(Modifier::ITALIC)
+            })
+        });
+        assert!(heading_bold);
+    }
+
+    #[test]
+    fn streaming_tail_renders_dim_italic() {
+        let th = pal_of(&palette::RAFIKX);
+        let rows = render_streaming_tail("Working on the fallback", 80, &th);
+        assert!(rows.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::ITALIC))
+        }));
     }
 
     #[test]
