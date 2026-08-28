@@ -627,7 +627,11 @@ impl Tool for MultiEdit {
             updated.into_bytes(),
         )?;
         ctx.commit_mutation(plan)?;
-        Ok(reports.join("\n"))
+        Ok(crate::tools::with_auto_diagnostics(
+            reports.join("\n"),
+            &resolved,
+            ctx,
+        ))
     }
 }
 

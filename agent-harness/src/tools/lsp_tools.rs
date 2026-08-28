@@ -100,3 +100,102 @@ where
         .map_err(|_| anyhow!("LSP tool requires the RafikX async runtime"))?;
     tokio::task::block_in_place(|| runtime.block_on(future))
 }
+
+pub struct LspHover;
+pub struct LspReferences;
+
+impl Tool for LspHover {
+    fn name(&self) -> &'static str {
+        "lsp_hover"
+    }
+
+    fn description(&self) -> &'static str {
+        "언어 서버로 심볼 위에 뜨는 정보(타입·문서)를 읽습니다. line과 column은 1부터 시작합니다."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "line":{"type":"integer","minimum":1},
+                "column":{"type":"integer","minimum":1}
+            },
+            "required":["path","line","column"]
+        })
+    }
+
+    fn needs_approval(&self, _input: &Value) -> bool {
+        false
+    }
+
+    fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("path 인자가 필요합니다"))?;
+        let (line, column) = line_column(&input)?;
+        let resolved = resolve_tool_path(ctx, path)?;
+        run_async(crate::lsp::hover(
+            &ctx.workspace,
+            &resolved,
+            line,
+            column,
+            ctx.run.as_ref(),
+        ))
+    }
+}
+
+impl Tool for LspReferences {
+    fn name(&self) -> &'static str {
+        "lsp_references"
+    }
+
+    fn description(&self) -> &'static str {
+        "언어 서버로 심볼이 참조되는 모든 위치를 찾습니다. line과 column은 1부터 시작합니다."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "line":{"type":"integer","minimum":1},
+                "column":{"type":"integer","minimum":1}
+            },
+            "required":["path","line","column"]
+        })
+    }
+
+    fn needs_approval(&self, _input: &Value) -> bool {
+        false
+    }
+
+    fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("path 인자가 필요합니다"))?;
+        let (line, column) = line_column(&input)?;
+        let resolved = resolve_tool_path(ctx, path)?;
+        run_async(crate::lsp::references(
+            &ctx.workspace,
+            &resolved,
+            line,
+            column,
+            ctx.run.as_ref(),
+        ))
+    }
+}
+
+/// line·column 인수 검증 — 두 도구가 공용으로 쓴다.
+fn line_column(input: &Value) -> Result<(u32, u32)> {
+    let parse = |key: &str| -> Result<u32> {
+        input
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow!("{key}은 1 이상의 정수여야 합니다"))
+    };
+    Ok((parse("line")?, parse("column")?))
+}

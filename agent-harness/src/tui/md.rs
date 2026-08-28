@@ -514,6 +514,7 @@ pub const KEY_HELP: &str = "\
 Enter            보내기\n\
 Ctrl+J / Shift+Enter  줄바꿈\n\
 Tab              plan(읽기전용)/build 모드 전환\n\
+Ctrl+T           파일 탐색기 (↑↓ 이동 · Enter 펼치기·미리보기)\n\
 Esc              생성 중단 · 도움말·선택·승인 닫기\n\
 Ctrl+C           종료 (실행 중이면 이번 턴이 끝난 뒤)\n\
 PgUp / PgDn      대화 스크롤\n\

@@ -99,7 +99,17 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(area);
 
     draw_header(f, app, chunks[0], &th);
-    draw_transcript_frame(f, app, chunks[1], &th);
+    if app.tree.is_some() {
+        // 파일 탐색기가 열리면 대화 영역을 좌우로 나눈다 — 왼쪽 트리, 오른쪽 대화.
+        let halves = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(chunks[1]);
+        draw_file_tree(f, app, halves[0], &th);
+        draw_transcript_frame(f, app, halves[1], &th);
+    } else {
+        draw_transcript_frame(f, app, chunks[1], &th);
+    }
     if rows[2] > 0 {
         draw_todo_panel(f, app, chunks[2], &th);
     }
@@ -171,6 +181,99 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     // 승인은 팝업 없이 인라인으로 — 미리보기는 트랜스크립트에, 선택은 푸터에서
     // Y/N/A 키로 (pi 스타일: 화면을 덮는 permission popup 을 두지 않는다).
+}
+
+/// 파일 탐색기 패널 — 위 트리, 아래 선택 파일 미리보기(최대 40줄).
+fn draw_file_tree(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
+    let Some(tree) = &app.tree else { return };
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let list = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(
+            " 파일 탐색기 (Ctrl+T 닫기) ",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = list.inner(halves[0]);
+    f.render_widget(list, halves[0]);
+
+    let visible = inner.height.max(1) as usize;
+    // 커서가 항상 화면 안에 오도록 오프셋을 계산한다.
+    let offset = tree.cursor.saturating_sub(visible.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    for (index, row) in tree.rows.iter().enumerate().skip(offset) {
+        if lines.len() >= visible {
+            break;
+        }
+        let indent = "  ".repeat(row.depth);
+        let marker = if row.is_dir {
+            if row.expanded {
+                "▾ "
+            } else {
+                "▸ "
+            }
+        } else {
+            "  "
+        };
+        let text = format!("{indent}{marker}{}", row.name);
+        let style = if index == tree.cursor {
+            Style::default()
+                .bg(th.panel)
+                .fg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if row.is_dir {
+            Style::default().fg(th.secondary)
+        } else {
+            Style::default().fg(th.body)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(비어 있음)",
+            Style::default().fg(th.mute),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines).scroll((0, 0)),
+        inner,
+    );
+
+    let (preview_title, preview_lines) = match &tree.preview {
+        Some(p) => (
+            format!(" {} ", p.name),
+            p.lines.iter().cloned().collect::<Vec<_>>(),
+        ),
+        None => (" 미리보기 ".to_string(), Vec::new()),
+    };
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.mute))
+        .title(Span::styled(
+            preview_title,
+            Style::default().fg(th.mute),
+        ));
+    let preview_inner = preview_block.inner(halves[1]);
+    f.render_widget(preview_block, halves[1]);
+    if preview_lines.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![Line::from(Span::styled(
+                "파일을 선택하세요 (Enter)",
+                Style::default().fg(th.mute),
+            ))]),
+            preview_inner,
+        );
+    } else {
+        let rows: Vec<Line> = preview_lines
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(th.body))))
+            .collect();
+        f.render_widget(Paragraph::new(rows), preview_inner);
+    }
 }
 
 fn slash_palette_height(hit_count: usize) -> u16 {
@@ -487,10 +590,12 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         )));
         let content_width = width.saturating_sub(3).max(1) as usize;
         for row in approval.preview.lines() {
+            // diff 표기(+/-/@@)를 줄 단위로 색칠해 변경 전후가 한눈에 보이게.
+            let row_style = preview_line_style(row, th);
             for wrapped in super::md::wrap_text(row, content_width) {
                 visual.push(Line::from(vec![
                     Span::styled("  │ ", Style::default().fg(th.warn)),
-                    Span::styled(wrapped, Style::default().fg(th.text)),
+                    Span::styled(wrapped, row_style),
                 ]));
             }
         }
@@ -586,6 +691,24 @@ fn entry_render_hash(e: &super::Entry, width: u16, theme: &str, work: bool) -> u
     theme.hash(&mut h);
     work.hash(&mut h);
     h.finish()
+}
+
+/// 승인 프리뷰 한 줄의 스타일 — unified diff 표기를 색으로 구분한다.
+/// (+ 추가=녹색, - 삭제=빨강, @@ 헝크=보조색, `--- diff/patch ---` 헤더=흐림)
+fn preview_line_style(row: &str, th: &Pal) -> Style {
+    if row == "--- diff ---" || row == "--- patch ---" {
+        return Style::default().fg(th.mute);
+    }
+    if row.starts_with("@@") {
+        return Style::default().fg(th.secondary);
+    }
+    if row.starts_with('+') {
+        return Style::default().fg(th.success);
+    }
+    if row.starts_with('-') {
+        return Style::default().fg(th.err);
+    }
+    Style::default().fg(th.text)
 }
 
 /// 엔트리 하나를 래핑 완료된 비주얼 행으로 렌더한다 (순수 함수 — 캐시 대상).
@@ -2085,5 +2208,22 @@ mod tests {
             .map(|span| super::super::md::display_width(&span.content))
             .sum();
         assert_eq!(width, 20);
+    }
+}
+
+#[cfg(test)]
+mod preview_style_tests {
+    use super::*;
+
+    #[test]
+    fn diff_lines_are_colored_by_marker() {
+        let th = pal_of(&palette::RAFIKX);
+        assert_eq!(preview_line_style("+added line", &th).fg, Some(th.success));
+        assert_eq!(preview_line_style("-removed line", &th).fg, Some(th.err));
+        assert_eq!(preview_line_style("@@ -1,3 +1,4 @@", &th).fg, Some(th.secondary));
+        assert_eq!(preview_line_style("--- diff ---", &th).fg, Some(th.mute));
+        assert_eq!(preview_line_style("--- patch ---", &th).fg, Some(th.mute));
+        assert_eq!(preview_line_style(" context line", &th).fg, Some(th.text));
+        assert_eq!(preview_line_style("plain text", &th).fg, Some(th.text));
     }
 }

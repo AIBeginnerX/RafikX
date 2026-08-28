@@ -27,7 +27,7 @@ mod lsp_tools;
 pub mod mutation;
 mod task;
 
-use lsp_tools::{LspDefinition, LspDiagnostics};
+use lsp_tools::{LspDefinition, LspDiagnostics, LspHover, LspReferences};
 pub use task::{TaskArgs, TaskResult, TaskTool};
 
 pub const MAX_LIST_ITEMS: usize = 500;
@@ -107,6 +107,8 @@ impl ToolRegistry {
                 Box::new(WebSearch),
                 Box::new(LspDiagnostics),
                 Box::new(LspDefinition),
+                Box::new(LspHover),
+                Box::new(LspReferences),
                 Box::new(EditFile),
                 Box::new(MultiEdit),
                 Box::new(WriteFile),
@@ -137,6 +139,8 @@ impl ToolRegistry {
         "web_search",
         "lsp_diagnostics",
         "lsp_definition",
+        "lsp_hover",
+        "lsp_references",
         "todo_read",
         "todo_write",
         "obsidian_search",
@@ -336,6 +340,33 @@ pub fn code_change_summary(
         "[코드 변경] {action} {}:{start}-{end} · +{added} -{removed}",
         path.display()
     )
+}
+
+/// 편집 후 언어 서버 진단 자동 수집 — 자가 검증 루프의 핵심.
+/// 예산(5초) 안에 서버가 답하면 결과를 덧붙이고, 서버가 없거나 늦거나
+/// 런타임이 block_in_place 를 못 쓰는 형태면 조용히 포기한다 (본 결과를 절대 막지 않는다).
+pub(crate) fn with_auto_diagnostics(output: String, resolved: &Path, ctx: &ToolCtx) -> String {
+    if !crate::lsp::has_server(resolved) {
+        return output;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return output;
+    };
+    // current_thread 런타임에선 block_in_place 가 패닉 — 자동 진단은 포기.
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+        return output;
+    }
+    let workspace = ctx.workspace.clone();
+    let path = resolved.to_path_buf();
+    let run = ctx.run.as_ref();
+    let note = tokio::task::block_in_place(|| {
+        handle.block_on(crate::lsp::diagnostics_quick(&workspace, &path, run))
+    });
+    let Ok(text) = note else {
+        return output;
+    };
+    let summary: Vec<&str> = text.lines().take(5).collect();
+    format!("{output}\n\n[lsp] {}", summary.join("\n"))
 }
 
 pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<String> {
@@ -698,7 +729,11 @@ impl Tool for EditFile {
                     )?;
                     ctx.commit_mutation(plan)?;
                     hashline::record_metric(ctx, "edit_file", "ok:anchors");
-                    return Ok(code_change_summary("수정", &resolved, &body, &old_span, new_str));
+                    return Ok(with_auto_diagnostics(
+                        code_change_summary("수정", &resolved, &body, &old_span, new_str),
+                        &resolved,
+                        ctx,
+                    ));
                 }
                 Err(e) => {
                     hashline::record_metric(ctx, "edit_file", "fail:hash_mismatch");
@@ -726,8 +761,10 @@ impl Tool for EditFile {
             updated.into_bytes(),
         )?;
         ctx.commit_mutation(plan)?;
-        Ok(code_change_summary(
-            "수정", &resolved, &body, old_str, new_str,
+        Ok(with_auto_diagnostics(
+            code_change_summary("수정", &resolved, &body, old_str, new_str),
+            &resolved,
+            ctx,
         ))
     }
 }
@@ -766,8 +803,10 @@ impl Tool for WriteFile {
         let mut plan = mutation::MutationPlan::new(&ctx.workspace)?;
         plan.replace(&resolved, before_state, content.as_bytes().to_vec())?;
         ctx.commit_mutation(plan)?;
-        Ok(code_change_summary(
-            action, &resolved, &before, &before, content,
+        Ok(with_auto_diagnostics(
+            code_change_summary(action, &resolved, &before, &before, content),
+            &resolved,
+            ctx,
         ))
     }
 }

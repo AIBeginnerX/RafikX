@@ -1,5 +1,6 @@
 mod md;
 mod start;
+mod tree;
 mod view;
 
 use std::io::{Write, stdout};
@@ -68,6 +69,8 @@ pub struct App {
     pub mode_line: String,
     /// 완료 요약 화면이 활성화되면 직전 실행의 늦은 진행 이벤트를 버린다.
     final_summary: bool,
+    /// 파일 탐색기 패널 — Some 이면 모달로 트리 키를 가로챈다 (Ctrl+T 토글).
+    pub tree: Option<tree::FileTree>,
     /// 현재 실행 중인 턴의 핸들 — Esc 인터럽트용
     pub turn_handle: Option<tokio::task::JoinHandle<()>>,
     pub active_run: Arc<Mutex<Option<crate::run::RunContext>>>,
@@ -245,6 +248,7 @@ pub async fn run(
         workers: Vec::new(),
         mode_line: String::new(),
         final_summary: false,
+        tree: None,
         turn_handle: None,
         active_run: Arc::new(Mutex::new(None)),
         cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -703,10 +707,37 @@ fn handle_key(
         return;
     }
 
+    // 파일 탐색기 모달 — 열려 있는 동안엔 트리 키만 먹는다. 승인·입력과 간섭하지 않게
+    // 오버레이들(approval·confirm·secret·text·picker) 뒤, 본 입력 앞에서 가로챈다.
+    if let Some(mut tree) = app.tree.take() {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.status = "파일 탐색기를 닫았습니다. (Ctrl+T 로 다시 열기)".into();
+            }
+            // Ctrl+T 는 토글 — 열려 있을 때 닫는다.
+            KeyCode::Char('t') | KeyCode::Char('T') if ctrl => {
+                app.status = "파일 탐색기를 닫았습니다.".into();
+            }
+            KeyCode::Down | KeyCode::Char('j') => tree.move_down(),
+            KeyCode::Up | KeyCode::Char('k') => tree.move_up(),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => tree.activate(),
+            KeyCode::Left | KeyCode::Char('h') => tree.collapse_or_up(),
+            _ => {}
+        }
+        app.tree = Some(tree);
+        return;
+    }
+
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
 
     match k.code {
+        KeyCode::Char('t') | KeyCode::Char('T') if ctrl => {
+            let workspace = app.session.cfg.workspace.clone();
+            app.tree = Some(tree::FileTree::open(&workspace));
+            app.status = "파일 탐색기 · ↑↓ 이동 · Enter 펼치기·미리보기 · Esc 닫기".into();
+        }
         KeyCode::PageUp => {
             app.follow = false;
             app.scroll = app.scroll.saturating_add(8);

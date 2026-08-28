@@ -82,7 +82,7 @@ pub fn render_diagnostics(result: &Value) -> String {
         .join("\n")
 }
 
-pub fn render_locations(result: &Value) -> String {
+pub fn render_locations(result: &Value, label: &str) -> String {
     let locations = result
         .as_array()
         .cloned()
@@ -103,15 +103,50 @@ pub fn render_locations(result: &Value) -> String {
         })
         .collect::<Vec<_>>();
     if rendered.is_empty() {
-        "LSP definition: not found".into()
+        format!("LSP {label}: not found")
     } else {
         rendered.join("\n")
+    }
+}
+
+/// textDocument/hover 결과 — contents 가 문자열·배열·MarkupContent 등 여러 모양이라
+/// 전부 문자열로 평탄화한다. 비어 있으면 not found.
+pub fn render_hover(result: &Value) -> String {
+    let default = Value::Null;
+    let contents = result.get("contents").unwrap_or(&default);
+    let rendered: Vec<String> = match contents {
+        Value::String(_) => vec![hover_piece(contents)],
+        Value::Array(items) => items.iter().map(hover_piece).collect(),
+        Value::Object(_) => vec![hover_piece(contents)],
+        _ => Vec::new(),
+    };
+    let rendered: Vec<String> = rendered
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    if rendered.is_empty() {
+        "LSP hover: not found".into()
+    } else {
+        rendered.join("\n")
+    }
+}
+
+fn hover_piece(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Object(map) => map
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn initialize_advertises_rust_analyzer_readiness_status() {
@@ -120,5 +155,23 @@ mod tests {
             params["capabilities"]["experimental"]["serverStatusNotification"],
             true
         );
+    }
+
+    #[test]
+    fn hover_flattens_all_contents_shapes() {
+        // MarkedString 문자열
+        assert_eq!(render_hover(&json!({"contents":"fn foo()"})), "fn foo()");
+        // MarkupContent
+        assert_eq!(
+            render_hover(&json!({"contents":{"kind":"markdown","value":"**docs**"}})),
+            "**docs**"
+        );
+        // MarkedString 배열
+        assert_eq!(
+            render_hover(&json!({"contents":["```rust\nu32\n```","설명"]})),
+            "```rust\nu32\n```\n설명"
+        );
+        assert_eq!(render_hover(&json!({})), "LSP hover: not found");
+        assert_eq!(render_locations(&json!([]), "references"), "LSP references: not found");
     }
 }
