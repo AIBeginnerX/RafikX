@@ -6,7 +6,10 @@
     "code": "src/ulw.rs",
     "excerpt": "pub const MAX_NUDGES: u32 = 3;\npub const MAX_RUNS: u32 = 1 + MAX_NUDGES;",
     "since": "1.1.0",
-    "tags": ["ulw", "automation"]
+    "tags": [
+      "ulw",
+      "automation"
+    ]
   },
   {
     "id": "ulw-resume",
@@ -15,7 +18,9 @@
     "code": "src/ulw.rs",
     "excerpt": "pub fn load(workspace: &Path, run_id: &str) -> Result<Self>",
     "since": "1.1.0",
-    "tags": ["ulw"]
+    "tags": [
+      "ulw"
+    ]
   },
   {
     "id": "ulw-telegram",
@@ -24,7 +29,10 @@
     "code": "src/telegram.rs",
     "excerpt": "fn spawn_ulw(bot: Bot, chat_id: ChatId, app: Arc<App>, goal: Option<String>, resume_id: Option<String>)",
     "since": "1.1.0",
-    "tags": ["ulw", "telegram"]
+    "tags": [
+      "ulw",
+      "telegram"
+    ]
   },
   {
     "id": "facts",
@@ -33,7 +41,9 @@
     "code": "src/tools/facts.rs",
     "excerpt": "\"사용자·프로젝트의 지속 사실(스택, 선호, 관습, 환경)을 기억한다.\"",
     "since": "1.1.0",
-    "tags": ["memory"]
+    "tags": [
+      "memory"
+    ]
   },
   {
     "id": "hashline",
@@ -42,16 +52,22 @@
     "code": "src/tools/hashline.rs",
     "excerpt": "pub fn verify_span(body: &str, start_raw: &str, end_raw: &str) -> Result<(usize, usize)>",
     "since": "1.1.0",
-    "tags": ["edit", "quality"]
+    "tags": [
+      "edit",
+      "quality"
+    ]
   },
   {
     "id": "combo",
     "tip": "[combos] 에 체인을 등록하면 모델이 죽어도 다음 모델로 이어집니다",
-    "detail": "chain = [\"claude:opus\", \"kimi:k2\"] 처럼 등록하고 /model 에서 combo 를 고륵세요. 요청 실패 시 체인 다음 후보로 자동 전환되고 \"폴 fallback: ... 사용 중\" 배지가 뜹니다.",
+    "detail": "chain = [\"claude:opus\", \"kimi:k2\"] 처럼 등록하고 /model 에서 combo 를 고륵세요. 요청 실패 시 체인 다음 후보로 자동 전환되고 \"폴 fallback: ... 사용 중\" 배지가 뜹니다. 콤보 이름은 ASCII 권장입니다 (TOML 키에 한글을 쓰려면 따옴표가 필요합니다).",
     "code": "src/harness/binding.rs",
     "excerpt": "pub const COMBO_MAX_HOPS: usize = 3;",
     "since": "1.1.0",
-    "tags": ["model", "reliability"]
+    "tags": [
+      "model",
+      "reliability"
+    ]
   },
   {
     "id": "quota",
@@ -60,7 +76,10 @@
     "code": "src/usage.rs",
     "excerpt": "pub fn quota_lines(cfg: &crate::config::Config) -> Vec<String>",
     "since": "1.1.0",
-    "tags": ["model", "ops"]
+    "tags": [
+      "model",
+      "ops"
+    ]
   },
   {
     "id": "init-deep",
@@ -69,7 +88,10 @@
     "code": "src/rules.rs",
     "excerpt": "pub fn propose_init_deep(workspace: &Path) -> Vec<InitDeepProposal>",
     "since": "1.1.0",
-    "tags": ["rules", "onboarding"]
+    "tags": [
+      "rules",
+      "onboarding"
+    ]
   },
   {
     "id": "fallback-architect",
@@ -78,7 +100,9 @@
     "code": "src/fallback.rs",
     "excerpt": "pub fn is_refusal_candidate(answer: &str, no_changes: bool, single_iteration: bool, signals: &[String]) -> bool",
     "since": "1.1.0",
-    "tags": ["reliability"]
+    "tags": [
+      "reliability"
+    ]
   },
   {
     "id": "engine",
@@ -87,7 +111,9 @@
     "code": "src/engine.rs",
     "excerpt": "pub fn catalog() -> &'static [EngineSpec]",
     "since": "1.0.0",
-    "tags": ["harness"]
+    "tags": [
+      "harness"
+    ]
   },
   {
     "id": "team-mode",
@@ -96,7 +122,10 @@
     "code": "src/harness/team.rs",
     "excerpt": "pub(crate) const TEAM_MULTI_BLOCK: &str",
     "since": "1.0.0",
-    "tags": ["harness", "parallel"]
+    "tags": [
+      "harness",
+      "parallel"
+    ]
   },
   {
     "id": "explorer-lane",
@@ -105,7 +134,10 @@
     "code": "src/harness/classify.rs",
     "excerpt": "pub fn suggest_lane(text: &str) -> Option<&'static str>",
     "since": "1.1.0",
-    "tags": ["lane", "speed"]
+    "tags": [
+      "lane",
+      "speed"
+    ]
   },
   {
     "id": "skills",
@@ -114,7 +146,9 @@
     "code": "src/skills.rs",
     "excerpt": "// 검색 위치는 전역(`~/.rafikx/skills`)과 워크스페이스(`<ws>/.rafikx/skills`) 둘이며,\n// 같은 이름이면 워크스페이스 스킬이 우선한다.",
     "since": "1.0.0",
-    "tags": ["skills"]
+    "tags": [
+      "skills"
+    ]
   },
   {
     "id": "inspector",
@@ -123,7 +157,10 @@
     "code": "src/inspector.rs",
     "excerpt": "const ANALYZE_PROMPT: &str = \"당신은 RafikX Inspector다.",
     "since": "0.6.0",
-    "tags": ["ops", "self-improve"]
+    "tags": [
+      "ops",
+      "self-improve"
+    ]
   },
   {
     "id": "self-harness",
@@ -132,7 +169,9 @@
     "code": "src/self_harness.rs",
     "excerpt": "// 1. Weakness Mining — 매 에피소드 종료 시 verifier-grounded 실패 시그니처 φ=(c,q,m) 를 추출한다.",
     "since": "0.6.0",
-    "tags": ["self-improve"]
+    "tags": [
+      "self-improve"
+    ]
   },
   {
     "id": "yolo",
@@ -141,6 +180,32 @@
     "code": "src/chat.rs",
     "excerpt": "(\"/yolo\", \"권한무시 on|off — 도구 자동 승인 (영속)\"),",
     "since": "0.7.0",
-    "tags": ["approval", "automation"]
+    "tags": [
+      "approval",
+      "automation"
+    ]
+  },
+  {
+    "id": "lsp-python",
+    "tip": "Python 진단은 pyright가 정확합니다 — pip install python-lsp-server 보다 npm i -g pyright 권장",
+    "detail": "lsp_diagnostics·lsp_definition 이 Rust/TS/Go/Python 을 지원합니다. pylsp 는 기본 설정에서 구문 오류를 빈 진단으로 보내는 경우가 있어(실측) pyright 를 권장합니다. 서버는 RafikX 가 자동 설치하지 않고, RAFIKX_LSP_PYTHON 등으로 경로 지정도 가능합니다.",
+    "code": "src/lsp/process.rs",
+    "excerpt": "for cand in [\"pyright-langserver\", \"pylsp\"] {",
+    "since": "1.1.0",
+    "tags": [
+      "lsp",
+      "ide"
+    ]
+  },
+  {
+    "id": "ulw-long",
+    "tip": "긴 작업은 /ulw 로 — 중단돼도 /ulw-resume 으로 이어집니다",
+    "detail": "수 분 이상 걸릴 작업은 /ulw 가 맞습니다. 산출물이 파일로 남고, 진전 없으면 재촉하고, 못 끝내면 blocked 로 보고합니다 — 조용한 실패가 없습니다.",
+    "code": "src/ulw.rs",
+    "excerpt": "pub fn nudge_message(&self) -> String",
+    "since": "1.1.0",
+    "tags": [
+      "ulw"
+    ]
   }
 ]

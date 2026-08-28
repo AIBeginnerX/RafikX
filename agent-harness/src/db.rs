@@ -549,6 +549,19 @@ impl Db {
         Ok(())
     }
 
+    /// 편집 지표 전역 조회 (F3 계측 → Inspector 인용) — (도구, 결과) 목록.
+    pub fn edit_metrics(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT label, detail FROM graph_events WHERE kind='edit_metric' ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn graph_events(&self, run_id: &str) -> Result<Vec<GraphEventRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, kind, label, detail, parent FROM graph_events WHERE run_id = ?1 ORDER BY seq ASC",

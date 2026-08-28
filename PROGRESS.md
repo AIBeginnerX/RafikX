@@ -1,3 +1,3 @@
-완료: v5 + 캠페인 1·2라운드 + G5 + ulw 기준별 증거 정교화(기준↔todo 매칭·개별 증거(매칭 todo+파일 변경+검증 통과)·evidence.md 표 갱신·검증 실패 시 충족 표시 금지, 실전 2파일 과업에서 기준별 상이 증거 확인). 테스트 329개 통과.
-다음: G6~G8 문서 개선 / Inspector의 ulw evidence 인용 / facts MCP 노출 / 성능 기준선 재측정.
+완료: Inspector 통합 — ulw 이력(상태·중단 사유) + 편집 지표(도구별 성공률·실패 유형) 자동 인용, 실inspect로 apply_patch 0/18 실패율 발견. 팁 18종(G6~G8 반영). 테스트 333개 통과.
+다음: apply_patch fail:apply 원인 조사 / facts MCP 노출 / 성능 기준선.
 이슈: 없음.

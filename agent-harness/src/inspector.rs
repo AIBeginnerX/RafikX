@@ -83,7 +83,9 @@ async fn build_report(
         let log_tail = error_log_tail(80);
         let doctor = doctor_snapshot(cfg);
         (
-            format_stats(&stats, runs.len(), lessons.len(), &log_tail, &doctor),
+            format_stats(&stats, runs.len(), lessons.len(), &log_tail, &doctor)
+                + "\n## ulw 자율 루프\n" + &ulw_summary(&cfg.workspace)
+                + "\n## 편집 지표\n" + &edit_metric_summary(&db),
             call_model,
         )
     };
@@ -126,6 +128,93 @@ struct Stats {
     tokens_in: i64,
     tokens_out: i64,
     top_errors: Vec<(String, usize)>,
+}
+
+/// ulw 자율 루프 이력 요약 — 워크스페이스 .omo/ulw/*/state.json 을 읽는다.
+fn ulw_summary(workspace: &std::path::Path) -> String {
+    let root = workspace.join(".omo").join("ulw");
+    let Ok(rd) = fs::read_dir(&root) else {
+        return "- (실행 없음)
+".into();
+    };
+    let mut done = 0usize;
+    let mut blocked = 0usize;
+    let mut running = 0usize;
+    let mut reasons: Vec<String> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path().join("state.json");
+        let Ok(body) = fs::read_to_string(&path) else { continue };
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+        match state.get("status").and_then(|s| s.as_str()) {
+            Some("done") => done += 1,
+            Some("blocked") => {
+                blocked += 1;
+                if let Some(r) = state.get("blocked_reason").and_then(|s| s.as_str())
+                    && !r.is_empty()
+                {
+                    reasons.push(r.to_string());
+                }
+            }
+            _ => running += 1,
+        }
+    }
+    let total = done + blocked + running;
+    if total == 0 {
+        return "- (실행 없음)
+".into();
+    }
+    let mut out = format!("- 실행 {total}건 — 완료 {done} · 중단 {blocked} · 진행 {running}
+");
+    for r in reasons.iter().take(3) {
+        out.push_str(&format!("- 중단 사유: {r}
+"));
+    }
+    out
+}
+
+/// 편집 지표 요약 — graph_events 의 edit_metric 을 도구·결과별로 집계한다.
+fn edit_metric_summary(db: &Db) -> String {
+    let Ok(rows) = db.edit_metrics() else {
+        return "- (계측 없음)
+".into();
+    };
+    if rows.is_empty() {
+        return "- (계측 없음)
+".into();
+    }
+    let mut by_tool: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut fail_reasons: HashMap<String, usize> = HashMap::new();
+    for (tool, outcome) in &rows {
+        let entry = by_tool.entry(tool.clone()).or_insert((0, 0));
+        if outcome.starts_with("ok") {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+            *fail_reasons.entry(outcome.clone()).or_insert(0) += 1;
+        }
+    }
+    let total_ok: usize = by_tool.values().map(|(o, _)| o).sum();
+    let total_fail: usize = by_tool.values().map(|(_, f)| f).sum();
+    let rate = if total_ok + total_fail == 0 {
+        0.0
+    } else {
+        total_ok as f64 * 100.0 / (total_ok + total_fail) as f64
+    };
+    let mut out = format!("- 편집 {total}건 — 성공 {total_ok} · 실패 {total_fail} · 성공률 {rate:.0}%
+", total = total_ok + total_fail);
+    let mut tools: Vec<_> = by_tool.iter().collect();
+    tools.sort_by_key(|(k, _)| k.clone());
+    for (tool, (ok, fail)) in tools {
+        out.push_str(&format!("- {tool}: 성공 {ok} · 실패 {fail}
+"));
+    }
+    let mut reasons: Vec<_> = fail_reasons.iter().collect();
+    reasons.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (reason, n) in reasons.into_iter().take(3) {
+        out.push_str(&format!("- 실패 유형 {reason}: {n}건
+"));
+    }
+    out
 }
 
 fn compute_stats(runs: &[RunRow]) -> Stats {
@@ -472,5 +561,64 @@ mod tests {
             stream: false,
         };
         assert!(req.tools.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn ulw_summary_counts_statuses_and_reasons() {
+        let dir = std::env::temp_dir().join(format!("rafikx-insp-ulw-{}", std::process::id()));
+        let ulw = dir.join(".omo").join("ulw");
+        fs::create_dir_all(ulw.join("a")).unwrap();
+        fs::create_dir_all(ulw.join("b")).unwrap();
+        fs::write(ulw.join("a/state.json"), r#"{"status":"done"}"#).unwrap();
+        fs::write(
+            ulw.join("b/state.json"),
+            r#"{"status":"blocked","blocked_reason":"재촉 초과"}"#,
+        )
+        .unwrap();
+        let out = ulw_summary(&dir);
+        assert!(out.contains("실행 2건"));
+        assert!(out.contains("완료 1"));
+        assert!(out.contains("중단 1"));
+        assert!(out.contains("재촉 초과"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ulw_summary_empty_when_no_runs() {
+        let dir = std::env::temp_dir().join(format!("rafikx-insp-empty-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(ulw_summary(&dir).contains("실행 없음"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_metric_summary_aggregates() {
+        let dir = std::env::temp_dir().join(format!("rafikx-insp-em-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        let run = db.start_run("t", "x", None, None, None, None).unwrap();
+        db.push_graph_event(&run, "edit_metric", "edit_file", "ok:anchors", None).unwrap();
+        db.push_graph_event(&run, "edit_metric", "edit_file", "ok:anchors", None).unwrap();
+        db.push_graph_event(&run, "edit_metric", "edit_file", "fail:hash_mismatch", None).unwrap();
+        let out = edit_metric_summary(&db);
+        assert!(out.contains("편집 3건"));
+        assert!(out.contains("성공 2"));
+        assert!(out.contains("hash_mismatch"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_metric_summary_empty() {
+        let dir = std::env::temp_dir().join(format!("rafikx-insp-em0-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        assert!(edit_metric_summary(&db).contains("계측 없음"));
+        let _ = fs::remove_dir_all(dir);
     }
 }
