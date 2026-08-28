@@ -20,6 +20,7 @@ pub mod lessons;
 pub mod lifecycle;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_serve;
 pub mod menu;
 pub mod model_wizard;
 pub mod obsidian;

@@ -79,6 +79,8 @@ enum Commands {
     InitDeep,
     /// 계정·프로바이더 쿼터 상태
     Quota,
+    /// MCP 서버 모드 (facts 메모리 remember/recall/forget/list 를 stdio MCP로 노출)
+    McpServe,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
     Update,
     /// Vault 노트를 FTS5에 인덱싱
@@ -258,6 +260,7 @@ async fn main() -> ExitCode {
         Some(Commands::Facts) => cmd_facts(&cli),
         Some(Commands::InitDeep) => cmd_init_deep(&cli),
         Some(Commands::Quota) => cmd_quota(&cli),
+        Some(Commands::McpServe) => rafikx::mcp_serve::stdio().await,
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
         Some(Commands::Inspect {
