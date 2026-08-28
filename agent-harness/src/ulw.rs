@@ -20,6 +20,21 @@ pub const MAX_NUDGES: u32 = 3;
 /// 총 실행 상한 = 초기 실행 + 재촉 3회.
 pub const MAX_RUNS: u32 = 1 + MAX_NUDGES;
 
+/// 기준↔todo 텍스트 매칭 점수 — 공유 토큰(2자 이상) 수. 한글도 단어 경계가
+/// 띄어쓰기라면 동작한다 (완전 일치가 아니라 유사도다 — 낮을수록 보수적).
+pub(crate) fn match_score(criterion: &str, todo: &str) -> usize {
+    let tokens = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 2)
+            .map(str::to_string)
+            .collect()
+    };
+    let ct = tokens(criterion);
+    let tt = tokens(todo);
+    ct.iter().filter(|tok| tt.contains(tok)).count()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Criterion {
     pub text: String,
@@ -66,6 +81,8 @@ pub struct RunSummaryLite {
     pub iterations: u32,
     pub tool_errors: usize,
     pub answer_tail: String,
+    /// 턴 종료 시 todo 목록 (내용, 상태) — 기준별 개별 판정의 근거.
+    pub todos: Vec<(String, String)>,
     /// ulw 가 에이전트 주장과 독립으로 직접 실행한 검증 (F4b 품질 게이트).
     /// verify_ran=false 면 검증 불필요(코드 변경 없음·감지된 명령 없음)로 본다.
     pub verify_ran: bool,
@@ -263,21 +280,66 @@ impl UlwState {
                 return Ok(UlwVerdict::Blocked(self.blocked_reason.clone()));
             }
         }
-        let all_done =
-            summary.total_todos > 0 && summary.completed_todos == summary.total_todos && verify_passed;
-        if all_done {
-            for c in &mut self.criteria {
-                if c.status != "met" {
-                    c.status = "met".into();
-                    c.evidence = format!("실행 #{}: todo 전부 완료 + {}", self.runs, files);
-                }
+        // 기준별 개별 판정 (F4 정교화) — "todo 전부 완료" 담합 프록시로 전부 met 를
+        // 찍는 대신, 기준↔todo 텍스트 매칭으로 각 기준을 따로 판정하고 증거도 다르게 쓴다.
+        let mut newly_met = 0usize;
+        let all_todos_done =
+            summary.total_todos > 0 && summary.completed_todos == summary.total_todos;
+        for c in &mut self.criteria {
+            if c.status == "met" {
+                continue;
             }
+            let best = summary
+                .todos
+                .iter()
+                .map(|(content, status)| (match_score(&c.text, content), content, status))
+                .max_by_key(|(s, _, _)| *s);
+            let todo_met =
+                matches!(best, Some((s, _, st)) if s >= 2 && st.as_str() == "completed");
+            // 전체 완료 폴백 — 계획과 todo 표현이 어긋나도 목표를 막지 않는다.
+            // 매칭 품질은 증거 문구에 남긴다 (점수 0 이면 직접 대응 없음을 명시).
+            // 검증이 실패한 실행에서는 어떤 기준도 충족으로 표시하지 않는다 (품질 게이트).
+            let blanket_met = all_todos_done;
+            if (todo_met || blanket_met) && verify_passed {
+                c.status = "met".into();
+                newly_met += 1;
+                let (score, matched) = best
+                    .map(|(s, content, _)| (s, content.clone()))
+                    .unwrap_or((0, String::new()));
+                let mut ev = if todo_met {
+                    format!("실행 #{}: todo 완료 — {}", self.runs, matched)
+                } else if score >= 1 {
+                    format!("실행 #{}: todo 완료 — {} (유사 항목)", self.runs, matched)
+                } else {
+                    format!("실행 #{}: 전체 todo 완료로 충족 처리 (직접 대응 항목 없음)", self.runs)
+                };
+                for f in &summary.changed_files {
+                    let stem = f.rsplit('/').next().unwrap_or(f);
+                    if !stem.is_empty() && c.text.contains(stem) {
+                        ev.push_str(&format!(" · 파일 변경: {f}"));
+                    }
+                }
+                if summary.verify_ran
+                    && summary.verify_ok
+                    && (c.text.contains("테스트") || c.text.contains("검증") || c.text.contains("통과") || c.text.to_lowercase().contains("test"))
+                {
+                    ev.push_str(" · 검증 통과");
+                }
+                c.evidence = ev;
+            }
+        }
+        // evidence.md 의 기준 표를 현재 상태로 다시 쓴다 (실행 기록은 보존).
+        self.rewrite_criteria_table(&dir);
+        let met = self.criteria.iter().filter(|c| c.status == "met").count();
+        let all_met = !self.criteria.is_empty() && met == self.criteria.len();
+        let all_done = all_met && verify_passed;
+        if all_done {
             self.status = "done".into();
             self.save(workspace)?;
             return Ok(UlwVerdict::Done);
         }
 
-        if progress && !verify_failed {
+        if (progress || newly_met > 0) && !verify_failed {
             self.nudges = 0;
         } else {
             self.nudges += 1;
@@ -330,6 +392,31 @@ impl UlwState {
         )
     }
 
+    /// evidence.md 상단의 기준 표를 현재 상태로 갱신한다 (실행 기록 부분은 보존).
+    fn rewrite_criteria_table(&self, dir: &Path) {
+        let path = dir.join("evidence.md");
+        let Ok(existing) = std::fs::read_to_string(&path) else { return };
+        let log_part = existing
+            .split_once("## 실행 기록")
+            .map(|(_, tail)| tail.to_string())
+            .unwrap_or_default();
+        let mut out = String::from("# 증거 로그
+
+| 기준 | 상태 | 증거 |
+|---|---|---|
+");
+        for c in &self.criteria {
+            let status = if c.status == "met" { "충족" } else { "대기" };
+            let evidence = if c.evidence.is_empty() { "—" } else { &c.evidence };
+            out.push_str(&format!("| {} | {} | {} |
+", c.text, status, evidence));
+        }
+        out.push_str("
+## 실행 기록");
+        out.push_str(&log_part);
+        let _ = std::fs::write(path, out);
+    }
+
     pub fn write_report(&self, workspace: &Path, extra: &str) -> Result<()> {
         let dir = Self::dir(workspace, &self.run_id);
         let mut body = format!(
@@ -371,6 +458,14 @@ mod tests {
             iterations: 3,
             tool_errors: 0,
             answer_tail: "완료했습니다".into(),
+            todos: (0..total)
+                .map(|i| {
+                    (
+                        format!("작업 {i}"),
+                        if i < completed { "completed".into() } else { "pending".into() },
+                    )
+                })
+                .collect(),
             verify_ran: false,
             verify_ok: false,
             verify_tail: String::new(),
@@ -396,7 +491,7 @@ mod tests {
     fn done_when_all_todos_completed() {
         let (dir, mut state) = setup("done");
         state
-            .set_criteria(&dir, "plan", vec!["a".into(), "b".into()])
+            .set_criteria(&dir, "plan", vec!["작업 완료 확인".into(), "테스트 통과".into()])
             .unwrap();
         let verdict = state.record_run(&dir, &summary(3, 3)).unwrap();
         assert_eq!(verdict, UlwVerdict::Done);
@@ -486,7 +581,7 @@ mod quality_gate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut state = UlwState::start(&dir, "기능 추가").unwrap();
         state
-            .set_criteria(&dir, "plan", vec!["테스트 통과".into()])
+            .set_criteria(&dir, "plan", vec!["테스트 통과 확인".into()])
             .unwrap();
         (dir, state)
     }
@@ -499,6 +594,14 @@ mod quality_gate_tests {
             iterations: 2,
             tool_errors: 0,
             answer_tail: String::new(),
+            todos: (0..total)
+                .map(|i| {
+                    (
+                        format!("작업 {i}"),
+                        if i < completed { "completed".into() } else { "pending".into() },
+                    )
+                })
+                .collect(),
             verify_ran: ran,
             verify_ok: ok,
             verify_tail: tail.into(),
@@ -523,6 +626,7 @@ mod quality_gate_tests {
         let verdict = state
             .record_run(&dir, &summary_with_verify(2, 2, true, true, ""))
             .unwrap();
+        // 품질 게이트 우회 없이 todo 완료 + 검증 통과로 done
         assert_eq!(verdict, UlwVerdict::Done);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -561,5 +665,93 @@ mod quality_gate_tests {
         assert!(msg.contains("auth"));
         assert!(msg.contains("같은 방식의 재시도는 금지"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+
+#[cfg(test)]
+mod per_criterion_tests {
+    use super::*;
+
+    fn setup(tag: &str) -> (PathBuf, UlwState) {
+        let dir = std::env::temp_dir().join(format!("rafikx-ulwpc-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = UlwState::start(&dir, "목표").unwrap();
+        (dir, state)
+    }
+
+    #[test]
+    fn criteria_get_individual_evidence() {
+        let (dir, mut state) = setup("distinct");
+        state
+            .set_criteria(
+                &dir,
+                "plan",
+                vec!["api.rs 에 로그인 추가".into(), "테스트 작성".into()],
+            )
+            .unwrap();
+        let summary = RunSummaryLite {
+            changed_files: vec!["src/api.rs".into()],
+            completed_todos: 2,
+            total_todos: 2,
+            iterations: 2,
+            tool_errors: 0,
+            answer_tail: String::new(),
+            todos: vec![
+                ("api.rs 로그인 구현".into(), "completed".into()),
+                ("테스트 작성".into(), "completed".into()),
+            ],
+            verify_ran: true,
+            verify_ok: true,
+            verify_tail: String::new(),
+        };
+        let verdict = state.record_run(&dir, &summary).unwrap();
+        assert_eq!(verdict, UlwVerdict::Done);
+        let e0 = &state.criteria[0].evidence;
+        let e1 = &state.criteria[1].evidence;
+        assert!(e0.contains("로그인"), "기준1 증거: {e0}");
+        assert!(e0.contains("파일 변경: src/api.rs"), "기준1 파일 증거: {e0}");
+        assert!(e1.contains("테스트 작성"), "기준2 증거: {e1}");
+        assert!(e1.contains("검증 통과"), "기준2 검증 증거: {e1}");
+        assert_ne!(e0, e1, "증거가 서로 달라야 한다");
+        // evidence.md 표도 개별 갱신됐는지
+        let md = std::fs::read_to_string(UlwState::dir(&dir, &state.run_id).join("evidence.md")).unwrap();
+        assert!(md.contains("충족"));
+        assert!(md.contains("로그인 구현"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn partial_todo_completion_keeps_unmatched_criterion_pending() {
+        let (dir, mut state) = setup("partial");
+        state
+            .set_criteria(&dir, "plan", vec!["api.rs 추가".into(), "문서 작성".into()])
+            .unwrap();
+        let summary = RunSummaryLite {
+            changed_files: vec![],
+            completed_todos: 1,
+            total_todos: 2,
+            iterations: 1,
+            tool_errors: 0,
+            answer_tail: String::new(),
+            todos: vec![
+                ("api.rs 추가".into(), "completed".into()),
+                ("문서 작성".into(), "pending".into()),
+            ],
+            verify_ran: false,
+            verify_ok: false,
+            verify_tail: String::new(),
+        };
+        let verdict = state.record_run(&dir, &summary).unwrap();
+        assert_eq!(verdict, UlwVerdict::Continue);
+        assert_eq!(state.criteria[0].status, "met");
+        assert_eq!(state.criteria[1].status, "pending");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn match_score_shared_tokens() {
+        assert!(match_score("api.rs 에 로그인 추가", "api.rs 로그인 구현") >= 2);
+        assert_eq!(match_score("문서 작성", "테스트 실행"), 0);
     }
 }

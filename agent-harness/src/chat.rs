@@ -1957,6 +1957,7 @@ pub async fn run_turn_observed(
                 ctx_window: binding.context_window,
                 cached_in: outcome.cached_tokens,
                 cache_reported: outcome.cache_reported,
+                todos: crate::tools_more::current_todos_in(&run_context),
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 answer,
                 summary,
@@ -2011,6 +2012,8 @@ pub struct TurnInfo {
     pub elapsed_ms: u64,
     /// 모델이 사용자의 요청에 직접 답한 최종 Markdown 본문.
     pub answer: String,
+    /// 턴 종료 시점의 todo 목록 — ulw 기준별 판정(F4 개선)에 쓴다.
+    pub todos: Vec<crate::tools_more::TodoItem>,
     pub summary: CompletionSummary,
     pub lifecycle_state: Option<crate::lifecycle::LifecycleState>,
     pub lifecycle: Vec<crate::lifecycle::LifecycleEvent>,
@@ -2688,6 +2691,7 @@ fn ulw_summary_of(info: &TurnInfo) -> crate::ulw::RunSummaryLite {
         iterations: info.summary.iterations,
         tool_errors: info.summary.tool_errors,
         answer_tail: info.answer.chars().take(200).collect(),
+        todos: info.todos.iter().map(|td| (td.content.clone(), td.status.clone())).collect(),
         verify_ran: false,
         verify_ok: false,
         verify_tail: String::new(),

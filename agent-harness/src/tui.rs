@@ -1223,6 +1223,7 @@ fn start_compact(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>) {
             Ok(len) => {
                 push_live_system(format!("압축 완료 ({len}자 요약)."));
                 Ok(chat::TurnInfo {
+                    todos: Vec::new(),
                     run_id: String::new(),
                     label: "compact 완료".into(),
                     status: "ok".into(),
@@ -1272,6 +1273,7 @@ fn start_assign(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>) {
                 }
                 session.sticky = None;
                 Ok(chat::TurnInfo {
+                    todos: Vec::new(),
                     run_id: String::new(),
                     label: "역할 배정 완료".into(),
                     status: "ok".into(),
@@ -1318,6 +1320,7 @@ fn start_model_fetch(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>, q
         // 카탈로그는 config 가 아니라 catalogs.json 이고 조회할 때마다 파일에서
         // 읽으므로 cfg.reload() 는 필요 없다.
         let result = Ok(chat::TurnInfo {
+                    todos: Vec::new(),
             run_id: String::new(),
             label: "모델 목록 갱신 완료".into(),
             status: "ok".into(),
@@ -2635,6 +2638,7 @@ mod upgrade_tests {
     #[test]
     fn completion_report_has_no_next_action_menu() {
         let info = chat::TurnInfo {
+            todos: Vec::new(),
             run_id: "run-1".into(),
             label: "dev".into(),
             status: "ok".into(),
