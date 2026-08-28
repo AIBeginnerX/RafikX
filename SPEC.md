@@ -1,3 +1,5 @@
+> ⚠️ 이 문서는 v3 시절(2026-08 초) 기준입니다. 현행 구현(v1.0.1+)은 README.md와 docs/HARNESS_V2_DESIGN.md가 기준이며, 앞으로의 Phase 지시는 v5 기획서를 따릅니다. 5장 '인터페이스 계약'·6장 '안전장치' 등 설계 원칙은 여전히 유효합니다.
+
 🛠 RafikX v3.0 — AI 구현 지시서 (SPEC.md)
 목적: Rust 기반 초경량 개인용 AI 코딩 에이전트 CLI (Claude Code류) v3 핵심: ① 작업 난이도별 자동 Harness(서브에이전트) 시스템 ② 자기학습 메모리(같은 실수 반복 방지) ③ Inspector 자가 점검 에이전트(오류 로그 분석 → 개선 리포트) ④ 모바일 원격 접속 필수화(텔레그램) 사용법: 이 파일을 프로젝트 루트에 SPEC.md로 저장 → AI(Claude Code / Cursor)에게 "SPEC.md의 Phase N을 구현해라"라고 지시
 
