@@ -1,3 +1,3 @@
-완료: v5 전체 + 실모델 /ulw 종단 검증 + 분야별 검증 테스트 캠페인(T1~T8) — 실버그 2건(비대화형 승인 프롬프트 EOF 무한 루프·ask 경로 config yolo 미적용)과 개선 3건(편집 동사 분류·judge 실패 경고·ask 레인 라우팅·메모리 도구 상시 보장) 수정, 테스트 317개 통과.
-다음: v6 후보 — Python LSP 매핑 추가 / 기준별 증거 정교화 / Inspector의 ulw evidence 인용.
+완료: v5 + 캠페인 1~2라운드 — Python LSP 완성(pyright/pylsp·push/pull 이중·workspaceFolders), 확장 테스트 T9~T15 + 데스크탑 QA(스플래시 대응 수정 후 10면 통과), 콤보 배지 가시화. 테스트 321개 통과.
+다음: G5(인용 속 지시어 혼선 IntentGate 강화) / ulw 기준별 증거 정교화 / Inspector evidence 인용.
 이슈: 없음.
