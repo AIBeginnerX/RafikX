@@ -230,14 +230,19 @@ async fn on_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let Some(text) = msg.text() else {
         return Ok(());
     };
-    if text.starts_with("/ulw") {
-        send_chunks(
-            &bot,
-            msg.chat.id,
-            "/ulw 자율 루프는 터미널(CLI/TUI)에서 시작하세요 — 원격 승인 연결은 F4b 에서 다룹니다. \
-             시작되면 완료·중단 시 이 채팅으로 알림이 옵니다.",
-        )
-        .await?;
+    if let Some(rest) = text.strip_prefix("/ulw-resume") {
+        let id = rest.trim();
+        let id = if id.is_empty() { None } else { Some(id.to_string()) };
+        spawn_ulw(bot.clone(), msg.chat.id, app.clone(), None, id);
+        return Ok(());
+    }
+    if let Some(rest) = text.strip_prefix("/ulw") {
+        let goal = rest.trim();
+        if goal.is_empty() {
+            send_chunks(&bot, msg.chat.id, "/ulw <목표> — 증거가 모일 때까지 자율 실행. /ulw-resume [id] 로 재개.").await?;
+            return Ok(());
+        }
+        spawn_ulw(bot.clone(), msg.chat.id, app.clone(), Some(goal.to_string()), None);
         return Ok(());
     }
     if text.starts_with('/') {
@@ -245,6 +250,46 @@ async fn on_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
         return Ok(());
     }
     run_ask(&bot, &msg, &app, text).await
+}
+
+/// ulw 루프를 백그라운드 태스크로 실행한다 (F4b) — 데몬이 다른 메시지에 응답할 수 있게.
+/// 승인은 인라인 버튼(LocalAsk 어댑터), 완료·중단 알림은 ulw_finish 의 notify_owner 가 담당.
+fn spawn_ulw(bot: Bot, chat_id: ChatId, app: Arc<App>, goal: Option<String>, resume_id: Option<String>) {
+    tokio::spawn(async move {
+        let cfg = app.cfg.clone();
+        if !cfg.file.telegram.allow_agent {
+            let _ = send_chunks(
+                &bot,
+                chat_id,
+                "ulw 는 파일 편집·명령 실행이 필요합니다. config [telegram] allow_agent=true 일 때만 원격 실행됩니다.",
+            )
+            .await;
+            return;
+        }
+        let mut session = match crate::chat::open_session(cfg.clone(), false, None, None, None, None, true) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = send_chunks(&bot, chat_id, &format!("ulw 세션 시작 실패: {e}")).await;
+                return;
+            }
+        };
+        let local_ask = make_local_ask(bot.clone(), chat_id, &app);
+        let _ = send_chunks(&bot, chat_id, "[ulw] 루프를 시작합니다. 승인 요청은 버튼으로 옵니다.").await;
+        let result = match (goal, resume_id) {
+            (Some(goal), _) => match crate::ulw::UlwState::start(&cfg.workspace, &goal) {
+                Ok(state) => {
+                    crate::chat::ulw_loop_observed(&mut session, &goal, state, None, Some(local_ask)).await
+                }
+                Err(e) => Err(e),
+            },
+            (None, id) => {
+                crate::chat::ulw_resume_observed(&mut session, id, None, Some(local_ask)).await
+            }
+        };
+        if let Err(e) = result {
+            let _ = send_chunks(&bot, chat_id, &format!("[ulw] 오류: {e}")).await;
+        }
+    });
 }
 
 async fn on_callback(bot: Bot, q: CallbackQuery, app: Arc<App>) -> ResponseResult<()> {
@@ -409,6 +454,41 @@ fn make_remote(bot: Bot, chat_id: ChatId, app: &Arc<App>) -> RemoteApproval {
             })
         }),
     }
+}
+
+/// ulw 루프용 로컬 승인 어댑터 (F4b) — 인라인 버튼 승인을 LocalAsk 형태로 제공한다.
+/// 원격에서는 Always 가 없다 (자동 승인 금지 규칙 — effective_yes 강제 차단과 같은 철학).
+fn make_local_ask(bot: Bot, chat_id: ChatId, app: &Arc<App>) -> crate::agent::LocalAsk {
+    let pending = app.pending.clone();
+    let app = app.clone();
+    std::sync::Arc::new(move |preview: String| {
+        let bot = bot.clone();
+        let pending = pending.clone();
+        let app = app.clone();
+        Box::pin(async move {
+            let id = next_approval_id(&app);
+            let (tx, rx) = oneshot::channel();
+            pending.lock().await.insert(id.clone(), (chat_id, tx));
+            let kb = InlineKeyboardMarkup::new([[
+                InlineKeyboardButton::callback("✅ 승인", format!("ok:{id}")),
+                InlineKeyboardButton::callback("❌ 거부", format!("no:{id}")),
+            ]]);
+            let body = truncate_preview(&preview);
+            if bot
+                .send_message(chat_id, body)
+                .reply_markup(kb)
+                .await
+                .is_err()
+            {
+                pending.lock().await.remove(&id);
+                return crate::agent::ApprovalChoice::No;
+            }
+            match rx.await {
+                Ok(true) => crate::agent::ApprovalChoice::Yes,
+                _ => crate::agent::ApprovalChoice::No,
+            }
+        })
+    })
 }
 
 async fn reject_pending_for_chat(app: &App, chat_id: ChatId) {

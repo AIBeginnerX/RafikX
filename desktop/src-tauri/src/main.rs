@@ -264,6 +264,60 @@ async fn send(
     let mut prompt = prompt.trim().to_string();
     if prompt.starts_with('/') && !prompt.starts_with("/agent ") {
         let slash = api::apply_slash(&mut session, &prompt).map_err(err)?;
+        if slash.ulw_goal.is_some() || slash.ulw_resume.is_some() {
+            // /ulw 자율 루프 (F4b) — 한 send 안에서 루프 전체를 돌린다.
+            // 라이브 이벤트·승인 브리지는 평소 턴과 동일하게 동작한다.
+            if let Ok(mut active) = inner.active_sid.lock() {
+                *active = Some(sid.clone());
+            }
+            if let Ok(mut pending) = inner.cancel_pending.lock() {
+                pending.remove(&sid);
+            }
+            let ask = local_ask(app.clone(), inner.clone());
+            let observer = run_observer(app.clone(), inner.clone(), sid.clone());
+            install_live(app.clone());
+            let result = if let Some(goal) = slash.ulw_goal {
+                match rafikx::ulw::UlwState::start(&session.cfg.workspace, &goal) {
+                    Ok(state) => {
+                        rafikx::chat::ulw_loop_observed(
+                            &mut session,
+                            &goal,
+                            state,
+                            Some(observer),
+                            Some(ask),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                let id = slash.ulw_resume.filter(|s| !s.is_empty());
+                rafikx::chat::ulw_resume_observed(&mut session, id, Some(observer), Some(ask))
+                    .await
+            };
+            ui::set_live(None);
+            if let Ok(mut runs) = inner.runs.lock() {
+                runs.remove(&sid);
+            }
+            if let Ok(mut active) = inner.active_sid.lock() {
+                *active = None;
+            }
+            if session.dirty {
+                let _ = rafikx::chat::save_if_dirty(&mut session);
+            }
+            let messages = api::transcript(&session);
+            let session_id = session.session_id.clone();
+            let turn = result.map(|info| api::turn_result_of(&session, info)).map_err(err)?;
+            put_session(&inner, sid, session)?;
+            return Ok(SendResult {
+                kind: "ulw".into(),
+                notes: String::new(),
+                quit: false,
+                turn: Some(turn),
+                messages,
+                session_id,
+            });
+        }
         if let Some(task) = slash.agent_task {
             prompt = task;
             session.class = Some("dev".into());

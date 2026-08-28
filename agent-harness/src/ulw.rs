@@ -48,6 +48,11 @@ pub struct UlwState {
     pub last_completed: usize,
     #[serde(default)]
     pub blocked_reason: String,
+    /// 직전 검증 실패 시그니처 — 같은 실패의 연속 횟수를 센다 (디버그 루프 탈출 조건).
+    #[serde(default)]
+    pub last_failure_sig: String,
+    #[serde(default)]
+    pub failure_streak: u32,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -61,6 +66,11 @@ pub struct RunSummaryLite {
     pub iterations: u32,
     pub tool_errors: usize,
     pub answer_tail: String,
+    /// ulw 가 에이전트 주장과 독립으로 직접 실행한 검증 (F4b 품질 게이트).
+    /// verify_ran=false 면 검증 불필요(코드 변경 없음·감지된 명령 없음)로 본다.
+    pub verify_ran: bool,
+    pub verify_ok: bool,
+    pub verify_tail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +108,8 @@ impl UlwState {
             nudges: 0,
             last_completed: 0,
             blocked_reason: String::new(),
+            last_failure_sig: String::new(),
+            failure_streak: 0,
             created_at: now,
             updated_at: now,
         };
@@ -204,8 +216,15 @@ impl UlwState {
         } else {
             summary.changed_files.join(", ")
         };
+        let verify_line = if !summary.verify_ran {
+            "검증: 생략(변경 없음 또는 명령 미감지)".to_string()
+        } else if summary.verify_ok {
+            "검증: 통과".to_string()
+        } else {
+            format!("검증: 실패 — {}", summary.verify_tail.chars().take(200).collect::<String>())
+        };
         let entry = format!(
-            "\n### 실행 #{} — todo {}/{} · 반복 {} · 오류 {} · 진전 {}\n- 변경 파일: {}\n- 답변 끝: {}\n",
+            "\n### 실행 #{} — todo {}/{} · 반복 {} · 오류 {} · 진전 {}\n- 변경 파일: {}\n- {}\n- 답변 끝: {}\n",
             self.runs,
             summary.completed_todos,
             summary.total_todos,
@@ -213,6 +232,7 @@ impl UlwState {
             summary.tool_errors,
             if progress { "있음" } else { "없음" },
             files,
+            verify_line,
             summary.answer_tail.chars().take(200).collect::<String>()
         );
         let evidence_path = dir.join("evidence.md");
@@ -220,7 +240,31 @@ impl UlwState {
         ev.push_str(&entry);
         std::fs::write(&evidence_path, ev)?;
 
-        let all_done = summary.total_todos > 0 && summary.completed_todos == summary.total_todos;
+        // 품질 게이트 (F4b): todo 완료만으로는 부족 — 코드 변경이 있었으면 ulw 가 직접
+        // 실행한 검증(빌드·테스트)도 통과해야 한다. 에이전트의 "다 됐습니다"는 증거가 아니다.
+        let verify_passed = !summary.verify_ran || summary.verify_ok;
+        let verify_failed = summary.verify_ran && !summary.verify_ok;
+        if verify_failed {
+            let sig: String = summary.verify_tail.chars().take(120).collect();
+            if sig == self.last_failure_sig && !sig.is_empty() {
+                self.failure_streak += 1;
+            } else {
+                self.failure_streak = 1;
+            }
+            self.last_failure_sig = sig;
+            if self.failure_streak >= 3 {
+                self.status = "blocked".into();
+                self.blocked_reason = format!(
+                    "같은 검증 실패가 {}회 연속 — 독립 리뷰가 필요합니다: {}",
+                    self.failure_streak,
+                    summary.verify_tail.chars().take(120).collect::<String>()
+                );
+                self.save(workspace)?;
+                return Ok(UlwVerdict::Blocked(self.blocked_reason.clone()));
+            }
+        }
+        let all_done =
+            summary.total_todos > 0 && summary.completed_todos == summary.total_todos && verify_passed;
         if all_done {
             for c in &mut self.criteria {
                 if c.status != "met" {
@@ -233,7 +277,7 @@ impl UlwState {
             return Ok(UlwVerdict::Done);
         }
 
-        if progress {
+        if progress && !verify_failed {
             self.nudges = 0;
         } else {
             self.nudges += 1;
@@ -253,15 +297,25 @@ impl UlwState {
         Ok(UlwVerdict::Continue)
     }
 
-    /// Todo Enforcer 가 주입하는 재촉 메시지.
+    /// Todo Enforcer 가 주입하는 재촉 메시지 — 직전 검증 실패 로그가 있으면 함께 준다
+    /// (디버그 루프: 에이전트는 추측이 아니라 실제 실패 출력을 보고 고친다).
     pub fn nudge_message(&self) -> String {
         let unmet: Vec<String> = self.unmet().iter().map(|c| format!("- {}", c.text)).collect();
+        let failure = if self.last_failure_sig.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n직전 검증 실패 로그 (연속 {}회):\n```\n{}\n```\n이 출력의 원인을 먼저 고쳐라. 같은 방식의 재시도는 금지한다.",
+                self.failure_streak, self.last_failure_sig
+            )
+        };
         format!(
-            "[ulw 재촉 {}/{}] 아직 완료 기준이 {}개 남았습니다:\n{}\n계속하세요. 각 기준의 증거(명령 출력·테스트 결과·파일 경로)를 모으기 전에는 완료를 선언하지 마세요.",
+            "[ulw 재촉 {}/{}] 아직 완료 기준이 {}개 남았습니다:\n{}\n계속하세요. 각 기준의 증거(명령 출력·테스트 결과·파일 경로)를 모으기 전에는 완료를 선언하지 마세요.{}",
             self.nudges,
             MAX_NUDGES,
             unmet.len(),
-            unmet.join("\n")
+            unmet.join("\n"),
+            failure
         )
     }
 
@@ -269,7 +323,7 @@ impl UlwState {
     pub fn kickoff_task(&self) -> String {
         let criteria: Vec<String> = self.criteria.iter().map(|c| format!("- [ ] {}", c.text)).collect();
         format!(
-            "{}\n\n[ulw 실행 규칙]\n완료 기준:\n{}\n- 위 기준을 todo_write 로 등록한 뒤 시작하라.\n- 각 기준은 증거(명령 출력·테스트 결과·파일 경로)가 있어야 완료로 표시한다.\n- 모든 기준이 충족될 때까지 멈추지 마라. 산출물 근거는 .omo/ulw/{}/ 에 기록된다.",
+            "{}\n\n[ulw 실행 규칙]\n완료 기준:\n{}\n- 위 기준을 todo_write 로 등록한 뒤 시작하라.\n- 각 기준은 증거(명령 출력·테스트 결과·파일 경로)가 있어야 완료로 표시한다.\n- 코드 변경이 있는 기준은 테스트를 추가·실행한다. 테스트가 없는 기준은 evidence.md 에 '수동 확인' 사유를 반드시 적는다 — 조용한 생략은 실패로 본다.\n- 모든 기준이 충족될 때까지 멈추지 마라. 산출물 근거는 .omo/ulw/{}/ 에 기록된다.",
             self.goal,
             criteria.join("\n"),
             self.run_id
@@ -317,6 +371,9 @@ mod tests {
             iterations: 3,
             tool_errors: 0,
             answer_tail: "완료했습니다".into(),
+            verify_ran: false,
+            verify_ok: false,
+            verify_tail: String::new(),
         }
     }
 
@@ -416,6 +473,93 @@ mod tests {
         assert!(task.contains("rate limit"));
         assert!(task.contains("- [ ] 빌드 통과"));
         assert!(task.contains("todo_write"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod quality_gate_tests {
+    use super::*;
+
+    fn setup(tag: &str) -> (PathBuf, UlwState) {
+        let dir = std::env::temp_dir().join(format!("rafikx-ulwq-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = UlwState::start(&dir, "기능 추가").unwrap();
+        state
+            .set_criteria(&dir, "plan", vec!["테스트 통과".into()])
+            .unwrap();
+        (dir, state)
+    }
+
+    fn summary_with_verify(completed: usize, total: usize, ran: bool, ok: bool, tail: &str) -> RunSummaryLite {
+        RunSummaryLite {
+            changed_files: vec!["src/lib.rs".into()],
+            completed_todos: completed,
+            total_todos: total,
+            iterations: 2,
+            tool_errors: 0,
+            answer_tail: String::new(),
+            verify_ran: ran,
+            verify_ok: ok,
+            verify_tail: tail.into(),
+        }
+    }
+
+    #[test]
+    fn todos_complete_but_verify_failed_is_not_done() {
+        let (dir, mut state) = setup("gate");
+        let verdict = state
+            .record_run(&dir, &summary_with_verify(2, 2, true, false, "cargo test: FAILED"))
+            .unwrap();
+        assert!(matches!(verdict, UlwVerdict::Continue));
+        assert_eq!(state.status, "running");
+        assert!(state.criteria.iter().all(|c| c.status != "met"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn todos_complete_and_verify_passed_is_done() {
+        let (dir, mut state) = setup("pass");
+        let verdict = state
+            .record_run(&dir, &summary_with_verify(2, 2, true, true, ""))
+            .unwrap();
+        assert_eq!(verdict, UlwVerdict::Done);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_failure_three_times_blocks_immediately() {
+        let (dir, mut state) = setup("streak");
+        let fail = || summary_with_verify(1, 2, true, false, "error[E0308]: mismatched types");
+        assert!(matches!(state.record_run(&dir, &fail()).unwrap(), UlwVerdict::Continue));
+        assert!(matches!(state.record_run(&dir, &fail()).unwrap(), UlwVerdict::Continue));
+        let verdict = state.record_run(&dir, &fail()).unwrap();
+        assert!(matches!(verdict, UlwVerdict::Blocked(_)));
+        assert!(state.blocked_reason.contains("리뷰"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn different_failures_reset_streak() {
+        let (dir, mut state) = setup("streak-reset");
+        let f1 = || summary_with_verify(1, 2, true, false, "error A");
+        let f2 = || summary_with_verify(1, 2, true, false, "error B");
+        assert!(matches!(state.record_run(&dir, &f1()).unwrap(), UlwVerdict::Continue));
+        assert!(matches!(state.record_run(&dir, &f1()).unwrap(), UlwVerdict::Continue));
+        assert_eq!(state.failure_streak, 2);
+        assert!(matches!(state.record_run(&dir, &f2()).unwrap(), UlwVerdict::Continue));
+        assert_eq!(state.failure_streak, 1); // 다른 실패면 스트릭 리셋
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nudge_message_carries_failure_log() {
+        let (dir, mut state) = setup("nudge-log");
+        let _ = state.record_run(&dir, &summary_with_verify(1, 2, true, false, "cargo test FAILED: auth"));
+        let msg = state.nudge_message();
+        assert!(msg.contains("검증 실패"));
+        assert!(msg.contains("auth"));
+        assert!(msg.contains("같은 방식의 재시도는 금지"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

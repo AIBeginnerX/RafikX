@@ -88,6 +88,8 @@ fn legacy_api_contracts_keep_required_json_fields() {
         notes: "saved".into(),
         quit: false,
         agent_task: None,
+        ulw_goal: None,
+        ulw_resume: None,
         compact: false,
         assign: false,
         model_fetch: false,

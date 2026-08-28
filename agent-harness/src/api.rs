@@ -123,6 +123,10 @@ pub struct SlashResult {
     pub notes: String,
     pub quit: bool,
     pub agent_task: Option<String>,
+    /// /ulw — 자율 루프 목표 (데스크탑은 이 필드를 받아 루프를 실행한다)
+    pub ulw_goal: Option<String>,
+    /// /ulw-resume — Some(id) 또는 Some("")=최근 실행, None=해당 없음
+    pub ulw_resume: Option<String>,
     /// true 면 호출자가 compact_session 을 실행해야 한다.
     pub compact: bool,
     /// true 면 호출자가 assign_roles 를 실행해야 한다 (/engine multi).
@@ -350,15 +354,20 @@ pub async fn run_turn_observed(
         observer,
     )
     .await?;
+    if session.dirty {
+        let _ = chat::save_if_dirty(session);
+    }
+    Ok(turn_result_of(session, info))
+}
+
+/// TurnInfo → TurnResult 변환 (ulw 루프처럼 chat:: 을 직접 부르는 경로도 같은 조립을 쓴다).
+pub fn turn_result_of(session: &Session, info: chat::TurnInfo) -> TurnResult {
     let nodes = if info.run_id.is_empty() {
         Vec::new()
     } else {
         graph::for_run(&info.run_id).unwrap_or_default()
     };
-    if session.dirty {
-        let _ = chat::save_if_dirty(session);
-    }
-    Ok(TurnResult {
+    TurnResult {
         run_id: info.run_id,
         label: info.label,
         status: info.status,
@@ -370,7 +379,7 @@ pub async fn run_turn_observed(
         lifecycle_state: info.lifecycle_state,
         lifecycle: info.lifecycle,
         context_sources: info.context_sources,
-    })
+    }
 }
 
 pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
@@ -379,6 +388,8 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             notes: notes.join("\n"),
             quit: false,
             agent_task: None,
+            ulw_goal: None,
+            ulw_resume: None,
             compact: false,
             assign: false,
             model_fetch: false,
@@ -387,15 +398,28 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             notes: "세션을 닫습니다.".into(),
             quit: true,
             agent_task: None,
+            ulw_goal: None,
+            ulw_resume: None,
             compact: false,
             assign: false,
             model_fetch: false,
         }),
-        // ulw 루프는 대화형 오케스트레이션이라 터미널(CLI/TUI) 전용 — 데스크탑은 안내로 강등.
-        Slash::Ulw { .. } | Slash::UlwResume { .. } => Ok(SlashResult {
-            notes: "/ulw 는 터미널(CLI/TUI)에서 실행됩니다. 데스크탑 연결은 F4b 에서 다룹니다.".into(),
+        Slash::Ulw { goal } => Ok(SlashResult {
+            notes: String::new(),
             quit: false,
             agent_task: None,
+            ulw_goal: Some(goal),
+            ulw_resume: None,
+            compact: false,
+            assign: false,
+            model_fetch: false,
+        }),
+        Slash::UlwResume { run_id } => Ok(SlashResult {
+            notes: String::new(),
+            quit: false,
+            agent_task: None,
+            ulw_goal: None,
+            ulw_resume: Some(run_id.unwrap_or_default()),
             compact: false,
             assign: false,
             model_fetch: false,
@@ -404,6 +428,8 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             notes: String::new(),
             quit: false,
             agent_task: Some(task),
+            ulw_goal: None,
+            ulw_resume: None,
             compact: false,
             assign: false,
             model_fetch: false,
@@ -412,6 +438,8 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             notes: String::new(),
             quit: false,
             agent_task: None,
+            ulw_goal: None,
+            ulw_resume: None,
             compact: true,
             assign: false,
             model_fetch: false,
@@ -420,6 +448,8 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
             notes: String::new(),
             quit: false,
             agent_task: None,
+            ulw_goal: None,
+            ulw_resume: None,
             compact: false,
             assign: true,
             model_fetch: false,
@@ -437,6 +467,8 @@ pub fn apply_slash(session: &mut Session, line: &str) -> Result<SlashResult> {
                 notes,
                 quit: false,
                 agent_task: None,
+            ulw_goal: None,
+            ulw_resume: None,
                 compact: false,
                 assign: false,
                 model_fetch: fetch,

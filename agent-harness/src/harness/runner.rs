@@ -2348,7 +2348,7 @@ async fn run_graph_discipline(
     Ok(agg)
 }
 
-fn auto_verify_command(cfg: &Config, changed: &[String]) -> String {
+pub(crate) fn auto_verify_command(cfg: &Config, changed: &[String]) -> String {
     if cfg.workspace.join("Cargo.toml").exists() {
         return "cargo check".into();
     }

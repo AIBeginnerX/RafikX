@@ -2621,7 +2621,78 @@ fn ulw_summary_of(info: &TurnInfo) -> crate::ulw::RunSummaryLite {
         iterations: info.summary.iterations,
         tool_errors: info.summary.tool_errors,
         answer_tail: info.answer.chars().take(200).collect(),
+        verify_ran: false,
+        verify_ok: false,
+        verify_tail: String::new(),
     }
+}
+
+/// 테스트 명령 감지 (F4b) — 있으면 빌드 검사를 통과한 뒤 함께 실행한다.
+fn ulw_detect_test_command(workspace: &std::path::Path) -> String {
+    if workspace.join("Cargo.toml").exists() {
+        return "cargo test --quiet".into();
+    }
+    if workspace.join("pytest.ini").exists()
+        || workspace.join("tests").is_dir() && workspace.join("pyproject.toml").exists()
+    {
+        return "python3 -m pytest -q".into();
+    }
+    if workspace.join("package.json").exists()
+        && std::fs::read_to_string(workspace.join("package.json"))
+            .map(|s| s.contains("\"test\""))
+            .unwrap_or(false)
+    {
+        return "npm test --silent".into();
+    }
+    String::new()
+}
+
+/// ulw 가 에이전트 주장과 독립으로 검증을 직접 실행한다 (mandela 원칙 — 외부 근거가
+/// 루프에 들어와야 한다). 빌드 수준 명령(auto_verify_command) → 통과 시 테스트 명령.
+/// 반환: (실행 여부, 통과 여부, 실패 출력 꼬리)
+async fn ulw_run_verification(
+    cfg: &crate::config::Config,
+    changed: &[String],
+) -> (bool, bool, String) {
+    if changed.is_empty() {
+        return (false, true, String::new());
+    }
+    let mut commands: Vec<String> = Vec::new();
+    let build = crate::harness::auto_verify_command(cfg, changed);
+    if !build.is_empty() {
+        commands.push(build);
+    }
+    let test = ulw_detect_test_command(&cfg.workspace);
+    if !test.is_empty() && !commands.contains(&test) {
+        commands.push(test);
+    }
+    if commands.is_empty() {
+        return (false, true, String::new());
+    }
+    let mut ran_any = false;
+    for cmd in commands {
+        ran_any = true;
+        let shell = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+        let child = tokio::process::Command::new(shell.0)
+            .arg(shell.1)
+            .arg(&cmd)
+            .current_dir(&cfg.workspace)
+            .output();
+        let output = match tokio::time::timeout(std::time::Duration::from_secs(180), child).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return (true, false, format!("검증 명령 실행 실패 ({cmd}): {e}")),
+            Err(_) => return (true, false, format!("검증 명령 타임아웃 (180초): {cmd}")),
+        };
+        if !output.status.success() {
+            let mut tail = String::from_utf8_lossy(&output.stderr).to_string();
+            if tail.trim().is_empty() {
+                tail = String::from_utf8_lossy(&output.stdout).to_string();
+            }
+            let tail: String = tail.chars().rev().take(400).collect::<String>().chars().rev().collect();
+            return (true, false, format!("{cmd}\n{tail}"));
+        }
+    }
+    (ran_any, true, String::new())
 }
 
 async fn ulw_finish(
@@ -2695,7 +2766,11 @@ pub async fn ulw_loop_observed(
                 return Err(e);
             }
         };
-        let summary = ulw_summary_of(&info);
+        let mut summary = ulw_summary_of(&info);
+        let (v_ran, v_ok, v_tail) = ulw_run_verification(&session.cfg, &summary.changed_files).await;
+        summary.verify_ran = v_ran;
+        summary.verify_ok = v_ok;
+        summary.verify_tail = v_tail;
         match state.record_run(&workspace, &summary)? {
             crate::ulw::UlwVerdict::Done => {
                 state.write_report(&workspace, "")?;
