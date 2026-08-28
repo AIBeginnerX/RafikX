@@ -549,6 +549,19 @@ impl Db {
         Ok(())
     }
 
+    /// 알려진 워크스페이스 경로 전부 (projects 테이블 — Inspector 다중 워크스페이스 합산용).
+    pub fn list_projects(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT canonical_path FROM projects ORDER BY updated_at DESC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// 편집 지표 전역 조회 (F3 계측 → Inspector 인용) — (도구, 결과) 목록.
     pub fn edit_metrics(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(

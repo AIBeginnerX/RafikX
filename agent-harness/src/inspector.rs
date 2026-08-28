@@ -84,7 +84,7 @@ async fn build_report(
         let doctor = doctor_snapshot(cfg);
         (
             format_stats(&stats, runs.len(), lessons.len(), &log_tail, &doctor)
-                + "\n## ulw 자율 루프\n" + &ulw_summary(&cfg.workspace)
+                + "\n## ulw 자율 루프 (전체 워크스페이스)\n" + &ulw_summary(&db, &cfg.workspace)
                 + "\n## 편집 지표\n" + &edit_metric_summary(&db),
             call_model,
         )
@@ -130,48 +130,78 @@ struct Stats {
     top_errors: Vec<(String, usize)>,
 }
 
-/// ulw 자율 루프 이력 요약 — 워크스페이스 .omo/ulw/*/state.json 을 읽는다.
-fn ulw_summary(workspace: &std::path::Path) -> String {
-    let root = workspace.join(".omo").join("ulw");
-    let Ok(rd) = fs::read_dir(&root) else {
-        return "- (실행 없음)
-".into();
-    };
-    let mut done = 0usize;
-    let mut blocked = 0usize;
-    let mut running = 0usize;
-    let mut reasons: Vec<String> = Vec::new();
-    for entry in rd.flatten() {
-        let path = entry.path().join("state.json");
-        let Ok(body) = fs::read_to_string(&path) else { continue };
-        let Ok(state) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
-        match state.get("status").and_then(|s| s.as_str()) {
-            Some("done") => done += 1,
-            Some("blocked") => {
-                blocked += 1;
-                if let Some(r) = state.get("blocked_reason").and_then(|s| s.as_str())
-                    && !r.is_empty()
-                {
-                    reasons.push(r.to_string());
-                }
-            }
-            _ => running += 1,
+/// ulw 자율 루프 이력 요약 — 알려진 모든 워크스페이스(projects 테이블)와 현재
+/// 워크스페이스를 합산한다. 워크스페이스별 행 + 합계 행.
+fn ulw_summary(db: &Db, workspace: &std::path::Path) -> String {
+    let mut roots: Vec<std::path::PathBuf> = db
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    // projects 는 canonical 경로를 저장한다 — macOS /tmp→/private/tmp 같은 심링크를
+    // 정규화해 비교하지 않으면 현재 워크스페이스가 중복 집계된다 (실측).
+    let canonical = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    if !roots.iter().any(|p| *p == canonical) {
+        roots.insert(0, canonical);
+    }
+    let mut total_done = 0usize;
+    let mut total_blocked = 0usize;
+    let mut total_running = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+    for ws in roots {
+        let (done, blocked, running, reasons) = ulw_counts(&ws);
+        let n = done + blocked + running;
+        if n == 0 {
+            continue;
+        }
+        total_done += done;
+        total_blocked += blocked;
+        total_running += running;
+        let label = ws.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        lines.push(format!("- {label}: 실행 {n}건 — 완료 {done} · 중단 {blocked} · 진행 {running}"));
+        for r in reasons {
+            lines.push(format!("  · 중단 사유: {r}"));
         }
     }
-    let total = done + blocked + running;
+    let total = total_done + total_blocked + total_running;
     if total == 0 {
-        return "- (실행 없음)
-".into();
+        return "- (실행 없음)\n".into();
     }
-    let mut out = format!("- 실행 {total}건 — 완료 {done} · 중단 {blocked} · 진행 {running}
-");
-    for r in reasons.iter().take(3) {
-        out.push_str(&format!("- 중단 사유: {r}
-"));
+    let mut out = format!("- 전체 합계: 실행 {total}건 — 완료 {total_done} · 중단 {total_blocked} · 진행 {total_running}\n");
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
     }
     out
 }
 
+/// 워크스페이스 한 곳의 ulw 상태 집계 — (완료, 중단, 진행, 중단 사유 상위 3).
+fn ulw_counts(workspace: &std::path::Path) -> (usize, usize, usize, Vec<String>) {
+    let root = workspace.join(".omo").join("ulw");
+    let mut out = (0, 0, 0, Vec::new());
+    let Ok(rd) = fs::read_dir(&root) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let Ok(body) = fs::read_to_string(entry.path().join("state.json")) else { continue };
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+        match state.get("status").and_then(|s| s.as_str()) {
+            Some("done") => out.0 += 1,
+            Some("blocked") => {
+                out.1 += 1;
+                if let Some(r) = state.get("blocked_reason").and_then(|s| s.as_str())
+                    && !r.is_empty()
+                    && out.3.len() < 3
+                {
+                    out.3.push(r.to_string());
+                }
+            }
+            _ => out.2 += 1,
+        }
+    }
+    out
+}
 /// 편집 지표 요약 — graph_events 의 edit_metric 을 도구·결과별로 집계한다.
 fn edit_metric_summary(db: &Db) -> String {
     let Ok(rows) = db.edit_metrics() else {
@@ -581,7 +611,11 @@ mod summary_tests {
             r#"{"status":"blocked","blocked_reason":"재촉 초과"}"#,
         )
         .unwrap();
-        let out = ulw_summary(&dir);
+        let dbdir = std::env::temp_dir().join(format!("rafikx-insp-db-{}", std::process::id()));
+        fs::create_dir_all(&dbdir).unwrap();
+        let db = Db::open(&dbdir.join("t.db")).unwrap();
+        let _ = db.ensure_project(&dir);
+        let out = ulw_summary(&db, &dir);
         assert!(out.contains("실행 2건"));
         assert!(out.contains("완료 1"));
         assert!(out.contains("중단 1"));
@@ -593,7 +627,10 @@ mod summary_tests {
     fn ulw_summary_empty_when_no_runs() {
         let dir = std::env::temp_dir().join(format!("rafikx-insp-empty-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        assert!(ulw_summary(&dir).contains("실행 없음"));
+        let dbdir = std::env::temp_dir().join(format!("rafikx-insp-db0-{}", std::process::id()));
+        fs::create_dir_all(&dbdir).unwrap();
+        let db = Db::open(&dbdir.join("t.db")).unwrap();
+        assert!(ulw_summary(&db, &dir).contains("실행 없음"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -620,5 +657,41 @@ mod summary_tests {
         let db = Db::open(&dir.join("t.db")).unwrap();
         assert!(edit_metric_summary(&db).contains("계측 없음"));
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+
+#[cfg(test)]
+mod multi_ws_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn aggregates_across_workspaces() {
+        let base = std::env::temp_dir().join(format!("rafikx-insp-mw-{}", std::process::id()));
+        let ws_a = base.join("alpha");
+        let ws_b = base.join("beta");
+        let dbdir = base.join("db");
+        for d in [&ws_a, &ws_b, &dbdir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let db = Db::open(&dbdir.join("t.db")).unwrap();
+        for (ws, status) in [(&ws_a, "done"), (&ws_b, "blocked")] {
+            let ulw = ws.join(".omo").join("ulw").join("r1");
+            fs::create_dir_all(&ulw).unwrap();
+            let reason = if status == "blocked" { r#","blocked_reason":"막힘""# } else { "" };
+            fs::write(
+                ulw.join("state.json"),
+                format!(r#"{{"status":"{status}"{reason}}}"#),
+            )
+            .unwrap();
+            let _ = db.ensure_project(ws);
+        }
+        let out = ulw_summary(&db, &ws_a);
+        assert!(out.contains("전체 합계: 실행 2건"), "{out}");
+        assert!(out.contains("alpha"), "{out}");
+        assert!(out.contains("beta"), "{out}");
+        assert!(out.contains("막힘"), "{out}");
+        let _ = fs::remove_dir_all(base);
     }
 }
