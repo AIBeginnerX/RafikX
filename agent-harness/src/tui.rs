@@ -711,21 +711,22 @@ fn handle_key(
     // 오버레이들(approval·confirm·secret·text·picker) 뒤, 본 입력 앞에서 가로챈다.
     if let Some(mut tree) = app.tree.take() {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let mut close = false;
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                app.status = "파일 탐색기를 닫았습니다. (Ctrl+T 로 다시 열기)".into();
-            }
+            KeyCode::Esc | KeyCode::Char('q') => close = true,
             // Ctrl+T 는 토글 — 열려 있을 때 닫는다.
-            KeyCode::Char('t') | KeyCode::Char('T') if ctrl => {
-                app.status = "파일 탐색기를 닫았습니다.".into();
-            }
+            KeyCode::Char('t') | KeyCode::Char('T') if ctrl => close = true,
             KeyCode::Down | KeyCode::Char('j') => tree.move_down(),
             KeyCode::Up | KeyCode::Char('k') => tree.move_up(),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => tree.activate(),
             KeyCode::Left | KeyCode::Char('h') => tree.collapse_or_up(),
             _ => {}
         }
-        app.tree = Some(tree);
+        if close {
+            app.status = "파일 탐색기를 닫았습니다. (Ctrl+T 로 다시 열기)".into();
+        } else {
+            app.tree = Some(tree);
+        }
         return;
     }
 
