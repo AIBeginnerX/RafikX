@@ -41,7 +41,7 @@ pub fn theme_of(app: &App) -> Pal {
     })
 }
 
-fn pal_of(t: &Theme) -> Pal {
+pub(crate) fn pal_of(t: &Theme) -> Pal {
     Pal {
         bg: rgb(t.bg),
         accent: rgb(t.accent),
@@ -505,12 +505,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             Style::default().fg(th.code),
         ),
     ];
-    if area.width >= 112 {
-        spans.push(Span::raw("   "));
-        spans.extend(super::start::compact_signal(app, th));
-    } else if area.width >= 72 {
-        spans.push(Span::raw("   "));
-        spans.extend(super::start::short_signal(app, th));
+    // 시작 화면에선 스테이지 리본이 배너(좌측 패널)에 산다 — 헤더는 비워 시원하게.
+    if !app.show_start {
+        if area.width >= 112 {
+            spans.push(Span::raw("   "));
+            spans.extend(super::start::compact_signal(app, th));
+        } else if area.width >= 72 {
+            spans.push(Span::raw("   "));
+            spans.extend(super::start::short_signal(app, th));
+        }
     }
     if area.width >= 96 {
         spans.push(Span::raw("   "));

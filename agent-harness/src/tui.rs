@@ -30,6 +30,12 @@ use crate::db::Db;
 use crate::provider::{ContentBlock, Message, Role};
 use crate::ui::{self, Live};
 
+/// 시작 화면 세션 목록 항목 — 제목 표시용 문자열과 이어하기용 id.
+pub struct RecentSession {
+    pub id: String,
+    pub title: String,
+}
+
 pub struct App {
     session: Session,
     pub transcript: Vec<Entry>,
@@ -77,7 +83,9 @@ pub struct App {
     pub cancel_requested: Arc<AtomicBool>,
     pub lifecycle_state: Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
     pub show_start: bool,
-    pub recent_sessions: Vec<String>,
+    pub recent_sessions: Vec<RecentSession>,
+    /// 시작 화면 세션 목록 커서 — ↑↓ 로 움직이고 Enter 로 이어하기.
+    pub start_session_sel: usize,
     /// 시작 화면 팁 1줄 — App 생성 시 한 번만 고른다 (매 프레임 바뀌지 않게, F9).
     pub start_tip: Option<String>,
     pub motion_tick: u16,
@@ -254,7 +262,8 @@ pub async fn run(
         cancel_requested: Arc::new(AtomicBool::new(false)),
         lifecycle_state: Arc::new(Mutex::new(None)),
         show_start,
-        recent_sessions: recent_session_hints(),
+        recent_sessions: recent_sessions(),
+        start_session_sel: 0,
         start_tip: if tips_on {
             crate::tips::pick_random().map(|t| t.tip)
         } else {
@@ -707,6 +716,36 @@ fn handle_key(
         return;
     }
 
+    // 시작 화면 세션 선택 — 입력이 비었을 때 ↑↓ 로 커서를 옮기고 Enter 로 이어한다.
+    // j/k·타이핑은 건드리지 않는다(메시지 첫 글자 충돌 방지). 입력이 있으면 일반 편집.
+    if app.show_start
+        && app.tree.is_none()
+        && app.input.is_empty()
+        && !k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        match k.code {
+            KeyCode::Up => {
+                let len = app.recent_sessions.len();
+                app.start_session_sel = clamp_selection(app.start_session_sel, -1, len);
+                return;
+            }
+            KeyCode::Down => {
+                let len = app.recent_sessions.len();
+                app.start_session_sel = clamp_selection(app.start_session_sel, 1, len);
+                return;
+            }
+            KeyCode::Enter => {
+                if let Some(session) = app.recent_sessions.get(app.start_session_sel) {
+                    let id = session.id.clone();
+                    resume_session_by_id(app, &id);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
     if app.help {
         if matches!(k.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
             app.help = false;
@@ -843,6 +882,15 @@ fn handle_key(
         KeyCode::Char(c) if !ctrl => insert_char(app, c),
         _ => {}
     }
+}
+
+/// 커서 이동 경계 처리 — 빈 목록과 양 끝에서 멈춘다.
+fn clamp_selection(current: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let max = len - 1;
+    (current as i64 + delta as i64).clamp(0, max as i64) as usize
 }
 
 fn submit(app: &mut App, local_ask: &LocalAsk, done_tx: &mpsc::UnboundedSender<TurnDone>) {
@@ -1687,20 +1735,22 @@ fn binding_label(session: &Session) -> String {
 }
 
 /// 최근 세션 제목 힌트 — 시작 화면의 세션 히스토리 표시용.
-fn recent_session_hints() -> Vec<String> {
+fn recent_sessions() -> Vec<RecentSession> {
     let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
         return Vec::new();
     };
     db.list_sessions(4)
         .unwrap_or_default()
         .into_iter()
-        .map(|row| {
-            row.title
+        .map(|row| RecentSession {
+            id: row.id,
+            title: row
+                .title
                 .as_deref()
                 .map(str::trim)
                 .filter(|title| !title.is_empty())
                 .unwrap_or("제목 없음")
-                .to_string()
+                .to_string(),
         })
         .collect()
 }
@@ -2060,6 +2110,38 @@ fn start_connect(app: &mut App, raw: &str) {
     begin_connect(app, &name);
 }
 
+/// 세션 id 로 이어하기 — /sessions 피커와 시작 화면 Enter 가 같이 쓴다.
+fn resume_session_by_id(app: &mut App, id: &str) {
+    let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
+        return;
+    };
+    match db.load_session(id) {
+        Ok(Some(row)) => match serde_json::from_str::<Vec<Message>>(&row.messages_json) {
+            Ok(mut messages) => {
+                crate::agent::sanitize_tool_pairs(&mut messages);
+                app.session.messages = messages;
+                app.session.session_id = Some(row.id.clone());
+                app.session.dirty = false;
+                app.session.attachments.clear();
+                app.transcript.clear();
+                app.show_start = false;
+                app.turn_start = 0;
+                push(
+                    app,
+                    EntryKind::System,
+                    format!(
+                        "세션 재개: {}  ({})",
+                        row.id,
+                        row.title.unwrap_or_else(|| "(제목 없음)".into())
+                    ),
+                );
+            }
+            Err(_) => push(app, EntryKind::Warn, "세션 메시지를 읽지 못했습니다."),
+        },
+        _ => push(app, EntryKind::Warn, format!("세션 '{id}' 를 찾지 못했습니다.")),
+    }
+}
+
 fn apply_picker(app: &mut App, picker: Picker) {
     let Some(id) = picker.ids.get(picker.selected).cloned() else {
         return;
@@ -2114,40 +2196,7 @@ fn apply_picker(app: &mut App, picker: Picker) {
                 pick_managed(app, &id);
             }
         }
-        PickerKind::Session => {
-            let Ok(db) = Db::open(&Db::db_path().unwrap_or_default()) else {
-                return;
-            };
-            match db.load_session(&id) {
-                Ok(Some(row)) => match serde_json::from_str::<Vec<Message>>(&row.messages_json) {
-                    Ok(mut messages) => {
-                        crate::agent::sanitize_tool_pairs(&mut messages);
-                        app.session.messages = messages;
-                        app.session.session_id = Some(row.id.clone());
-                        app.session.dirty = false;
-                        app.session.attachments.clear();
-                        app.transcript.clear();
-                        app.show_start = false;
-                        app.turn_start = 0;
-                        push(
-                            app,
-                            EntryKind::System,
-                            format!(
-                                "세션 재개: {}  ({})",
-                                row.id,
-                                row.title.unwrap_or_else(|| "(제목 없음)".into())
-                            ),
-                        );
-                    }
-                    Err(_) => push(app, EntryKind::Warn, "세션 메시지를 읽지 못했습니다."),
-                },
-                _ => push(
-                    app,
-                    EntryKind::Warn,
-                    format!("세션 '{id}' 를 찾지 못했습니다."),
-                ),
-            }
-        }
+        PickerKind::Session => resume_session_by_id(app, &id),
         PickerKind::Action => {
             let Some(name) = picker.target else { return };
             apply_action(app, &name, &id);

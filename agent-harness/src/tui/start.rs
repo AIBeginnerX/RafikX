@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -11,8 +11,12 @@ use crate::lifecycle::LifecycleState;
 const STAGES: [&str; 4] = ["CONTEXT", "PLAN", "EXECUTE", "VERIFY"];
 
 /// 분할 시작 화면이 필요한 최소 크기 — 그 밖에선 기존 중앙 배치 폴백.
+/// 높이 26: 7행 배너 + 리본·마키(11행)와 하단 정보(9행)가 함께 들어가는 선.
 pub const SPLIT_MIN_WIDTH: u16 = 84;
-pub const SPLIT_MIN_HEIGHT: u16 = 22;
+pub const SPLIT_MIN_HEIGHT: u16 = 26;
+
+/// 배너 최대 줄 수 — 글자 7행 + 여백 + 리본 + 마키.
+const BANNER_LINES: u16 = 11;
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     if area.width >= SPLIT_MIN_WIDTH && area.height >= SPLIT_MIN_HEIGHT {
@@ -29,10 +33,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
 fn draw_split(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     // 하단 기존 내용(RECENT 제외)에 필요한 줄 수를 확보하고 나머지를 배너에 준다.
     let bottom_rows = bottom_lines(app, palette, false).len() as u16 + 2;
-    let banner_h = area.height.saturating_sub(bottom_rows).min(10);
-    let (banner, bottom) = if banner_h >= 8 {
-        (Rect::new(area.x, area.y, area.width, banner_h),
-         Rect::new(area.x, area.y + banner_h, area.width, area.height - banner_h))
+    let banner_h = area.height.saturating_sub(bottom_rows).min(BANNER_LINES);
+    let (banner, bottom) = if banner_h >= 10 {
+        (
+            Rect::new(area.x, area.y, area.width, banner_h),
+            Rect::new(area.x, area.y + banner_h, area.width, area.height - banner_h),
+        )
     } else {
         (area, Rect::new(area.x, area.y, area.width, 0))
     };
@@ -46,29 +52,56 @@ fn draw_split(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
 
     if bottom.height > 0 {
         let lines = bottom_lines(app, palette, false);
-        f.render_widget(
-            Paragraph::new(lines).alignment(Alignment::Center),
-            bottom,
-        );
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), bottom);
     }
 }
 
-/// RAFIKX 블록 글리프 — 5행 블록 글꼴. 행마다 같은 폭 (간격 1칸은 조립 시).
-const GLYPHS: &[(char, [&str; 5])] = &[
-    ('R', ["████ ", "█   █", "████ ", "█  █ ", "█   █"]),
-    ('A', ["█████", "█   █", "█████", "█   █", "█   █"]),
-    ('F', ["█████", "█    ", "████ ", "█    ", "█    "]),
-    ('I', ["█████", "  █  ", "  █  ", "  █  ", "█████"]),
-    ('K', ["█   █", "█  █ ", "████ ", "█  █ ", "█   █"]),
-    ('X', ["█   █", " █ █ ", "  █  ", " █ █ ", "█   █"]),
+/// RAFIKX 블록 글리프 — 7행 블록 글꼴 (글자 폭 5, 간격 1칸은 조립 시).
+const GLYPHS: &[(char, [&str; 7])] = &[
+    (
+        'R',
+        [
+            "█████", "█   █", "█   █", "█████", "█ █  ", "█  █ ", "█   █",
+        ],
+    ),
+    (
+        'A',
+        [
+            "█████", "█   █", "█   █", "█████", "█   █", "█   █", "█   █",
+        ],
+    ),
+    (
+        'F',
+        [
+            "█████", "█    ", "█████", "█    ", "█    ", "█    ", "█    ",
+        ],
+    ),
+    (
+        'I',
+        [
+            "█████", "  █  ", "  █  ", "  █  ", "  █  ", "  █  ", "█████",
+        ],
+    ),
+    (
+        'K',
+        [
+            "█   █", "█  █ ", "█ █  ", "██   ", "█ █  ", "█  █ ", "█   █",
+        ],
+    ),
+    (
+        'X',
+        [
+            "█   █", "█   █", " █ █ ", "  █  ", " █ █ ", "█   █", "█   █",
+        ],
+    ),
 ];
 
-fn glyph(ch: char) -> Option<&'static [&'static str; 5]> {
-    GLYPHS
-        .iter()
-        .find(|(c, _)| *c == ch)
-        .map(|(_, rows)| rows)
+fn glyph(ch: char) -> Option<&'static [&'static str; 7]> {
+    GLYPHS.iter().find(|(c, _)| *c == ch).map(|(_, rows)| rows)
 }
+
+/// 글자 총 폭 — 6글자 × (5폭 + 간격 1) − 마지막 간격.
+const LETTERS_W: usize = 6 * 6 - 1;
 
 /// 부팅 연출 — 글자가 아래에서부터 한 행씩 켜진다 (reduced_motion 이면 즉시 전체).
 fn visible_rows(app: &App) -> usize {
@@ -77,9 +110,9 @@ fn visible_rows(app: &App) -> usize {
 
 fn visible_rows_for(tick: u16, settled: bool) -> usize {
     if settled {
-        return 5;
+        return 7;
     }
-    ((tick as usize + 2) / 3).clamp(1, 5)
+    ((tick as usize + 2) / 2).clamp(1, 7)
 }
 
 /// 반짝임 — (틱, 행, 열) 해시의 일부 칸만 밝게. 규칙적이지 않아 스치는 느낌이 난다.
@@ -88,6 +121,28 @@ fn spark(tick: u16, row: usize, col: usize) -> bool {
     let h = (t ^ row.wrapping_mul(31) ^ col.wrapping_mul(137))
         .wrapping_mul(2_654_435_761);
     (h >> 13) % 19 == 0
+}
+
+/// 테마별 배너 색 — 글자 전체에 accent→code 그라디언트를 깐다.
+/// 테마가 바뀌면 accent·code 편성이 달라져 배너 색조가 함께 바뀐다.
+fn banner_fill(palette: &Pal, t: f32) -> Color {
+    lerp_rgb(palette.accent, palette.code, t)
+}
+
+fn lerp_rgb(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+            Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2))
+        }
+        _ => {
+            if t < 0.5 {
+                a
+            } else {
+                b
+            }
+        }
+    }
 }
 
 const MARQUEE_CYCLE: &str = "RAFIKX HARNESS · THE TERMINAL IS NOW A RUNTIME · ";
@@ -106,48 +161,58 @@ fn marquee_line(tick: u16, width: usize) -> String {
 
 fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     let left_inner_w = area.width.saturating_sub(4) as usize;
-    let letters_w = 6 * 6 - 1; // 6글자 × (5폭+간격) − 마지막 간격
     let mut lines: Vec<Line> = Vec::new();
 
-    if left_inner_w >= letters_w {
+    if left_inner_w >= LETTERS_W {
         let shown = visible_rows(app);
-        for (row_index, _) in (0..5).enumerate().take(shown.max(1)) {
+        for row_index in 0..shown {
             let mut spans = Vec::new();
+            let mut abs_col = 0usize;
             for (letter_index, ch) in "RAFIKX".chars().enumerate() {
                 if letter_index > 0 {
                     spans.push(Span::raw(" "));
+                    abs_col += 1;
                 }
                 let Some(rows) = glyph(ch) else { continue };
-                let cells = rows[row_index].chars().collect::<Vec<_>>();
-                for (col, cell) in cells.iter().enumerate() {
-                    if *cell == '█' {
-                        let (mark, color) = if !reduced_motion(app)
+                for (col, cell) in rows[row_index].chars().enumerate() {
+                    if cell == '█' {
+                        let t = abs_col as f32 / (LETTERS_W - 1).max(1) as f32;
+                        let (mark, style) = if !reduced_motion(app)
                             && spark(app.motion_tick, row_index, col)
                         {
-                            ("▓", palette.code)
+                            (
+                                "▓",
+                                Style::default()
+                                    .fg(palette.text)
+                                    .add_modifier(Modifier::BOLD),
+                            )
                         } else {
-                            ("█", palette.accent)
+                            ("█", Style::default().fg(banner_fill(palette, t)))
                         };
-                        spans.push(Span::styled(mark.to_string(), Style::default().fg(color)));
+                        spans.push(Span::styled(mark.to_string(), style));
                     }
+                    abs_col += 1;
                 }
             }
             lines.push(Line::from(spans));
         }
         // 부팅 중 남는 행 — 글자가 다 켜질 때까지 자리를 비워둔다.
-        while lines.len() < 5 {
+        while lines.len() < 7 {
             lines.push(Line::default());
         }
         lines.push(Line::default());
+        lines.push(Line::from(compact_signal(app, palette)));
         lines.push(Line::from(Span::styled(
-            marquee_line(app.motion_tick, left_inner_w.min(letters_w + 4)),
+            marquee_line(app.motion_tick, left_inner_w.min(LETTERS_W + 6)),
             Style::default().fg(palette.secondary),
         )));
     } else {
         // 좁은 패널 — 블록 글꼴 대신 한 줄 표기.
         lines.push(Line::from(Span::styled(
             "R A F I K X",
-            Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             marquee_line(app.motion_tick, left_inner_w),
@@ -160,13 +225,16 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     f.render_widget(Paragraph::new(padded), area);
 }
 
+/// 오른쪽 패널 — 선택 가능한 최근 세션 + 핵심 기능 요약.
 fn draw_digest(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     let mut lines: Vec<Line> = Vec::new();
     let width = area.width.saturating_sub(2) as usize;
 
     lines.push(Line::from(Span::styled(
         "최근 세션",
-        Style::default().fg(palette.secondary).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(palette.secondary)
+            .add_modifier(Modifier::BOLD),
     )));
     if app.recent_sessions.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -174,21 +242,40 @@ fn draw_digest(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
             Style::default().fg(palette.mute),
         )));
     } else {
-        for title in app.recent_sessions.iter().take(4) {
-            lines.push(truncated_line(" › ", title, width, palette.text));
+        for (index, session) in app.recent_sessions.iter().take(4).enumerate() {
+            let selected = index == app.start_session_sel;
+            let (marker, style) = if selected {
+                (
+                    " ▸ ",
+                    Style::default()
+                        .fg(palette.accent)
+                        .bg(palette.panel)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (" › ", Style::default().fg(palette.text))
+            };
+            lines.push(truncated_line(marker, &session.title, width, style));
         }
         lines.push(Line::from(Span::styled(
-            "이어하기: /sessions",
+            "↑↓ 선택 · Enter 이어하기 · /sessions 전체",
             Style::default().fg(palette.mute),
         )));
     }
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "핵심 기능",
-        Style::default().fg(palette.secondary).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(palette.secondary)
+            .add_modifier(Modifier::BOLD),
     )));
     for feature in digest_features() {
-        lines.push(truncated_line(" · ", feature, width, palette.body));
+        lines.push(truncated_line(
+            " · ",
+            feature,
+            width,
+            Style::default().fg(palette.body),
+        ));
     }
 
     let top = (area.height.saturating_sub(lines.len() as u16)) / 2;
@@ -206,7 +293,7 @@ fn digest_features() -> [&'static str; 4] {
     ]
 }
 
-fn truncated_line(marker: &str, text: &str, width: usize, color: ratatui::style::Color) -> Line<'static> {
+fn truncated_line(marker: &str, text: &str, width: usize, style: Style) -> Line<'static> {
     let budget = width.saturating_sub(marker.chars().count());
     let shown: String = if display_width(text) <= budget {
         text.to_string()
@@ -225,8 +312,8 @@ fn truncated_line(marker: &str, text: &str, width: usize, color: ratatui::style:
         out
     };
     Line::from(vec![
-        Span::styled(marker.to_string(), Style::default().fg(color)),
-        Span::styled(shown, Style::default().fg(color)),
+        Span::styled(marker.to_string(), style),
+        Span::styled(shown, style),
     ])
 }
 
@@ -259,11 +346,13 @@ fn bottom_lines(app: &App, palette: &Pal, include_recent: bool) -> Vec<Line<'sta
     lines.push(metadata_line("MODEL", &app.binding, palette));
     lines.push(metadata_line("WORKSPACE", &app.cwd, palette));
     if include_recent && !app.recent_sessions.is_empty() {
-        lines.push(metadata_line(
-            "RECENT",
-            &app.recent_sessions.join("  ›  "),
-            palette,
-        ));
+        let joined = app
+            .recent_sessions
+            .iter()
+            .map(|s| s.title.as_str())
+            .collect::<Vec<_>>()
+            .join("  ›  ");
+        lines.push(metadata_line("RECENT", &joined, palette));
     }
     if let Some(tip) = &app.start_tip {
         // 세션당 1줄 — App 생성 시 고정된 팁 (F9). /tips off 로 영구 해제.
@@ -321,11 +410,13 @@ fn draw_centered(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     lines.push(metadata_line("WORKSPACE", &app.cwd, palette));
     if area.height >= 16 && !app.recent_sessions.is_empty() {
         // 데스크탑 splash의 세션 히스토리에 대응하는 CLI 시작 화면 요소.
-        lines.push(metadata_line(
-            "RECENT",
-            &app.recent_sessions.join("  ›  "),
-            palette,
-        ));
+        let joined = app
+            .recent_sessions
+            .iter()
+            .map(|s| s.title.as_str())
+            .collect::<Vec<_>>()
+            .join("  ›  ");
+        lines.push(metadata_line("RECENT", &joined, palette));
     }
     if let Some(tip) = &app.start_tip {
         lines.push(metadata_line("TIP", &format!("{tip}  ·  /tips"), palette));
@@ -421,16 +512,16 @@ fn active_stage(app: &App) -> Option<usize> {
         Some(LifecycleState::Planning) => Some(1),
         Some(
             LifecycleState::Running
-            | LifecycleState::WaitingApproval
-            | LifecycleState::Delegating
-            | LifecycleState::CancelRequested,
+                | LifecycleState::WaitingApproval
+                | LifecycleState::Delegating
+                | LifecycleState::CancelRequested,
         ) => Some(2),
         Some(
             LifecycleState::Answering
-            | LifecycleState::Succeeded
-            | LifecycleState::Limited
-            | LifecycleState::Failed
-            | LifecycleState::Cancelled,
+                | LifecycleState::Succeeded
+                | LifecycleState::Limited
+                | LifecycleState::Failed
+                | LifecycleState::Cancelled,
         ) => Some(3),
         None => None,
     }
@@ -490,11 +581,14 @@ pub fn terminal_reduced_motion(session: &crate::chat::Session) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::palette;
+    use crate::tui::clamp_selection;
+    use crate::tui::view::pal_of;
 
     #[test]
-    fn glyphs_are_uniform_five_rows() {
+    fn glyphs_are_uniform_seven_rows() {
         for (ch, rows) in GLYPHS {
-            assert_eq!(rows.len(), 5, "{ch} 행 수");
+            assert_eq!(rows.len(), 7, "{ch} 행 수");
             for row in rows {
                 assert_eq!(row.chars().count(), 5, "{ch} 행 폭: {row}");
                 assert!(
@@ -512,21 +606,36 @@ mod tests {
         assert_eq!(a.chars().count(), 20);
         assert_ne!(a, b, "틱이 다르면 흘러간다");
         assert!(
-            marquee_line(0, MARQUEE_CYCLE.len()).contains("RAFIKX HARNESS"),
+            marquee_line(0, MARQUEE_CYCLE.chars().count()).contains("RAFIKX HARNESS"),
             "순환 문구에 HARNESS 포함"
         );
         assert_eq!(marquee_line(0, 0), "");
+        // 다중 바이트 문자가 깨지지 않는다 — 순환 문구의 '·' 가 그대로 나온다.
+        assert!(marquee_line(0, 60).contains('·'), "UTF-8 보존");
     }
 
     #[test]
     fn boot_reveals_rows_progressively() {
-        let dir = std::env::temp_dir().join(format!("rafikx-start-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
         assert_eq!(visible_rows_for(0, false), 1, "부팅 첫 틱 — 1행만");
-        assert_eq!(visible_rows_for(13, false), 5, "부팅 끝 — 전체 5행");
-        assert_eq!(visible_rows_for(40, false), 5, "부팅 종료 후 — 전체");
-        assert_eq!(visible_rows_for(0, true), 5, "reduced_motion — 즉시 전체");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(visible_rows_for(12, false), 7, "부팅 끝 — 전체 7행");
+        assert_eq!(visible_rows_for(40, false), 7, "부팅 종료 후 — 전체");
+        assert_eq!(visible_rows_for(0, true), 7, "reduced_motion — 즉시 전체");
+    }
+
+    #[test]
+    fn banner_fill_is_theme_gradient_between_accent_and_code() {
+        let th = pal_of(&palette::RAFIKX);
+        assert_eq!(banner_fill(&th, 0.0), th.accent, "t=0 — accent");
+        assert_eq!(banner_fill(&th, 1.0), th.code, "t=1 — code");
+        assert_ne!(banner_fill(&th, 0.5), th.accent, "중간은 혼합색");
+    }
+
+    #[test]
+    fn session_selection_stays_in_bounds() {
+        assert_eq!(clamp_selection(0, -1, 4), 0, "위 끝에서 더 올라가지 않는다");
+        assert_eq!(clamp_selection(0, 1, 4), 1);
+        assert_eq!(clamp_selection(3, 1, 4), 3, "아래 끝 고정");
+        assert_eq!(clamp_selection(2, 0, 4), 2, "이동 없음");
+        assert_eq!(clamp_selection(0, 1, 0), 0, "빈 목록");
     }
 }
