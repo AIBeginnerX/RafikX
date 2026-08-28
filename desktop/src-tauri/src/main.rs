@@ -538,6 +538,12 @@ fn stop_watch(state: State<Shared>) -> Result<(), String> {
     Ok(())
 }
 
+
+#[tauri::command]
+fn ui_policy() -> rafikx::ui_policy::UiPolicy {
+    rafikx::ui_policy::current()
+}
+
 fn main() {
     let inner = Arc::new(Inner {
         sessions: Mutex::new(HashMap::new()),
@@ -578,7 +584,8 @@ fn main() {
             detect_workspace,
             pick_folder,
             start_watch,
-            stop_watch
+            stop_watch,
+            ui_policy
         ])
         .run(tauri::generate_context!())
         .expect("RafikX desktop failed to start");

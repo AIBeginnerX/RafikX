@@ -1,18 +1,35 @@
 // 대량 텍스트 붙여넣기 블록 — 긴 로그/코드를 채팅창에 도배하지 않고
 // 접힘 칩으로 보관했다가, 전송 시 프롬프트에 합성하고 일괄 비운다.
 
-import { $ } from "./state.js";
+import { $, invoke } from "./state.js";
 
-/** 이 값을 넘으면 접힘 블록으로 분리한다. */
-const CHAR_THRESHOLD = 1200;
-const LINE_THRESHOLD = 25;
-const PREVIEW_MAX = 300;
+/** 접힘 기준 — Rust 원천은 agent-harness/src/ui_policy.rs.
+ *  폴 fallback 기본값은 Rust 테스트(js_fallback_matches_rust)가 원천과의 일치를 단언한다. */
+const POLICY = {
+  CHAR_THRESHOLD: 1200,
+  LINE_THRESHOLD: 25,
+  PREVIEW_MAX: 300,
+};
+
+/** 부팅 시 Rust 원천(ui_policy 명령)에서 정책을 가져와 덮어쓴다. */
+export async function initPastePolicy() {
+  try {
+    const policy = await invoke("ui_policy");
+    if (policy && typeof policy.paste_collapse_chars === "number") {
+      POLICY.CHAR_THRESHOLD = policy.paste_collapse_chars;
+      POLICY.LINE_THRESHOLD = policy.paste_collapse_lines;
+      POLICY.PREVIEW_MAX = policy.paste_preview_max;
+    }
+  } catch {
+    // 명령 실패 시 폴 fallback 기본값 사용 (Rust 테스트가 일치 단언)
+  }
+}
 
 const blocks = [];
 let nextId = 1;
 
 function isLarge(text) {
-  return text.length >= CHAR_THRESHOLD || text.split("\n").length > LINE_THRESHOLD;
+  return text.length >= POLICY.CHAR_THRESHOLD || text.split("\n").length > POLICY.LINE_THRESHOLD;
 }
 
 /** 대량 텍스트 판정 — 메시지 렌더 접기에도 공용으로 쓴다. */
@@ -83,7 +100,7 @@ function renderBlocks() {
       const pre = document.createElement("pre");
       pre.className = "paste-chip__preview";
       pre.textContent = truncatePreview(block.text);
-      pre.style.maxHeight = `${PREVIEW_MAX}px`;
+      pre.style.maxHeight = `${POLICY.PREVIEW_MAX}px`;
       chip.appendChild(pre);
     }
     host.appendChild(chip);

@@ -5,8 +5,6 @@
 
 ## v5 기획 진행
 
-- [ ] (대기) Phase C4 — 교차-표면 정책 상수 통합 (프롬프트 C4)
-- [ ] (대기) Phase C4 — 교차-표면 정책 상수 통합 (프롬프트 C4)
 - [ ] (대기) Phase F1 — 팩트 메모리 (remember/recall/forget)
 - [ ] (대기) Phase F2 — IntentGate (의도 게이트 + 분류 확신도)
 - [ ] (대기) Phase F3 — Hashline 편집 도구

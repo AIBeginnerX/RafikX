@@ -1585,8 +1585,8 @@ fn recent_session_hints() -> Vec<String> {
 fn collapsed_input(input: &str) -> String {
     let lines = input.lines().count().max(1);
     let chars = input.chars().count();
-    // 데스크탑 desktop/ui/js/paste-blocks.js의 CHAR/LINE_THRESHOLD(1200/25)와 동일 기준 유지.
-    if chars >= 1200 || lines > 25 {
+    // 임계값 원천은 ui_policy (데스크탑 JS도 같은 값을 ui_policy 명령으로 받는다).
+    if crate::ui_policy::paste_needs_collapse(chars, lines) {
         format!("[붙여넣기 {lines}줄 · {chars}자]")
     } else {
         input.to_string()
