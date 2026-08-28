@@ -164,7 +164,13 @@ mod tests {
     use super::*;
 
     fn sample_tree() -> (PathBuf, FileTree) {
-        let dir = std::env::temp_dir().join(format!("rafikx-tree-{}", std::process::id()));
+        // 테스트는 병렬로 돈다 — 디렉터를 호출마다 고유하게 만들어 경합을 없앤다.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rafikx-tree-{}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src/agent")).unwrap();
         std::fs::create_dir_all(dir.join("target")).unwrap();

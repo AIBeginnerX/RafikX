@@ -386,9 +386,16 @@ pub async fn run(
             _ = tick.tick() => {
                 // 스피너가 돌 때만 주기 리드로우 — 유휴 상태에서는 이벤트가
                 // 있을 때만 그린다 (초당 12.5회 무조건 리드로우 제거).
+                // 시작 화면에선 배너 애니메이션(마키·반짝임)을 위해 2틱마다 —
+                // reduced_motion 이면 애니메이션 없이 이벤트 기반만.
                 if app.show_start && app.motion_tick < 16 {
                     app.motion_tick += 1;
                     dirty = true;
+                } else if app.show_start && !crate::tui::start::terminal_reduced_motion(&app.session) {
+                    app.motion_tick = app.motion_tick.wrapping_add(1);
+                    if app.motion_tick % 2 == 0 {
+                        dirty = true;
+                    }
                 } else if app.busy || app.upgrading {
                     app.motion_tick = app.motion_tick.wrapping_add(1);
                     dirty = true;
