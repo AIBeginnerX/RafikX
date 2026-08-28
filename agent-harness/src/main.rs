@@ -225,6 +225,10 @@ async fn main() -> ExitCode {
     // 주 1회 모델 순위 갱신 — 백그라운드, 실패 무음.
     rafikx::ranks::spawn_weekly_refresh();
     let cli = Cli::parse();
+    // 하루 1회 모델 카탈로그 자동 갱신 — 백그라운드, 실패 무음. 설정을 못 읽으면 건너뛴다.
+    if let Ok(cfg) = Config::load(cli.config.as_deref()) {
+        rafikx::auth::spawn_catalog_refresh(&cfg);
+    }
     let result = match &cli.cmd {
         None => cmd_default(&cli).await,
         Some(Commands::Doctor) => cmd_doctor(&cli).await,
@@ -455,6 +459,11 @@ async fn cmd_models(cli: &Cli, provider: &str) -> Result<()> {
     if models.is_empty() {
         println!("{provider}: 사용 가능한 원격 모델 목록이 비어 있습니다 (키/연결 확인)");
         return Ok(());
+    }
+    // 조회 결과를 캐시에 저장 — 이 명령이 곧 한 서비스의 카탈로그 갱신이 되도록.
+    match auth::save_catalog(&cfg, provider, &models) {
+        Ok(()) => println!("({}개 모델을 캐시에 저장했습니다)", models.len()),
+        Err(e) => ui::note(&format!("모델 목록 캐시 저장 실패: {e:#}")),
     }
     println!(
         "{} 사용 가능 모델 {}개:",

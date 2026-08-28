@@ -652,7 +652,12 @@ async fn list_gemini_native(
 ) -> Result<Vec<String>> {
     let mut req = client.get("https://generativelanguage.googleapis.com/v1beta/models");
     if let Some(c) = cred {
-        req = req.header("Authorization", format!("Bearer {}", c.token));
+        // API 키는 x-goog-api-key, OAuth 토큰은 Bearer — 네이티브 API 가 받는 헤더가 다르다.
+        req = if c.oauth {
+            req.header("Authorization", format!("Bearer {}", c.token))
+        } else {
+            req.header("x-goog-api-key", &c.token)
+        };
     }
     let resp = req.send().await?;
     let status = resp.status();
@@ -669,6 +674,14 @@ async fn list_gemini_native(
         }
     }
     Ok(ids)
+}
+
+/// ChatGPT/Codex OAuth 모델 목록 엔드포인트. client_version 쿼리가 없으면 400 이 온다.
+fn codex_models_url() -> String {
+    format!(
+        "https://chatgpt.com/backend-api/codex/models?client_version={}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>> {
@@ -720,7 +733,7 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
         "openai_compat" => {
             let oauth_openai = name == "openai" && cred.as_ref().is_some_and(|c| c.oauth);
             let url = if oauth_openai {
-                "https://chatgpt.com/backend-api/codex/models".to_string()
+                codex_models_url()
             } else if let Some(custom) = &p.models_url {
                 // /models 가 없는 프로바이더용 직접 지정 엔드포인트 (예: commandcode).
                 custom.clone()
@@ -749,13 +762,22 @@ pub async fn list_remote_models(cfg: &Config, name: &str) -> Result<Vec<String>>
             let status = resp.status();
             if !status.is_success() {
                 // gemini 는 OpenAI 호환 /models 가 없거나 제한적이다 (실측 400) —
-                // 네이티브 /v1beta/models 로 폴 fallback 한다.
+                // 네이티브 /v1beta/models 로 폴 fallback 한다. 다만 OAuth 토큰은
+                // 네이티브 models API 스코프가 없어 항상 403 (실측) — 정적 카탈로그로 대체한다.
                 if name == "gemini" {
+                    if cred.as_ref().is_some_and(|c| c.oauth) {
+                        return Ok(Vec::new());
+                    }
                     return list_gemini_native(&client, &cred).await;
                 }
                 if oauth_openai && status.as_u16() == 400 {
                     // ChatGPT/Codex OAuth 는 /models 엔드포인트가 없다 — 정적 카탈로그 사용.
                     return Ok(Vec::new());
+                }
+                if status.as_u16() == 404 {
+                    anyhow::bail!(
+                        "HTTP {status} — /models 가 없는 서비스는 config 의 models_url 로 목록 위치를 지정하세요"
+                    );
                 }
                 anyhow::bail!("HTTP {status}");
             }
@@ -1689,7 +1711,90 @@ fn catalogs_file(cfg: &Config) -> std::path::PathBuf {
     cfg.data_dir.join("catalogs.json")
 }
 
+fn catalogs_meta_file(cfg: &Config) -> std::path::PathBuf {
+    cfg.data_dir.join("catalogs_meta.json")
+}
+
+/// 카탈로그 만료 기준 — 하루. 신규 모델 반영은 하루에 한 번, 백그라운드로 충분하다.
+const CATALOG_STALE_SECS: i64 = 24 * 60 * 60;
+
+/// 카탈로그를 마지막으로 건든 시각을 기록한다 (성공·실패 모두 — 실패가 프로세스마다
+/// 재시도되는 네트워크 폭탄이 되지 않도록 하루에 한 번만 묶는다).
+fn stamp_catalog(cfg: &Config, name: &str) -> Result<()> {
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct Meta(std::collections::BTreeMap<String, i64>);
+    let path = catalogs_meta_file(cfg);
+    let mut m: Meta = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    m.0.insert(name.to_string(), now_secs());
+    std::fs::create_dir_all(cfg.data_dir.clone())?;
+    std::fs::write(&path, serde_json::to_string(&m)?)?;
+    Ok(())
+}
+
+fn catalog_touched_at(cfg: &Config, name: &str) -> Option<i64> {
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct Meta(std::collections::BTreeMap<String, i64>);
+    std::fs::read_to_string(catalogs_meta_file(cfg))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Meta>(&raw).ok())
+        .and_then(|mut m| m.0.remove(name))
+}
+
+/// 연결 중인 프로바이더 중 카탈로그를 하루 이상 안 건드린 곳이 하나라도 있는지.
+/// 스탬프가 아예 없으면(등록 직후, 또는 옛 버전에서 받아둔 캐시) 갱신 대상으로 본다.
+pub fn catalogs_stale(cfg: &Config) -> bool {
+    usable_names(cfg).iter().any(|n| {
+        catalog_touched_at(cfg, n)
+            .map(|ts| now_secs() - ts >= CATALOG_STALE_SECS)
+            .unwrap_or(true)
+    })
+}
+
+/// 하루 1회 모델 카탈로그 자동 갱신 — ranks 주간 갱신과 같은 방식. 부트를 절대 막지 않는다.
+/// 프로세스당 1회만 기회를 얻고, 데스크탑·텔레그램처럼 오래 사는 프로세스는 6시간마다
+/// 만료분을 다시 돈다. 순수 백그라운드라 실패해도 본 작업에 소리도 없다.
+pub fn spawn_catalog_refresh(cfg: &Config) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let cfg = cfg.clone();
+    let run = async move {
+        // interval 의 첫 tick 은 즉시 발동한다 — 시작 시 1회 + 이후 6시간마다 검사.
+        let mut ticker = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+        loop {
+            if catalogs_stale(&cfg) {
+                let rows = refresh_catalogs(&cfg).await;
+                let summary = refresh_summary(&rows).join(" | ");
+                crate::applog::info(&format!("모델 카탈로그 자동 갱신: {summary}"));
+            }
+            ticker.tick().await;
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(run);
+        }
+        Err(_) => {
+            let _ = thread::Builder::new()
+                .name("rafikx-catalog-refresh".into())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    if let Ok(rt) = rt {
+                        rt.block_on(run);
+                    }
+                });
+        }
+    }
+}
+
 /// 원격 모델 목록을 캐시에 저장한다 (/model · Harness 선택이 이 목록을 쓴다).
+/// 마지막 건든 시각도 함께 기록해 자동 갱신의 만료 판단에 쓴다.
 pub fn save_catalog(cfg: &Config, name: &str, list: &[String]) -> Result<()> {
     #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct Catalogs(std::collections::BTreeMap<String, Vec<String>>);
@@ -1701,7 +1806,7 @@ pub fn save_catalog(cfg: &Config, name: &str, list: &[String]) -> Result<()> {
     c.0.insert(name.to_string(), list.to_vec());
     std::fs::create_dir_all(cfg.data_dir.clone())?;
     std::fs::write(&path, serde_json::to_string(&c)?)?;
-    Ok(())
+    stamp_catalog(cfg, name)
 }
 
 fn cached_catalog(cfg: &Config, name: &str) -> Vec<String> {
@@ -1712,6 +1817,18 @@ fn cached_catalog(cfg: &Config, name: &str) -> Vec<String> {
         .and_then(|raw| serde_json::from_str::<Catalogs>(&raw).ok())
         .and_then(|mut c| c.0.remove(name))
         .unwrap_or_default()
+}
+
+/// 원격 모델 목록을 조회해 캐시에 저장한다 — 등록 직후 자동 검색(로그인·models 명령)의
+/// 한 통로. 조회 실패·빈 목록이면 아무것도 건드리지 않고 None.
+pub async fn fetch_and_save_catalog(cfg: &Config, name: &str) -> Option<usize> {
+    let list = match list_remote_models(cfg, name).await {
+        Ok(list) if !list.is_empty() => list,
+        _ => return None,
+    };
+    let n = list.len();
+    save_catalog(cfg, name, &list).ok()?;
+    Some(n)
 }
 
 /// 연결 하나의 카탈로그 갱신 결과 — 저장한 모델 수, 또는 실패 사유 요약.
@@ -1734,30 +1851,40 @@ fn short_error(e: &anyhow::Error) -> String {
 
 /// 연결된 모든 서비스의 모델 목록을 동시에 다시 조회해 캐시에 저장한다.
 /// 빈 목록은 저장하지 않는다 — 일시적 실패로 기존 캐시를 지워 버리면 퇴보다.
+/// 저장은 조회가 다 끈 뒤 순서대로 — catalogs.json 이 파일 통째 read-modify-write 라
+/// 동시에 쓰면 나중 쓰기가 먼저 쓰기를 덮어 항목이 사라진다.
 pub async fn refresh_catalogs(cfg: &Config) -> Vec<CatalogRefresh> {
     let names = usable_names(cfg);
-    let jobs = names.iter().map(|name| async move {
+    let fetched = futures_util::future::join_all(names.iter().map(|name| async move {
         // auto_assign_roles 와 같은 12초 상한 — 한 연결이 늦어도 전체가 잠기지 않는다.
         let fetched = tokio::time::timeout(
             Duration::from_secs(12),
             list_remote_models(cfg, name.as_str()),
         )
         .await;
+        (name.clone(), fetched)
+    }))
+    .await;
+    let mut rows = Vec::new();
+    for (name, fetched) in fetched {
         let result = match fetched {
             Err(_) => Err("시간 초과 (12초)".to_string()),
             Ok(Err(e)) => Err(short_error(&e)),
             Ok(Ok(list)) if list.is_empty() => Ok(0),
-            Ok(Ok(list)) => match save_catalog(cfg, name.as_str(), &list) {
+            Ok(Ok(list)) => match save_catalog(cfg, &name, &list) {
                 Ok(()) => Ok(list.len()),
                 Err(e) => Err(short_error(&e)),
             },
         };
-        CatalogRefresh {
-            provider: name.clone(),
+        // 어느 결과든 시각을 남긴다 — 실패·빈 목록도 하루에 한 번만 다시 시도하도록.
+        // (save_catalog 가 이미 찍은 경우 같은 초에 한 번 더 찍히지만 무해하다.)
+        let _ = stamp_catalog(cfg, &name);
+        rows.push(CatalogRefresh {
+            provider: name,
             result,
-        }
-    });
-    futures_util::future::join_all(jobs).await
+        });
+    }
+    rows
 }
 
 /// 갱신 결과를 사람이 읽는 줄로 조립한다 (프로바이더별 한 줄 + 총계 한 줄).
@@ -2232,6 +2359,79 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 카탈로그 스탬프·만료 판단 테스트용 — auth=none 로컬 프로바이더 하나뿐인 설정.
+    /// data_dir 을 temp 로 독립시켜 실제 사용자 데이터를 건드리지 않는다.
+    fn catalog_test_cfg(tag: &str) -> (Config, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rafikx-catalog-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut file: crate::config::ConfigFile =
+            toml::from_str(crate::config::DEFAULT_CONFIG).unwrap();
+        file.providers.clear();
+        file.providers.insert(
+            "local".into(),
+            crate::config::ProviderConfig {
+                kind: "openai_compat".into(),
+                auth: "none".into(),
+                api_key_env: String::new(),
+                model: "qwen3:8b".into(),
+                small_model: None,
+                base_url: None,
+                supports_tools: false,
+                models_url: None,
+                model_auto: false,
+                context_window: None,
+                enabled: true,
+            },
+        );
+        let cfg = Config {
+            path: dir.join("config.toml"),
+            data_dir: dir.clone(),
+            workspace: dir.clone(),
+            file,
+            loaded_at: None,
+        };
+        (cfg, dir)
+    }
+
+    #[test]
+    fn catalog_stamp_roundtrip_and_staleness() {
+        let (cfg, dir) = catalog_test_cfg("roundtrip");
+
+        // 스탬프가 없으면 (등록 직후, 받은 적 없음) 갱신 대상이다.
+        assert!(catalogs_stale(&cfg));
+
+        // 저장하면 스탬프가 함께 찍혀 하루 안으로 본다.
+        save_catalog(&cfg, "local", &["qwen3:8b".to_string()]).unwrap();
+        assert!(!catalogs_stale(&cfg));
+        assert_eq!(cached_catalog(&cfg, "local"), vec!["qwen3:8b".to_string()]);
+        assert!(catalog_touched_at(&cfg, "local").is_some());
+
+        // 하루 이전 스탬프는 다시 갱신 대상.
+        let path = catalogs_meta_file(&cfg);
+        let old = now_secs() - 25 * 60 * 60;
+        fs::write(&path, format!(r#"{{"local":{old}}}"#)).unwrap();
+        assert!(catalogs_stale(&cfg));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catalog_meta_keys_are_per_provider() {
+        let (cfg, dir) = catalog_test_cfg("perkey");
+        save_catalog(&cfg, "local", &["a".to_string(), "b".to_string()]).unwrap();
+        assert!(catalog_touched_at(&cfg, "other-provider").is_none());
+        assert!(catalog_touched_at(&cfg, "local").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_models_url_carries_client_version() {
+        let url = codex_models_url();
+        assert!(url.starts_with("https://chatgpt.com/backend-api/codex/models?"));
+        assert!(url.contains(&format!("client_version={}", env!("CARGO_PKG_VERSION"))));
+    }
 
     #[test]
     fn pkce_challenge_is_base64url() {

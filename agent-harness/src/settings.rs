@@ -469,7 +469,12 @@ fn disconnect_menu(cfg: &mut Config) -> Result<()> {
 
 async fn pick_provider_model(cfg: &Config, name: &str) -> Result<()> {
     let mut models = auth::catalog_models(cfg, name);
-    if let Ok(remote) = auth::list_remote_models(cfg, name).await {
+    // 연결 직후 원격 목록을 한 번 받아 캐시에 저장한다 — TUI 키 등록과 같은 통로.
+    // (여기서 저장해 두어야 /model 피커가 신규 모델을 계속 보여준다.)
+    if let Ok(remote) = auth::list_remote_models(cfg, name).await
+        && !remote.is_empty()
+    {
+        let _ = auth::save_catalog(cfg, name, &remote);
         for m in remote {
             if !models.iter().any(|x| x == &m) {
                 models.push(m);

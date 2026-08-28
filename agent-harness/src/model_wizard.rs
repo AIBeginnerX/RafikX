@@ -93,7 +93,10 @@ async fn fetch_models(cfg: &Config, name: &str) -> Vec<String> {
     let remote = crate::auth::list_remote_models(cfg, name).await.ok();
     sp.finish();
     let mut list = remote.unwrap_or_default();
-    if list.is_empty() {
+    if !list.is_empty() {
+        // 원격 목록을 캐시에 저장 — /model 피커·Harness 선택이 계속 볼 수 있게.
+        let _ = crate::auth::save_catalog(cfg, name, &list);
+    } else {
         crate::ui::note("원격 목록 unavailable — 등록된 선호 카탈로그 사용");
         list = crate::auth::catalog_models(cfg, name);
     }

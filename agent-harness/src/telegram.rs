@@ -98,6 +98,8 @@ pub async fn run(config_path: Option<&Path>, with_watch: bool) -> Result<()> {
 
     spawn_inspector_scheduler(bot.clone(), cfg.clone());
     spawn_anomaly_watcher(bot.clone(), cfg.clone());
+    // 데몬은 오래 살므로 6시간 주기 카탈로그 갱신 루프가 실제로 돈다.
+    crate::auth::spawn_catalog_refresh(&cfg);
 
     let handler = dptree::entry()
         .branch(Update::filter_callback_query().endpoint(on_callback))
