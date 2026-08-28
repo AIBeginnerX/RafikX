@@ -79,21 +79,30 @@ fn draw_split(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     }
 }
 
-/// RafikX 로고 마크 — { / } 를 7행 블록 아트로. 공식 로고(검은 바탕의 중괄호+사선)의
-/// 터미널 재현: 중괄호 갈고리는 사선 쪽(안쪽)으로, 중앙 돌기는 바깥쪽으로, 사선은
-/// 아래-왼쪽에서 위-오른쪽으로 뻗는다. 행마다 폭은 글리프별로 균일.
+/// RafikX 로고 — { / } 마크와 RIX 워드마크를 7행 블록 아트로. 공식 로고(검은 바탕의
+/// 중괄호+사선+RAFIKX 워드마크)의 터미널 재현: 중괄호 갈고리는 사선 쪽(안쪽)으로,
+/// 중앙 돌기는 바깥쪽으로, 사선은 아래-왼쪽에서 위-오른쪽으로 뻗는다.
 const GLYPHS: &[(char, [&str; 7])] = &[
+    ('{', [" ██", " █ ", " █ ", "██ ", " █ ", " █ ", " ██"]),
+    ('/', ["   █", "  █ ", "  █ ", " █  ", " █  ", "█   ", "█   "]),
+    ('}', ["██ ", " █ ", " █ ", " ██", " █ ", " █ ", "██ "]),
     (
-        '{',
-        [" ██", " █ ", " █ ", "██ ", " █ ", " █ ", " ██"],
+        'R',
+        [
+            "█████", "█   █", "█   █", "█████", "█ █  ", "█  █ ", "█   █",
+        ],
     ),
     (
-        '/',
-        ["   █", "  █ ", "  █ ", " █  ", " █  ", "█   ", "█   "],
+        'I',
+        [
+            "█████", "  █  ", "  █  ", "  █  ", "  █  ", "  █  ", "█████",
+        ],
     ),
     (
-        '}',
-        ["██ ", " █ ", " █ ", " ██", " █ ", " █ ", "██ "],
+        'X',
+        [
+            "█   █", "█   █", " █ █ ", "  █  ", " █ █ ", "█   █", "█   █",
+        ],
     ),
 ];
 
@@ -101,22 +110,19 @@ fn glyph(ch: char) -> Option<&'static [&'static str; 7]> {
     GLYPHS.iter().find(|(c, _)| *c == ch).map(|(_, rows)| rows)
 }
 
-/// 배너에 크게 뜨는 로고 마크.
-const BANNER_MARK: &str = "{/}";
-
-/// 마크 기본 폭 — { (3) + / (4) + } (3), 간격은 리본 폭에 맞춰 계산.
-const MARK_BASE_W: usize = 3 + 4 + 3;
-
-/// 리본 폭에 마크를 펼칠 간격 — 리본과 배너가 같은 폭의 한 블록이 되도록.
-/// 패널이 좁으면 간격을 1로 줄이고, 그래도 안 들어가면 0 (호출부가 한 줄 폴백).
-fn mark_gap(ribbon_w: usize, panel_w: usize) -> usize {
-    let n = BANNER_MARK.chars().count();
-    let span = ribbon_w.min(panel_w);
-    if span <= MARK_BASE_W || n < 2 {
-        return 0;
-    }
-    ((span - MARK_BASE_W) / (n - 1)).max(1)
-}
+/// 배너 락업 — 콤팩트한 로고 마크 + 오른쪽 RIX 워드마크 (공식 로고 구성과 동일).
+const MARK: &str = "{/}";
+const WORD: &str = "RIX";
+/// 마크 내부 간격 — 로고처럼 사선이 중괄호에 바짝 붙는다.
+const MARK_GAP: usize = 2;
+/// 마크와 워드마크 사이 — 로고의 마크↔RAFIKX 간격에 해당.
+const GROUP_GAP: usize = 4;
+/// 워드마크 글자 간격.
+const WORD_GAP: usize = 1;
+const MARK_W: usize = 3 + MARK_GAP + 4 + MARK_GAP + 3;
+const WORD_W: usize = 3 * 5 + WORD_GAP * 2;
+/// 락업 전체 폭 — 마크 + 그룹 간격 + 워드마크.
+const LOCKUP_W: usize = MARK_W + GROUP_GAP + WORD_W;
 
 /// 부팅 연출 — 글자가 아래에서부터 한 행씩 켜진다 (reduced_motion 이면 즉시 전체).
 fn visible_rows(app: &App) -> usize {
@@ -178,26 +184,19 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     let left_inner_w = area.width.saturating_sub(4) as usize;
     let mut lines: Vec<Line> = Vec::new();
     let ribbon: Vec<Span<'static>> = compact_signal(app, palette);
-    let ribbon_w: usize = ribbon.iter().map(|s| s.content.chars().count()).sum();
-    let gap = mark_gap(ribbon_w, left_inner_w);
-    let mark_span = MARK_BASE_W + gap * (BANNER_MARK.chars().count() - 1);
-
-    if gap > 0 && left_inner_w >= mark_span {
+    if left_inner_w >= LOCKUP_W {
+        // 락업을 패널 중앙에 모은다 — 콤팩트한 로고 + 워드마크 한 덩어리.
+        let pad = (left_inner_w - LOCKUP_W) / 2;
         let shown = visible_rows(app);
         for row_index in 0..shown {
-            let mut spans = Vec::new();
+            let mut spans = vec![Span::raw(" ".repeat(pad))];
             let mut abs_col = 0usize;
-            for (part_index, ch) in BANNER_MARK.chars().enumerate() {
-                if part_index > 0 {
-                    // 리본 폭에 맞춘 간격 — 리본과 배너가 한 블록으로 정렬된다.
-                    spans.push(Span::raw(" ".repeat(gap)));
-                    abs_col += gap;
-                }
-                let Some(rows) = glyph(ch) else { continue };
+            let mut draw_glyph = |spans: &mut Vec<Span<'static>>, ch: char, abs_col: &mut usize| {
+                let Some(rows) = glyph(ch) else { return };
                 for (col, cell) in rows[row_index].chars().enumerate() {
                     if cell == '█' {
-                        let t = abs_col as f32 / (mark_span - 1).max(1) as f32;
-                        // 사선은 로고의 선처럼 항상 선명하게 — 중괄호만 그라디언트·반짝임.
+                        let t = *abs_col as f32 / (LOCKUP_W - 1).max(1) as f32;
+                        // 사선은 로고의 선처럼 항상 선명하게 — 나머지는 그라디언트·반짝임.
                         let style = if ch == '/' {
                             Style::default()
                                 .fg(palette.text)
@@ -213,12 +212,27 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
                         };
                         spans.push(Span::styled("█".to_string(), style));
                     } else {
-                        // 마크 내부 공백도 그대로 출력 — 빈 칸을 건너뛰면
-                        // 모양이 뭉개져 글자가 불완전해 보인다.
+                        // 내부 공백도 그대로 출력 — 건너뛰면 모양이 뭉개진다.
                         spans.push(Span::raw(" "));
                     }
-                    abs_col += 1;
+                    *abs_col += 1;
                 }
+            };
+            for (part_index, ch) in MARK.chars().enumerate() {
+                if part_index > 0 {
+                    spans.push(Span::raw(" ".repeat(MARK_GAP)));
+                    abs_col += MARK_GAP;
+                }
+                draw_glyph(&mut spans, ch, &mut abs_col);
+            }
+            spans.push(Span::raw(" ".repeat(GROUP_GAP)));
+            abs_col += GROUP_GAP;
+            for (letter_index, ch) in WORD.chars().enumerate() {
+                if letter_index > 0 {
+                    spans.push(Span::raw(" ".repeat(WORD_GAP)));
+                    abs_col += WORD_GAP;
+                }
+                draw_glyph(&mut spans, ch, &mut abs_col);
             }
             lines.push(Line::from(spans));
         }
@@ -229,7 +243,7 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
         lines.push(Line::default());
         lines.push(Line::from(ribbon));
         lines.push(Line::from(Span::styled(
-            marquee_line(app.motion_tick, left_inner_w.min(mark_span + 6)),
+            marquee_line(app.motion_tick, left_inner_w.min(LOCKUP_W + 6)),
             Style::default().fg(palette.secondary),
         )));
     } else {
@@ -624,9 +638,9 @@ mod tests {
                 );
             }
         }
-        // 로고 마크 구성 — { / } 순서와 중앙 돌기 방향(바깥) 확인.
+        // 로고 구성 — 마크 3요소 + 워드마크 3글자.
         let keys: Vec<char> = GLYPHS.iter().map(|(c, _)| *c).collect();
-        assert_eq!(keys, vec!['{', '/', '}']);
+        assert_eq!(keys, vec!['{', '/', '}', 'R', 'I', 'X']);
         let brace_left = GLYPHS.iter().find(|(c, _)| *c == '{').unwrap().1;
         assert_eq!(brace_left[3], "██ ", "{{ 중앙 돌기는 왼쪽(바깥)");
         let brace_right = GLYPHS.iter().find(|(c, _)| *c == '}').unwrap().1;
@@ -665,13 +679,16 @@ mod tests {
     }
 
     #[test]
-    fn mark_spans_ribbon_width() {
-        // 리본 폭 41 — { / }(10폭)가 간격 15로 펼쳐져 41에 맞닿는다.
-        assert_eq!(mark_gap(41, 60), 15);
-        // 패널이 리본보다 좁으면 패널 폭에 맞춘다: (20−10)/2 = 5.
-        assert_eq!(mark_gap(41, 20), 5);
-        // 리본보다 마크가 더 넓은 극단 — 0 은 호출부의 한 줄 폴백 신호.
-        assert_eq!(mark_gap(9, 60), 0);
+    fn lockup_is_mark_plus_word() {
+        // 락업 구성 — 콤팩트 마크 { / } + 간격 + RIX.
+        assert_eq!(MARK, "{/}");
+        assert_eq!(WORD, "RIX");
+        assert_eq!(MARK_W, 3 + MARK_GAP + 4 + MARK_GAP + 3);
+        assert_eq!(WORD_W, 17);
+        assert_eq!(LOCKUP_W, MARK_W + GROUP_GAP + WORD_W);
+        // 로고 키 집합 — 마크 3요소와 워드마크 3글자.
+        let keys: Vec<char> = GLYPHS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(keys, vec!['{', '/', '}', 'R', 'I', 'X']);
     }
 
     #[test]
