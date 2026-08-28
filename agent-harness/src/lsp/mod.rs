@@ -64,12 +64,21 @@ async fn run_query(
         }
         let result = match query {
             Query::Diagnostics => {
-                server
+                // pull(3.17) 우선 — 미지원 서버(-32601)는 push(publishDiagnostics)로 받는다.
+                let uri = protocol::file_uri(path);
+                match server
                     .request(
                         "textDocument/diagnostic",
-                        json!({"textDocument":{"uri":protocol::file_uri(path)}}),
+                        json!({"textDocument":{"uri":uri}}),
                     )
                     .await
+                {
+                    Ok(v) => Ok(v),
+                    Err(e) if is_method_missing(&e) => {
+                        server.collect_diagnostics(&uri, 2000).await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Query::Definition { line, column } => {
                 let position = position::position(&text, line, column)?;
@@ -125,5 +134,21 @@ fn record_source(run: Option<&RunContext>, path: &Path, operation: &str, output:
             (MAX_RESULT_CHARS / 4) as u32,
             crate::context::tokens(output),
         );
+    }
+}
+
+/// LSP -32601(Method not found)·"not supported" 계열 오류인가.
+fn is_method_missing(error: &anyhow::Error) -> bool {
+    let text = format!("{error}");
+    text.contains("-32601") || text.contains("not supported") || text.contains("Method not found")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn detects_method_missing_errors() {
+        assert!(super::is_method_missing(&anyhow::anyhow!("LSP textDocument/diagnostic failed: {{\"code\":-32601}}")));
+        assert!(super::is_method_missing(&anyhow::anyhow!("method is not supported")));
+        assert!(!super::is_method_missing(&anyhow::anyhow!("connection reset")));
     }
 }

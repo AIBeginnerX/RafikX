@@ -5,7 +5,11 @@ use serde_json::{Value, json};
 pub fn initialize(workspace: &Path, process_id: u32) -> Value {
     json!({
         "processId": process_id,
+        "rootPath": workspace.to_string_lossy(),
         "rootUri": file_uri(workspace),
+        // pyright 등은 workspaceFolders 없으면 "<default workspace root>" 로 떨어져
+        // 진단이 빈 배열로 나온다 (실측).
+        "workspaceFolders": [{"uri": file_uri(workspace), "name": workspace.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "workspace".into())}],
         "capabilities": {
             "experimental": {"serverStatusNotification": true},
             "textDocument": {
