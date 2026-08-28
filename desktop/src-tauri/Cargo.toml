@@ -1,6 +1,6 @@
 [package]
 name = "rafikx-desktop"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "RafikX desktop runtime powered by the same harness as the CLI"
 default-run = "rafikx-desktop"
