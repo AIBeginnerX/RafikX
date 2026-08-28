@@ -6,8 +6,6 @@
 ## v5 기획 진행
 
 
-- [ ] (대기) apply_patch 성공률 0/18 (fail:apply) 조사 — Inspector 편집 지표가 실측으로 발견
-      (edit_file 21/0·multi_edit 19/0 과 대비). 패치 파서/적용 경로 점검 필요
 - [ ] (대기) Inspector 리포트의 ulw 섹션 — 다중 워크스페이스 합산 여부 결정
 
 ## 잔여 관찰 (수정 보류)

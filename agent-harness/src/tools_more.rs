@@ -797,11 +797,37 @@ impl Tool for WebSearch {
 #[derive(Debug)]
 pub enum PatchOp {
     Add(String, String),
-    Update(String, Vec<(String, String)>), // (removed, added) 치환 목록
+    Update(String, Vec<(String, String, String)>), // (removed, added) 치환 목록
     Delete(String),
 }
 
 pub struct ApplyPatch;
+
+/// Update 변경 블록의 위치를 확정한다 — 정확히 1번 매칭이 우선, 중복이면
+/// 문맥 앵커(앞 줄)를 붙여 재시도한다. 반환은 실제로 치환할 키(앵커 포함 여부 반영).
+///
+/// 빈 삭제 블록은 거부한다 — 빈 문자열은 모든 위치에 매칭되어 "7683번 나타납니다"
+/// 류의 오진을 만들었다 (실측, 2026-08-28).
+fn locate_change(body: &str, anchor: &str, old: &str) -> Result<String> {
+    if old.trim().is_empty() {
+        return Err(anyhow!(
+            "빈 삭제 블록은 지원하지 않습니다. 삭제할 빈 줄은 앞뒤 문맥 줄과 함께 적으세요."
+        ));
+    }
+    if body.matches(old).count() == 1 {
+        return Ok(old.to_string());
+    }
+    if !anchor.is_empty() {
+        let key = format!("{anchor}\n{old}");
+        if body.matches(&key).count() == 1 {
+            return Ok(key);
+        }
+    }
+    Err(anyhow!(
+        "변경 블록이 {}번 나타납니다. 문맥 줄을 더 붙이거나 edit_file 의 anchors 모드를 쓰세요.",
+        body.matches(old).count()
+    ))
+}
 
 impl ApplyPatch {
     pub const NAME: &'static str = "apply_patch";
@@ -815,14 +841,15 @@ impl ApplyPatch {
         let mut cur_file: Option<String> = None;
         let mut mode: Option<&'static str> = None; // "add" | "update" | "delete"
         let mut add_buf = Vec::new();
-        let mut changes: Vec<(String, String)> = Vec::new();
+        let mut changes: Vec<(String, String, String)> = Vec::new();
+        let mut last_ctx = String::new();
         let mut rem: Vec<String> = Vec::new();
         let mut addl: Vec<String> = Vec::new();
 
         let flush_change =
-            |rem: &mut Vec<String>, addl: &mut Vec<String>, changes: &mut Vec<(String, String)>| {
+            |rem: &mut Vec<String>, addl: &mut Vec<String>, changes: &mut Vec<(String, String, String)>, last_ctx: &mut String| {
                 if !rem.is_empty() || !addl.is_empty() {
-                    changes.push((rem.join("\n"), addl.join("\n")));
+                    changes.push((std::mem::take(last_ctx), rem.join("\n"), addl.join("\n")));
                     rem.clear();
                     addl.clear();
                 }
@@ -838,7 +865,7 @@ impl ApplyPatch {
                     if mode == Some("add") {
                         ops.push(PatchOp::Add(f, add_buf.join("\n")));
                     } else if mode == Some("update") {
-                        flush_change(&mut rem, &mut addl, &mut changes);
+                        flush_change(&mut rem, &mut addl, &mut changes, &mut last_ctx);
                         ops.push(PatchOp::Update(f, std::mem::take(&mut changes)));
                     } else if mode == Some("delete") {
                         ops.push(PatchOp::Delete(f));
@@ -854,7 +881,7 @@ impl ApplyPatch {
                     if mode == Some("add") {
                         ops.push(PatchOp::Add(f, add_buf.join("\n")));
                     } else if mode == Some("update") {
-                        flush_change(&mut rem, &mut addl, &mut changes);
+                        flush_change(&mut rem, &mut addl, &mut changes, &mut last_ctx);
                         ops.push(PatchOp::Update(f, std::mem::take(&mut changes)));
                     } else if mode == Some("delete") {
                         ops.push(PatchOp::Delete(f));
@@ -869,7 +896,7 @@ impl ApplyPatch {
                     if mode == Some("add") {
                         ops.push(PatchOp::Add(f, add_buf.join("\n")));
                     } else if mode == Some("update") {
-                        flush_change(&mut rem, &mut addl, &mut changes);
+                        flush_change(&mut rem, &mut addl, &mut changes, &mut last_ctx);
                         ops.push(PatchOp::Update(f, std::mem::take(&mut changes)));
                     } else if mode == Some("delete") {
                         ops.push(PatchOp::Delete(f));
@@ -896,14 +923,16 @@ impl ApplyPatch {
                     }
                     if let Some(c) = line.strip_prefix('-') {
                         if !addl.is_empty() {
-                            flush_change(&mut rem, &mut addl, &mut changes);
+                            flush_change(&mut rem, &mut addl, &mut changes, &mut last_ctx);
                         }
                         rem.push(c.to_string());
                     } else if let Some(c) = line.strip_prefix('+') {
                         addl.push(c.to_string());
                     } else {
-                        // 문맥 줄 — 현재 변경을 확정
-                        flush_change(&mut rem, &mut addl, &mut changes);
+                        // 문맥 줄 — 현재 변경을 확정하고, 이 줄을 다음 변경의 위치 앵커로 남긴다.
+                        flush_change(&mut rem, &mut addl, &mut changes, &mut last_ctx);
+                        // unified diff 문맥 표시(앞의 공백 1칸)를 벗겨 실제 내용만 남긴다.
+                        last_ctx = line.strip_prefix(' ').unwrap_or(line).to_string();
                     }
                 }
                 _ => {}
@@ -913,7 +942,7 @@ impl ApplyPatch {
             match mode {
                 Some("add") => ops.push(PatchOp::Add(f, add_buf.join("\n"))),
                 Some("update") => {
-                    flush_change(&mut rem, &mut addl, &mut changes);
+                    flush_change(&mut rem, &mut addl, &mut changes, &mut last_ctx);
                     ops.push(PatchOp::Update(f, changes));
                 }
                 Some("delete") => ops.push(PatchOp::Delete(f)),
@@ -949,12 +978,9 @@ impl ApplyPatch {
                     let f = root.join(p);
                     let body = fs::read_to_string(&f)
                         .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {p}"))?;
-                    for (i, (o, n)) in changes.iter().enumerate() {
-                        let cnt = body.matches(o.as_str()).count();
-                        if cnt != 1 {
-                            return Err(anyhow!(
-                                "{p} 의 {i}번째 변경 블록이 {cnt}번 나타납니다. 정확히 1번이어야 합니다."
-                            ));
+                    for (i, (anchor, o, n)) in changes.iter().enumerate() {
+                        if let Err(e) = locate_change(&body, anchor, o) {
+                            return Err(anyhow!("{p} 의 {i}번째 변경 블록: {e}"));
                         }
                         let _ = n;
                     }
@@ -996,18 +1022,18 @@ impl ApplyPatch {
                     let body = fs::read_to_string(&f)
                         .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", f.display()))?;
                     let mut updated = body.clone();
-                    for (o, n) in changes {
-                        let cnt = updated.matches(o.as_str()).count();
-                        if cnt != 1 {
-                            return Err(anyhow!(
-                                "{} 에서 변경 블록이 {cnt}번 나타납니다. 정확히 1번이어야 합니다.",
-                                f.display()
-                            ));
-                        }
+                    for (anchor, o, n) in changes {
+                        let key = match locate_change(&updated, anchor, o) {
+                            Ok(key) => key,
+                            Err(e) => {
+                                return Err(anyhow!("{} — {}\n{}", f.display(), e, crate::tools::hashline::ANCHOR_HINT));
+                            }
+                        };
                         done.push(crate::tools::code_change_summary(
                             "수정", &f, &updated, o, n,
                         ));
-                        updated = updated.replacen(o.as_str(), n.as_str(), 1);
+                        let replacement = key.replacen(o.as_str(), n.as_str(), 1);
+                        updated = updated.replacen(&key, &replacement, 1);
                     }
                     plan.replace(
                         &f,
@@ -1190,5 +1216,40 @@ mod tests {
             TaskTool::resolve_class("안녕", Some("simple".to_string()).as_deref()),
             crate::harness::TaskClass::Simple
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_patch_anchor_tests {
+    use super::*;
+
+    #[test]
+    fn context_anchor_disambiguates_duplicate_blocks() {
+        // 같은 -/+ 블록이 두 곳에 있어도 앞 문맥 줄로 구분된다.
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n fn one() {\n-    run();\n+    run(1);\n fn two() {\n-    run();\n+    run(2);\n*** End Patch\n";
+        let ops = ApplyPatch::parse(patch).unwrap();
+        let PatchOp::Update(_, changes) = &ops[0] else { panic!("update") };
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].0, "fn one() {");
+        assert_eq!(changes[1].0, "fn two() {");
+        assert_eq!(changes[0].1, "    run();");
+    }
+
+    #[test]
+    fn locate_with_anchor_picks_the_right_spot() {
+        let body = "fn one() {\n    run();\n}\nfn two() {\n    run();\n}\n";
+        // 중복 블록 — 앵커 없으면 오류, 있으면 해당 지점만
+        assert!(locate_change(body, "", "    run();").is_err());
+        let key = locate_change(body, "fn two() {", "    run();").unwrap();
+        let out = body.replacen(key.as_str(), key.replacen("    run();", "    run(2);", 1).as_str(), 1);
+        assert!(out.contains("fn one() {\n    run();\n}"));
+        assert!(out.contains("fn two() {\n    run(2);\n}"));
+    }
+
+    #[test]
+    fn empty_removal_block_is_rejected() {
+        // 모델이 빈 줄 삭제를 맨 "-" 줄로 쓴 사례 — "7683번 나타납니다" 오진 방지
+        let err = locate_change("a\n\nb\n", "", "").unwrap_err();
+        assert!(err.to_string().contains("빈 삭제 블록"));
     }
 }
