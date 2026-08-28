@@ -119,7 +119,7 @@ pub async fn run(config_path: Option<&Path>, with_watch: bool) -> Result<()> {
 
 /// 이상 감시자 (F: Inspector 강화) — 지표 이상을 주기 없이 즉시 알린다.
 /// 코드 계산만 하므로 모델 호출 없이 가볍다. [inspector] anomaly_minutes = 0 이면 끔.
-fn spawn_anomaly_watcher(bot: Bot, cfg: Config) {
+fn spawn_anomaly_watcher(_bot: Bot, cfg: Config) {
     let minutes = cfg.file.inspector.anomaly_minutes;
     if minutes == 0 {
         return;
