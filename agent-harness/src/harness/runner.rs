@@ -1322,6 +1322,7 @@ async fn run_verify(
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
     ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
     ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
+    ctx.hashline = cfg.file.edit.hashline;
     ctx.local_ask = local_ask.clone();
     ctx.remote = remote.clone();
     ctx.run = Some(run_context.clone());
@@ -2153,6 +2154,7 @@ async fn graph_node_boundary_check(
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
     ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
     ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
+    ctx.hashline = cfg.file.edit.hashline;
     ctx.local_ask = local_ask.clone();
     ctx.remote = remote.clone();
     ctx.run = Some(run_context.clone());

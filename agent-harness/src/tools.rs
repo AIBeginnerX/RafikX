@@ -22,6 +22,7 @@ use crate::tools_more::{
 };
 
 mod facts;
+pub(crate) mod hashline;
 mod lsp_tools;
 pub mod mutation;
 mod task;
@@ -47,6 +48,8 @@ pub struct ToolCtx {
     pub workspace: PathBuf,
     pub vault: Option<PathBuf>,
     pub db_path: PathBuf,
+    /// 해시 앵커(hashline) 모드 — config [edit] hashline. 테스트 기본 true.
+    pub hashline: bool,
     /// 서브에이전트(task 도구)가 승인 흐름을 이어받기 위한 채널.
     pub local_ask: Option<LocalAsk>,
     pub remote: Option<RemoteApproval>,
@@ -59,6 +62,7 @@ impl ToolCtx {
             workspace,
             vault: None,
             db_path: PathBuf::from("."),
+            hashline: true,
             local_ask: None,
             remote: None,
             run: None,
@@ -424,7 +428,7 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "워크스페이스 안의 파일을 읽습니다. 큰 파일은 offset/limit(줄 단위)로 범위를 지정하세요."
+        "워크스페이스 안의 파일을 읽습니다. 큰 파일은 offset/limit(줄 단위)로 범위를 지정하세요. 출력 각 줄에는 N#HASH| 태그가 붙습니다 — 편집할 때 edit_file 의 anchors(start/end) 인자로 이 태그를 사용하세요."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -462,7 +466,11 @@ impl Tool for ReadFile {
         let start_idx = start.saturating_sub(1).min(lines.len());
         let take = limit.map(|n| n as usize).unwrap_or(lines.len());
         let slice = &lines[start_idx..lines.len().min(start_idx + take)];
-        Ok(slice.join("\n"))
+        let body = slice.join("\n");
+        if ctx.hashline {
+            return Ok(hashline::tag_lines(&body, start));
+        }
+        Ok(body)
     }
 }
 
@@ -642,17 +650,26 @@ impl Tool for EditFile {
         "edit_file"
     }
     fn description(&self) -> &'static str {
-        "파일에서 old_str 를 new_str 로 바꿉니다. old_str 는 파일 안에서 정확히 한 번만 나타나야 합니다."
+        "파일을 바꿉니다. 두 모드: ① anchors(start/end에 read_file 의 N#HASH 태그) — 해시 검증 후 구간 교체(가장 정확) ② old_str/new_str — 파일 안에서 정확히 한 번만 나타나야 합니다."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "old_str": {"type": "string"},
-                "new_str": {"type": "string"}
+                "old_str": {"type": "string", "description": "모드②: 바꿀 원문 (anchors 없을 때 필수)"},
+                "new_str": {"type": "string"},
+                "anchors": {
+                    "type": "object",
+                    "properties": {
+                        "start": {"type": "string", "description": "시작 앵커 (예: 12#abc)"},
+                        "end": {"type": "string", "description": "끝 앵커 (예: 15#def)"}
+                    },
+                    "required": ["start", "end"],
+                    "description": "모드①: read_file 의 N#HASH 태그 구간"
+                }
             },
-            "required": ["path", "old_str", "new_str"]
+            "required": ["path", "new_str"]
         })
     }
     fn needs_approval(&self, _input: &Value) -> bool {
@@ -660,17 +677,47 @@ impl Tool for EditFile {
     }
     fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
         let path = str_field(&input, "path")?;
-        let old_str = str_field(&input, "old_str")?;
         let new_str = str_field(&input, "new_str")?;
         let resolved = resolve_tool_path(ctx, path)?;
         let body = fs::read_to_string(&resolved)
             .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", resolved.display()))?;
+
+        // 모드① 해시 앵커 — 검증 실패 시 아무것도 쓰지 않는다 (원자 거부).
+        if let Some(anchors) = input.get("anchors") {
+            let start = anchors.get("start").and_then(|v| v.as_str()).unwrap_or("");
+            let end = anchors.get("end").and_then(|v| v.as_str()).unwrap_or("");
+            match hashline::verify_span(&body, start, end) {
+                Ok((s, e)) => {
+                    let old_span = body.lines().skip(s).take(e - s + 1).collect::<Vec<_>>().join("\n");
+                    let updated = hashline::replace_span(&body, s, e, new_str);
+                    let mut plan = mutation::MutationPlan::new(&ctx.workspace)?;
+                    plan.replace(
+                        &resolved,
+                        mutation::MutationState::Present(body.as_bytes().to_vec()),
+                        updated.into_bytes(),
+                    )?;
+                    ctx.commit_mutation(plan)?;
+                    hashline::record_metric(ctx, "edit_file", "ok:anchors");
+                    return Ok(code_change_summary("수정", &resolved, &body, &old_span, new_str));
+                }
+                Err(e) => {
+                    hashline::record_metric(ctx, "edit_file", "fail:hash_mismatch");
+                    return Err(e);
+                }
+            }
+        }
+
+        // 모드② old_str (하위호환) — 실패 시 앵커 모드 힌트를 붙인다.
+        let old_str = str_field(&input, "old_str")?;
         let count = body.matches(old_str).count();
         if count != 1 {
+            hashline::record_metric(ctx, "edit_file", "fail:old_str_miss");
             return Err(anyhow!(
-                "old_str 가 파일에서 {count}번 나타납니다. 정확히 1번이어야 합니다."
+                "old_str 가 파일에서 {count}번 나타납니다. 정확히 1번이어야 합니다.\n{}",
+                hashline::ANCHOR_HINT
             ));
         }
+        hashline::record_metric(ctx, "edit_file", "ok:old_str");
         let updated = body.replacen(old_str, new_str, 1);
         let mut plan = mutation::MutationPlan::new(&ctx.workspace)?;
         plan.replace(
@@ -984,5 +1031,88 @@ mod tests {
         );
         assert!(shown.contains("src/main.rs:2-3"));
         assert!(shown.contains("+2 -1"));
+    }
+}
+
+#[cfg(test)]
+mod hashline_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn setup(tag: &str) -> (PathBuf, ToolCtx) {
+        let dir = std::env::temp_dir().join(format!("rafikx-hashline-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), ToolCtx::new(dir))
+    }
+
+    #[test]
+    fn read_file_tags_and_edit_file_anchor_edits() {
+        let (dir, ctx) = setup("anchor-ok");
+        fs::write(dir.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let tagged = ReadFile.run(json!({"path": "a.txt"}), &ctx).unwrap();
+        let anchor1 = tagged.lines().nth(1).unwrap().split('|').next().unwrap().to_string();
+        assert!(anchor1.contains('#'));
+
+        EditFile
+            .run(
+                json!({"path": "a.txt", "anchors": {"start": anchor1, "end": anchor1}, "new_str": "BETA"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "alpha\nBETA\ngamma\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn anchor_mismatch_rejects_atomically() {
+        let (dir, ctx) = setup("anchor-stale");
+        fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let err = EditFile
+            .run(
+                json!({"path": "a.txt", "anchors": {"start": "1#zzz", "end": "1#zzz"}, "new_str": "X"}),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("파일이 바뀌었습니다"));
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "alpha\nbeta\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_str_miss_carries_anchor_hint() {
+        let (dir, ctx) = setup("oldstr-hint");
+        fs::write(dir.join("a.txt"), "dup\ndup\n").unwrap();
+        let err = EditFile
+            .run(json!({"path": "a.txt", "old_str": "dup", "new_str": "X"}), &ctx)
+            .unwrap_err();
+        assert!(err.to_string().contains("anchors"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_off_keeps_legacy_read() {
+        let (dir, mut ctx) = setup("legacy-read");
+        ctx.hashline = false;
+        fs::write(dir.join("a.txt"), "plain\n").unwrap();
+        let out = ReadFile.run(json!({"path": "a.txt"}), &ctx).unwrap();
+        assert_eq!(out, "plain");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multi_edit_anchor_op_edits_span() {
+        let (dir, ctx) = setup("multi-anchor");
+        fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let tagged = ReadFile.run(json!({"path": "a.txt"}), &ctx).unwrap();
+        let a1 = tagged.lines().next().unwrap().split('|').next().unwrap().to_string();
+        MultiEdit
+            .run(
+                json!({"path": "a.txt", "edits": [{"anchors": {"start": a1, "end": a1}, "new_str": "ONE"}]}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "ONE\ntwo\nthree\n");
+        let _ = fs::remove_dir_all(dir);
     }
 }

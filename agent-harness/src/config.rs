@@ -309,6 +309,9 @@ approval_timeout_secs = 300
 theme = "rafikx"                   # rafikx | opal | synth | claude
 appearance = "auto"                # 데스크탑: light | dark | auto (운영체제 설정 자동)
 reduced_motion = false              # TUI 애니메이션 최소화
+#
+# [edit]
+# hashline = true   # read_file 에 N#HASH 태그 + 편집 도구 해시 앵커 모드 (권장)
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -318,6 +321,9 @@ pub struct ConfigFile {
     pub harness: HarnessConfig,
     pub subagents: HashMap<String, SubAgentConfig>,
     pub memory: MemoryConfig,
+    /// `[edit]` 편집 동작 — 옛 설정에 없으면 기본값(hashline on).
+    #[serde(default)]
+    pub edit: EditConfig,
     /// `[engines.<name>]` 엔진 사양 오버라이드 — 없으면 내장 카탈로그 그대로.
     #[serde(default)]
     pub engines: HashMap<String, crate::engine::EngineOverride>,
@@ -545,6 +551,24 @@ pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
         verify_command: String::new(),
         system_extra: system_extra.into(),
     })
+}
+
+/// `[edit]` — 편집 도구 동작.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditConfig {
+    /// read_file 출력에 N#HASH 태그를 붙이고 편집 도구의 anchors 모드를 켠다.
+    #[serde(default = "edit_hashline_default")]
+    pub hashline: bool,
+}
+
+fn edit_hashline_default() -> bool {
+    true
+}
+
+impl Default for EditConfig {
+    fn default() -> Self {
+        Self { hashline: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

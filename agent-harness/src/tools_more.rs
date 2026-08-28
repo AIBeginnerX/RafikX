@@ -458,6 +458,12 @@ impl Tool for WebFetch {
 
 pub struct MultiEdit;
 
+/// multi_edit 의 편집 단위 — old_str 치환 또는 해시 앵커 구간 교체.
+pub enum MultiEditOp {
+    Replace { old: String, new: String },
+    Anchor { start: String, end: String, new: String },
+}
+
 impl MultiEdit {
     pub fn apply(body: &str, edits: &[(String, String)]) -> Result<String> {
         let mut updated = body.to_string();
@@ -475,6 +481,46 @@ impl MultiEdit {
             updated = updated.replacen(old_str.as_str(), new_str.as_str(), 1);
         }
         Ok(updated)
+    }
+
+    /// 편집별 해시 앵커 모드(F3)를 포함한 파싱 결과.
+    pub fn parse_edits_with_anchors(input: &Value) -> Result<Vec<MultiEditOp>> {
+        let arr = input
+            .get("edits")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("edits 배열이 필요합니다"))?;
+        if arr.is_empty() {
+            return Err(anyhow!("edits 가 비어 있습니다"));
+        }
+        let mut out = Vec::new();
+        for e in arr {
+            let new = e
+                .get("new_str")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(anchors) = e.get("anchors") {
+                let start = anchors
+                    .get("start")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("anchors.start 가 필요합니다"))?
+                    .to_string();
+                let end = anchors
+                    .get("end")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("anchors.end 가 필요합니다"))?
+                    .to_string();
+                out.push(MultiEditOp::Anchor { start, end, new });
+            } else {
+                let old = e
+                    .get("old_str")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("edit 에 old_str 또는 anchors 가 필요합니다"))?
+                    .to_string();
+                out.push(MultiEditOp::Replace { old, new });
+            }
+        }
+        Ok(out)
     }
 
     pub fn parse_edits(input: &Value) -> Result<Vec<(String, String)>> {
@@ -520,10 +566,18 @@ impl Tool for MultiEdit {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "old_str": {"type": "string"},
-                            "new_str": {"type": "string"}
-                        },
-                        "required": ["old_str"]
+                            "old_str": {"type": "string", "description": "anchors 없을 때 필수"},
+                            "new_str": {"type": "string"},
+                            "anchors": {
+                                "type": "object",
+                                "properties": {
+                                    "start": {"type": "string"},
+                                    "end": {"type": "string"}
+                                },
+                                "required": ["start", "end"],
+                                "description": "read_file 의 N#HASH 태그 구간 (적용 시점 해시 검증)"
+                            }
+                        }
                     }
                 }
             },
@@ -538,18 +592,34 @@ impl Tool for MultiEdit {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("path 인자가 필요합니다"))?;
-        let edits = Self::parse_edits(&input)?;
+        let edits = Self::parse_edits_with_anchors(&input)?;
         let resolved = crate::tools::resolve_tool_path(ctx, path)?;
         let body = fs::read_to_string(&resolved)
             .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {}", resolved.display()))?;
         let mut updated = body.clone();
         let mut reports = Vec::new();
-        for (old, new) in &edits {
-            reports.push(crate::tools::code_change_summary(
-                "수정", &resolved, &updated, old, new,
-            ));
-            updated = Self::apply(&updated, &[(old.clone(), new.clone())])?;
+        for edit in &edits {
+            match edit {
+                MultiEditOp::Replace { old, new } => {
+                    reports.push(crate::tools::code_change_summary(
+                        "수정", &resolved, &updated, old, new,
+                    ));
+                    updated = Self::apply(&updated, &[(old.clone(), new.clone())]).map_err(|e| {
+                        crate::tools::hashline::record_metric(ctx, "multi_edit", "fail:old_str_miss");
+                        anyhow!("{e}\n{}", crate::tools::hashline::ANCHOR_HINT)
+                    })?;
+                }
+                MultiEditOp::Anchor { start, end, new } => {
+                    // 적용 시점의 현재 텍스트와 대조 — 앞선 편집으로 줄이 밀려도 해시가 막아준다.
+                    let (s, e) = crate::tools::hashline::verify_span(&updated, start, end).map_err(|err| {
+                        crate::tools::hashline::record_metric(ctx, "multi_edit", "fail:hash_mismatch");
+                        err
+                    })?;
+                    updated = crate::tools::hashline::replace_span(&updated, s, e, new);
+                }
+            }
         }
+        crate::tools::hashline::record_metric(ctx, "multi_edit", "ok");
         let mut plan = crate::tools::mutation::MutationPlan::new(&ctx.workspace)?;
         plan.replace(
             &resolved,
@@ -976,8 +1046,15 @@ impl Tool for ApplyPatch {
             .get("patch")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("patch 인자가 필요합니다"))?;
-        let ops = Self::parse(patch)?;
-        let done = Self::apply(ctx, &ops)?;
+        let ops = Self::parse(patch).map_err(|e| {
+            crate::tools::hashline::record_metric(ctx, "apply_patch", "fail:parse");
+            anyhow!("{e}\n{}", crate::tools::hashline::ANCHOR_HINT)
+        })?;
+        let done = Self::apply(ctx, &ops).map_err(|e| {
+            crate::tools::hashline::record_metric(ctx, "apply_patch", "fail:apply");
+            anyhow!("{e}\n{}", crate::tools::hashline::ANCHOR_HINT)
+        })?;
+        crate::tools::hashline::record_metric(ctx, "apply_patch", "ok");
         Ok(done.join("\n"))
     }
 }
