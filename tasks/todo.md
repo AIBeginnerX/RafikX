@@ -5,8 +5,7 @@
 
 ## v5 기획 진행
 
-- [ ] (진행) Phase C2 — 문서·버전 동기화 (이번 세션)
-- [ ] (대기) Phase C3 — harness.rs 모듈 분리 (v5 기획서 프롬프트 C3)
+- [ ] (대기) Phase C4 — 교차-표면 정책 상수 통합 (프롬프트 C4)
 - [ ] (대기) Phase C4 — 교차-표면 정책 상수 통합 (프롬프트 C4)
 - [ ] (대기) Phase F1 — 팩트 메모리 (remember/recall/forget)
 - [ ] (대기) Phase F2 — IntentGate (의도 게이트 + 분류 확신도)
