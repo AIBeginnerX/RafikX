@@ -170,7 +170,7 @@ pub fn bind_profile(
     }
 
     let window = crate::packer::context_window_for(&provider_name, &model, Some(p));
-    let tools = lane_filtered_tools(&profile_name, &sub.tools);
+    let tools = with_memory_tools(&lane_filtered_tools(&profile_name, &sub.tools));
     Ok(Binding {
         combo_chain: Vec::new(),
         class,
@@ -202,6 +202,27 @@ fn lane_filtered_tools(profile_name: &str, tools: &[String]) -> Vec<String> {
     let mut tools = tools.to_vec();
     if let Some(allow) = crate::harness::lane_tool_allowlist(profile_name) {
         tools.retain(|name| allow.contains(&name.as_str()));
+    }
+    tools
+}
+
+/// 메모리 도구 — 어떤 도구든 쓰는 프로파일이면 항상 포함한다 (F1·T4 실측 결함 수정).
+/// 기억은 작업 종류와 무관한 상시 능력이어야 한다. 도구 0개 프로파일(quick·plan)은
+/// 그 성질(텍스트 전용)을 해치지 않기 위해 제외한다.
+const MEMORY_TOOLS: &[&str] = &["remember", "recall", "forget"];
+
+fn with_memory_tools(tools: &[String]) -> Vec<String> {
+    if tools.is_empty() {
+        return Vec::new();
+    }
+    let mut tools = tools.to_vec();
+    if tools.iter().any(|t| t == "*") {
+        return tools; // 와일드카드는 이미 전부 포함
+    }
+    for m in MEMORY_TOOLS {
+        if !tools.iter().any(|t| t == m) {
+            tools.push((*m).to_string());
+        }
     }
     tools
 }
@@ -1584,5 +1605,35 @@ mod combo_tests {
         assert!(cfg.file.combos.is_empty());
         // 콤보 미설정 시 model_override "combo:x" 만 오류 — 일반 경로는 무영향
         assert!(combo_chain_specs(&cfg, "x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod memory_tool_tests {
+    use super::*;
+
+    #[test]
+    fn memory_tools_appended_to_tool_profiles() {
+        let tools = with_memory_tools(&["read_file".into(), "grep".into()]);
+        for m in ["remember", "recall", "forget"] {
+            assert!(tools.iter().any(|t| t == m), "{m} 누락");
+        }
+    }
+
+    #[test]
+    fn empty_tool_profiles_stay_tool_free() {
+        assert!(with_memory_tools(&[]).is_empty());
+    }
+
+    #[test]
+    fn wildcard_profiles_unchanged() {
+        let tools = with_memory_tools(&["*".into()]);
+        assert_eq!(tools, vec!["*"]);
+    }
+
+    #[test]
+    fn memory_intent_is_not_simple() {
+        assert_ne!(crate::harness::classify_rules("이 프로젝트는 pytest 써. 기억해줘", false), crate::harness::TaskClass::Simple);
+        assert_ne!(crate::harness::classify_rules("이전에 뭐라고 했는지 기억나?", false), crate::harness::TaskClass::Simple);
     }
 }

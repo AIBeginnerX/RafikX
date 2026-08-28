@@ -798,7 +798,18 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         cli.class.as_deref()
     };
     let class = classify(&cfg, prompt, obsidian, forced).await?;
-    let mut binding = bind(&cfg, class, cli.provider.as_deref(), cli.model.as_deref())?;
+    // 레인 라우팅 — chat 경로(run_turn_observed)와 같은 규칙을 단발 ask 에도 적용한다.
+    let lane = rafikx::harness::suggest_lane(prompt);
+    let mut binding = match lane {
+        Some(l) => rafikx::harness::bind_profile(
+            &cfg,
+            class,
+            Some(l),
+            cli.provider.as_deref(),
+            cli.model.as_deref(),
+        )?,
+        None => bind(&cfg, class, cli.provider.as_deref(), cli.model.as_deref())?,
+    };
     if let Some(w) = harness::apply_engine_pin(
         &cfg,
         &mut binding,
@@ -865,7 +876,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         &cfg,
         &binding,
         &task,
-        cli.yes,
+        cli.yes || cfg.file.general.approval.eq_ignore_ascii_case("yolo"),  // chat 경로(open_session)와 같은 yolo 규칙 (B2 수정)
         cli.provider.as_deref(),
         None,
         None,

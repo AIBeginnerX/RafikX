@@ -966,17 +966,29 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     *messages = keep;
 }
 
+fn parse_approval(input: &str) -> Option<Approval> {
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => Some(Approval::Yes),
+        "n" | "no" => Some(Approval::No),
+        "a" | "all" => Some(Approval::Always),
+        _ => None,
+    }
+}
+
 fn read_approval() -> Result<Approval> {
     loop {
         print!("[y] 이번만  / [n] 거부  / [a] 이번 실행 모두 허용 : ");
         let _ = io::stdout().flush();
         let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        match line.trim().to_lowercase().as_str() {
-            "y" | "yes" => return Ok(Approval::Yes),
-            "n" | "no" => return Ok(Approval::No),
-            "a" | "all" => return Ok(Approval::Always),
-            _ => println!("y / n / a 중에서 고르세요."),
+        let n = io::stdin().read_line(&mut line)?;
+        // 비대화형 stdin EOF — 재질문 루프는 무한 스핀이 된다. 안전하게 거부로 닫는다.
+        if n == 0 {
+            println!("(입력이 닫혔습니다 — 거부로 처리)");
+            return Ok(Approval::No);
+        }
+        match parse_approval(&line) {
+            Some(a) => return Ok(a),
+            None => println!("y / n / a 중에서 고르세요."),
         }
     }
 }
@@ -1195,5 +1207,21 @@ mod tests {
         assert!(!effective_yes(false, &remote));
         assert!(effective_yes(true, &None));
         assert!(!effective_yes(false, &None));
+    }
+}
+
+
+#[cfg(test)]
+mod approval_eof_tests {
+    use super::*;
+
+    #[test]
+    fn parses_approval_answers() {
+        assert!(matches!(parse_approval("y"), Some(Approval::Yes)));
+        assert!(matches!(parse_approval("Y"), Some(Approval::Yes)));
+        assert!(matches!(parse_approval("no"), Some(Approval::No)));
+        assert!(matches!(parse_approval("a"), Some(Approval::Always)));
+        assert!(parse_approval("").is_none());
+        assert!(parse_approval("뭐").is_none());
     }
 }

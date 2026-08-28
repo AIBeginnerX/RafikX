@@ -49,6 +49,8 @@ impl TaskClass {
 const MEDIUM_KEYWORDS: &[&str] = &[
     "요약", "정리", "번역", "초안", "검색", "찾아", "노트", "문서", "파일", "마크다운",
     "폴터", "디렉토리", "워크스페이스",
+    // 기억 의도 — remember/recall 도구가 필요하므로 도구 없는 quick 으로내면 안 된다 (T4 실측).
+    "기억해", "기억나", "기록해", "remember", "recall",
 ];
 
 /// 경로·파일 신호 — dev 키워드는 안 맞지만 도구 필요 가능성이 있는 짧은 입력.
@@ -156,12 +158,20 @@ pub async fn classify_gated(
             confident: true,
             via: ClassSource::Judge,
         }),
-        _ => Ok(ClassDecision {
-            class: rules_class,
-            rules_class,
-            confident: false,
-            via: ClassSource::Rules,
-        }),
+        _ => {
+            // 재판정이 못 열린 채 불확실 분류로 진행한다 — 조용한 무동작을 막기 위해
+            // 사용자에게 보인다 (T2 실측: judge 실패 시 simple 조용 종료).
+            crate::ui::live_warn(&format!(
+                "분류 재판정을 쓸 수 없어 규칙 결과({})로 진행합니다. 작업이 안 움직이면 /class dev 로 고정하세요.",
+                rules_class.as_str()
+            ));
+            Ok(ClassDecision {
+                class: rules_class,
+                rules_class,
+                confident: false,
+                via: ClassSource::Rules,
+            })
+        }
     }
 }
 
@@ -196,6 +206,10 @@ fn looks_like_dev(text: &str) -> bool {
             "함수",
             "에러 잡아",
             "업그레이드",
+            "바꿔",
+            "바꾸",
+            "교체",
+            "변경해",
             "만들어",
             "생성해",
             "작성해",
@@ -410,4 +424,9 @@ mod lane_tests {
         assert_eq!(suggest_lane("안녕"), None);
         assert_eq!(suggest_lane("이 파일 요약해줘"), None);
     }
+}
+
+#[test]
+fn t3_actual_input_routes_explorer() {
+    assert_eq!(crate::harness::suggest_lane("src 에서 helper 함수를 호출하는 곳을 다 찾아줘"), Some("explorer"));
 }
