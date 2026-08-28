@@ -272,7 +272,7 @@ async fn run_ask(bot: &Bot, msg: &Message, app: &Arc<App>, prompt: &str) -> Resp
 
 async fn ask_pipeline(bot: &Bot, msg: &Message, app: &Arc<App>, prompt: &str) -> Result<String> {
     let cfg = &app.cfg;
-    let class = harness::classify(cfg, prompt, false, None).await?;
+    let class = harness::classify_gated(cfg, prompt, false, None).await?.class;
     let mut binding = harness::bind(cfg, class, None, None)?;
     if let Some(w) = harness::apply_engine_pin(cfg, &mut binding, None, None) {
         crate::ui::live_warn(&w);

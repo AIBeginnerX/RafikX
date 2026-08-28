@@ -7,7 +7,7 @@ use crate::agent::{self, LocalAsk};
 use crate::applog;
 use crate::config::Config;
 use crate::db::Db;
-use crate::harness::{bind, classify, print_binding, run_pipeline_with_context};
+use crate::harness::{bind, print_binding, run_pipeline_with_context};
 use crate::obsidian;
 use crate::provider::{ChatRequest, ContentBlock, Message, Role};
 use crate::run::{RunContext, RunId};
@@ -1562,7 +1562,24 @@ pub async fn run_turn_observed(
     let mut auto_compacted = false;
     crate::spinner::set_label("질문 확인 중…");
     reload_cfg_if_changed(session);
-    let class = classify(&session.cfg, prompt, obsidian_on, forced_class).await?;
+    let decision = crate::harness::classify_gated(&session.cfg, prompt, obsidian_on, forced_class).await?;
+    let class = decision.class;
+    if decision.via == crate::harness::ClassSource::Judge && decision.rules_class != decision.class
+        && let Ok(db) = Db::open(&Db::db_path()?)
+    {
+        // 재판정이 규칙을 뒤집은 사례 — 규칙 개선 재료로 lessons 에 남긴다 (F2).
+        let _ = db.add_lesson(
+            "분류 재판정",
+            &format!("{}→{}", decision.rules_class.as_str(), decision.class.as_str()),
+            &format!(
+                "규칙은 {}(으)로 봤지만 재판정은 {}: {}",
+                decision.rules_class.as_str(),
+                decision.class.as_str(),
+                prompt.chars().take(80).collect::<String>()
+            ),
+            200,
+        );
+    }
     // 연속성: 사용자가 직접 고르지 않았으면 마지막 성공 조합(provider, model)을 재사용해
     // 매 턴마다 다른 모델이 추첨되어 인증·리밋 오류가 나는 일을 막는다.
     let (ov_provider, ov_model) = if session.provider.is_none() && session.model.is_none() {

@@ -233,7 +233,8 @@ pub(crate) const PLAN_CONTRACT_INSTRUCTION: &str = "\
     [완료 기준] 검증 가능한 체크리스트 3~10항목. 각 항목은 '무엇이 충족되어야 하는가'와 \
     '어떻게 확인하는가(명령·파일·관찰 대상)'를 함께 적는다.\n\
     [작업 분해] 실행 순서 3~9단계. 각 단계는 한 줄로 적고 결과물을 명시한다.\n\
-    [반박] 이 계획을 실패시킬 가장 유력한 위험 1개와 그것을 조기 확인할 최소 테스트 1개.";
+    [반박] 이 계획을 실패시킬 가장 유력한 위험 1개와 그것을 조기 확인할 최소 테스트 1개.
+    [질문] 실행을 바꿀 수 있는 분기점이 남아 있을 때만 한두 개로 모은다. 사소한 모호함은     [해석]의 채택 해석으로 처리하고 묻지 않는다(확인 연극 금지). 분기점이 없으면 '없음'이라고만 적는다.";
 
 /// discipline = loop — 종료 조건을 시스템 프롬프트에 못 박는다.
 pub(crate) const LOOP_DISCIPLINE_RULE: &str =
@@ -646,6 +647,16 @@ async fn run_pipeline_inner(
                         dod_checklist = extract_plan_section(&plan, "[완료 기준]");
                         rebuttal = extract_plan_section(&plan, "[반박]");
                         plan_steps = extract_plan_section(&plan, "[작업 분해]");
+                        let intent_q = extract_plan_section(&plan, "[질문]");
+                        if !intent_q.is_empty() && intent_q.trim() != "없음" {
+                            crate::graph::node_in(
+                                &run_context,
+                                "pre_step",
+                                "intent_gate",
+                                &format!("실행 전 확인이 필요한 분기점: {intent_q}"),
+                                None,
+                            );
+                        }
                     }
                 }
             }
