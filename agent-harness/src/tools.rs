@@ -256,10 +256,25 @@ pub fn resolve_in_workspace(workspace: &Path, user_path: &str) -> Result<PathBuf
     }
 }
 
+/// 쓰기 대상 경로 해석 — 파일 수정 도구(edit/write/multi_edit/apply_patch) 전용.
+/// 읽기 도구는 이 게이트를 거치지 않는다 (acceptance 읽기는 자유).
 pub fn resolve_tool_path(ctx: &ToolCtx, user_path: &str) -> Result<PathBuf> {
     let resolved = resolve_in_workspace(&ctx.workspace, user_path)?;
     reject_vault(&resolved, ctx.vault.as_deref())?;
+    reject_acceptance(&resolved)?;
     Ok(resolved)
+}
+
+/// tests/acceptance/ 는 SPEC 동결 산출물 — 에이전트 도구의 쓰기 대상이 아니다.
+/// 읽기는 자유로우므로 검증자·Executor 가 내용을 확인하는 데는 지장이 없다 (M3: G4).
+fn reject_acceptance(path: &Path) -> Result<()> {
+    let rendered = path.to_string_lossy();
+    if rendered.contains("tests/acceptance/") || rendered.contains("tests\\acceptance\\") {
+        return Err(anyhow!(
+            "tests/acceptance/ 는 SPEC 동결 산출물이다 — 에이전트 도구로 수정할 수 없다(NEVER). 인수 테스트 변경은 사용자 절차로만 한다"
+        ));
+    }
+    Ok(())
 }
 
 fn reject_vault(path: &Path, vault: Option<&Path>) -> Result<()> {
@@ -477,7 +492,10 @@ impl Tool for ReadFile {
     }
     fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
         let path = str_field(&input, "path")?;
-        let resolved = resolve_tool_path(ctx, path)?;
+        // 읽기는 쓰기 게이트를 통과하지 않는다 — 검증자·Executor 가 acceptance
+        // 내용을 확인하는 것은 자유다. 쓰기 차단은 resolve_tool_path 가 담당.
+        let resolved = resolve_in_workspace(&ctx.workspace, path)?;
+        reject_vault(&resolved, ctx.vault.as_deref())?;
         if !resolved.is_file() {
             return Err(anyhow!("파일이 아닙니다: {}", resolved.display()));
         }
@@ -1015,6 +1033,32 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn acceptance_paths_are_write_blocked_for_agent_tools() {
+        let dir = std::env::temp_dir().join(format!("rk-accept-{}", std::process::id()));
+        let acc = dir.join("tests/acceptance");
+        std::fs::create_dir_all(&acc).unwrap();
+        std::fs::write(acc.join("a.rs"), "#[test]\nfn ok() {}").unwrap();
+        let mut ctx = ToolCtx::new(dir.clone());
+        ctx.hashline = false;
+        // 파일 도구 — write_file 이 tests/acceptance/ 를 건드리면 거부된다.
+        let registry = ToolRegistry::all();
+        let tool = registry.get("write_file").unwrap();
+        let err = tool
+            .run(
+                json!({"path": "tests/acceptance/a.rs", "content": "hacked"}),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("SPEC 동결 산출물"), "{err}");
+        // 읽기는 자유 — 검증자가 내용을 확인할 수 있어야 한다.
+        let read = registry.get("read_file").unwrap();
+        assert!(read
+            .run(json!({"path": "tests/acceptance/a.rs"}), &ctx)
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn bash_blocks_sudo_and_rm_root() {

@@ -1,7 +1,7 @@
 # 05 — 구현 로드맵 (Phase 5)
 
 > 원칙(지시서 7.1): 마일스톤 1은 반드시 검증 인프라다. 각 마일스톤의 태스크는 04_DESIGN §6.2 스키마로 정의한다.
-> 상태: M1·M2 완료(구현+테스트+실증), M3~M6 대기.
+> 상태: M1·M2·M3 완료(구현+테스트+실증), M4~M6 대기.
 
 ## 마일스톤 1 — 검증 인프라 (완료 ✅)
 
@@ -37,18 +37,22 @@
 
 전체 회귀: `cargo test` **364 passed / 0 failed**.
 
-## 마일스톤 3 — 스펙 인터뷰 (대기)
+## 마일스톤 3 — 스펙 인터뷰 + acceptance 불변 (완료 ✅ 2026-08-29)
 
-| 태스크 | 내용 |
-|---|---|
-| T-M3-1 | 인터뷰 루프 — 모호성 질문 ≤5개 제시 + 가정 명시 (G9) |
-| T-M3-2 | SPEC.md 생성·승인·동결 플래그 (G9) |
-| T-M3-3 | tests/acceptance/ 생성 + Executor 쓰기 경로 차단 (G4) |
+| 태스크 | 내용 | 검증(증거) | 상태 |
+|---|---|---|---|
+| T-M3-1 | 인터뷰 루프 — 시스템 프롬프트 [스펙 우위] 섹션: 해석 후보·질문 ≤5·'가정' 명시·동결 기준 임의 변경 금지 (G9) | runner.rs system_prompt | ✅ |
+| T-M3-2 | SpecDoc 스키마 + `rafikx spec-freeze` CLI — AC 검증 방법 필수·가정/인터뷰 기록 필수·동결 후 덮어쓰기 거부 (G9) | 실측: 정상 동결 exit 0(frozen=true), 무단 변경 "이미 동결된 SPEC", 불완전 SPEC 2건 사유 리포트 후 거부 | ✅ |
+| T-M3-3 | tests/acceptance 쓰기 경로 차단 — resolve_tool_path 게이트(파일 도구 전체 커버: edit/write/multi_edit/apply_patch), 읽기는 자유 (G4) | 단위 테스트 acceptance_paths_are_write_blocked_for_agent_tools 통과 | ✅ |
 
-**판단 기록 — tests/acceptance 도입 시점: M3 (스펙 인터뷰와 동시).** 이유: acceptance test 는
+전체 회귀: `cargo test` **368 passed / 0 failed**.
+
+**판단 기록 — tests/acceptance 도입 시점: M3 (스펙 인터뷰와 동시) — ✅ 이행 완료.** 이유: acceptance test 는
 동결된 SPEC AC 의 실행 형태다. 동결 게이트 없이 먼저 도입하면 그것들은 그저 일반 테스트일 뿐
 Executor 가 고칠 수 있는 파일이 되어 취지가 사라진다. M1·M2 에서 이미 무결성 가드가
 tests/ 하위 변경을 전수 검사하고 acceptance 경로는 무조건 위반 처리하므로 기술적 기반은 준비돼 있다.
+이행 내용: (1) SpecDoc 동결(spec-freeze) 2) 도구 계층 쓰기 차단(resolve_tool_path 게이트,
+읽기는 자유) 3) 검증 시 acceptance 경로 변경 무조건 위반(guard).
 
 ## 마일스톤 4~6
 

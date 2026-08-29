@@ -9,8 +9,10 @@
 pub mod guard;
 pub mod plan;
 pub mod runner;
+pub mod spec;
 pub mod task;
 
 pub use plan::PlanDoc;
+pub use spec::SpecDoc;
 pub use runner::{ratchet_check, run_task_verification};
 pub use task::{TaskDoc, TaskState};

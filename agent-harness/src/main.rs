@@ -89,6 +89,11 @@ enum Commands {
         /// 계획 문서 경로 (JSON)
         path: String,
     },
+    /// SPEC 문서(JSON)를 검증하고 동결한다 — 동결 후 변경은 재승인으로만.
+    SpecFreeze {
+        /// SPEC 문서 경로 (JSON)
+        path: String,
+    },
     /// MCP 서버 모드 (facts 메모리 remember/recall/forget/list 를 stdio MCP로 노출)
     McpServe,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
@@ -276,6 +281,7 @@ async fn main() -> ExitCode {
         Some(Commands::Quota) => cmd_quota(&cli),
         Some(Commands::VerifyTask { path }) => cmd_verify_task(path).await,
         Some(Commands::VerifyPlan { path }) => cmd_verify_plan(path),
+        Some(Commands::SpecFreeze { path }) => cmd_spec_freeze(path),
         Some(Commands::McpServe) => rafikx::mcp_serve::stdio().await,
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
@@ -1051,6 +1057,20 @@ async fn cmd_verify_task(path: &str) -> Result<()> {
 }
 
 /// verify-plan — 계획 데이터의 AC 커버리지·태스크 검증 가능성을 검사한다 (M2).
+/// spec-freeze — SPEC 을 검증하고 동결한다 (M3). 동결 후엔 재승인 없이 변경 불가.
+fn cmd_spec_freeze(path: &str) -> Result<()> {
+    let mut spec = rafikx::verify::SpecDoc::load(std::path::Path::new(path))?;
+    spec.freeze()?;
+    spec.save(std::path::Path::new(path))?;
+    println!(
+        "[spec-freeze] {} 동결 — AC {}개 · 가정 {}건. 이후 변경은 변경 요청 절차로만 가능합니다.",
+        spec.id,
+        spec.acceptance.len(),
+        spec.assumptions.len()
+    );
+    Ok(())
+}
+
 fn cmd_verify_plan(path: &str) -> Result<()> {
     let plan = rafikx::verify::PlanDoc::load(std::path::Path::new(path))?;
     print!("{}", plan.coverage_matrix());
