@@ -3,6 +3,7 @@
 //!
 //! 파이프라인 강도: S3·S5 는 항상 강제. 나머지(S1 설계노트·루브릭)는 태스크 데이터로.
 
+pub mod browser;
 pub mod design_note;
 pub mod profile;
 pub mod review;
@@ -17,6 +18,7 @@ use tokio::process::Command;
 
 pub use design_note::DesignNote;
 pub use profile::{Language, LanguageProfile};
+pub use browser::parse_console_errors;
 pub use rubric::Rubric;
 pub use security::Finding;
 
@@ -129,6 +131,19 @@ pub async fn run_quality_gate(
         }
     }
 
+    // S3-syntax — node --check 파일별 구문 검사 (JS 계열, node 있을 때).
+    if matches!(lang, Language::JavaScript | Language::TypeScript | Language::Unknown) {
+        if profile::tool_available("node") {
+            for file in changed {
+                if file.ends_with(".js") || file.ends_with(".mjs") || file.ends_with(".cjs") {
+                    steps.push(
+                        run_step("S3-syntax", &format!("node --check {file:?}"), workspace).await,
+                    );
+                }
+            }
+        }
+    }
+
     // S5 — 보안. 내장 스캐너는 변경 파일 원문을 직접 검사한다 (항상 강제).
     let mut findings = Vec::new();
     for file in changed {
@@ -182,6 +197,51 @@ pub async fn run_quality_gate(
                     detail: d.split(" — ").nth(1).unwrap_or(&d).to_string(),
                 }
             }));
+        }
+    }
+
+    // S4-smoke — 브라우저 런타임 스모크 (HTML/JS 산출물). 실측 실패(camTarget) 이후 추가된 게이트.
+    let entry = changed
+        .iter()
+        .find(|f| f.ends_with(".html"))
+        .map(|f| workspace.join(f))
+        .or_else(|| {
+            let idx = workspace.join("index.html");
+            idx.exists().then_some(idx)
+        });
+    if let Some(entry) = entry {
+        match browser::smoke_test(&entry).await {
+            Ok(Some(errors)) if !errors.is_empty() => {
+                for e in errors {
+                    findings.push(security::Finding {
+                        kind: "browser-error",
+                        file: entry.display().to_string(),
+                        line: 0,
+                        detail: format!("브라우저 런타임 오류 — {e}"),
+                    });
+                }
+            }
+            Ok(Some(_)) => steps.push(GateStep {
+                stage: "S4-smoke",
+                command: "browser smoke (headless)".into(),
+                passed: true,
+                exit_code: Some(0),
+                note: Some("콘솔 오류 0건".into()),
+            }),
+            Ok(None) => steps.push(GateStep {
+                stage: "S4-smoke",
+                command: "browser smoke (headless)".into(),
+                passed: true,
+                exit_code: None,
+                note: Some("브라우저 미설치 — 스킵".into()),
+            }),
+            Err(e) => steps.push(GateStep {
+                stage: "S4-smoke",
+                command: "browser smoke (headless)".into(),
+                passed: false,
+                exit_code: None,
+                note: Some(format!("{e:#}")),
+            }),
         }
     }
 

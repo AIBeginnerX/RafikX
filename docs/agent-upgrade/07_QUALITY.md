@@ -94,3 +94,38 @@
    설정: [harness] review_committee (기본 true).
 
 테스트 396개 통과.
+
+## 7. 게이트 자기 성장 사례 — 마리오 게임 실측 실패 (2026-08-29, v1.1.7 직후)
+
+### 사건
+사용자가 rafikx(Executor: MiniMax-M3, 능력 0.44 → Strict 강제 상태)로 '슈퍼마리오 게임'을
+만들게 했다. 결과물(`~/dev/playground/mario`, HTML/JS 1056줄)은 **실행 자체가 안 됐고**,
+Claude 리뷰(claude-fable-5, fresh-context)도 통과시켰다.
+
+### 직접 원인
+`game.js:230` — 카메라 추적 코드를 고치면서 **이전 줄의 잔재를 삭제하지 않았다**:
+`state.cameraX += (camTarget - …)` — `camTarget` 은 정의된 적이 없는 변수.
+첫 프레임에서 `Uncaught ReferenceError` → 게임 루프 전체 사망.
+
+### 시스템이 놓친 3겹 (진단)
+1. **검증 생략** — HTML/JS 워크스페이스는 `auto_verify_command` 가 빈 값을 반환
+   (Cargo.toml·pyproject 만 지원) → run_verify 가 "검증 생략"으로 끝남. 아무 게이트도 안 돌았음.
+2. **브라우저 런타임 게이트 부재** — `node --check` 은 통과(구문 오류가 아님),
+   eslint 미설치, 내장 보안 스캐너는 보안 전용. 런타임 ReferenceError 를 커버하는 게이트가 없었다.
+3. **모델 리뷰의 한계** — 1056줄에서 한 줄 런타임 버그를 fresh-context 리뷰어가 놓침.
+   모델 리뷰는 기계 게이트의 보조일 뿐이라는 지시서 원칙의 실증.
+
+### 게이트 추가 (자기 성장)
+- **S4-smoke 브라우저 스모크** (`quality/browser.rs`) — headless Chrome 으로 엔트리 HTML 을
+  로드, 콘솔의 Uncaught/Syntax/Reference/TypeError 를 수집해 fail 처리.
+  실측: 결함 복원본 → `✗ [S5-browser-error] … camTarget is not defined` exit 1,
+  수정본 → `✓ [S4-smoke] 콘솔 오류 0건`.
+- **S3-syntax** — node --check 파일별 구문 검사 (JS 계열, node 있을 때).
+- **run_verify 통합** — 빌드 명령 자동 감지가 없어도(Cargo.toml·pyproject 없는 프로젝트)
+  변경 파일이 있으면 품질 게이트를 실행한다. "검증 생략" 경로 폐쇄.
+
+### 실측 노트
+- Chrome `--no-sandbox` 플래그는 **콘솔 로그 캡처를 무효화**한다(실측) — 플래그 제거,
+  필요 환경은 `RAFIKX_BROWSER_EXTRA_FLAGS` env 로 주입.
+- 수정 후 게이트 결과: S4-smoke 통과. 잔여 exit 1 은 prettier 포맷 엄격 검사(S3)가
+  규정대로 동작한 것 — 핸드메이트 코드의 포맷 정리는 사용자 몫/재요청 사항이다.

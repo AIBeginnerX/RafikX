@@ -1487,7 +1487,30 @@ async fn run_verify(
         cmd = auto_verify_command(cfg, &outcome.changed_files);
     }
     if cmd.is_empty() {
-        crate::ui::live_line_in(&run_context, "검증 생략: 자동 감지할 빌드가 없습니다.");
+        // 품질 엔진 통합 — 언어 감지 빌드 명령이 없어도(Cargo.toml·pyproject 없는
+        // HTML/JS 프로젝트 등) 품질 게이트(S3 구문·S5 보안·브라우저 스모크)는 돌린다.
+        // 실측 실패: 마리오 게임(HTML/JS)이 검증 생략으로 잔재 변수 오류를 통과했다.
+        crate::ui::live_line_in(
+            &run_context,
+            "빌드 명령 자동 감지 없음 — 품질 게이트(구문·보안·런타임 스모크)로 대체 검증한다.",
+        );
+        let workspace = cfg.workspace.clone();
+        let report =
+            crate::quality::run_quality_gate(&workspace, &outcome.changed_files).await;
+        let rendered = crate::quality::render_report(&report);
+        for line in rendered.lines().take(24) {
+            crate::ui::live_line_in(&run_context, line);
+        }
+        if !report.passed {
+            let summary: String = report
+                .findings
+                .first()
+                .map(|f| format!("{}:{} {}", f.file, f.line, f.detail))
+                .unwrap_or_else(|| "게이트 스텝 실패".into());
+            outcome.status = "fail".into();
+            outcome.error = Some(summary.clone());
+            outcome.verify_fail = Some(summary);
+        }
         return Ok(outcome);
     }
 
