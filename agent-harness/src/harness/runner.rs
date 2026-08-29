@@ -202,7 +202,7 @@ pub async fn run_pipeline_with_context(
             false,
         );
     }
-    let result = run_pipeline_inner(
+    let mut result = run_pipeline_inner(
         cfg,
         binding,
         task,
@@ -214,6 +214,11 @@ pub async fn run_pipeline_with_context(
         run_context.clone(),
     )
     .await;
+    if run_context.parent_run_id().is_none()
+        && let Ok(outcome) = &mut result
+    {
+        outcome.iterations = run_context.model_iterations_used();
+    }
     match &result {
         Ok(outcome) => {
             let state = match outcome.status.as_str() {
@@ -236,6 +241,14 @@ pub async fn run_pipeline_with_context(
 
 /// 계획 호출은 메인 system 을 그대로 이어받고 이 머리말만 덧붙인다.
 pub(crate) const PLAN_MODE_HEADER: &str = "\n\n[계획 모드] 지금은 계획만 세운다. 도구는 쓰지 마라.\n";
+
+const BROWSER_GAME_CONTRACT_RULE: &str = "\n\n[브라우저 게임 검증 계약]\n\
+    브라우저 게임을 만들거나 수정할 때는 HTML <head>에 \
+    <meta name=\"rafikx-browser-game-contract\" content=\"v1\">를 넣고, 실행 스크립트가 \
+    window.__rafikxGameTest = { state, forceLoss, restarts }를 제공해야 한다(MUST). \
+    state()는 ready·playing·paused·lost 중 현재 상태를 반환하고, forceLoss()는 lost로 전환하며, \
+    restarts()는 KeyR 재시작마다 1 증가한 수를 반환한다. document의 Space는 ready→playing, \
+    KeyP는 playing↔paused, KeyR은 lost→ready를 실제 UI와 같은 상태 머신으로 처리한다.\n";
 
 const PLAN_BRIEF_INSTRUCTION: &str = "작업 계획을 3~7개 항목으로만 출력하라.";
 
@@ -458,6 +471,9 @@ async fn run_pipeline_inner(
     }
     let memory_block = format!("{lessons_block}{facts_block}{rules_block}");
     let mut system = system_prompt(cfg, &binding.system_extra, &memory_block);
+    if matches!(binding.class, TaskClass::Dev | TaskClass::Advanced) {
+        system.push_str(BROWSER_GAME_CONTRACT_RULE);
+    }
     crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
     system.push_str(&format!(
         "\n\n[현재 실행 정보]\nProvider: {}\nModel: {}\nContext window: {} tokens\nHarness: {}\n\
@@ -568,6 +584,7 @@ async fn run_pipeline_inner(
         }
     }
     let turn_iteration_limit = turn_iteration_budget(effective_max_iter);
+    run_context.ensure_model_iteration_limit(turn_iteration_limit);
 
     // 계획 단계 — 메인 system 을 그대로 이어받아 lessons·system_extra·프로젝트 규칙·
     // 엔진 지시가 계획에도 반영되게 한다 (system 을 통째로 교체하던 결함 수정).
@@ -582,6 +599,9 @@ async fn run_pipeline_inner(
     let mut dag: Option<(Vec<DagNode>, Vec<usize>)> = None;
     // 그래프는 계획 산출물(DAG) 없이는 성립하지 않으므로 계획 호출을 반드시 지난다.
     if (binding.plan_first || graph_mode) && plan_depth != crate::engine::PlanDepth::Off {
+        if !run_context.claim_model_iteration() {
+            return Ok(shared_iteration_limit_outcome(&run_context));
+        }
         let plan_budget: u32 = if contract_plan || graph_mode {
             2048
         } else {
@@ -714,6 +734,9 @@ async fn run_pipeline_inner(
 
     let use_tools = !binding.tools.is_empty();
     if !use_tools {
+        if !run_context.claim_model_iteration() {
+            return Ok(shared_iteration_limit_outcome(&run_context));
+        }
         let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
         messages = crate::packer::pack_messages(
             &messages,
@@ -1032,6 +1055,7 @@ async fn run_pipeline_inner(
             && progress.total > 0
             && progress.completed == progress.total
             && current.status == "limit"
+            && current.error.as_deref() == Some("반복 상한")
         {
             current.status = "ok".into();
             current.error = None;
@@ -1039,7 +1063,8 @@ async fn run_pipeline_inner(
 
         let seeded_missing = staged && progress.total == 0 && continuations == 0;
         let continuation_eligible = matches!(current.status.as_str(), "ok" | "limit");
-        let has_iteration_budget = total_iterations < turn_iteration_limit;
+        let has_iteration_budget = run_context.model_iterations_used()
+            < run_context.model_iteration_limit();
         let should_continue = continuation_eligible
             && has_iteration_budget
             && (seeded_missing
@@ -1065,6 +1090,11 @@ async fn run_pipeline_inner(
                 current.iterations <= 1,
                 &crate::fallback::refusal_signals(cfg),
             ) {
+                if !run_context.claim_model_iteration() {
+                    current.status = "limit".into();
+                    current.error = shared_iteration_limit_outcome(&run_context).error;
+                    break current;
+                }
                 match crate::fallback::consult_architect(cfg, task, &answer).await {
                     Ok(Some(judgment)) => {
                         fallback_budget -= 1;
@@ -1429,6 +1459,15 @@ fn cancelled_outcome() -> AgentOutcome {
     }
 }
 
+fn shared_iteration_limit_outcome(run: &RunContext) -> AgentOutcome {
+    let limit = run.model_iteration_limit();
+    AgentOutcome {
+        status: "limit".into(),
+        error: Some(format!("공유 모델 반복 예산 {limit}회 소진")),
+        ..AgentOutcome::default()
+    }
+}
+
 /// 모델이 도구 호출을 구조체가 아니라 텍스트로 흉내 낸 흔적 —
 /// MiniMax 계열의 내부 마커(`]<]`)와 `<tool_call>` JSON 조각을 감지한다.
 pub(crate) fn leaked_tool_call(text: &str) -> bool {
@@ -1511,6 +1550,12 @@ fn refresh_change_evidence(class: TaskClass, run: &RunContext, outcome: &mut Age
         return;
     }
     mark_missing_dev_change(class, outcome);
+    if outcome.status == "ok"
+        && let Some(summary) = run.unresolved_child_task_summary()
+    {
+        outcome.status = "incomplete".into();
+        outcome.error = Some(summary);
+    }
 }
 
 pub(crate) fn turn_iteration_budget(per_cycle: u32) -> u32 {
@@ -2180,7 +2225,7 @@ async fn run_review_once(
             yes,
             max_iterations,
             system,
-            registry: ToolRegistry::with_names(&reviewer.tools),
+            registry: reviewer_registry(&reviewer.tools)?,
             resume,
             remote,
             local_ask,
@@ -2189,6 +2234,18 @@ async fn run_review_once(
         run_context,
     )
     .await
+}
+
+fn reviewer_registry(requested: &[String]) -> Result<ToolRegistry> {
+    let allowlist = crate::harness::lane_tool_allowlist("reviewer")
+        .ok_or_else(|| anyhow!("reviewer 도구 허용목록이 없습니다"))?;
+    if let Some(name) = requested
+        .iter()
+        .find(|name| !allowlist.contains(&name.as_str()))
+    {
+        anyhow::bail!("reviewer 허용목록 밖의 도구입니다: {name}");
+    }
+    ToolRegistry::with_exact_names(requested)
 }
 
 fn record_reviewer_workspace_delta(
@@ -3180,5 +3237,34 @@ mod tests {
         assert!(!prompt.contains("직접 실행한 명령"));
         let reviewer = crate::config::builtin_profile("reviewer").expect("reviewer profile");
         assert!(!reviewer.tools.iter().any(|tool| tool == "bash"));
+        let registry = reviewer_registry(&reviewer.tools).expect("exact reviewer registry");
+        let names = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["read_file", "list_dir", "grep", "glob"]);
+        for forbidden in ["todo_write", "webfetch", "bash", "load_skill", "mcp_list"] {
+            assert!(
+                registry.get(forbidden).is_none(),
+                "reviewer exposed {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_registry_rejects_capability_expansion() {
+        for tools in [
+            vec!["read_file".to_string(), "todo_write".to_string()],
+            vec!["bash".to_string()],
+            vec!["*".to_string()],
+            vec!["read_file".to_string(), "read_file".to_string()],
+        ] {
+            assert!(reviewer_registry(&tools).is_err(), "accepted {tools:?}");
+        }
+        let reduced = reviewer_registry(&["read_file".to_string()]).expect("reduced registry");
+        assert_eq!(reduced.specs().len(), 1);
+        assert!(reduced.get("read_file").is_some());
+        assert!(reduced.get("list_dir").is_none());
     }
 }

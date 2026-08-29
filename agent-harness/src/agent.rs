@@ -223,6 +223,7 @@ pub async fn run_agent_with_context(
     let mut deny_reasons: Vec<String> = Vec::new();
     let mut truncation_retries = 0u8;
     let max_iter = max_iterations.min(HARD_CAP);
+    run_context.ensure_model_iteration_limit(max_iter);
 
     loop {
         if run_context.is_cancelled() {
@@ -254,6 +255,26 @@ pub async fn run_agent_with_context(
                 cached_tokens,
                 cache_reported,
                 error: Some("반복 상한".into()),
+                messages,
+                changed_files: committed_files(&run_context),
+                tool_errors,
+                deny_reasons,
+                verify_fail: None,
+                verify_recovered: None,
+            });
+        }
+        if !run_context.claim_model_iteration() {
+            let limit = run_context.model_iteration_limit();
+            crate::ui::live_line_in(&run_context, &format!("공유 모델 반복 예산 {limit}회 소진"));
+            return Ok(AgentOutcome {
+                status: "limit".into(),
+                iterations,
+                input_tokens,
+                output_tokens,
+                context_tokens,
+                cached_tokens,
+                cache_reported,
+                error: Some(format!("공유 모델 반복 예산 {limit}회 소진")),
                 messages,
                 changed_files: committed_files(&run_context),
                 tool_errors,
@@ -588,9 +609,14 @@ pub async fn run_agent_with_context(
                         }
                     }))
                     .await;
-                for ((id, name, _), out) in batch.into_iter().zip(outs) {
+                for ((id, name, input), out) in batch.into_iter().zip(outs) {
                     match out {
                         Ok(text) => {
+                            if name == tools::TaskTool::NAME {
+                                run_context.clear_unresolved_child_task(
+                                    &tools::TaskTool::invocation_key(&input),
+                                );
+                            }
                             crate::graph::node_in(
                                 &run_context,
                                 "tool_post",
@@ -612,6 +638,12 @@ pub async fn run_agent_with_context(
                             );
                         }
                         Err(e) => {
+                            if name == tools::TaskTool::NAME {
+                                run_context.mark_unresolved_child_task(
+                                    tools::TaskTool::invocation_key(&input),
+                                    e.to_string(),
+                                );
+                            }
                             crate::graph::node_in(
                                 &run_context,
                                 "tool_post",
@@ -823,6 +855,10 @@ pub async fn run_agent_with_context(
 
             match tool.run(input.clone(), &ctx) {
                 Ok(out) => {
+                    if name == tools::TaskTool::NAME {
+                        run_context
+                            .clear_unresolved_child_task(&tools::TaskTool::invocation_key(&input));
+                    }
                     crate::graph::node_in(&run_context, "tool_post", &name, "ok", Some("tool_pre"));
                     if name != "todo_write" {
                         // 도구 출력 원문 전량 투척 대신 요약 한 줄 (pi 저소음).
@@ -839,6 +875,12 @@ pub async fn run_agent_with_context(
                     });
                 }
                 Err(e) => {
+                    if name == tools::TaskTool::NAME {
+                        run_context.mark_unresolved_child_task(
+                            tools::TaskTool::invocation_key(&input),
+                            e.to_string(),
+                        );
+                    }
                     crate::graph::node_in(
                         &run_context,
                         "tool_post",

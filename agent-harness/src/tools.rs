@@ -177,6 +177,33 @@ impl ToolRegistry {
         }
     }
 
+    pub(crate) fn with_exact_names(names: &[String]) -> Result<Self> {
+        if names.iter().any(|name| name == "*") {
+            return Err(anyhow!(
+                "정확 도구 레지스트리에서는 '*'를 사용할 수 없습니다"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for name in names {
+            if !seen.insert(name.as_str()) {
+                return Err(anyhow!("중복 도구 이름: {name}"));
+            }
+        }
+        let all = Self::all();
+        for name in names {
+            if all.get(name).is_none() {
+                return Err(anyhow!("알 수 없는 도구: {name}"));
+            }
+        }
+        Ok(Self {
+            tools: all
+                .tools
+                .into_iter()
+                .filter(|tool| seen.contains(tool.name()))
+                .collect(),
+        })
+    }
+
     /// 지정한 도구들을 제외한 레지스트리 (task 재귀 방지·plan 모드 등).
     pub fn without(self, exclude: &[&str]) -> Self {
         Self {
@@ -1006,10 +1033,7 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .stdin(Stdio::null());
-    let process_scope = crate::process_tree::isolate(&mut cmd);
-
-    let mut child = cmd
-        .spawn()
+    let (mut child, process_scope) = crate::process_tree::spawn_scoped(&mut cmd)
         .map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?;
     let mut stdout = child
         .stdout
@@ -1055,11 +1079,21 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
 
     match wait {
         Err(_) => {
-            crate::process_tree::terminate(&mut child, &process_scope).await;
+            crate::process_tree::terminate(&mut child, &process_scope)
+                .await
+                .map_err(|error| anyhow!("명령 시간 초과 후 프로세스 정리 실패: {error}"))?;
             Err(anyhow!("명령이 {timeout_secs}초를 넘겨 중단되었습니다"))
         }
-        Ok(Err(e)) => Err(anyhow!("명령 실행 오류: {e}")),
+        Ok(Err(e)) => {
+            crate::process_tree::terminate(&mut child, &process_scope)
+                .await
+                .map_err(|error| anyhow!("명령 대기 실패 후 프로세스 정리 실패: {error}"))?;
+            Err(anyhow!("명령 실행 오류: {e}"))
+        }
         Ok(Ok(status)) => {
+            crate::process_tree::terminate(&mut child, &process_scope)
+                .await
+                .map_err(|error| anyhow!("명령 종료 후 프로세스 정리 실패: {error}"))?;
             let mut combined = String::new();
             if !out_buf.is_empty() {
                 combined.push_str(&String::from_utf8_lossy(&out_buf));
@@ -1150,19 +1184,43 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_timeout_kills_reparented_session_descendants() {
+    async fn bash_completion_cleans_reparented_environment_cleared_descendants() {
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file());
+        let Some(python) = python else { return };
+        let root =
+            std::env::temp_dir().join(format!("rafikx-bash-tree-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let result = run_bash(
+            format!(
+                "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\nos._exit(0)'"
+            ),
+            root.clone(),
+            1,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!root.join("DESCENDANT_SURVIVED").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_reparented_environment_cleared_descendants() {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file());
         let Some(python) = python else { return };
         let root = std::env::temp_dir().join(format!(
-            "rafikx-bash-tree-{}",
+            "rafikx-bash-timeout-tree-{}",
             crate::db::Db::new_id()
         ));
         std::fs::create_dir_all(&root).expect("workspace");
         let result = run_bash(
             format!(
-                "\"{python}\" -c 'import os,time\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\nelse:\n time.sleep(5)'"
+                "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\n os._exit(0)\ntime.sleep(5)'"
             ),
             root.clone(),
             1,

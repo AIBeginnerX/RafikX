@@ -46,6 +46,24 @@ impl TaskTool {
             .unwrap_or_else(|| crate::harness::classify_rules(prompt, false))
     }
 
+    pub(crate) fn invocation_key(input: &Value) -> String {
+        let field = |name| {
+            input
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+        };
+        json!({
+            "prompt": field("prompt"),
+            "class": field("class"),
+            "role": field("role"),
+            "category": field("category"),
+            "model": field("model"),
+        })
+        .to_string()
+    }
+
     /// 도구 입력을 소유 인자로 옮긴다. 동기 run() 과 병렬 경로가 같은 파싱을 쓴다.
     pub fn parse_args(input: &Value, ctx: &ToolCtx) -> Result<TaskArgs> {
         let prompt = input
@@ -236,6 +254,12 @@ impl TaskTool {
             output_tokens: outcome.output_tokens,
         };
         let summary = crate::agent::assistant_text(&outcome.messages);
+        require_child_success(
+            &metadata.status,
+            outcome.error.as_deref(),
+            &summary,
+            &cfg.workspace,
+        )?;
         Ok(format!(
             "[task 결과] class={} profile={} model={} status={}\n[task 메타] {}\n{summary}",
             metadata.class,
@@ -245,6 +269,30 @@ impl TaskTool {
             serde_json::to_string(&metadata)?
         ))
     }
+}
+
+fn require_child_success(
+    status: &str,
+    error: Option<&str>,
+    summary: &str,
+    workspace: &std::path::Path,
+) -> Result<()> {
+    if status == "ok" {
+        return Ok(());
+    }
+    let detail = error
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| summary.trim());
+    let detail = crate::quality::redact_local_output(detail, workspace);
+    let detail = detail.chars().take(500).collect::<String>();
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    Err(anyhow!(
+        "위임 작업이 정상 완료되지 않았습니다 (status={status}){suffix}"
+    ))
 }
 
 fn propagate_child_result<T>(
@@ -353,6 +401,46 @@ mod category_tests {
             vec![source.canonicalize().expect("canonical source")]
         );
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn non_ok_child_outcomes_are_tool_errors() {
+        let workspace = std::path::Path::new("/tmp/rafikx-task-status");
+        for status in [
+            "fail",
+            "incomplete",
+            "denied",
+            "cancelled",
+            "limit",
+            "unknown",
+        ] {
+            let error = require_child_success(status, Some("child stopped"), "", workspace)
+                .expect_err("non-ok child status");
+            assert!(error.to_string().contains(status));
+        }
+        assert!(require_child_success("ok", None, "done", workspace).is_ok());
+    }
+
+    #[test]
+    fn child_failure_details_are_redacted_and_bounded() {
+        let workspace = std::path::Path::new("/tmp/rafikx-task-status");
+        let secret = format!("TOKEN={}{}", "s".repeat(700), "-marker");
+        let message = require_child_success("fail", Some(&secret), "", workspace)
+            .expect_err("failed child")
+            .to_string();
+        assert!(message.contains("TOKEN=[redacted]"));
+        assert!(!message.contains("-marker"));
+        assert!(message.chars().count() < 600);
+    }
+
+    #[test]
+    fn invocation_key_is_stable_across_json_field_order() {
+        let first = json!({"prompt":" fix game ","role":"frontend","class":"dev"});
+        let second = json!({"class":"dev","prompt":"fix game","role":"frontend"});
+        assert_eq!(
+            TaskTool::invocation_key(&first),
+            TaskTool::invocation_key(&second)
+        );
     }
 
     fn cfg_with_categories(tag: &str) -> crate::config::Config {

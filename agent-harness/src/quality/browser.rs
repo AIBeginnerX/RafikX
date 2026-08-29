@@ -15,6 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 const ERROR_MARKER: &str = "__RAFIKX_BROWSER_ERROR__";
 const READY_MARKER: &str = "__RAFIKX_BROWSER_READY__";
+const GAME_CONTRACT_META: &str = "rafikx-browser-game-contract";
+const GAME_SEQUENCE_MARKER: &str = "__RAFIKX_GAME_SEQUENCE_READY__";
 const PROBE_PATH: &str = "/__rafikx_probe.js";
 const MAX_STAGED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -45,8 +47,55 @@ const PROBE_SCRIPT: &str = r#"(() => {
     }
   }, true);
   window.addEventListener('unhandledrejection', event => emit('promise', event.reason || 'unhandled rejection'));
-  window.addEventListener('load', () => setTimeout(() => console.log('__RAFIKX_BROWSER_READY__'), 0), { once: true });
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const gameState = api => String(api.state()).toLowerCase();
+  const expectState = (api, expected) => {
+    const actual = gameState(api);
+    if (actual !== expected) throw new Error(`expected ${expected}, got ${actual}`);
+  };
+  const press = code => document.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
+  const runGameContract = async () => {
+    if (!document.querySelector('meta[name="rafikx-browser-game-contract"][content="v1"]')) return;
+    const api = window.__rafikxGameTest;
+    if (!api || typeof api.state !== 'function' || typeof api.forceLoss !== 'function' || typeof api.restarts !== 'function') {
+      throw new Error('window.__rafikxGameTest contract is missing');
+    }
+    expectState(api, 'ready');
+    press('Space');
+    await frame();
+    expectState(api, 'playing');
+    press('KeyP');
+    await frame();
+    expectState(api, 'paused');
+    press('KeyP');
+    await frame();
+    expectState(api, 'playing');
+    api.forceLoss();
+    await frame();
+    expectState(api, 'lost');
+    const restarts = Number(api.restarts());
+    press('KeyR');
+    await frame();
+    expectState(api, 'ready');
+    if (Number(api.restarts()) !== restarts + 1) throw new Error('restart counter did not advance');
+    console.log('__RAFIKX_GAME_SEQUENCE_READY__');
+  };
+  window.addEventListener('load', () => setTimeout(async () => {
+    try {
+      await runGameContract();
+    } catch (error) {
+      emit('game', error?.message || error);
+    } finally {
+      console.log('__RAFIKX_BROWSER_READY__');
+    }
+  }, 0), { once: true });
 })();"#;
+
+fn entry_requires_game_contract(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    lower.contains(&format!("name=\"{GAME_CONTRACT_META}\""))
+        || lower.contains(&format!("name='{GAME_CONTRACT_META}'"))
+}
 
 /// 콘솔 로그(stderr)에서 런타임 오류를 추출한다 — 순수 함수(테스트 가능).
 pub fn parse_console_errors(stderr: &str) -> Vec<String> {
@@ -132,6 +181,7 @@ fn evaluate_browser_output(
     stderr: &str,
     stderr_overflow: bool,
     server_errors: &[String],
+    game_contract_required: bool,
 ) -> anyhow::Result<Vec<String>> {
     let mut errors = parse_console_errors(stderr);
     for error in server_errors {
@@ -154,6 +204,9 @@ fn evaluate_browser_output(
     }
     if !stderr.contains(READY_MARKER) {
         anyhow::bail!("브라우저 준비 프로브가 실행되지 않았습니다");
+    }
+    if game_contract_required && !stderr.contains(GAME_SEQUENCE_MARKER) {
+        anyhow::bail!("브라우저 게임 상태 전이 프로브가 완료되지 않았습니다");
     }
     Ok(errors)
 }
@@ -1301,6 +1354,8 @@ pub(crate) async fn smoke_test_in_workspace(
     let Some(browser) = detect_browser() else {
         return Ok(None);
     };
+    let game_contract_required =
+        entry_requires_game_contract(&std::fs::read_to_string(entry_html)?);
     let run_dir =
         std::env::temp_dir().join(format!("rafikx-browser-smoke-{}", crate::db::Db::new_id()));
     std::fs::create_dir_all(&run_dir)?;
@@ -1346,12 +1401,12 @@ pub(crate) async fn smoke_test_in_workspace(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let process_scope = crate::process_tree::isolate(&mut command);
-    let mut child = command
-        .spawn()
+    let (mut child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
         .map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?;
     let Some(stderr) = child.stderr.take() else {
-        crate::process_tree::terminate(&mut child, &process_scope).await;
+        crate::process_tree::terminate(&mut child, &process_scope)
+            .await
+            .map_err(anyhow::Error::msg)?;
         anyhow::bail!("브라우저 stderr를 열 수 없습니다");
     };
     let stderr_log = Arc::new(Mutex::new(String::new()));
@@ -1411,18 +1466,20 @@ pub(crate) async fn smoke_test_in_workspace(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         match child.try_wait()? {
             Some(status) => (status.success(), status.code()),
-            None => {
-                crate::process_tree::terminate(&mut child, &process_scope).await;
-                (true, Some(0))
-            }
+            None => (true, Some(0)),
         }
     } else if let Some(status) = early_status {
         (status.success(), status.code())
     } else {
-        crate::process_tree::terminate(&mut child, &process_scope).await;
+        crate::process_tree::terminate(&mut child, &process_scope)
+            .await
+            .map_err(anyhow::Error::msg)?;
         let _ = await_stderr_reader(&mut resources).await;
         anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
     };
+    crate::process_tree::terminate(&mut child, &process_scope)
+        .await
+        .map_err(anyhow::Error::msg)?;
     await_stderr_reader(&mut resources).await?;
     let captured_server_errors = server_errors
         .lock()
@@ -1435,6 +1492,7 @@ pub(crate) async fn smoke_test_in_workspace(
         &stderr,
         stderr_overflow.load(Ordering::Relaxed),
         &captured_server_errors,
+        game_contract_required,
     )?))
 }
 
@@ -1462,7 +1520,7 @@ mod tests {
 
     #[test]
     fn nonzero_browser_exit_is_a_gate_failure() {
-        let error = evaluate_browser_output(false, Some(9), "chrome crashed", false, &[])
+        let error = evaluate_browser_output(false, Some(9), "chrome crashed", false, &[], false)
             .expect_err("nonzero browser exit must fail");
         assert!(error.to_string().contains('9'));
     }
@@ -1479,16 +1537,29 @@ mod tests {
 
     #[test]
     fn successful_process_without_ready_probe_is_not_a_pass() {
-        let error = evaluate_browser_output(true, Some(0), "", false, &[])
+        let error = evaluate_browser_output(true, Some(0), "", false, &[], false)
             .expect_err("missing probe must fail");
         assert!(error.to_string().contains("프로브"));
     }
 
     #[test]
     fn browser_stderr_overflow_is_a_gate_failure() {
-        let error = evaluate_browser_output(true, Some(0), READY_MARKER, true, &[])
+        let error = evaluate_browser_output(true, Some(0), READY_MARKER, true, &[], false)
             .expect_err("stderr overflow must fail");
         assert!(error.to_string().contains("상한"));
+    }
+
+    #[test]
+    fn opted_in_game_requires_the_full_state_sequence() {
+        let error = evaluate_browser_output(true, Some(0), READY_MARKER, false, &[], true)
+            .expect_err("missing game sequence");
+        assert!(error.to_string().contains("상태 전이"));
+        let output = format!("{GAME_SEQUENCE_MARKER}\n{READY_MARKER}");
+        assert!(evaluate_browser_output(true, Some(0), &output, false, &[], true).is_ok());
+        assert!(entry_requires_game_contract(
+            r#"<meta name="rafikx-browser-game-contract" content="v1">"#
+        ));
+        assert!(!entry_requires_game_contract("<title>ordinary app</title>"));
     }
 
     #[tokio::test]

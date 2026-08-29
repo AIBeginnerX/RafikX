@@ -18,6 +18,11 @@ use crate::tools::workspace_delta::FileFingerprint;
 
 pub type RunLiveSink = Arc<dyn Fn(crate::ui::Live) + Send + Sync>;
 
+struct ModelIterationBudget {
+    limit: AtomicU32,
+    used: AtomicU32,
+}
+
 #[derive(Default)]
 pub struct RunMetrics {
     context_window: AtomicU32,
@@ -61,6 +66,8 @@ pub struct RunContext {
     context_sources: Arc<Mutex<Vec<ContextSourceRecord>>>,
     lifecycle: Arc<LifecycleRuntime>,
     approval_all: Arc<AtomicBool>,
+    model_iterations: Arc<ModelIterationBudget>,
+    unresolved_child_tasks: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl RunContext {
@@ -110,6 +117,8 @@ impl RunContext {
             context_sources: Arc::new(Mutex::new(Vec::new())),
             lifecycle,
             approval_all: Arc::clone(&self.approval_all),
+            model_iterations: Arc::clone(&self.model_iterations),
+            unresolved_child_tasks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -210,6 +219,78 @@ impl RunContext {
         &self.progress
     }
 
+    pub(crate) fn ensure_model_iteration_limit(&self, limit: u32) -> u32 {
+        let limit = limit.max(1);
+        let _ = self.model_iterations.limit.compare_exchange(
+            0,
+            limit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.model_iterations.limit.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn claim_model_iteration(&self) -> bool {
+        let limit = self.model_iterations.limit.load(Ordering::Acquire);
+        if limit == 0 {
+            return false;
+        }
+        let mut used = self.model_iterations.used.load(Ordering::Acquire);
+        loop {
+            if used >= limit {
+                return false;
+            }
+            match self.model_iterations.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    pub(crate) fn model_iterations_used(&self) -> u32 {
+        self.model_iterations.used.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn model_iteration_limit(&self) -> u32 {
+        self.model_iterations.limit.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_unresolved_child_task(&self, key: String, failure: String) {
+        self.unresolved_child_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, failure);
+    }
+
+    pub(crate) fn clear_unresolved_child_task(&self, key: &str) {
+        self.unresolved_child_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+
+    pub(crate) fn unresolved_child_task_summary(&self) -> Option<String> {
+        let unresolved = self
+            .unresolved_child_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = unresolved
+            .values()
+            .next()?
+            .chars()
+            .take(300)
+            .collect::<String>();
+        Some(format!(
+            "미해결 위임 작업 {}건이 남아 있습니다: {first}",
+            unresolved.len()
+        ))
+    }
+
     fn new(
         run_id: RunId,
         workspace: PathBuf,
@@ -237,6 +318,11 @@ impl RunContext {
             context_sources: Arc::new(Mutex::new(Vec::new())),
             lifecycle,
             approval_all: Arc::new(AtomicBool::new(false)),
+            model_iterations: Arc::new(ModelIterationBudget {
+                limit: AtomicU32::new(0),
+                used: AtomicU32::new(0),
+            }),
+            unresolved_child_tasks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -261,5 +347,46 @@ mod tests {
 
         assert_eq!(run.workspace_relative(&source), PathBuf::from("game.js"));
         let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn model_iteration_budget_is_shared_by_the_run_tree() {
+        let root = RunContext::isolated(
+            crate::run::RunId::new("iteration-root"),
+            std::env::temp_dir(),
+        );
+        assert_eq!(root.ensure_model_iteration_limit(50), 50);
+        let child = root.child(
+            crate::run::RunId::new("iteration-child"),
+            crate::run::AgentId::new("child"),
+        );
+        let sibling = root.child(
+            crate::run::RunId::new("iteration-sibling"),
+            crate::run::AgentId::new("sibling"),
+        );
+        let mut workers = Vec::new();
+        for index in 0..80 {
+            let run = if index % 2 == 0 {
+                child.clone()
+            } else {
+                sibling.clone()
+            };
+            workers.push(std::thread::spawn(move || run.claim_model_iteration()));
+        }
+        let claimed = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().expect("budget worker")))
+            .sum::<usize>();
+        assert_eq!(claimed, 50);
+        assert_eq!(root.model_iterations_used(), 50);
+        assert!(!root.claim_model_iteration());
+
+        let independent = RunContext::isolated(
+            crate::run::RunId::new("iteration-independent"),
+            std::env::temp_dir(),
+        );
+        independent.ensure_model_iteration_limit(2);
+        assert!(independent.claim_model_iteration());
+        assert_eq!(independent.model_iterations_used(), 1);
     }
 }
