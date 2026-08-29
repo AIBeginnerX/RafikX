@@ -56,6 +56,15 @@ const MEDIUM_KEYWORDS: &[&str] = &[
 /// 경로·파일 신호 — dev 키워드는 안 맞지만 도구 필요 가능성이 있는 짧은 입력.
 const TOOL_HINTS: &[&str] = &["~/", "./", "src/", "/tmp", ".txt", ".log", ".csv"];
 
+const ENGLISH_DEV_ACTIONS: &[&str] = &[
+    "build", "create", "develop", "generate", "implement", "make", "repair", "update",
+];
+
+const ENGLISH_ARTIFACTS: &[&str] = &[
+    "api", "app", "application", "browser game", "cli", "code", "component", "file", "game",
+    "script", "tool", "web page", "website",
+];
+
 pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
     classify_rules_with_confidence(text, obsidian).0
 }
@@ -128,17 +137,17 @@ pub async fn classify_gated(
             via: ClassSource::Forced,
         });
     }
+    let (rules_class, confident) = classify_rules_with_confidence(text, obsidian);
     if cfg.file.general.classifier == "llm"
         && let Ok(c) = classify_llm(cfg, text).await
     {
         return Ok(ClassDecision {
-            class: c,
-            rules_class: c,
+            class: apply_tool_floor(rules_class, c),
+            rules_class,
             confident: true,
             via: ClassSource::Judge,
         });
     }
-    let (rules_class, confident) = classify_rules_with_confidence(text, obsidian);
     if confident {
         return Ok(ClassDecision {
             class: rules_class,
@@ -206,16 +215,30 @@ fn looks_like_dev(text: &str) -> bool {
     if text.contains("```") {
         return true;
     }
-    let text = &strip_quoted(text);
+    let text = strip_quoted(text);
+    let lower = text.to_ascii_lowercase();
     let exts = [
-        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".toml", ".json", ".go", ".java", ".c", ".cpp",
-        ".h", ".cs", ".rb", ".php", ".kt", ".swift", ".sh", ".ps1", ".md", ".yml", ".yaml",
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".toml", ".json", ".go",
+        ".java", ".c", ".cpp", ".h", ".cs", ".rb", ".php", ".kt", ".swift", ".sh", ".ps1",
+        ".md", ".yml", ".yaml",
     ];
-    if exts.iter().any(|e| text.contains(e)) {
+    if exts.iter().any(|e| lower.contains(e)) {
+        return true;
+    }
+    if contains_english_term(&lower, "compile")
+        || contains_english_term(&lower, "debug")
+        || contains_english_term(&lower, "refactor")
+        || ENGLISH_DEV_ACTIONS
+            .iter()
+            .any(|term| contains_english_term(&lower, term))
+            && ENGLISH_ARTIFACTS
+                .iter()
+                .any(|term| contains_english_term(&lower, term))
+    {
         return true;
     }
     contains_any(
-        text,
+        &text,
         &[
             "코드",
             "구현",
@@ -243,6 +266,72 @@ fn looks_like_dev(text: &str) -> bool {
             "적용해",
         ],
     )
+}
+
+fn contains_english_term(text: &str, term: &str) -> bool {
+    let words: Vec<&str> = text
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let term_words: Vec<&str> = term.split_whitespace().collect();
+    words
+        .windows(term_words.len())
+        .any(|window| window == term_words.as_slice())
+}
+
+pub(crate) fn continuation_class(
+    text: &str,
+    class: TaskClass,
+    history: &[Message],
+) -> TaskClass {
+    if class != TaskClass::Simple {
+        return class;
+    }
+    let lower = text.to_ascii_lowercase();
+    let continues = contains_any(
+        &lower,
+        &[
+            "다시 해",
+            "다시 만들",
+            "계속",
+            "마저",
+            "이어서",
+            "재시도",
+            "continue",
+            "resume",
+            "retry",
+            "try again",
+        ],
+    );
+    let had_dev_tools = history.iter().flat_map(|message| &message.content).any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolUse { name, .. }
+                if matches!(
+                    name.as_str(),
+                    "apply_patch"
+                        | "bash"
+                        | "edit_file"
+                        | "multi_edit"
+                        | "task"
+                        | "todo_write"
+                        | "write_file"
+                )
+        )
+    });
+    if continues && had_dev_tools {
+        TaskClass::Dev
+    } else {
+        class
+    }
+}
+
+pub(crate) fn apply_tool_floor(rules_class: TaskClass, judged_class: TaskClass) -> TaskClass {
+    if rules_class == TaskClass::Dev {
+        TaskClass::Dev
+    } else {
+        judged_class
+    }
 }
 
 fn looks_like_advanced(text: &str) -> bool {

@@ -32,7 +32,7 @@ pub fn parse_console_errors(stderr: &str) -> Vec<String> {
     out
 }
 
-/// 설치된 브라우저 바이너리를 찾는다 — 없으면 None (게이트는 "스킵"으로 기록).
+/// 설치된 브라우저 바이너리를 찾는다 — 없으면 None.
 pub fn detect_browser() -> Option<&'static str> {
     const CANDIDATES: &[&str] = &[
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -47,8 +47,31 @@ pub fn detect_browser() -> Option<&'static str> {
         .copied()
 }
 
+fn evaluate_browser_output(
+    success: bool,
+    code: Option<i32>,
+    stderr: &str,
+) -> anyhow::Result<Vec<String>> {
+    if !success {
+        let detail: String = stderr
+            .chars()
+            .rev()
+            .take(500)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        anyhow::bail!(
+            "브라우저가 종료 코드 {}로 실패했습니다: {}",
+            code.map_or_else(|| "signal".into(), |code| code.to_string()),
+            detail.trim()
+        );
+    }
+    Ok(parse_console_errors(stderr))
+}
+
 /// 엔트리 HTML 을 실제 브라우저로 로드해 콘솔 오류를 수집한다.
-/// 브라우저가 없으면 Ok(None) — 스킵으로 기록한다(환경 제한).
+/// 브라우저가 없으면 Ok(None) — 호출자가 HTML 런타임 검증 불가로 처리한다.
 pub async fn smoke_test(
     entry_html: &std::path::Path,
 ) -> anyhow::Result<Option<Vec<String>>> {
@@ -81,12 +104,16 @@ pub async fn smoke_test(
             .output(),
     )
     .await;
-    let stderr = match out {
+    let (success, code, stderr) = match out {
         Err(_) => anyhow::bail!("브라우저 스모크 시간 초과 (60초)"),
         Ok(Err(e)) => anyhow::bail!("브라우저 실행 실패: {e}"),
-        Ok(Ok(o)) => String::from_utf8_lossy(&o.stderr).to_string(),
+        Ok(Ok(o)) => (
+            o.status.success(),
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        ),
     };
-    Ok(Some(parse_console_errors(&stderr)))
+    Ok(Some(evaluate_browser_output(success, code, &stderr)?))
 }
 
 #[cfg(test)]
@@ -109,6 +136,14 @@ mod tests {
 [3:3:INFO:CONSOLE(3)] \"Uncaught TypeError: foo is not a function\", source: x (2)";
         let errors = parse_console_errors(stderr);
         assert_eq!(errors.len(), 1, "정보 로그 무시·중복 제거: {errors:?}");
+    }
+
+    #[test]
+    fn nonzero_browser_exit_is_a_gate_failure() {
+        let error = evaluate_browser_output(false, Some(9), "chrome crashed")
+            .expect_err("nonzero browser exit must fail");
+        assert!(error.to_string().contains('9'));
+        assert!(error.to_string().contains("chrome crashed"));
     }
 
     #[test]

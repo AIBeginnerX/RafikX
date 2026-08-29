@@ -132,7 +132,7 @@ pub fn profile_for(lang: Language) -> LanguageProfile {
                 "npx tsc --strict --noEmit".into(),
             ],
             vec!["npx vitest run".into()],
-            vec!["npm audit --audit-level=high".into()],
+            vec!["npm audit --offline --audit-level=high".into()],
             vec![(
                 "any".into(),
                 "any 타입 — unknown 으로 좁히거나 구체 타입을 쓴다".to_string(),
@@ -184,11 +184,45 @@ vec![(
 /// 도구가 없는 환경에서 게이트 전체가 무의미해지지 않게: 있는 것만 돌리고
 /// 없는 도구는 보고서에 "설치 권장"으로 남긴다.
 pub fn runnable_commands(commands: &[String]) -> (Vec<String>, Vec<String>) {
+    runnable_commands_in(std::path::Path::new("."), commands)
+}
+
+pub fn runnable_commands_in(
+    workspace: &std::path::Path,
+    commands: &[String],
+) -> (Vec<String>, Vec<String>) {
     let mut runnable = Vec::new();
     let mut missing = Vec::new();
     for cmd in commands {
-        let binary = cmd.split_whitespace().next().unwrap_or("");
-        let binary = if binary == "npx" { "npx" } else { binary };
+        let mut words = cmd.split_whitespace();
+        let binary = words.next().unwrap_or("");
+        if binary == "npx" {
+            let Some(package) = words.next() else {
+                missing.push(cmd.clone());
+                continue;
+            };
+            let local = workspace.join("node_modules/.bin").join(package);
+            if local.is_file() {
+                let suffix = words.collect::<Vec<_>>().join(" ");
+                let local_cmd = format!("./node_modules/.bin/{package}");
+                runnable.push(if suffix.is_empty() {
+                    local_cmd
+                } else {
+                    format!("{local_cmd} {suffix}")
+                });
+            } else {
+                missing.push(cmd.clone());
+            }
+            continue;
+        }
+        if binary == "npm"
+            && words.next() == Some("audit")
+            && !workspace.join("package-lock.json").is_file()
+            && !workspace.join("npm-shrinkwrap.json").is_file()
+        {
+            missing.push(cmd.clone());
+            continue;
+        }
         if tool_available(binary) {
             runnable.push(cmd.clone());
         } else {
@@ -243,5 +277,36 @@ mod tests {
         ]);
         assert!(runnable.iter().any(|c| c.contains("cargo test")));
         assert!(missing.iter().any(|c| c.contains("분명히-없는-도구42")));
+    }
+
+    #[test]
+    fn javascript_tools_must_be_installed_in_the_workspace() {
+        let dir = std::env::temp_dir().join(format!("rk-js-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("node_modules/.bin")).unwrap();
+        let commands = vec!["npx prettier --check .".to_string()];
+
+        let (runnable, missing) = runnable_commands_in(&dir, &commands);
+        assert!(runnable.is_empty());
+        assert_eq!(missing, commands);
+
+        std::fs::write(dir.join("node_modules/.bin/prettier"), "").unwrap();
+        let (runnable, missing) = runnable_commands_in(&dir, &commands);
+        assert_eq!(runnable, vec!["./node_modules/.bin/prettier --check ."]);
+        assert!(missing.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn npm_audit_requires_a_local_lockfile() {
+        let dir = std::env::temp_dir().join(format!("rk-npm-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let commands = vec!["npm audit --offline --audit-level=high".to_string()];
+
+        let (runnable, missing) = runnable_commands_in(&dir, &commands);
+        assert!(runnable.is_empty());
+        assert_eq!(missing, commands);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

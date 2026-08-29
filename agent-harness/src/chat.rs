@@ -397,10 +397,9 @@ fn default_new_session_pair(cfg: &Config) -> Option<(String, String)> {
 fn seed_default_choice(mut session: Session) -> Session {
     if session.provider.is_none()
         && session.model.is_none()
-        && let Some((provider, model)) = default_new_session_pair(&session.cfg)
+        && let Some(pair) = default_new_session_pair(&session.cfg)
     {
-        session.provider = Some(provider);
-        session.model = Some(model);
+        session.sticky = Some(pair);
     }
     session
 }
@@ -408,7 +407,7 @@ fn seed_default_choice(mut session: Session) -> Session {
 /// 재시작 후에도 이전에 선택/성공한 (provider, model)을 이어받는다.
 /// 사용자가 명시적으로 지정한 경우에는 그 값을 우선한다.
 fn seed_last_choice(mut s: Session) -> Session {
-    if s.provider.is_none() || s.model.is_none() {
+    if s.provider.is_none() && s.model.is_none() {
         let lp = s.cfg.file.general.last_provider.trim();
         let lm = s.cfg.file.general.last_model.trim();
         if !lp.is_empty() && !lm.is_empty() && s.cfg.file.providers.contains_key(lp) {
@@ -423,11 +422,8 @@ fn seed_last_choice(mut s: Session) -> Session {
                     .map(|p| p.model.clone())
                     .unwrap_or_default()
             };
-            if s.provider.is_none() {
-                s.provider = Some(lp.to_string());
-            }
-            if s.model.is_none() && !selected_model.is_empty() {
-                s.model = Some(selected_model);
+            if !selected_model.is_empty() {
+                s.sticky = Some((lp.to_string(), selected_model));
             }
         }
     }
@@ -572,13 +568,17 @@ pub fn handle_slash(session: &mut Session, line: &str, read_stdin: bool) -> Resu
             session.session_id = None;
             session.dirty = false;
             session.sticky = None;
-            if let Some((provider, model)) = default_new_session_pair(&session.cfg) {
-                session.provider = Some(provider);
-                session.model = Some(model);
+            if session.provider.is_none() && session.model.is_none() {
+                session.sticky = default_new_session_pair(&session.cfg);
             }
+            let default_model = session
+                .model
+                .as_deref()
+                .or_else(|| session.sticky.as_ref().map(|(_, model)| model.as_str()))
+                .unwrap_or("auto");
             Ok(Slash::New(vec![format!(
                 "새 세션을 시작합니다. 기본 모델: {}",
-                session.model.as_deref().unwrap_or("auto")
+                default_model
             )]))
         }
         "/clear" => {
@@ -1664,7 +1664,7 @@ pub async fn run_turn_observed(
     crate::spinner::set_label("질문 확인 중…");
     reload_cfg_if_changed(session);
     let decision = crate::harness::classify_gated(&session.cfg, prompt, obsidian_on, forced_class).await?;
-    let class = decision.class;
+    let class = crate::harness::continuation_class(prompt, decision.class, &session.messages);
     if decision.via == crate::harness::ClassSource::Judge && decision.rules_class != decision.class
         && let Ok(db) = Db::open(&Db::db_path()?)
     {
@@ -1941,11 +1941,14 @@ pub async fn run_turn_observed(
             crate::lessons::maybe_spawn(&session.cfg, prompt, &outcome);
             crate::ui::print_footer();
             // 성공한 조합을 세션에 고정(사용자 지정이 없을 때만) — 다음 턴도 같은 모델로 진행.
-            if session.provider.is_none() && session.model.is_none() {
-                session.sticky = Some((binding.provider_name.clone(), binding.model.clone()));
+            if outcome.status == "ok" {
+                if session.provider.is_none() && session.model.is_none() {
+                    session.sticky = Some((binding.provider_name.clone(), binding.model.clone()));
+                }
+                persist_last_choice(&session.cfg.clone(), &binding.provider_name, &binding.model);
+            } else if session.provider.is_none() && session.model.is_none() {
+                session.sticky = None;
             }
-            // 영속화: 재시작해도 같은 조합으로 시작한다.
-            persist_last_choice(&session.cfg.clone(), &binding.provider_name, &binding.model);
             // 세션 자동 저장 (pi 스타일) — 턴 태스크(백그라운드)에서 실행되므로
             // 큰 세션 직렬화가 TUI 메인 루프를 멈추지 않는다.
             let _ = save_if_dirty(session);
@@ -2079,6 +2082,50 @@ mod tests {
         } else {
             assert_eq!(pair.map(|(p, _)| p), Some(lp.to_string()));
         }
+    }
+
+    #[test]
+    fn persisted_choice_is_a_soft_sticky_selection() {
+        let dir = std::env::temp_dir().join(format!("rafikx-sticky-{}", Db::new_id()));
+        let mut cfg = Config::load(Some(&dir.join("config.toml"))).expect("config");
+        cfg.file.general.last_provider = "soft".into();
+        cfg.file.general.last_model = "soft-model".into();
+        cfg.file.providers.insert(
+            "soft".into(),
+            crate::config::ProviderConfig {
+                kind: "openai_compat".into(),
+                auth: "api_key".into(),
+                api_key_env: "SOFT_KEY".into(),
+                model: "soft-model".into(),
+                small_model: None,
+                base_url: None,
+                supports_tools: true,
+                models_url: None,
+                model_auto: false,
+                context_window: None,
+                enabled: true,
+            },
+        );
+        let session = seed_default_choice(Session {
+            cfg,
+            yes: true,
+            provider: None,
+            model: None,
+            class: None,
+            mode: "build".into(),
+            session_id: None,
+            messages: vec![],
+            last_context_tokens: 0,
+            obsidian_on: false,
+            attachments: vec![],
+            dirty: false,
+            sticky: None,
+        });
+
+        assert!(session.provider.is_none());
+        assert!(session.model.is_none());
+        assert_eq!(session.sticky, Some(("soft".into(), "soft-model".into())));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

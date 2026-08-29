@@ -986,7 +986,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
             // 제안)이 백그라운드에서 abort 되지 않게 완료를 기다린다.
             rafikx::self_harness::flush_observations(std::time::Duration::from_secs(120)).await;
             ui::print_footer();
-            Ok(())
+            one_shot_outcome_result(&outcome)
         }
         Err(e) => {
             sp.finish();
@@ -1002,6 +1002,17 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
             Err(e)
         }
     }
+}
+
+fn one_shot_outcome_result(outcome: &agent::AgentOutcome) -> Result<()> {
+    if outcome.status == "ok" {
+        return Ok(());
+    }
+    let detail = outcome.error.as_deref().unwrap_or("상세 오류 없음");
+    Err(anyhow::anyhow!(
+        "실행이 완료되지 않았습니다 (status={}): {detail}",
+        outcome.status
+    ))
 }
 
 async fn cmd_inspect_entry(
@@ -1430,4 +1441,30 @@ async fn cmd_chat_entry(cli: &Cli, list: bool, resume: Option<String>) -> Result
         resume,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_shot_commands_fail_unless_the_agent_completed() {
+        let complete = agent::AgentOutcome {
+            status: "ok".into(),
+            ..Default::default()
+        };
+        assert!(one_shot_outcome_result(&complete).is_ok());
+
+        for status in ["incomplete", "fail", "denied", "cancelled"] {
+            let outcome = agent::AgentOutcome {
+                status: status.into(),
+                error: Some("evidence".into()),
+                ..Default::default()
+            };
+            let error = one_shot_outcome_result(&outcome)
+                .expect_err("non-complete one-shot outcome must fail");
+            assert!(error.to_string().contains(status));
+            assert!(error.to_string().contains("evidence"));
+        }
+    }
 }

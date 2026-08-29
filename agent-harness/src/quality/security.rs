@@ -135,9 +135,9 @@ pub async fn run_dependency_audit(
     lang: crate::quality::profile::Language,
     workspace: &std::path::Path,
 ) -> Vec<(String, Option<bool>, String)> {
-    use crate::quality::profile::{profile_for, runnable_commands};
+    use crate::quality::profile::{profile_for, runnable_commands_in};
     let profile = profile_for(lang);
-    let (runnable, missing) = runnable_commands(&profile.audit);
+    let (runnable, missing) = runnable_commands_in(workspace, &profile.audit);
     let mut results = Vec::new();
     for cmd in runnable {
         let out = tokio::time::timeout(

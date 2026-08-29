@@ -26,6 +26,7 @@ pub(crate) mod hashline;
 mod lsp_tools;
 pub mod mutation;
 mod task;
+mod workspace_delta;
 
 use lsp_tools::{LspDefinition, LspDiagnostics, LspHover, LspReferences};
 pub use task::{TaskArgs, TaskResult, TaskTool};
@@ -860,9 +861,25 @@ impl Tool for Bash {
             .unwrap_or(BASH_TIMEOUT_SECS)
             .clamp(5, 600);
         let workspace = ctx.workspace.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(run_bash(command, workspace, timeout_secs))
-        })
+        let run = ctx.run.clone();
+        let track_changes = run.is_some();
+        let (result, changed_paths) = tokio::task::block_in_place(|| {
+            let snapshot = track_changes
+                .then(|| workspace_delta::WorkspaceSnapshot::capture(&workspace));
+            let result = tokio::runtime::Handle::current().block_on(run_bash(
+                command,
+                workspace,
+                timeout_secs,
+            ));
+            let changed_paths = snapshot
+                .map(|snapshot| snapshot.changed_paths())
+                .unwrap_or_default();
+            (result, changed_paths)
+        });
+        if let Some(run) = run {
+            run.record_committed_paths(changed_paths);
+        }
+        result
     }
 }
 
@@ -961,8 +978,14 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("명령 stdout 파이프를 열지 못했습니다"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("명령 stderr 파이프를 열지 못했습니다"))?;
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
 
@@ -1019,7 +1042,15 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
                 combined.push_str("\n... (출력이 20KB에서 잘렸습니다)");
             }
             if !status.success() {
-                combined.push_str(&format!("\n[exit {}]", status.code().unwrap_or(-1)));
+                let code = status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |code| code.to_string());
+                let detail = if combined.is_empty() {
+                    "(출력 없음)"
+                } else {
+                    combined.trim_end()
+                };
+                return Err(anyhow!("명령이 종료 코드 {code}로 실패했습니다\n{detail}"));
             }
             if combined.is_empty() {
                 combined = "(출력 없음)".to_string();

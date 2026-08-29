@@ -163,6 +163,55 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_dev_tool_activity_stays_dev() {
+        let history = vec![Message {
+            role: crate::provider::Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "index.html"}),
+            }],
+        }];
+
+        assert_eq!(
+            continuation_class("다시 해줘", TaskClass::Simple, &history),
+            TaskClass::Dev
+        );
+        assert_eq!(
+            continuation_class("원리를 설명해줘", TaskClass::Simple, &history),
+            TaskClass::Simple
+        );
+    }
+
+    #[test]
+    fn judge_cannot_remove_tools_from_a_clear_dev_request() {
+        assert_eq!(
+            apply_tool_floor(TaskClass::Dev, TaskClass::Simple),
+            TaskClass::Dev
+        );
+        assert_eq!(
+            apply_tool_floor(TaskClass::Medium, TaskClass::Simple),
+            TaskClass::Simple
+        );
+    }
+
+    #[test]
+    fn turn_iteration_budget_caps_all_continuations() {
+        assert_eq!(turn_iteration_budget(25), 50);
+        assert_eq!(turn_iteration_budget(50), agent::HARD_CAP);
+        assert_eq!(remaining_iteration_budget(50, 49, 25), 1);
+        assert_eq!(remaining_iteration_budget(50, 50, 25), 0);
+    }
+
+    #[test]
+    fn goal_is_not_complete_before_verification_finishes() {
+        assert_eq!(goal_persist_status("ok", 0, 0, false), "active");
+        assert_eq!(goal_persist_status("ok", 2, 2, true), "complete");
+        assert_eq!(goal_persist_status("fail", 2, 2, true), "failed");
+        assert_eq!(goal_persist_status("incomplete", 1, 2, true), "blocked");
+    }
+
+    #[test]
     fn contract_plan_prompt_keeps_main_system_context() {
         // 회귀 방지: 계획 호출이 system 을 통째로 교체하면 lessons·system_extra·
         // 프로젝트 규칙이 계획에서 사라진다 (v1 결함).
@@ -952,6 +1001,40 @@ mod tests {
         mark_verify_recovered(&mut clean);
         assert_eq!(clean.verify_fail, None);
         assert_eq!(clean.verify_recovered, None);
+    }
+
+    #[test]
+    fn repair_outcome_preserves_prior_execution_evidence() {
+        let previous = AgentOutcome {
+            status: "fail".into(),
+            iterations: 20,
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_tokens: 30,
+            changed_files: vec!["index.html".into()],
+            tool_errors: vec!["first failure".into()],
+            verify_fail: Some("syntax".into()),
+            ..AgentOutcome::default()
+        };
+        let next = AgentOutcome {
+            status: "ok".into(),
+            iterations: 4,
+            input_tokens: 40,
+            output_tokens: 8,
+            cached_tokens: 5,
+            changed_files: vec!["index.html".into(), "game.js".into()],
+            ..AgentOutcome::default()
+        };
+
+        let merged = merge_agent_outcomes(previous, next);
+        assert_eq!(merged.status, "ok");
+        assert_eq!(merged.iterations, 24);
+        assert_eq!(merged.input_tokens, 140);
+        assert_eq!(merged.output_tokens, 18);
+        assert_eq!(merged.cached_tokens, 35);
+        assert_eq!(merged.changed_files, vec!["index.html", "game.js"]);
+        assert_eq!(merged.tool_errors, vec!["first failure"]);
+        assert_eq!(merged.verify_fail.as_deref(), Some("syntax"));
     }
 
     #[test]

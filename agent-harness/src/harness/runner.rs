@@ -96,6 +96,7 @@ pub fn system_prompt(cfg: &Config, extra: &str, lessons: &str) -> String {
          - 작게 만들고 즉시 검증한다(MUST): 검증되지 않은 변경을 쌓지 않는다. 한 변경 = 하나의 검증 가능한 단위.\n\
          [전달 계약]\n\
          - 완전한 산출물 전에 멈추지 않는다(NEVER). 단계 경계·todo 전환·중간 단계는 멈출 이유가 아니다: 같은 턴에서 계속한다.\n\
+         - 원래 요청의 완료 기준이 검증을 통과하면 남은 todo 를 완료 처리하고 즉시 최종 답변한다(MUST). 요청에 없던 스트레치 목표·보너스 테스트·추가 리팩터링을 새로 만들지 않는다(NEVER).\n\
          - 출력을 지어내지 않는다(NEVER): 코드·도구·테스트·문서에 대한 주장은 근거가 있어야 한다.\n\
          - 더 쉬운 문제로 바꿔치기하지 않는다(NEVER): 요청에 없는 재시도·검증·텔레메트리·추상화를 멋대로 더하지 않고, 증상만 가리지 않는다. 실제 요청만 푼다.\n\
          - '완료' = 명세된 end-to-end 동작 + 모든 수락 기준. 스텁·플레이스홀더·mock·no-op·'TODO: implement'·'일단 MVP' 는 미완이다(NEVER). 범위 축소는 이 대화에서 사용자의 명시적 승인이 있을 때만.\n\
@@ -902,6 +903,7 @@ async fn run_pipeline_inner(
     let mut total_input = 0u32;
     let mut total_output = 0u32;
     let mut total_iterations = 0u32;
+    let turn_iteration_limit = turn_iteration_budget(effective_max_iter);
     let mut all_changed = Vec::new();
     let mut all_tool_errors = Vec::new();
     let mut all_denials = Vec::new();
@@ -918,6 +920,11 @@ async fn run_pipeline_inner(
     }
 
     let mut outcome = loop {
+        let cycle_max_iterations = remaining_iteration_budget(
+            turn_iteration_limit,
+            total_iterations,
+            effective_max_iter,
+        );
         let registry = ToolRegistry::with_names(&binding.tools);
         let resume_for_failure = next_resume.clone().unwrap_or_default();
         let run = agent::run_agent_with_context(
@@ -928,7 +935,7 @@ async fn run_pipeline_inner(
                 model: &binding.model,
                 task: &agent_task,
                 yes,
-                max_iterations: effective_max_iter,
+                max_iterations: cycle_max_iterations,
                 system: system.clone(),
                 registry,
                 resume: next_resume.take(),
@@ -1014,7 +1021,9 @@ async fn run_pipeline_inner(
 
         let seeded_missing = staged && progress.total == 0 && continuations == 0;
         let continuation_eligible = matches!(current.status.as_str(), "ok" | "limit");
+        let has_iteration_budget = total_iterations < turn_iteration_limit;
         let should_continue = continuation_eligible
+            && has_iteration_budget
             && (seeded_missing
                 || goal_should_continue(
                     progress.completed,
@@ -1027,6 +1036,7 @@ async fn run_pipeline_inner(
         // simple/medium 클래스는 여기 도달하지 않는다 (큰 작업 전용 안전장치).
         if !should_continue
             && continuation_eligible
+            && has_iteration_budget
             && fallback_budget > 0
             && matches!(binding.class, TaskClass::Dev | TaskClass::Advanced)
         {
@@ -1113,27 +1123,33 @@ async fn run_pipeline_inner(
             // todo 를 등록하고도 못 끝낸 경우만 미완료다. todo 자체를 만들지 않고
             // ok 로 끝난 턴은 모델이 단계화가 불필요한 작업으로 판단한 것 —
             // 검증된 산출물이 있으면 완료로 인정한다 (성공을 실패로 오표시 금지).
-            if staged
-                && progress.total > 0
-                && progress.completed < progress.total
-                && continuation_eligible
-            {
+            let unfinished_todos = progress.total > 0 && progress.completed < progress.total;
+            let no_execution_evidence = progress.total == 0 && all_changed.is_empty();
+            if staged && continuation_eligible && (unfinished_todos || no_execution_evidence) {
                 current.status = "incomplete".into();
-                current.error = Some(format!(
-                    "목표 미완료: Todo {}/{} · 연속 정체 {}회",
-                    progress.completed, progress.total, stale_rounds
-                ));
+                current.error = Some(if no_execution_evidence {
+                    "목표 미완료: 실행 계획이나 변경 파일 증거가 없습니다.".into()
+                } else if !has_iteration_budget {
+                    format!(
+                        "목표 미완료: Todo {}/{} · 턴 반복 예산 {turn_iteration_limit}회 소진",
+                        progress.completed, progress.total
+                    )
+                } else {
+                    format!(
+                        "목표 미완료: Todo {}/{} · 연속 정체 {}회",
+                        progress.completed, progress.total, stale_rounds
+                    )
+                });
             }
             persist_goal_state(
                 &run_context,
                 task,
-                if current.status == "ok" && progress.completed >= progress.total {
-                    "complete"
-                } else if current.status == "incomplete" {
-                    "blocked"
-                } else {
-                    "failed"
-                },
+                goal_persist_status(
+                    &current.status,
+                    progress.completed,
+                    progress.total,
+                    false,
+                ),
                 progress.completed,
                 progress.total,
                 continuations,
@@ -1176,7 +1192,8 @@ async fn run_pipeline_inner(
         let mut nudge = String::from(
             "목표가 아직 완료되지 않았다. 현재 Todo와 도구 결과를 확인하고, \
              완료되지 않은 다음 항목부터 즉시 계속 실행하라. 이미 끝낸 작업은 반복하지 말고, \
-             항목을 마칠 때마다 todo_write 상태를 갱신하라. 모든 Todo가 완료된 뒤에만 최종 답변하라.",
+             항목을 마칠 때마다 todo_write 상태를 갱신하라. 원래 요청의 완료 기준을 확장하지 마라. \
+             완료 기준이 이미 검증을 통과했다면 남은 Todo를 완료 처리하고 즉시 최종 답변하라.",
         );
         // loop 분야는 정체를 감지한 그 사이클에서 바로 전략 전환을 지시한다
         // (기본 분야는 stale 2회에서 루프를 끊는 기존 동작 그대로).
@@ -1202,6 +1219,25 @@ async fn run_pipeline_inner(
         run_context.clone(),
     )
     .await?;
+    if staged {
+        let progress = crate::tools_more::todo_progress(
+            &crate::tools_more::current_todos_in(&run_context),
+        );
+        persist_goal_state(
+            &run_context,
+            task,
+            goal_persist_status(
+                &outcome.status,
+                progress.completed,
+                progress.total,
+                true,
+            ),
+            progress.completed,
+            progress.total,
+            continuations,
+            &outcome.messages,
+        );
+    }
     // 도구 없는 프로파일(quick)의 응답에 tool-call 텍스트가 새어 있으면 —
     // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이라는 뜻이다. 모델이
     // 도구 문법을 텍스트로 흉내 낸 오염 응답을 걷어내고 coder 로 1회 승격해
@@ -1404,6 +1440,31 @@ pub(crate) fn goal_should_continue(
     total > 0 && completed < total && stale_rounds < 2 && continuations < max_continuations
 }
 
+pub(crate) fn goal_persist_status(
+    status: &str,
+    completed: usize,
+    total: usize,
+    verification_finished: bool,
+) -> &'static str {
+    if !verification_finished && status == "ok" {
+        "active"
+    } else if status == "ok" && completed >= total {
+        "complete"
+    } else if status == "incomplete" {
+        "blocked"
+    } else {
+        "failed"
+    }
+}
+
+pub(crate) fn turn_iteration_budget(per_cycle: u32) -> u32 {
+    per_cycle.saturating_mul(2).min(agent::HARD_CAP).max(1)
+}
+
+pub(crate) fn remaining_iteration_budget(limit: u32, used: u32, per_cycle: u32) -> u32 {
+    limit.saturating_sub(used).min(per_cycle)
+}
+
 /// 검증이 재시도 끝에 통과했을 때의 정리 — 최종 실패가 아니므로 verify_fail 을 비우고,
 /// 첫 실패는 회복 증거로 옮긴다. 성공을 실패로 오표시하지 않으면서(§15.4)
 /// "실패 후 회복" 교훈 수집 경로는 살려 둔다.
@@ -1411,6 +1472,43 @@ pub(crate) fn mark_verify_recovered(outcome: &mut AgentOutcome) {
     if let Some(first) = outcome.verify_fail.take() {
         outcome.verify_recovered = Some(first);
     }
+}
+
+pub(crate) fn merge_agent_outcomes(
+    previous: AgentOutcome,
+    mut next: AgentOutcome,
+) -> AgentOutcome {
+    next.iterations = previous.iterations.saturating_add(next.iterations);
+    next.input_tokens = previous.input_tokens.saturating_add(next.input_tokens);
+    next.output_tokens = previous.output_tokens.saturating_add(next.output_tokens);
+    next.cached_tokens = previous.cached_tokens.saturating_add(next.cached_tokens);
+    next.cache_reported |= previous.cache_reported;
+    if next.context_tokens == 0 {
+        next.context_tokens = previous.context_tokens;
+    }
+    if next.messages.is_empty() {
+        next.messages = previous.messages;
+    }
+    let mut changed = previous.changed_files;
+    for path in next.changed_files {
+        if !changed.contains(&path) {
+            changed.push(path);
+        }
+    }
+    next.changed_files = changed;
+    let mut tool_errors = previous.tool_errors;
+    tool_errors.extend(next.tool_errors);
+    next.tool_errors = tool_errors;
+    let mut denials = previous.deny_reasons;
+    denials.extend(next.deny_reasons);
+    next.deny_reasons = denials;
+    if next.verify_fail.is_none() {
+        next.verify_fail = previous.verify_fail;
+    }
+    if next.verify_recovered.is_none() {
+        next.verify_recovered = previous.verify_recovered;
+    }
+    next
 }
 
 /// bash 검증 명령 1회에 대한 승인 결과.
@@ -1494,22 +1592,79 @@ async fn run_verify(
             &run_context,
             "빌드 명령 자동 감지 없음 — 품질 게이트(구문·보안·런타임 스모크)로 대체 검증한다.",
         );
-        let workspace = cfg.workspace.clone();
-        let report =
-            crate::quality::run_quality_gate(&workspace, &outcome.changed_files).await;
-        let rendered = crate::quality::render_report(&report);
-        for line in rendered.lines().take(24) {
-            crate::ui::live_line_in(&run_context, line);
-        }
-        if !report.passed {
-            let summary: String = report
+        for round in 0..3 {
+            let report =
+                crate::quality::run_quality_gate(&cfg.workspace, &outcome.changed_files).await;
+            let rendered = crate::quality::render_report(&report);
+            for line in rendered.lines().take(24) {
+                crate::ui::live_line_in(&run_context, line);
+            }
+            if report.passed {
+                mark_verify_recovered(&mut outcome);
+                return Ok(outcome);
+            }
+            let summary = report
                 .findings
                 .first()
-                .map(|f| format!("{}:{} {}", f.file, f.line, f.detail))
-                .unwrap_or_else(|| "게이트 스텝 실패".into());
-            outcome.status = "fail".into();
-            outcome.error = Some(summary.clone());
-            outcome.verify_fail = Some(summary);
+                .map(|finding| {
+                    format!("{}:{} {}", finding.file, finding.line, finding.detail)
+                })
+                .or_else(|| {
+                    report.steps.iter().find(|step| !step.passed).map(|step| {
+                        format!(
+                            "{} 실패: {}",
+                            step.stage,
+                            step.note.as_deref().unwrap_or(&step.command)
+                        )
+                    })
+                })
+                .unwrap_or_else(|| "품질 게이트 실패".into());
+            let remaining = remaining_iteration_budget(
+                turn_iteration_budget(binding.max_iterations),
+                outcome.iterations,
+                binding.max_iterations,
+            );
+            if round >= 2 || remaining == 0 {
+                outcome.status = "fail".into();
+                outcome.error = Some(summary.clone());
+                outcome.verify_fail = Some(summary);
+                return Ok(outcome);
+            }
+            crate::ui::live_line_in(
+                &run_context,
+                &format!("품질 게이트 실패, 수정 후 재검증합니다 ({}/2)", round + 1),
+            );
+            let mut messages = outcome.messages.clone();
+            if messages.is_empty() {
+                messages.push(Message::user_text(task));
+            }
+            messages.push(Message::user_text(format!(
+                "품질 게이트가 실패했습니다. 아래 실행 증거를 바탕으로 실제 파일을 수정하세요.\n{}",
+                rendered.chars().take(4000).collect::<String>()
+            )));
+            let mut next = agent::run_agent_with_context(
+                AgentRun {
+                    cfg,
+                    provider_name: &binding.provider_name,
+                    combo_chain: binding.combo_chain.clone(),
+                    model: binding.verify_model.as_deref().unwrap_or(&binding.model),
+                    task,
+                    yes,
+                    max_iterations: remaining,
+                    system: system.clone(),
+                    registry: ToolRegistry::with_names(&binding.tools),
+                    resume: Some(messages),
+                    remote: remote.clone(),
+                    local_ask: local_ask.clone(),
+                    context_window: binding.context_window,
+                },
+                run_context.clone(),
+            )
+            .await?;
+            if next.verify_fail.is_none() {
+                next.verify_fail = Some(summary);
+            }
+            outcome = merge_agent_outcomes(outcome, next);
         }
         return Ok(outcome);
     }
@@ -1575,6 +1730,19 @@ async fn run_verify(
                     &format!("검증 실패, 오류를 되먹여 재시도합니다 ({}/2)", round + 1),
                 );
                 let cause: String = err.chars().take(500).collect();
+                let remaining = remaining_iteration_budget(
+                    turn_iteration_budget(binding.max_iterations),
+                    outcome.iterations,
+                    binding.max_iterations,
+                );
+                if remaining == 0 {
+                    outcome.status = "fail".into();
+                    outcome.error = Some(format!(
+                        "검증 실패 후 턴 반복 예산을 모두 사용했습니다: {cause}"
+                    ));
+                    outcome.verify_fail = Some(cause);
+                    return Ok(outcome);
+                }
                 let mut msgs = outcome.messages.clone();
                 if msgs.is_empty() {
                     msgs.push(Message::user_text(task));
@@ -1590,7 +1758,7 @@ async fn run_verify(
                         model: binding.verify_model.as_deref().unwrap_or(&binding.model),
                         task,
                         yes,
-                        max_iterations: binding.max_iterations,
+                        max_iterations: remaining,
                         system: system.clone(),
                         registry: ToolRegistry::with_names(&binding.tools),
                         resume: Some(msgs),
@@ -1604,7 +1772,7 @@ async fn run_verify(
                 if next.verify_fail.is_none() {
                     next.verify_fail = Some(cause);
                 }
-                outcome = next;
+                outcome = merge_agent_outcomes(outcome, next);
             }
         }
     }
@@ -2056,6 +2224,17 @@ async fn run_review_gate(
             "독립 검증자가 완료 기준 대조에서 미통과로 판정했다. 아래 지적을 실제 파일 수정으로 \
              해소하라. 재설명·변명은 금지(NEVER)다. 고친 뒤 스스로 확인하고 무엇을 바꿨는지 보고하라.\n{summary}"
         )));
+        let remaining = remaining_iteration_budget(
+            turn_iteration_budget(binding.max_iterations),
+            outcome.iterations,
+            binding.max_iterations,
+        );
+        if remaining == 0 {
+            outcome.status = "fail".into();
+            outcome.error = Some(format!("검증자 미통과 후 턴 반복 예산 소진: {headline}"));
+            outcome.verify_fail = Some(headline);
+            return outcome;
+        }
         let resumed = agent::run_agent_with_context(
             AgentRun {
                 cfg,
@@ -2064,7 +2243,7 @@ async fn run_review_gate(
                 model: &binding.model,
                 task,
                 yes,
-                max_iterations: binding.max_iterations,
+                max_iterations: remaining,
                 system: system.to_string(),
                 registry: ToolRegistry::with_names(&binding.tools),
                 resume: Some(messages),
@@ -2076,24 +2255,8 @@ async fn run_review_gate(
         )
         .await;
         match resumed {
-            Ok(mut next) => {
-                next.input_tokens = outcome.input_tokens.saturating_add(next.input_tokens);
-                next.output_tokens = outcome.output_tokens.saturating_add(next.output_tokens);
-                next.iterations = outcome.iterations.saturating_add(next.iterations);
-                let mut changed = outcome.changed_files.clone();
-                for path in &next.changed_files {
-                    if !changed.contains(path) {
-                        changed.push(path.clone());
-                    }
-                }
-                next.changed_files = changed;
-                let mut tool_errors = outcome.tool_errors.clone();
-                tool_errors.extend(next.tool_errors.clone());
-                next.tool_errors = tool_errors;
-                let mut denials = outcome.deny_reasons.clone();
-                denials.extend(next.deny_reasons.clone());
-                next.deny_reasons = denials;
-                outcome = next;
+            Ok(next) => {
+                outcome = merge_agent_outcomes(outcome, next);
                 // 재개가 정상 종료하지 못했으면 재검증 없이 그 상태를 그대로 보고한다.
                 if outcome.status != "ok" || run_context.is_cancelled() {
                     crate::ui::live_warn_in(
@@ -2652,6 +2815,7 @@ mod tests {
         assert!(s.contains("작업 진행 설명은 영어로 쓴다"));
         assert!(s.contains("제목(헤더·섹션 제목)은 한국어로 쓴다"));
         assert!(s.contains("최종 답변(작업 결과 브리핑)은 한국어로 쓴다"));
+        assert!(s.contains("요청에 없던 스트레치 목표·보너스 테스트·추가 리팩터링"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

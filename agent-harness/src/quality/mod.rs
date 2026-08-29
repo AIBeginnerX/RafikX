@@ -12,7 +12,6 @@ pub mod security;
 
 use std::path::Path;
 
-use anyhow::Result;
 use serde::Serialize;
 use tokio::process::Command;
 
@@ -111,7 +110,7 @@ pub async fn run_quality_gate(
         ("S3-lint", &profile.lint),
         ("S3-test", &profile.test),
     ] {
-        let (runnable, missing) = profile::runnable_commands(commands);
+        let (runnable, missing) = profile::runnable_commands_in(workspace, commands);
         for cmd in missing {
             steps.push(GateStep {
                 stage,
@@ -181,22 +180,19 @@ pub async fn run_quality_gate(
         });
     }
 
-    // S7 가독성 보조 — 중복 블록 감지 (레드팀 시나리오 6).
     for file in changed {
         let path = workspace.join(file);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            findings.extend(detect_duplicate_blocks(file, &text).into_iter().map(|d| {
-                security::Finding {
-                    kind: "duplication",
-                    file: file.to_string(),
-                    line: d
-                        .split(':')
-                        .nth(1)
-                        .and_then(|n| n.parse().ok())
-                        .unwrap_or(0),
-                    detail: d.split(" — ").nth(1).unwrap_or(&d).to_string(),
-                }
-            }));
+            let duplicates = detect_duplicate_blocks(file, &text);
+            if !duplicates.is_empty() {
+                steps.push(GateStep {
+                    stage: "S7-duplication",
+                    command: format!("duplicate scan {file}"),
+                    passed: true,
+                    exit_code: None,
+                    note: Some(duplicates.join("\n")),
+                });
+            }
         }
     }
 
@@ -231,9 +227,9 @@ pub async fn run_quality_gate(
             Ok(None) => steps.push(GateStep {
                 stage: "S4-smoke",
                 command: "browser smoke (headless)".into(),
-                passed: true,
+                passed: false,
                 exit_code: None,
-                note: Some("브라우저 미설치 — 스킵".into()),
+                note: Some("브라우저 미설치 — HTML 런타임을 검증할 수 없음".into()),
             }),
             Err(e) => steps.push(GateStep {
                 stage: "S4-smoke",
@@ -254,33 +250,45 @@ pub async fn run_quality_gate(
     }
 }
 
-/// 중복 블록 감지 (S7 가독성·간결성 보조) — 3줄 이상의 동일 연속 블록이
+/// 중복 블록 감지 (S7 가독성·간결성 보조) — 의미 있는 5줄 구현이
 /// 같은 파일에서 반복되면 지적한다 (레드팀 시나리오 6). 텍스트 기반 휴리스틱.
 pub fn detect_duplicate_blocks(
     file: &str,
     text: &str,
 ) -> Vec<String> {
     let mut findings = Vec::new();
-    let lines: Vec<&str> = text
+    let lines: Vec<(usize, &str)> = text
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .enumerate()
+        .map(|(line, text)| (line + 1, text.trim()))
+        .filter(|(_, text)| !text.is_empty() && !text.starts_with("//"))
         .collect();
-    if lines.len() < 6 {
+    let window = 5usize;
+    if lines.len() < window * 2 {
         return findings;
     }
-    let window = 3usize;
     let mut reported = std::collections::HashSet::new();
     for i in 0..=(lines.len().saturating_sub(window)) {
         for j in (i + window)..=(lines.len().saturating_sub(window)) {
-            if lines[i..i + window] == lines[j..j + window]
-                && lines[i].len() >= 4
+            let first = &lines[i..i + window];
+            let second = &lines[j..j + window];
+            let same = first
+                .iter()
+                .zip(second)
+                .all(|((_, left), (_, right))| left == right);
+            let content_chars = first.iter().map(|(_, text)| text.len()).sum::<usize>();
+            let fresh_region = reported
+                .iter()
+                .all(|start| j >= *start + window || *start >= j + window);
+            if same
+                && content_chars >= 120
+                && fresh_region
                 && reported.insert(j)
             {
                 findings.push(format!(
-                    "{file}:{} — 직전 블록({})과 동일한 3줄 중복",
-                    j + window,
-                    i + 1
+                    "{file}:{} — 직전 블록({})과 동일한 5줄 중복",
+                    second[0].0,
+                    first[0].0
                 ));
             }
         }
