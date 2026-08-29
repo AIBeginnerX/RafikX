@@ -1565,7 +1565,9 @@ pub async fn summarize_messages(cfg: &Config, messages: &[Message]) -> Result<St
     let req = ChatRequest {
         model: String::new(),
         system: "너는 대화 요약가다. 아래 대화를 결정·사실·남은 할 일 중심으로 한국어 15줄 이내로 요약하라.\n\
-                 파일 경로·오류 메시지 등 나중에 필요한 구체 정보는 그대로 보존하라."
+                 파일 경로·오류 메시지 등 나중에 필요한 구체 정보는 그대로 보존하라.\n\
+                 검증 구분(G20): 명령을 실행해 확인된 사실에는 앞에 '✓'를 붙인다.\n\
+                 실행 없이 모델이 주장만 한 내용은 ✓ 없이 나열해 검증되지 않았음이 드러나게 한다."
             .into(),
         messages: vec![Message::user_text(transcript)],
         tools: vec![],

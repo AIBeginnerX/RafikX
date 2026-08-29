@@ -80,8 +80,18 @@ async fn run_executor(
 
 /// git 체크포인트 — 통과한 태스크를 커밋으로 남긴다 (G15). 저장소가 아니면 조용히 생략.
 async fn checkpoint(task: &TaskDoc, workspace: &Path) {
+    // 워크 메타(루트의 *.json·*.jsonl·PROGRESS.md)는 커밋에서 제외한다 — 태스크
+    // 산출물과 메타가 한 커밋에 섞이면 revert 롤백이 메타와 충돌한다(실측).
     let _ = Command::new("git")
-        .args(["add", "-A"])
+        .args([
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude)*.json",
+            ":(exclude)*.jsonl",
+            ":(exclude)PROGRESS.md",
+        ])
         .current_dir(workspace)
         .status()
         .await;
@@ -314,4 +324,117 @@ fn reports_with_stop(mut reports: Vec<TaskReport>) -> Vec<TaskReport> {
         reason: Some("앞선 태스크가 막혀 의존성 안전을 위해 중단했다".into()),
     });
     reports
+}
+
+// ---------------------------------------------------------------------------
+// 태스크 롤백 (G15 완성) — 체크포인트 커밋을 revert 로 되돌린다.
+// ---------------------------------------------------------------------------
+
+/// 태스크 체크포인트를 되돌린다: (1) git revert 로 산출물 복원(이력 보존),
+/// (2) 태스크 문서를 PENDING 으로 초기화해 재실행 대기.
+/// revert 충돌 시 그대로 오류를 돌려준다 — 자동 해결은 하지 않는다(§5 안전).
+pub async fn rollback_task(
+    work: &mut WorkRun,
+    task_id: &str,
+    workspace: &Path,
+    ledger_path: &Path,
+) -> Result<String> {
+    use anyhow::Context;
+    // 파일명 규칙이 아니라 태스크 문서의 id 로 찾는다 — 유일한 진실 원천.
+    let rel = work
+        .plan
+        .tasks
+        .iter()
+        .find(|t| {
+            let path = work
+                .plan_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(t);
+            TaskDoc::load_trusting_state(&path)
+                .map(|doc| doc.id == task_id)
+                .unwrap_or(false)
+        })
+        .context("계획에서 태스크를 찾지 못했다")?;
+    let task_path = work
+        .plan_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(rel);
+    let mut task = TaskDoc::load_trusting_state(&task_path)?;
+    // 체크포인트 커밋 탐색 — checkpoint() 가 남긴 메시지 형식과 짝.
+    // revert 는 깨끗한 작업 트리를 요구한다 — 워크 메타(json/md)만 더러우면
+    // 먼저 정리 커밋하고, 소스 코드가 더러우면 안전하게 중단한다.
+    let status = tokio::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace)
+        .output()
+        .await
+        .context("git status 실행 실패")?;
+    let dirty: Vec<String> = String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let meta_only = dirty.iter().all(|l| {
+        let path = l.split_once(' ').map(|(_, p)| p).unwrap_or(l);
+        path.ends_with(".json") || path.ends_with(".md") || path.ends_with(".jsonl")
+    });
+    if !dirty.is_empty() {
+        if !meta_only {
+            anyhow::bail!(
+                "커밋되지 않은 소스 변경이 있다 — 정리 후 롤백하라: {}",
+                dirty.join(", ")
+            );
+        }
+        let _ = tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(workspace)
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("git")
+            .args(["commit", "-qm", "chore(work): rollback 전 워크 메타 정리"])
+            .current_dir(workspace)
+            .status()
+            .await;
+    }
+
+    let marker = format!("task({task_id}):");
+    let out = tokio::process::Command::new("git")
+        .args(["log", "-n", "1", "--format=%H", "--grep", &marker])
+        .current_dir(workspace)
+        .output()
+        .await
+        .context("git log 실행 실패")?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        anyhow::bail!("체크포인트 커밋이 없다 — git 이 아니거나 커밋 전에 실패한 태스크다");
+    }
+    let revert = tokio::process::Command::new("git")
+        .args(["revert", "--no-edit", &sha])
+        .current_dir(workspace)
+        .output()
+        .await
+        .context("git revert 실행 실패")?;
+    if !revert.status.success() {
+        // 충돌 상태로 남기지 않는다 — revert 를 중단하고 원 상태로 돌려놓는다.
+        let _ = tokio::process::Command::new("git")
+            .args(["revert", "--abort"])
+            .current_dir(workspace)
+            .status()
+            .await;
+        anyhow::bail!(
+            "revert 실패(충돌) — 작업 트리는 원 상태로 복구했다: {}",
+            String::from_utf8_lossy(&revert.stderr).lines().next().unwrap_or("").trim()
+        );
+    }
+    task.state = TaskState::Pending;
+    task.save(&task_path)?;
+    let _ = append_ledger(
+        ledger_path,
+        &serde_json::json!({"event":"state","task_id":task_id,"state":"ROLLED_BACK","revert":sha}),
+    );
+    Ok(format!(
+        "{task_id} 되돌림 완료 — revert {sha:.7}, 태스크는 PENDING (재실행 대기)"
+    ))
 }

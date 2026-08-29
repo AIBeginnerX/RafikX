@@ -60,6 +60,31 @@ pub fn keywords_from_text(text: &str) -> String {
         .join(" ")
 }
 
+/// 교훈 근거 검증 (G21) — 교훈 문장이 관측된 오류(detail)와 실제 토큰을 공유하는지.
+/// 모델이 오류와 무관한 일반론을 지어내 "지식"으로 남기는 오염을 막는다.
+/// ASCII 토큰은 4자 이상, 한글 등 비ASCII 는 2자 이상만 후보로 쓴다.
+pub fn lesson_grounded(lesson: &str, detail: &str) -> bool {
+    let meaningful = |t: &str| -> Option<String> {
+        let n = t.chars().count();
+        if t.is_ascii() {
+            (n >= 4).then(|| t.to_ascii_lowercase())
+        } else {
+            (n >= 2).then(|| t.to_string())
+        }
+    };
+    let observed: std::collections::HashSet<String> = detail
+        .split_whitespace()
+        .filter_map(meaningful)
+        .collect();
+    if observed.is_empty() {
+        return false;
+    }
+    lesson
+        .split_whitespace()
+        .filter_map(meaningful)
+        .any(|t| observed.contains(&t))
+}
+
 pub fn parse_reflection_json(text: &str) -> Option<(String, String)> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
@@ -242,6 +267,13 @@ async fn reflect_and_save(cfg: &Config, task: &str, trigger: &str, detail: &str)
             }
         }
     };
+    // G21 — 관측된 오류와 토큰을 공유하지 않는 교훈은 일반론·추측일 뿐: 저장하지 않는다.
+    if !lesson_grounded(&lesson, detail) {
+        applog::info(&format!(
+            "lesson skipped (ungrounded): 관측된 오류와 근거 토큰이 없음 — {lesson}"
+        ));
+        return Ok(());
+    }
     let db = Db::open(&Db::db_path()?)?;
     let _ = db.add_project_lesson(
         &cfg.workspace,
@@ -252,6 +284,26 @@ async fn reflect_and_save(cfg: &Config, task: &str, trigger: &str, detail: &str)
     )?;
     applog::info(&format!("lesson saved trigger={trigger} {lesson}"));
     Ok(())
+}
+
+#[cfg(test)]
+mod grounding_tests {
+    use super::*;
+
+    #[test]
+    fn grounded_lesson_shares_observed_token() {
+        let detail = "edit_file 실패: 시작 앵커 해시가 다릅니다 (줄 323)";
+        assert!(lesson_grounded("파일 편집 전에 앵커 해시를 재확인한다", detail), "앵커 공유");
+        assert!(lesson_grounded("edit_file 사용 전 파일을 다시 읽는다", detail), "edit_file 공유");
+    }
+
+    #[test]
+    fn ungrounded_generalities_are_rejected() {
+        let detail = "HTTP 429 rate_limited retry_after=45";
+        assert!(!lesson_grounded("항상 침착하게 문제를 해결한다", detail), "무관 일반론");
+        assert!(!lesson_grounded("코드를 잘 읽어야 한다", detail), "짧은 일반론");
+        assert!(!lesson_grounded("뭔가", ""), "관측 자체가 없으면 거부");
+    }
 }
 
 #[cfg(test)]

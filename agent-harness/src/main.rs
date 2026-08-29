@@ -106,6 +106,13 @@ enum Commands {
         /// LEDGER.jsonl 경로
         path: String,
     },
+    /// 태스크 체크포인트를 되돌린다 — git revert + 태스크 PENDING 재실행 대기.
+    PlanRollback {
+        /// 계획 문서 경로 (JSON)
+        plan: String,
+        /// 되돌릴 태스크 id
+        task: String,
+    },
     /// 계획을 실행한다 — Executor(서브프로세스·격리) → 검증 → 체크포인트 → 재개.
     RunPlan {
         /// 계획 문서 경로 (JSON)
@@ -309,6 +316,7 @@ async fn main() -> ExitCode {
             cmd_calibrate(provider.as_deref(), model.as_deref()).await
         }
         Some(Commands::PlanReport { path }) => cmd_plan_report(path),
+        Some(Commands::PlanRollback { plan, task }) => cmd_plan_rollback(&plan, &task).await,
         Some(Commands::RunPlan {
             path,
             yes,
@@ -1136,6 +1144,20 @@ async fn cmd_calibrate(provider: Option<&str>, model: Option<&str>) -> Result<()
         }
     );
     rafikx::calibrate::save_profile(&cfg, &cal)?;
+    Ok(())
+}
+
+/// plan-rollback — 태스크 체크포인트 revert (G15 완성).
+async fn cmd_plan_rollback(plan: &str, task: &str) -> Result<()> {
+    let mut work = rafikx::verify::WorkRun::load(std::path::Path::new(plan))?;
+    let ledger = work
+        .plan_path
+        .parent()
+        .map(|d| d.join("LEDGER.jsonl"))
+        .unwrap_or_else(|| std::path::PathBuf::from("LEDGER.jsonl"));
+    let workspace = std::env::current_dir()?;
+    let msg = rafikx::verify::orchestrator::rollback_task(&mut work, task, &workspace, &ledger).await?;
+    println!("[plan-rollback] {msg}");
     Ok(())
 }
 
