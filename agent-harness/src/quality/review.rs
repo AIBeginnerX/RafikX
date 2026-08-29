@@ -1,6 +1,6 @@
 //! 리뷰 위원회 (S7) — 5개 독립 리뷰 패스로 "시니어 1000명"의 본질(독립적 시선의 수)을 재현.
 //! 근거: docs/agent-upgrade/07_QUALITY.md §2 S7.
-//! 각 리뷰어는 서로 다른 체크리스트를 갖고, fresh-context 에서 diff 를 직접 읽고,
+//! 각 리뷰어는 서로 다른 체크리스트를 갖고, fresh-context 에서 변경 파일을 직접 읽고,
 //! 구조화 판정(pass|fail + 지적·수정 지시)을 낸다. 전원 통과해야 위원회 통과다.
 
 use serde::Serialize;
@@ -64,7 +64,7 @@ pub const COMMITTEE: &[Reviewer] = &[
 ];
 
 /// 리뷰어 1인의 심사 프롬프트 — fresh-context, 자기 체크리스트만.
-/// diff 는 첨부하지 않고 직접 읽게 한다 (기존 검증자 원칙과 동일).
+/// 변경 파일 본문은 첨부하지 않고 읽기 전용 도구로 직접 확인하게 한다.
 pub fn reviewer_prompt(
     reviewer: &Reviewer,
     task: &str,

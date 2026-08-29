@@ -664,11 +664,13 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
         input_tokens: v
             .pointer("/usage/prompt_tokens")
             .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
+            .map(crate::provider::saturating_token_count)
+            .unwrap_or(0),
         output_tokens: v
             .pointer("/usage/completion_tokens")
             .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
+            .map(crate::provider::saturating_token_count)
+            .unwrap_or(0),
         cached_tokens: crate::provider::cached_tokens_from(&v),
         cache_reported: crate::provider::cached_tokens_entry(&v).is_some(),
         limit: LimitHint::default(),
@@ -961,14 +963,14 @@ fn take_usage(v: &Value, input_tokens: &mut u32, output_tokens: &mut u32) {
         .or_else(|| v.pointer("/usage/prompt_tokens"))
         .and_then(|x| x.as_u64())
     {
-        *input_tokens = n as u32;
+        *input_tokens = crate::provider::saturating_token_count(n);
     }
     if let Some(n) = v
         .pointer("/usage/output_tokens")
         .or_else(|| v.pointer("/usage/completion_tokens"))
         .and_then(|x| x.as_u64())
     {
-        *output_tokens = n as u32;
+        *output_tokens = crate::provider::saturating_token_count(n);
     }
 }
 
@@ -1079,6 +1081,39 @@ mod usage_tests {
             limit: LimitHint::default(),
         };
         let guarded = enforce_codex_output_limit(response, 1);
+        assert_eq!(guarded.stop_reason, StopReason::MaxTokens);
+        assert!(guarded.content.is_empty());
+    }
+
+    #[test]
+    fn codex_client_saturates_oversized_reported_usage_before_limiting() {
+        let usage = json!({
+            "usage": {
+                "input_tokens": 4_294_967_297u64,
+                "output_tokens": 4_294_967_297u64
+            }
+        });
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        take_usage(&usage, &mut input_tokens, &mut output_tokens);
+        assert_eq!(input_tokens, u32::MAX);
+        assert_eq!(output_tokens, u32::MAX);
+
+        let response = ChatResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: json!({"command": "true"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens,
+            output_tokens,
+            cached_tokens: 0,
+            model: "gpt-5.6-sol".into(),
+            cache_reported: false,
+            limit: LimitHint::default(),
+        };
+        let guarded = enforce_codex_output_limit(response, 32_768);
         assert_eq!(guarded.stop_reason, StopReason::MaxTokens);
         assert!(guarded.content.is_empty());
     }

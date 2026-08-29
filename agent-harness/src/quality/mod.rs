@@ -120,7 +120,7 @@ pub(super) async fn run_bounded_command(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    crate::process_tree::isolate(&mut command);
+    let process_scope = crate::process_tree::isolate(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("실행 실패: {error}"))?;
@@ -138,12 +138,12 @@ pub(super) async fn run_bounded_command(
     let status = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            crate::process_tree::terminate(&mut child).await;
+            crate::process_tree::terminate(&mut child, &process_scope).await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             return Err(format!("실행 대기 실패: {error}"));
         }
         Err(_) => {
-            crate::process_tree::terminate(&mut child).await;
+            crate::process_tree::terminate(&mut child, &process_scope).await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             return Err(format!("시간 초과 ({}초)", deadline.as_secs()));
         }
@@ -699,31 +699,51 @@ enum CredentialToken {
 }
 
 fn strip_ansi_sequences(value: &str) -> String {
-    let bytes = value.as_bytes();
     let mut output = String::with_capacity(value.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] == 0x1b {
-            index += 1;
-            if bytes.get(index) == Some(&b'[') {
-                index += 1;
-                while index < bytes.len() {
-                    let byte = bytes[index];
-                    index += 1;
-                    if (0x40..=0x7e).contains(&byte) {
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\x1b' => match characters.next() {
+                Some('[') => {
+                    for next in characters.by_ref() {
+                        if next.is_ascii() && ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']' | 'P' | 'X' | '^' | '_') => loop {
+                    match characters.next() {
+                        Some('\x07' | '\u{009c}') | None => break,
+                        Some('\x1b') if characters.peek() == Some(&'\\') => {
+                            characters.next();
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                },
+                Some(_) | None => {}
+            },
+            '\u{009b}' => {
+                for next in characters.by_ref() {
+                    if next.is_ascii() && ('@'..='~').contains(&next) {
                         break;
                     }
                 }
-            } else if index < bytes.len() {
-                index += 1;
             }
-            continue;
+            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => loop {
+                match characters.next() {
+                    Some('\x07' | '\u{009c}') | None => break,
+                    Some('\x1b') if characters.peek() == Some(&'\\') => {
+                        characters.next();
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            },
+            '\n' | '\r' | '\t' => output.push(character),
+            _ if character.is_control() => {}
+            _ => output.push(character),
         }
-        let Some(character) = value[index..].chars().next() else {
-            break;
-        };
-        output.push(character);
-        index += character.len_utf8();
     }
     output
 }
@@ -1080,6 +1100,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quality_command_redacts_osc_split_sensitive_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-osc-redaction-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp workspace");
+        let step = run_argv_step_with_timeout(
+            "S3-test",
+            "OSC redaction fixture".into(),
+            "sh".into(),
+            vec![
+                "-c".into(),
+                "printf 'TOK\\033]0;title\\007EN=OSC-MARKER\\n' >&2; exit 1".into(),
+            ],
+            &root,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(!step.passed);
+        let note = step.note.expect("redacted failure note");
+        assert!(!note.contains("OSC-MARKER"));
+        assert!(note.contains("TOKEN=[redacted]"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn repair_output_redacts_paths_and_credentials() {
         let workspace = Path::new("/tmp/private-workspace");
@@ -1096,6 +1144,8 @@ mod tests {
             "[Bearer STANDALONE-DECORATED]\n",
             "\x1b[31mBearer\x1b[0m ANSI-AUTH\n",
             "TO\x1b[31mKEN\x1b[0m=ANSI-SPLIT-KEY\n",
+            "TOK\x1b]0;terminal-title\x07EN=OSC-SPLIT-KEY\n",
+            "AUTH\x1b]0;terminal-title\x1b\\ORIZATION=OSC-ST-SPLIT-KEY\n",
             "AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret ",
             "API_KEY = \"hunter2\" {\"api_key\" : \"space secret\"}\n",
             "https://evil.test/x?value=query-secret postgres://user:password@host/db",
@@ -1123,6 +1173,8 @@ mod tests {
             "STANDALONE-DECORATED",
             "ANSI-AUTH",
             "ANSI-SPLIT-KEY",
+            "OSC-SPLIT-KEY",
+            "OSC-ST-SPLIT-KEY",
         ] {
             assert!(!redacted.contains(marker), "leaked marker: {marker}");
         }

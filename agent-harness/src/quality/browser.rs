@@ -985,6 +985,21 @@ pub(crate) fn discover_entries(
             }
         }
     }
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uncovered = changed_sources
+        .iter()
+        .filter(|source| !covered_sources.contains(*source))
+        .take(8)
+        .map(|source| source.display().to_string())
+        .collect::<Vec<_>>();
+    if !uncovered.is_empty() {
+        anyhow::bail!(
+            "변경된 웹 소스를 실행할 HTML 엔트리를 찾지 못했습니다: {}",
+            uncovered.join(", ")
+        );
+    }
     Ok(entries.into_iter().collect())
 }
 
@@ -1331,12 +1346,12 @@ pub(crate) async fn smoke_test_in_workspace(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    crate::process_tree::isolate(&mut command);
+    let process_scope = crate::process_tree::isolate(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?;
     let Some(stderr) = child.stderr.take() else {
-        crate::process_tree::terminate(&mut child).await;
+        crate::process_tree::terminate(&mut child, &process_scope).await;
         anyhow::bail!("브라우저 stderr를 열 수 없습니다");
     };
     let stderr_log = Arc::new(Mutex::new(String::new()));
@@ -1397,14 +1412,14 @@ pub(crate) async fn smoke_test_in_workspace(
         match child.try_wait()? {
             Some(status) => (status.success(), status.code()),
             None => {
-                crate::process_tree::terminate(&mut child).await;
+                crate::process_tree::terminate(&mut child, &process_scope).await;
                 (true, Some(0))
             }
         }
     } else if let Some(status) = early_status {
         (status.success(), status.code())
     } else {
-        crate::process_tree::terminate(&mut child).await;
+        crate::process_tree::terminate(&mut child, &process_scope).await;
         let _ = await_stderr_reader(&mut resources).await;
         anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
     };
@@ -1743,6 +1758,43 @@ mod tests {
                     .expect("second")
             )
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_covered_entry_cannot_mask_an_uncovered_changed_source() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-uncovered-source-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(root.join("index.html"), "<script src=\"app.js\"></script>")
+            .expect("entry fixture");
+        std::fs::write(root.join("app.js"), "console.log('ok')").expect("covered source");
+        std::fs::write(root.join("orphan.js"), "missingFunction();")
+            .expect("uncovered source");
+
+        let error = discover_entries(&root, &["app.js".into(), "orphan.js".into()])
+            .expect_err("uncovered source must fail closed");
+
+        assert!(error.to_string().contains("orphan.js"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_javascript_without_html_entry_stays_node_only() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-standalone-js-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(root.join("script.js"), "console.log('ok')")
+            .expect("standalone source");
+
+        let entries = discover_entries(&root, &["script.js".into()])
+            .expect("standalone JavaScript needs no browser entry");
+
+        assert!(entries.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

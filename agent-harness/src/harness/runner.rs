@@ -2139,7 +2139,8 @@ pub(crate) fn review_prompt(task: &str, dod: &str, rebuttal: &str, changed: &[St
          [판정-API설계] pass|fail — 최소 표면적·오용 방지·관례 일관성\n\
          fail 그룹에는 파일:줄과 수정 지시를 함께 쓴다.\n\
          \n판정 전 필수 검사:\n\
-         1. 테스트 무결성 — diff 에서 #[ignore] 추가·테스트 함수 삭제·어서션 감소가 있으면 무조건 fail.\n\
+         1. 테스트 무결성 — 변경된 테스트 파일의 현재 내용을 직접 읽고, #[ignore]·무의미한 어서션·\
+            요구를 피하는 특례가 있으면 fail. 삭제 여부처럼 현재 파일만으로 확인할 수 없는 사실은 추측하지 않는다.\n\
          2. 하드코딩 탐지 — 구현이 테스트 입력에만 특화돼 있지 않은가? 의심되면 입력을 변형한\n\
             추가 테스트 작성을 재작업 지시에 포함하라.\n\
          3. AC 커버리지 — 완료 기준 항목 하나라도 구현으로 확인되지 않으면 fail 이다.\n\
@@ -2499,6 +2500,43 @@ async fn run_review_gate(
                             outcome.status
                         ),
                     );
+                    return outcome;
+                }
+                crate::ui::live_line_in(
+                    &run_context,
+                    "검증자 수정 뒤 최신 파일을 기계 검증으로 확인합니다.",
+                );
+                let verification_fallback = outcome.clone();
+                outcome = match run_verify(
+                    cfg,
+                    binding,
+                    turn_iteration_limit,
+                    task,
+                    yes,
+                    system.to_string(),
+                    outcome,
+                    remote.clone(),
+                    local_ask.clone(),
+                    run_context.clone(),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        outcome = verification_fallback;
+                        let detail = crate::quality::redact_local_output(
+                            &error.to_string(),
+                            &cfg.workspace,
+                        );
+                        mark_verification_failure(
+                            &mut outcome,
+                            format!("검증자 수정 후 기계 검증 실패: {detail}"),
+                        );
+                        return outcome;
+                    }
+                };
+                refresh_change_evidence(binding.class, &run_context, &mut outcome);
+                if outcome.status != "ok" || run_context.is_cancelled() {
                     return outcome;
                 }
             }
@@ -3136,6 +3174,8 @@ mod tests {
         let prompt = review_prompt("작업", "완료 기준", "위험", &["src/main.rs".into()]);
         assert!(prompt.contains("[기계 검증]"));
         assert!(prompt.contains("읽기 전용 리뷰어"));
+        assert!(prompt.contains("현재 내용을 직접 읽고"));
+        assert!(!prompt.contains("diff 에서"));
         assert!(!prompt.contains("bash 로"));
         assert!(!prompt.contains("직접 실행한 명령"));
         let reviewer = crate::config::builtin_profile("reviewer").expect("reviewer profile");

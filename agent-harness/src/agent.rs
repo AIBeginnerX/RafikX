@@ -47,6 +47,7 @@ pub fn same_call_repeated(last: &mut Option<String>, streak: &mut u32, key: Stri
     *streak >= 3
 }
 
+#[derive(Clone)]
 pub struct AgentOutcome {
     pub status: String,
     pub iterations: u32,

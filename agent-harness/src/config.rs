@@ -817,9 +817,25 @@ fn ensure_default_config(path: &Path) -> Result<()> {
         .with_context(|| format!("{} 파일을 저장할 수 없습니다", path.display()))?;
     drop(file);
     set_owner_only_mode(&temporary);
-    match fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(_) if path.is_file() => {
+    publish_config_if_missing(&temporary, path)
+}
+
+fn publish_config_if_missing(temporary: &Path, path: &Path) -> Result<()> {
+    // 같은 디렉터리의 완성된 임시 파일을 hard link로 게시하면 대상이 없을 때만
+    // 원자적으로 성공한다. rename은 Unix에서 기존 파일을 교체하므로, 최초 실행과
+    // 사용자의 동시 저장이 겹치면 방금 쓴 설정을 덮어쓸 수 있다.
+    match fs::hard_link(temporary, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(temporary);
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .with_context(|| format!("{} 폴더를 저장할 수 없습니다", parent.display()))?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(temporary);
             Ok(())
         }
@@ -1208,6 +1224,28 @@ mod tests {
             fs::read_to_string(&path).expect("final config"),
             DEFAULT_CONFIG
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_run_publish_never_replaces_a_concurrent_user_config() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-config-no-clobber-{}",
+            crate::db::Db::new_id()
+        ));
+        fs::create_dir_all(&root).expect("test directory");
+        let path = root.join("config.toml");
+        let temporary = root.join(".config.toml.test.tmp");
+        fs::write(&temporary, DEFAULT_CONFIG).expect("prepared default");
+        fs::write(&path, "# concurrent user edit\n").expect("concurrent config");
+
+        publish_config_if_missing(&temporary, &path).expect("publish result");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("preserved config"),
+            "# concurrent user edit\n"
+        );
+        assert!(!temporary.exists());
         let _ = fs::remove_dir_all(root);
     }
 

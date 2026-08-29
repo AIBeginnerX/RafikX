@@ -96,10 +96,14 @@ pub fn cached_tokens_entry(v: &serde_json::Value) -> Option<u32> {
         "/usage/cached_content_token_count",
     ] {
         if let Some(n) = v.pointer(ptr).and_then(|x| x.as_u64()) {
-            return Some(n as u32);
+            return Some(saturating_token_count(n));
         }
     }
     None
+}
+
+pub(crate) fn saturating_token_count(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +228,7 @@ fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
 }
 
 fn header_u32(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u32> {
-    header_u64(headers, name).map(|n| n as u32)
+    header_u64(headers, name).map(saturating_token_count)
 }
 
 pub fn rate_limit_error(status: u16, body: &str, hint: &LimitHint) -> anyhow::Error {

@@ -1006,7 +1006,7 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .stdin(Stdio::null());
-    crate::process_tree::isolate(&mut cmd);
+    let process_scope = crate::process_tree::isolate(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -1055,7 +1055,7 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
 
     match wait {
         Err(_) => {
-            crate::process_tree::terminate(&mut child).await;
+            crate::process_tree::terminate(&mut child, &process_scope).await;
             Err(anyhow!("명령이 {timeout_secs}초를 넘겨 중단되었습니다"))
         }
         Ok(Err(e)) => Err(anyhow!("명령 실행 오류: {e}")),
@@ -1150,14 +1150,20 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_timeout_kills_descendants() {
+    async fn bash_timeout_kills_reparented_session_descendants() {
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file());
+        let Some(python) = python else { return };
         let root = std::env::temp_dir().join(format!(
             "rafikx-bash-tree-{}",
             crate::db::Db::new_id()
         ));
         std::fs::create_dir_all(&root).expect("workspace");
         let result = run_bash(
-            "(sleep 2; printf survived > DESCENDANT_SURVIVED) & wait".into(),
+            format!(
+                "\"{python}\" -c 'import os,time\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\nelse:\n time.sleep(5)'"
+            ),
             root.clone(),
             1,
         )

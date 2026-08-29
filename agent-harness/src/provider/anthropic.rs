@@ -183,7 +183,7 @@ impl AnthropicProvider {
                             if let Some(n) =
                                 v.pointer("/usage/output_tokens").and_then(|x| x.as_u64())
                             {
-                                output_tokens = n as u32;
+                                output_tokens = crate::provider::saturating_token_count(n);
                             }
                         }
                         Some("message_stop") => {
@@ -341,11 +341,13 @@ fn parse_message_json(text: &str) -> Result<ChatResponse> {
         input_tokens: v
             .pointer("/usage/input_tokens")
             .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
+            .map(crate::provider::saturating_token_count)
+            .unwrap_or(0),
         output_tokens: v
             .pointer("/usage/output_tokens")
             .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
+            .map(crate::provider::saturating_token_count)
+            .unwrap_or(0),
         cached_tokens: crate::provider::cached_tokens_from(&v),
         cache_reported: crate::provider::cached_tokens_entry(&v).is_some(),
         limit: LimitHint::default(),
@@ -378,14 +380,14 @@ fn take_stream_input_usage(
         .pointer("/message/usage/input_tokens")
         .and_then(|x| x.as_u64())
     {
-        *input_tokens = n as u32;
+        *input_tokens = crate::provider::saturating_token_count(n);
     }
     let cached = v
         .pointer("/message/usage/cache_read_input_tokens")
         .or_else(|| v.pointer("/usage/cache_read_input_tokens"))
         .and_then(|x| x.as_u64());
     if let Some(cached) = cached {
-        *cached_tokens = cached as u32;
+        *cached_tokens = crate::provider::saturating_token_count(cached);
         *cache_reported = true;
     }
 }
