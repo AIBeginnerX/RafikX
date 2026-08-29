@@ -79,6 +79,11 @@ enum Commands {
     InitDeep,
     /// 계정·프로바이더 쿼터 상태
     Quota,
+    /// 태스크 문서(JSON)의 검증 명령을 직접 실행해 증거를 남긴다 — 완료 판정은 이 결과만.
+    VerifyTask {
+        /// 태스크 문서 경로 (JSON)
+        path: String,
+    },
     /// MCP 서버 모드 (facts 메모리 remember/recall/forget/list 를 stdio MCP로 노출)
     McpServe,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
@@ -264,6 +269,7 @@ async fn main() -> ExitCode {
         Some(Commands::Facts) => cmd_facts(&cli),
         Some(Commands::InitDeep) => cmd_init_deep(&cli),
         Some(Commands::Quota) => cmd_quota(&cli),
+        Some(Commands::VerifyTask { path }) => cmd_verify_task(path).await,
         Some(Commands::McpServe) => rafikx::mcp_serve::stdio().await,
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
@@ -961,6 +967,55 @@ fn cmd_search(cli: &Cli, query: &str) -> Result<()> {
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let cfg = Config::load(cli.config.as_deref())?;
     obsidian::watch_vault(&cfg).await
+}
+
+/// verify-task — 태스크 문서의 verification 을 시스템이 직접 실행한다.
+/// 증거는 태스크 파일과 LEDGER.jsonl 에 남고, exit code 가 판정이다.
+async fn cmd_verify_task(path: &str) -> Result<()> {
+    use rafikx::verify::TaskState;
+    let task_path = std::path::PathBuf::from(path);
+    let mut task = rafikx::verify::TaskDoc::load(&task_path)?;
+    let workspace = std::env::current_dir()?;
+    println!(
+        "[verify-task] {} — 검증 명령 {}개 실행",
+        task.id,
+        task.verification.len()
+    );
+    let outcome = rafikx::verify::run_task_verification(&task, &workspace).await;
+    // LEDGER 원장 기록 (증거는 시스템만 쓴다).
+    let ledger = task_path
+        .parent()
+        .map(|d| d.join("LEDGER.jsonl"))
+        .unwrap_or_else(|| std::path::PathBuf::from("LEDGER.jsonl"));
+    let event = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "task_id": task.id,
+        "event": "verification",
+        "state_before": task.state,
+    });
+    rafikx::verify::runner::append_ledger(&ledger, &event)?;
+    let state = *task.apply(outcome);
+    if let TaskState::Done = state {
+        let n = task.verification.len();
+        for ev in task.evidence.iter().rev().take(n).rev() {
+            println!("  ✓ {} → exit {:?}", ev.cmd, ev.exit_code);
+        }
+        let stat = task.evidence.last().and_then(|e| e.diff_stat.clone());
+        if let Some(stat) = stat {
+            println!("  diff: {}", stat.lines().last().unwrap_or(""));
+        }
+    } else if let Some(last) = task.evidence.last() {
+        println!("  ✗ {}", last.output_tail);
+    }
+    task.save(&task_path)?;
+    println!("[verify-task] 상태: {state:?}");
+    match state {
+        TaskState::Done => Ok(()),
+        _ => Err(anyhow::anyhow!("verification failed — 상태 {state:?}")),
+    }
 }
 
 fn cmd_quota(cli: &Cli) -> Result<()> {

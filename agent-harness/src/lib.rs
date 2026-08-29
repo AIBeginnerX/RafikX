@@ -47,3 +47,4 @@ pub mod ulw;
 pub mod ui_policy;
 pub mod update;
 pub mod usage;
+pub mod verify;
