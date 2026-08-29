@@ -43,6 +43,10 @@ fn english_game_creation_routes_to_dev_tools() {
     assert_eq!(class, TaskClass::Dev);
     assert_eq!(classify_rules("write a browser game", false), TaskClass::Dev);
     assert_eq!(classify_rules("fix my browser game", false), TaskClass::Dev);
+    assert_eq!(classify_rules("add a button to the app", false), TaskClass::Dev);
+    assert_eq!(classify_rules("remove obsolete function", false), TaskClass::Dev);
+    assert_eq!(classify_rules("delete the old endpoint", false), TaskClass::Dev);
+    assert_eq!(classify_rules("add sugar to tea", false), TaskClass::Simple);
     assert_eq!(classify_rules("make me happy", false), TaskClass::Simple);
 }
 
@@ -222,6 +226,33 @@ async fn external_workspace_symlink_prevents_bash_execution() {
             &context,
         )
         .expect_err("external symlink must block bash before execution");
+    assert!(error.to_string().contains("실행 전 변경 추적 실패"));
+    assert!(!outside.path().join("outside.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_symlink_under_excluded_directory_prevents_bash_execution() {
+    let workspace = TestWorkspace::new("bash-excluded-external-link");
+    let outside = TestWorkspace::new("bash-excluded-external-target");
+    fs::create_dir_all(workspace.path().join(".cache")).expect("excluded directory");
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join(".cache/linked"))
+        .expect("external symlink");
+    let run = RunContext::isolated(
+        RunId::new("bash-excluded-external-link-test"),
+        workspace.path().to_path_buf(),
+    );
+    let mut context = ToolCtx::new(workspace.path().to_path_buf());
+    context.run = Some(run);
+    let registry = ToolRegistry::all();
+    let bash = registry.get("bash").expect("bash tool");
+
+    let error = bash
+        .run(
+            json!({"command": "printf escaped > .cache/linked/outside.txt"}),
+            &context,
+        )
+        .expect_err("excluded-directory external symlink must block bash");
     assert!(error.to_string().contains("실행 전 변경 추적 실패"));
     assert!(!outside.path().join("outside.txt").exists());
 }

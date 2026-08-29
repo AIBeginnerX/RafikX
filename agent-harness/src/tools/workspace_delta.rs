@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
-const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
+const MAX_SNAPSHOT_ENTRIES: usize = 500_000;
 const MAX_TRACKED_FILES: usize = 25_000;
 const MAX_TRACKED_CHANGES: usize = 25_000;
 const MAX_SINGLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -206,6 +206,44 @@ fn fingerprint_path(path: &Path, budget: &mut SnapshotBudget) -> Result<Option<F
     }
 }
 
+fn is_excluded_directory_name(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_string_lossy().as_ref(),
+        ".cache"
+            | ".git"
+            | ".gradle"
+            | ".next"
+            | ".nuxt"
+            | ".parcel-cache"
+            | ".svelte-kit"
+            | ".turbo"
+            | ".venv"
+            | ".vite"
+            | ".yarn"
+            | "Pods"
+            | "__pycache__"
+            | "node_modules"
+            | "target"
+            | "venv"
+            | "vendor"
+    )
+}
+
+fn has_excluded_directory(path: &Path) -> bool {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        if let std::path::Component::Normal(name) = component
+            && is_excluded_directory_name(name)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn fingerprint_paths(
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<BTreeMap<PathBuf, Option<FileFingerprint>>> {
@@ -254,32 +292,7 @@ impl WorkspaceSnapshot {
             .git_ignore(false)
             .git_exclude(false)
             .same_file_system(true)
-            .sort_by_file_path(|left, right| left.cmp(right))
-            .filter_entry(|entry| {
-                if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                    return true;
-                }
-                !matches!(
-                    entry.file_name().to_string_lossy().as_ref(),
-                    ".cache"
-                        | ".git"
-                        | ".gradle"
-                        | ".next"
-                        | ".nuxt"
-                        | ".parcel-cache"
-                        | ".svelte-kit"
-                        | ".turbo"
-                        | ".venv"
-                        | ".vite"
-                        | ".yarn"
-                        | "Pods"
-                        | "__pycache__"
-                        | "node_modules"
-                        | "target"
-                        | "venv"
-                        | "vendor"
-                )
-            });
+            .sort_by_file_path(|left, right| left.cmp(right));
         for entry in builder.build() {
             budget.record_entry()?;
             let entry = entry.map_err(|error| anyhow!("워크스페이스 순회 실패: {error}"))?;
@@ -287,6 +300,10 @@ impl WorkspaceSnapshot {
                 continue;
             };
             let path = entry.into_path();
+            let relative = path.strip_prefix(&root).map_err(|error| {
+                anyhow!("워크스페이스 상대 경로를 확인할 수 없습니다: {error}")
+            })?;
+            let under_excluded_directory = has_excluded_directory(relative);
             if file_type.is_symlink() {
                 let target = path.canonicalize().map_err(|error| {
                     anyhow!("워크스페이스 심볼릭 링크를 확인할 수 없습니다: {error}")
@@ -297,6 +314,9 @@ impl WorkspaceSnapshot {
                         path.display()
                     ));
                 }
+                if under_excluded_directory {
+                    continue;
+                }
                 if target.is_file() && !files.contains_key(&target) {
                     let fingerprint = fingerprint_file(&target, &mut budget)?;
                     files.insert(target, fingerprint);
@@ -304,6 +324,9 @@ impl WorkspaceSnapshot {
                 continue;
             }
             if !file_type.is_file() {
+                continue;
+            }
+            if under_excluded_directory {
                 continue;
             }
             let normalized = path.canonicalize().map_err(|error| {
@@ -467,6 +490,22 @@ mod tests {
         let error = WorkspaceSnapshot::capture(&workspace.0)
             .err()
             .expect("external symlink must fail closed");
+        assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_symlink_under_excluded_directory_fails_closed() {
+        let workspace = TestDir::new("excluded-external-link-workspace");
+        let outside = TestDir::new("excluded-external-link-target");
+        std::fs::create_dir_all(workspace.0.join(".cache")).expect("excluded directory");
+        std::fs::write(outside.0.join("target.txt"), "outside").expect("outside fixture");
+        std::os::unix::fs::symlink(&outside.0, workspace.0.join(".cache/linked"))
+            .expect("external symlink under excluded directory");
+
+        let error = WorkspaceSnapshot::capture(&workspace.0)
+            .err()
+            .expect("excluded-directory external symlink must fail closed");
         assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
     }
 }

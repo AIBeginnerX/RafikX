@@ -2024,12 +2024,14 @@ pub(crate) fn parse_committee_verdicts(text: &str) -> (bool, Vec<String>) {
             continue;
         };
         seen.push(group);
-        if verdict_token(&tail.trim().to_ascii_lowercase()) == Some(true) {
-            failed.push(format!(
+        match verdict_token(&tail.trim().to_ascii_lowercase()) {
+            Some(false) => {}
+            Some(true) => failed.push(format!(
                 "[{}] {}",
                 group,
                 tail.trim().chars().take(200).collect::<String>()
-            ));
+            )),
+            None => failed.push(format!("[{group}] 판정이 pass 또는 fail 이 아니다")),
         }
     }
     for g in GROUPS {
@@ -2038,6 +2040,24 @@ pub(crate) fn parse_committee_verdicts(text: &str) -> (bool, Vec<String>) {
         }
     }
     (failed.is_empty(), failed)
+}
+
+pub(crate) fn parse_review_gate_verdict(text: &str, committee: bool) -> ReviewVerdict {
+    if !committee {
+        return parse_review_verdict(text);
+    }
+    let (passed, failures) = parse_committee_verdicts(text);
+    if passed {
+        ReviewVerdict::Pass
+    } else {
+        ReviewVerdict::Fail {
+            summary: failures
+                .join("\n")
+                .chars()
+                .take(REVIEW_SUMMARY_CAP)
+                .collect(),
+        }
+    }
 }
 
 /// 판정 뒤 게이트가 취할 동작 — 재개는 1회만, 2번째 미통과면 기록 후 종료한다.
@@ -2362,7 +2382,10 @@ async fn run_review_gate(
 
             // 리뷰어가 정상 종료하지 못했으면 그 출력은 결론이 아니다 — 판정 불능으로 본다.
             let verdict = if review.status == "ok" {
-                parse_review_verdict(&agent::last_assistant_text(&review.messages))
+                parse_review_gate_verdict(
+                    &agent::last_assistant_text(&review.messages),
+                    persona.is_none(),
+                )
             } else {
                 ReviewVerdict::Indeterminate
             };

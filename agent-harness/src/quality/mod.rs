@@ -306,55 +306,70 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     }
 
     // S4-smoke — 브라우저 런타임 스모크 (HTML/JS 산출물). 실측 실패(camTarget) 이후 추가된 게이트.
-    let entry = changed
-        .iter()
-        .find(|f| f.ends_with(".html"))
-        .map(|f| workspace.join(f))
-        .or_else(|| {
-            let idx = workspace.join("index.html");
-            idx.exists().then_some(idx)
-        });
-    if let Some(entry) = entry {
-        let display_entry = entry
-            .strip_prefix(workspace)
-            .unwrap_or(&entry)
-            .display()
-            .to_string();
-        match browser::smoke_test(workspace, &entry).await {
-            Ok(Some(errors)) if !errors.is_empty() => {
-                for e in errors {
-                    findings.push(security::Finding {
-                        kind: "browser-error",
-                        file: display_entry.clone(),
-                        line: 0,
-                        detail: redact_local_output(
-                            &format!("브라우저 런타임 오류 — {e}"),
-                            workspace,
-                        ),
-                    });
+    match browser::discover_entries(workspace, changed) {
+        Err(error) => steps.push(GateStep {
+            stage: "S4-smoke",
+            command: "browser entry discovery".into(),
+            passed: false,
+            exit_code: None,
+            note: Some(redact_local_output(&format!("{error:#}"), workspace)),
+        }),
+        Ok(entries) => {
+            let display_root = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf());
+            for entry in entries {
+                let display_entry = entry
+                    .strip_prefix(&display_root)
+                    .unwrap_or(&entry)
+                    .display()
+                    .to_string();
+                let command = format!("browser smoke (headless): {display_entry}");
+                match browser::smoke_test(workspace, &entry).await {
+                    Ok(Some(errors)) if !errors.is_empty() => {
+                        let count = errors.len();
+                        for error in errors {
+                            findings.push(security::Finding {
+                                kind: "browser-error",
+                                file: display_entry.clone(),
+                                line: 0,
+                                detail: redact_local_output(
+                                    &format!("브라우저 런타임 오류 — {error}"),
+                                    workspace,
+                                ),
+                            });
+                        }
+                        steps.push(GateStep {
+                            stage: "S4-smoke",
+                            command,
+                            passed: false,
+                            exit_code: None,
+                            note: Some(format!("브라우저 런타임 오류 {count}건")),
+                        });
+                    }
+                    Ok(Some(_)) => steps.push(GateStep {
+                        stage: "S4-smoke",
+                        command,
+                        passed: true,
+                        exit_code: Some(0),
+                        note: Some("콘솔 오류 0건".into()),
+                    }),
+                    Ok(None) => steps.push(GateStep {
+                        stage: "S4-smoke",
+                        command,
+                        passed: false,
+                        exit_code: None,
+                        note: Some("브라우저 미설치 — HTML 런타임을 검증할 수 없음".into()),
+                    }),
+                    Err(error) => steps.push(GateStep {
+                        stage: "S4-smoke",
+                        command,
+                        passed: false,
+                        exit_code: None,
+                        note: Some(redact_local_output(&format!("{error:#}"), workspace)),
+                    }),
                 }
             }
-            Ok(Some(_)) => steps.push(GateStep {
-                stage: "S4-smoke",
-                command: "browser smoke (headless)".into(),
-                passed: true,
-                exit_code: Some(0),
-                note: Some("콘솔 오류 0건".into()),
-            }),
-            Ok(None) => steps.push(GateStep {
-                stage: "S4-smoke",
-                command: "browser smoke (headless)".into(),
-                passed: false,
-                exit_code: None,
-                note: Some("브라우저 미설치 — HTML 런타임을 검증할 수 없음".into()),
-            }),
-            Err(e) => steps.push(GateStep {
-                stage: "S4-smoke",
-                command: "browser smoke (headless)".into(),
-                passed: false,
-                exit_code: None,
-                note: Some(redact_local_output(&format!("{e:#}"), workspace)),
-            }),
         }
     }
 
@@ -481,10 +496,24 @@ fn looks_like_env_key(key: &str) -> bool {
         })
 }
 
-fn redact_url_query(token: &str) -> Option<String> {
-    token.find("://")?;
-    let split = token.find(['?', '#'])?;
-    Some(format!("{}?[redacted]", &token[..split]))
+fn redact_url(token: &str) -> Option<String> {
+    let scheme_end = token.find("://")?.saturating_add(3);
+    let authority_end = token[scheme_end..]
+        .find(['/', '?', '#'])
+        .map(|index| scheme_end + index)
+        .unwrap_or(token.len());
+    let mut sanitized = token.to_string();
+    let mut changed = false;
+    if let Some(at) = token[scheme_end..authority_end].rfind('@') {
+        sanitized.replace_range(scheme_end..scheme_end + at, "[redacted]");
+        changed = true;
+    }
+    if let Some(split) = sanitized.find(['?', '#']) {
+        sanitized.truncate(split);
+        sanitized.push_str("?[redacted]");
+        changed = true;
+    }
+    changed.then_some(sanitized)
 }
 
 pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
@@ -506,7 +535,7 @@ pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
         } else if matches!(lower.as_str(), "authorization:" | "basic" | "bearer") {
             redacted.push(token.to_string());
             redact_next = true;
-        } else if let Some(url) = redact_url_query(token) {
+        } else if let Some(url) = redact_url(token) {
             redacted.push(url);
         } else if let Some(at) = token.find(['=', ':'])
             && (looks_like_sensitive_key(&token[..at])
@@ -598,7 +627,7 @@ mod tests {
     #[test]
     fn repair_output_redacts_paths_and_credentials() {
         let workspace = Path::new("/tmp/private-workspace");
-        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret {\"api_key\":\"json-value\"} Cookie: session-value https://evil.test/x?value=query-secret";
+        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret {\"api_key\":\"json-value\"} Cookie: session-value https://evil.test/x?value=query-secret postgres://user:password@host/db";
         let redacted = redact_local_output(text, workspace);
         assert!(!redacted.contains("private-workspace"));
         assert!(!redacted.contains("abc123"));
@@ -609,5 +638,7 @@ mod tests {
         assert!(!redacted.contains("session-value"));
         assert!(!redacted.contains("short-secret"));
         assert!(!redacted.contains("query-secret"));
+        assert!(!redacted.contains("user:password"));
+        assert!(redacted.contains("postgres://[redacted]@host/db"));
     }
 }

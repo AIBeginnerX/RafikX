@@ -149,17 +149,15 @@ pub async fn run_dependency_audit(
                 continue;
             }
         };
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            tokio::process::Command::new(program)
-                .args(args)
-                .current_dir(workspace)
-                .output(),
-        )
-        .await;
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(args)
+            .current_dir(workspace)
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(120), command.output()).await;
         let (ok, summary) = match out {
-            Err(_) => (None, "시간 초과".into()),
-            Ok(Err(e)) => (None, format!("실행 실패: {e}")),
+            Err(_) => (Some(false), "시간 초과".into()),
+            Ok(Err(e)) => (Some(false), format!("실행 실패: {e}")),
             Ok(Ok(o)) => (
                 Some(o.status.success()),
                 String::from_utf8_lossy(&o.stderr)

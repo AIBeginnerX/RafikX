@@ -212,6 +212,10 @@ mod tests {
         assert_eq!(classify_rules("fix my browser game", false), TaskClass::Dev);
         assert_eq!(classify_rules("edit the app", false), TaskClass::Dev);
         assert_eq!(classify_rules("code a game", false), TaskClass::Dev);
+        assert_eq!(classify_rules("add a button to the app", false), TaskClass::Dev);
+        assert_eq!(classify_rules("remove obsolete function", false), TaskClass::Dev);
+        assert_eq!(classify_rules("delete the old endpoint", false), TaskClass::Dev);
+        assert_eq!(classify_rules("add sugar to tea", false), TaskClass::Simple);
         assert_eq!(classify_rules("write a poem", false), TaskClass::Simple);
     }
 
@@ -1121,15 +1125,27 @@ mod tests {
 mod committee_tests {
     #[test]
     fn committee_verdicts_require_all_five_groups() {
-        use crate::harness::parse_committee_verdicts;
+        use crate::harness::{
+            GateAction, ReviewVerdict, gate_action, parse_committee_verdicts,
+            parse_review_gate_verdict,
+        };
         let full = "[판정-정확성] pass\n[판정-보안] pass\n[판정-성능] pass\n[판정-가독성] pass\n[판정-API설계] pass";
         let (ok, fails) = parse_committee_verdicts(full);
         assert!(ok, "전원 통과: {fails:?}");
+        assert_eq!(parse_review_gate_verdict(full, true), ReviewVerdict::Pass);
+        assert_eq!(
+            gate_action(parse_review_gate_verdict(full, true), 0, false),
+            GateAction::Accept
+        );
 
         let one_fail = "[판정-정확성] pass\n[판정-보안] pass\n[판정-성능] pass\n[판정-가독성] fail — src/a.rs:12 중복\n[판정-API설계] pass";
         let (ok, fails) = parse_committee_verdicts(one_fail);
         assert!(!ok);
         assert!(fails[0].contains("가독성"));
+        let ReviewVerdict::Fail { summary } = parse_review_gate_verdict(one_fail, true) else {
+            panic!("committee failure must fail the review gate");
+        };
+        assert!(summary.contains("가독성"));
 
         // 그룹 누락도 실패다 — 판정 없음은 통과가 아니다.
         let missing = "[판정-정확성] pass\n[판정-보안] pass";

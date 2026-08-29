@@ -4,7 +4,9 @@
 //! node --check(구문만)·eslint(미설치)·내장 보안 스캐너(보안 전용) 어디에도 걸리지 않았다.
 //! "사용자가 결함을 발견하는 순간 = 게이트 설계의 실패" 원칙에 따라 추가된 게이트다.
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +22,9 @@ const MAX_STAGED_ENTRIES: usize = 25_000;
 const MAX_STAGING_DURATION: Duration = Duration::from_secs(3);
 const MAX_BROWSER_STDERR_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ERRORS: usize = 64;
+const MAX_DISCOVERY_ENTRIES: usize = 25_000;
+const MAX_BROWSER_ENTRIES: usize = 8;
+const MAX_DISCOVERY_DURATION: Duration = Duration::from_secs(3);
 const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; sandbox allow-same-origin allow-scripts; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
 const PROBE_SCRIPT: &str = r#"(() => {
   const emit = (kind, value) => console.log('__RAFIKX_BROWSER_ERROR__' + kind + ': ' + String(value));
@@ -121,6 +126,7 @@ fn evaluate_browser_output(
     success: bool,
     code: Option<i32>,
     stderr: &str,
+    stderr_overflow: bool,
     server_errors: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut errors = parse_console_errors(stderr);
@@ -128,6 +134,9 @@ fn evaluate_browser_output(
         if !errors.contains(error) {
             errors.push(error.clone());
         }
+    }
+    if stderr_overflow {
+        anyhow::bail!("브라우저 stderr가 수집 상한을 초과했습니다");
     }
     if !success {
         let detail = errors
@@ -284,6 +293,136 @@ fn has_sensitive_component(path: &Path) -> bool {
     })
 }
 
+fn is_discovery_excluded_name(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_string_lossy().as_ref(),
+        "Pods" | "__pycache__" | "node_modules" | "target" | "vendor"
+    )
+}
+
+fn is_changed_web_source(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "cjs" | "css" | "htm" | "html" | "js" | "jsx" | "mjs" | "ts" | "tsx"
+    )
+}
+
+fn insert_browser_entry(
+    entries: &mut BTreeSet<PathBuf>,
+    root: &Path,
+    candidate: &Path,
+) -> anyhow::Result<()> {
+    if !candidate.exists() {
+        return Ok(());
+    }
+    let candidate = candidate.canonicalize()?;
+    if !candidate.starts_with(root) || !candidate.is_file() {
+        anyhow::bail!("브라우저 엔트리가 워크스페이스 밖에 있습니다");
+    }
+    entries.insert(candidate);
+    if entries.len() > MAX_BROWSER_ENTRIES {
+        anyhow::bail!("브라우저 엔트리 수가 검증 상한을 넘었습니다");
+    }
+    Ok(())
+}
+
+pub(crate) fn discover_entries(
+    workspace: &Path,
+    changed: &[String],
+) -> anyhow::Result<Vec<PathBuf>> {
+    let root = workspace.canonicalize()?;
+    let mut entries = BTreeSet::new();
+    let mut changed_sources = Vec::new();
+    for file in changed {
+        let relative = Path::new(file);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            anyhow::bail!("워크스페이스 밖 변경 경로: {file}");
+        }
+        if !is_changed_web_source(relative) {
+            continue;
+        }
+        changed_sources.push(relative.to_path_buf());
+        if matches!(
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "htm" | "html"
+        ) {
+            insert_browser_entry(&mut entries, &root, &root.join(relative))?;
+        }
+    }
+    if changed_sources.is_empty() {
+        return Ok(entries.into_iter().collect());
+    }
+
+    for source in &changed_sources {
+        let joined = root.join(source);
+        let Some(parent) = joined.parent() else {
+            continue;
+        };
+        let Ok(mut directory) = parent.canonicalize() else {
+            continue;
+        };
+        while directory.starts_with(&root) {
+            insert_browser_entry(&mut entries, &root, &directory.join("index.html"))?;
+            if directory == root || !directory.pop() {
+                break;
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let filter_root = root.clone();
+    let walker = ignore::WalkBuilder::new(&root)
+        .hidden(false)
+        .ignore(false)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .filter_entry(move |item| {
+            if item.depth() == 0 {
+                return true;
+            }
+            let relative = item
+                .path()
+                .strip_prefix(&filter_root)
+                .unwrap_or(item.path());
+            !has_hidden_component(relative)
+                && !has_sensitive_component(relative)
+                && !is_discovery_excluded_name(item.file_name())
+        })
+        .build();
+    for (index, item) in walker.enumerate() {
+        if index >= MAX_DISCOVERY_ENTRIES {
+            anyhow::bail!("브라우저 엔트리 탐색 항목 수가 상한을 넘었습니다");
+        }
+        if started.elapsed() > MAX_DISCOVERY_DURATION {
+            anyhow::bail!("브라우저 엔트리 탐색 시간 상한을 넘었습니다");
+        }
+        let item = item.map_err(|error| anyhow::anyhow!("브라우저 엔트리 탐색 실패: {error}"))?;
+        if item.file_type().is_some_and(|kind| kind.is_file())
+            && item.file_name() == std::ffi::OsStr::new("index.html")
+        {
+            insert_browser_entry(&mut entries, &root, item.path())?;
+        }
+    }
+    Ok(entries.into_iter().collect())
+}
+
 fn safe_extra_browser_flag(flag: &str) -> bool {
     let flag = flag.to_ascii_lowercase();
     flag.starts_with('-')
@@ -399,16 +538,18 @@ fn stage_web_root_with_limits(
     Ok(staged_entry)
 }
 
-fn append_bounded_stderr(log: &mut String, chunk: &str) {
+fn append_bounded_stderr(log: &mut String, chunk: &str) -> bool {
     let remaining = MAX_BROWSER_STDERR_BYTES.saturating_sub(log.len());
     if remaining == 0 {
-        return;
+        return !chunk.is_empty();
     }
+    let overflow = chunk.len() > remaining;
     let mut end = remaining.min(chunk.len());
     while end > 0 && !chunk.is_char_boundary(end) {
         end -= 1;
     }
     log.push_str(&chunk[..end]);
+    overflow
 }
 
 struct SmokeResources {
@@ -436,6 +577,21 @@ impl Drop for SmokeResources {
             reader.abort();
         }
         let _ = std::fs::remove_dir_all(&self.run_dir);
+    }
+}
+
+async fn await_stderr_reader(resources: &mut SmokeResources) -> anyhow::Result<()> {
+    let Some(mut reader) = resources.reader.take() else {
+        return Ok(());
+    };
+    match tokio::time::timeout(Duration::from_secs(2), &mut reader).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => anyhow::bail!("브라우저 stderr 수집 작업 실패: {error}"),
+        Err(_) => {
+            reader.abort();
+            let _ = reader.await;
+            anyhow::bail!("브라우저 stderr 수집 종료 시간 초과")
+        }
     }
 }
 
@@ -611,6 +767,8 @@ pub async fn smoke_test(
     };
     let stderr_log = Arc::new(Mutex::new(String::new()));
     let reader_log = stderr_log.clone();
+    let stderr_overflow = Arc::new(AtomicBool::new(false));
+    let reader_overflow = stderr_overflow.clone();
     let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
     let reader = tokio::spawn(async move {
         let mut stderr = stderr;
@@ -631,7 +789,9 @@ pub async fn smoke_test(
             let keep = READY_MARKER.len().saturating_sub(1).min(scan.len());
             marker_tail = scan[scan.len() - keep..].to_vec();
             if let Ok(mut log) = reader_log.lock() {
-                append_bounded_stderr(&mut log, &String::from_utf8_lossy(&buffer[..read]));
+                if append_bounded_stderr(&mut log, &String::from_utf8_lossy(&buffer[..read])) {
+                    reader_overflow.store(true, Ordering::Relaxed);
+                }
             }
         }
     });
@@ -673,14 +833,10 @@ pub async fn smoke_test(
     } else {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        if let Some(reader) = resources.reader.take() {
-            let _ = reader.await;
-        }
+        let _ = await_stderr_reader(&mut resources).await;
         anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
     };
-    if let Some(reader) = resources.reader.take() {
-        let _ = reader.await;
-    }
+    await_stderr_reader(&mut resources).await?;
     let captured_server_errors = server_errors
         .lock()
         .map(|errors| errors.clone())
@@ -690,6 +846,7 @@ pub async fn smoke_test(
         success,
         code,
         &stderr,
+        stderr_overflow.load(Ordering::Relaxed),
         &captured_server_errors,
     )?))
 }
@@ -718,7 +875,7 @@ mod tests {
 
     #[test]
     fn nonzero_browser_exit_is_a_gate_failure() {
-        let error = evaluate_browser_output(false, Some(9), "chrome crashed", &[])
+        let error = evaluate_browser_output(false, Some(9), "chrome crashed", false, &[])
             .expect_err("nonzero browser exit must fail");
         assert!(error.to_string().contains('9'));
     }
@@ -735,9 +892,34 @@ mod tests {
 
     #[test]
     fn successful_process_without_ready_probe_is_not_a_pass() {
-        let error =
-            evaluate_browser_output(true, Some(0), "", &[]).expect_err("missing probe must fail");
+        let error = evaluate_browser_output(true, Some(0), "", false, &[])
+            .expect_err("missing probe must fail");
         assert!(error.to_string().contains("프로브"));
+    }
+
+    #[test]
+    fn browser_stderr_overflow_is_a_gate_failure() {
+        let error = evaluate_browser_output(true, Some(0), READY_MARKER, true, &[])
+            .expect_err("stderr overflow must fail");
+        assert!(error.to_string().contains("상한"));
+    }
+
+    #[tokio::test]
+    async fn stderr_reader_wait_has_a_deadline() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "rafikx-browser-reader-deadline-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("run directory");
+        let mut resources = SmokeResources::new(run_dir);
+        resources.reader = Some(tokio::spawn(std::future::pending()));
+        let started = Instant::now();
+
+        let error = await_stderr_reader(&mut resources)
+            .await
+            .expect_err("hung stderr reader must time out");
+        assert!(error.to_string().contains("시간 초과"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -749,6 +931,48 @@ mod tests {
         {
             assert!(found.is_some());
         }
+    }
+
+    #[test]
+    fn discovers_nested_entry_for_javascript_change() {
+        let root =
+            std::env::temp_dir().join(format!("rafikx-browser-discovery-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::create_dir_all(root.join("public")).expect("public directory");
+        std::fs::write(root.join("src/app.js"), "console.log('ok')").expect("source fixture");
+        std::fs::write(root.join("public/index.html"), "<canvas></canvas>")
+            .expect("entry fixture");
+
+        let entries = discover_entries(&root, &["src/app.js".into()]).expect("discover entries");
+        assert_eq!(
+            entries,
+            vec![root.join("public/index.html").canonicalize().expect("entry")]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_every_changed_html_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-multi-entry-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("first")).expect("first directory");
+        std::fs::create_dir_all(root.join("second")).expect("second directory");
+        std::fs::write(root.join("first/page.html"), "<canvas></canvas>")
+            .expect("first entry");
+        std::fs::write(root.join("second/page.html"), "<canvas></canvas>")
+            .expect("second entry");
+
+        let entries = discover_entries(
+            &root,
+            &["first/page.html".into(), "second/page.html".into()],
+        )
+        .expect("discover entries");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&root.join("first/page.html").canonicalize().expect("first")));
+        assert!(entries.contains(&root.join("second/page.html").canonicalize().expect("second")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -815,8 +1039,11 @@ mod tests {
     #[test]
     fn browser_stderr_is_bounded() {
         let mut log = String::new();
-        append_bounded_stderr(&mut log, &"x".repeat(MAX_BROWSER_STDERR_BYTES + 10));
-        append_bounded_stderr(&mut log, "more");
+        assert!(append_bounded_stderr(
+            &mut log,
+            &"x".repeat(MAX_BROWSER_STDERR_BYTES + 10)
+        ));
+        assert!(append_bounded_stderr(&mut log, "more"));
         assert_eq!(log.len(), MAX_BROWSER_STDERR_BYTES);
     }
 

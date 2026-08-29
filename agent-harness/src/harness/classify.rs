@@ -57,13 +57,15 @@ const MEDIUM_KEYWORDS: &[&str] = &[
 const TOOL_HINTS: &[&str] = &["~/", "./", "src/", "/tmp", ".txt", ".log", ".csv"];
 
 const ENGLISH_DEV_ACTIONS: &[&str] = &[
-    "build", "code", "create", "develop", "edit", "fix", "generate", "implement", "make",
-    "modify", "program", "repair", "update", "write",
+    "add", "build", "code", "create", "delete", "develop", "edit", "fix", "generate",
+    "implement", "make", "modify", "program", "remove", "rename", "repair", "replace",
+    "update", "upgrade", "write",
 ];
 
 const ENGLISH_ARTIFACTS: &[&str] = &[
-    "api", "app", "application", "browser game", "cli", "code", "component", "file", "game",
-    "script", "tool", "web page", "website",
+    "api", "app", "application", "browser game", "button", "class", "cli", "code",
+    "component", "endpoint", "feature", "file", "function", "game", "method", "module",
+    "page", "script", "test", "tool", "web page", "website",
 ];
 
 pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
