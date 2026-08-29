@@ -215,6 +215,7 @@ strategy = "single"            # single | multi  (한 모델 고정 | 역할별 
 # manual_debug = ""            # 디버깅 (dev)
 # manual_model = ""            # 전역 수동 모델 (provider:model)
 # strict_gate = true           # 독립 검증자 게이트 (claude/kimi 엔진 · dev|advanced 에서 동작)
+# review_committee = true     # 위원회 모드 — 게이트를 5개 독립 관점(정확성·보안·성능·가독성·API)으로 순차 심사
 # team = "single"              # single | multi  (/team 으로 변경)
                                # multi 는 계획 확정 후 독립 단계를 역할 서브에이전트로 위임합니다 (연속 위임은 병렬 실행).
 
@@ -455,6 +456,9 @@ pub struct HarnessConfig {
     /// 옛 설정에 없으면 켜짐.
     #[serde(default = "default_true")]
     pub strict_gate: bool,
+    /// 리뷰 위원회(S7) — Strict 게이트를 5개 독립 관점으로 순차 심사. 기본 on.
+    #[serde(default = "default_true")]
+    pub review_committee: bool,
     /// 팀 모드: single (기본) | multi. 그 밖의 값은 engine::normalize_team 이 single 로 흡수한다.
     #[serde(default = "default_team")]
     pub team: String,

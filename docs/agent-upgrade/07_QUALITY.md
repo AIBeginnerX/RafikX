@@ -75,3 +75,22 @@
    항상 fail 이므로(엄격 해석) 설치 권장.
 2. S8 렌더링 자동화 대상(웹 스크린샷 vs TUI 스크린캡처) — RafikX 자체가 TUI 라 확장 여지.
 3. 리뷰 위원회 완전 격리(5 프로세스)의 비용 수용 여부 — 현재는 1 fresh-context × 5그룹 구조화.
+
+
+## 6. 미해결 질문 3건 결정 (2026-08-29 실행)
+
+1. **보안 감사 도구 표준 설치 — 채택.** install.sh 에 best-effort 설치 섹션 추가
+   (cargo 있으면 cargo-audit 설치, 실패해도 진행). 본기계 실측: cargo-audit 0.22.2 설치 완료.
+   미설치 환경에서도 게이트는 fail 로 막으므로(엄격 해석) 안전성은 유지된다.
+
+2. **S8 렌더링 자동화 대상 — TUI 먼저(tmux 캡처 절차).** RafikX 자체가 TUI 이므로
+   tmux capture-pane(-e 포함) 기반 검증 절차를 design-checklist 스킬에 구체 명령으로
+   추가했다. 웹 스크린샷 자동화는 브라우저 도구가 필요해 M-later 로 남긴다.
+
+3. **리뷰 위원회 완전 격리 — 채택·구현.** Strict 게이트(review_committee=true, 기본)에서
+   5개 독립 관점을 각각 fresh-context 리뷰어(run_review_gate + reviewer_prompt)로 순차
+   심사한다. 전원 통과 시에만 진행, 한 관점이라도 미통과로 끝나면 이후 관점은 생략.
+   비용은 5배지만 Dev/Advanced × Strict 조합에서만 동작해 영향이 제한적이다.
+   설정: [harness] review_committee (기본 true).
+
+테스트 396개 통과.

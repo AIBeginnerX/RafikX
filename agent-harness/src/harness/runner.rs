@@ -1292,21 +1292,53 @@ async fn finish_verification(
         && !run_context.is_cancelled()
     {
         let review_worker = review_worker_id(&run_context);
-        outcome = run_review_gate(
-            cfg,
-            binding,
-            spec,
-            task,
-            dod,
-            rebuttal,
-            yes,
-            system,
-            outcome,
-            remote,
-            local_ask,
-            run_context.clone(),
-        )
-        .await;
+        // 리뷰 위원회(S7) — review_committee=true 면 5개 독립 관점(정확성·보안·성능·
+        // 가독성·API설계)을 각각 fresh-context 로 순차 심사한다. 전원 통과해야 통과.
+        if cfg.file.harness.review_committee {
+            for persona in crate::quality::review::COMMITTEE {
+                if outcome.status != "ok" {
+                    break; // 한 관점이라도 미통과로 끝났으면 이후 관점은 무의미
+                }
+                crate::ui::live_line_in(
+                    &run_context,
+                    &format!("[위원회] {} 리뷰어 심사 시작", persona.focus),
+                );
+                outcome = run_review_gate(
+                    cfg,
+                    binding,
+                    spec,
+                    task,
+                    dod,
+                    rebuttal,
+                    Some(persona),
+                    yes,
+                    system,
+                    outcome,
+                    remote.clone(),
+                    local_ask.clone(),
+                    run_context.clone(),
+                )
+                .await;
+                crate::ui::live_worker_in(&run_context, &review_worker, "", "", "", true);
+            }
+        } else {
+            outcome = run_review_gate(
+                cfg,
+                binding,
+                spec,
+                task,
+                dod,
+                rebuttal,
+                None,
+                yes,
+                system,
+                outcome,
+                remote,
+                local_ask,
+                run_context.clone(),
+            )
+            .await;
+        }
         // 게이트는 중간에 여러 경로로 빠져나간다 — 워커 줄은 호출부에서 한 번에 닫는다.
         crate::ui::live_worker_in(&run_context, &review_worker, "", "", "", true);
     }
@@ -1822,6 +1854,7 @@ async fn run_review_gate(
     task: &str,
     dod: &str,
     rebuttal: &str,
+    persona: Option<&crate::quality::review::Reviewer>,
     yes: bool,
     system: &str,
     mut outcome: AgentOutcome,
@@ -1889,7 +1922,10 @@ async fn run_review_gate(
             &format!("완료 기준 대조 · {}회차", attempt + 1),
             false,
         );
-        let prompt = review_prompt(task, dod, rebuttal, &outcome.changed_files);
+        let prompt = match persona {
+            Some(p) => crate::quality::review::reviewer_prompt(p, task, &outcome.changed_files, dod),
+            None => review_prompt(task, dod, rebuttal, &outcome.changed_files),
+        };
         // 안쪽 루프는 "판정 불능 → 결론만 재질의" 1회를 흡수한다.
         let mut resume: Option<Vec<Message>> = None;
         let action = loop {

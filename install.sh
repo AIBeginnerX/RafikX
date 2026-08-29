@@ -58,3 +58,15 @@ echo "  rafikx --version"
 echo "  rafikx"
 echo
 echo "설정 폴더: ~/.rafikx"
+
+
+# ── 보안 감사 도구 (best-effort) ─────────────────────────────────────────────
+# 품질 게이트(S5)의 의존성 감사에 사용. 실패해도 설치는 계속된다.
+if command -v cargo >/dev/null 2>&1; then
+  if ! command -v cargo-audit >/dev/null 2>&1; then
+    echo "[install] cargo-audit 설치 중 (보안 감사 — 몇 분 걸릴 수 있음)…"
+    cargo install cargo-audit --locked >/dev/null 2>&1 \
+      && echo "[install] cargo-audit 설치 완료" \
+      || echo "[install] cargo-audit 설치 실패 — 나중에 'cargo install cargo-audit' 로 설치하세요"
+  fi
+fi
