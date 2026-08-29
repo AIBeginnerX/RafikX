@@ -6,8 +6,9 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const ERROR_MARKER: &str = "__RAFIKX_BROWSER_ERROR__";
@@ -15,6 +16,10 @@ const READY_MARKER: &str = "__RAFIKX_BROWSER_READY__";
 const PROBE_PATH: &str = "/__rafikx_probe.js";
 const MAX_STAGED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_STAGED_ENTRIES: usize = 25_000;
+const MAX_STAGING_DURATION: Duration = Duration::from_secs(3);
+const MAX_BROWSER_STDERR_BYTES: usize = 256 * 1024;
+const MAX_BROWSER_ERRORS: usize = 64;
 const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; sandbox allow-same-origin allow-scripts; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
 const PROBE_SCRIPT: &str = r#"(() => {
   const emit = (kind, value) => console.log('__RAFIKX_BROWSER_ERROR__' + kind + ': ' + String(value));
@@ -38,6 +43,9 @@ const PROBE_SCRIPT: &str = r#"(() => {
 pub fn parse_console_errors(stderr: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in stderr.lines() {
+        if out.len() >= MAX_BROWSER_ERRORS {
+            break;
+        }
         if let Some(marker) = line.find(ERROR_MARKER) {
             let reason: String = line[marker + ERROR_MARKER.len()..]
                 .trim_matches([' ', '"', ','])
@@ -294,6 +302,22 @@ fn safe_extra_browser_flag(flag: &str) -> bool {
 }
 
 fn stage_web_root(workspace: &Path, entry_html: &Path, stage: &Path) -> anyhow::Result<PathBuf> {
+    stage_web_root_with_limits(
+        workspace,
+        entry_html,
+        stage,
+        MAX_STAGED_ENTRIES,
+        MAX_STAGING_DURATION,
+    )
+}
+
+fn stage_web_root_with_limits(
+    workspace: &Path,
+    entry_html: &Path,
+    stage: &Path,
+    max_entries: usize,
+    max_duration: Duration,
+) -> anyhow::Result<PathBuf> {
     let workspace = workspace.canonicalize()?;
     let entry = entry_html.canonicalize()?;
     if !entry.starts_with(&workspace) || !entry.is_file() {
@@ -305,6 +329,8 @@ fn stage_web_root(workspace: &Path, entry_html: &Path, stage: &Path) -> anyhow::
         .to_path_buf();
     std::fs::create_dir_all(stage)?;
     let mut staged_bytes = 0u64;
+    let mut entries = 0usize;
+    let started = Instant::now();
     let filter_root = source_root.clone();
     let walker = ignore::WalkBuilder::new(&source_root)
         .hidden(false)
@@ -328,7 +354,15 @@ fn stage_web_root(workspace: &Path, entry_html: &Path, stage: &Path) -> anyhow::
                 )
         })
         .build();
-    for item in walker.flatten() {
+    for item in walker {
+        if started.elapsed() > max_duration {
+            anyhow::bail!("브라우저 자산 스테이징 시간 상한을 넘었습니다");
+        }
+        entries = entries.saturating_add(1);
+        if entries > max_entries {
+            anyhow::bail!("브라우저 자산 항목 수가 상한을 넘었습니다");
+        }
+        let item = item.map_err(|error| anyhow::anyhow!("브라우저 자산 순회 실패: {error}"))?;
         if !item.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
@@ -353,6 +387,9 @@ fn stage_web_root(workspace: &Path, entry_html: &Path, stage: &Path) -> anyhow::
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(&source, destination)?;
+        if started.elapsed() > max_duration {
+            anyhow::bail!("브라우저 자산 스테이징 시간 상한을 넘었습니다");
+        }
     }
     let relative_entry = entry.strip_prefix(&source_root)?;
     let staged_entry = stage.join(relative_entry);
@@ -360,6 +397,18 @@ fn stage_web_root(workspace: &Path, entry_html: &Path, stage: &Path) -> anyhow::
         anyhow::bail!("브라우저 엔트리를 격리 스테이징하지 못했습니다");
     }
     Ok(staged_entry)
+}
+
+fn append_bounded_stderr(log: &mut String, chunk: &str) {
+    let remaining = MAX_BROWSER_STDERR_BYTES.saturating_sub(log.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut end = remaining.min(chunk.len());
+    while end > 0 && !chunk.is_char_boundary(end) {
+        end -= 1;
+    }
+    log.push_str(&chunk[..end]);
 }
 
 struct SmokeResources {
@@ -451,7 +500,9 @@ async fn serve_request(
         Ok(path) if path.starts_with(&root) && path.is_file() => path,
         _ => {
             if let Ok(mut errors) = errors.lock() {
-                errors.push(format!("HTTP 404: /{decoded}"));
+                if errors.len() < MAX_BROWSER_ERRORS {
+                    errors.push(format!("HTTP 404: /{decoded}"));
+                }
             }
             return write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await;
         }
@@ -562,14 +613,25 @@ pub async fn smoke_test(
     let reader_log = stderr_log.clone();
     let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
     let reader = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.contains(READY_MARKER) {
+        let mut stderr = stderr;
+        let mut buffer = [0u8; 8 * 1024];
+        let mut marker_tail = Vec::new();
+        while let Ok(read) = stderr.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            let mut scan = marker_tail;
+            scan.extend_from_slice(&buffer[..read]);
+            if scan
+                .windows(READY_MARKER.len())
+                .any(|window| window == READY_MARKER.as_bytes())
+            {
                 let _ = ready_tx.send(true);
             }
+            let keep = READY_MARKER.len().saturating_sub(1).min(scan.len());
+            marker_tail = scan[scan.len() - keep..].to_vec();
             if let Ok(mut log) = reader_log.lock() {
-                log.push_str(&line);
-                log.push('\n');
+                append_bounded_stderr(&mut log, &String::from_utf8_lossy(&buffer[..read]));
             }
         }
     });
@@ -725,6 +787,37 @@ mod tests {
         assert!(!stage.join("secret.js").exists());
         assert!(!stage.join("aws-secrets.js").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_entry_limit_fails_closed() {
+        let root =
+            std::env::temp_dir().join(format!("rafikx-browser-cap-{}", crate::db::Db::new_id()));
+        let workspace = root.join("workspace");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let entry = workspace.join("index.html");
+        std::fs::write(&entry, "<canvas></canvas>").expect("entry");
+
+        let error = stage_web_root_with_limits(
+            &workspace,
+            &entry,
+            &stage,
+            1,
+            Duration::from_secs(1),
+        )
+        .err()
+        .expect("entry limit must fail");
+        assert!(error.to_string().contains("항목 수"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_stderr_is_bounded() {
+        let mut log = String::new();
+        append_bounded_stderr(&mut log, &"x".repeat(MAX_BROWSER_STDERR_BYTES + 10));
+        append_bounded_stderr(&mut log, "more");
+        assert_eq!(log.len(), MAX_BROWSER_STDERR_BYTES);
     }
 
     #[test]

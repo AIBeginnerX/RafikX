@@ -1852,7 +1852,7 @@ async fn run_verify(
                 let safe_err = crate::quality::redact_local_output(&err, &cfg.workspace);
                 if round >= 2 {
                     crate::ui::live_line_in(&run_context, "검증이 2회 재시도 후에도 실패했습니다.");
-                    crate::ui::live_line_in(&run_context, &err);
+                    crate::ui::live_line_in(&run_context, &safe_err);
                     outcome.status = "fail".into();
                     outcome.error = Some(safe_err.chars().take(500).collect());
                     outcome.verify_fail = Some(safe_err.chars().take(500).collect());
@@ -2170,6 +2170,16 @@ async fn run_review_once(
     .await
 }
 
+fn record_reviewer_workspace_delta(
+    snapshot: crate::tools::workspace_delta::WorkspaceSnapshot,
+    run_context: &RunContext,
+) -> Result<bool> {
+    let changes = snapshot.changed_baselines()?;
+    let mutated = !changes.is_empty();
+    run_context.record_committed_changes(changes);
+    Ok(mutated)
+}
+
 /// 독립 검증자 게이트 — pass 면 그대로, fail 이면 지적을 되먹여 1회 재개 후 재검증.
 /// 2번째 fail 이면 status 는 유지하고 error 에만 사유를 남긴다 (무한루프 방지).
 #[allow(clippy::too_many_arguments)]
@@ -2271,7 +2281,24 @@ async fn run_review_gate(
                 outcome.error = Some("독립 검증 전 턴 반복 예산을 모두 사용했습니다.".into());
                 return outcome;
             }
-            let review = match run_review_once(
+            let reviewer_snapshot = match crate::tools::workspace_delta::WorkspaceSnapshot::capture(
+                run_context.workspace(),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    run_context.mark_change_tracking_incomplete();
+                    let detail = crate::quality::redact_local_output(
+                        &error.to_string(),
+                        &cfg.workspace,
+                    );
+                    mark_verification_failure(
+                        &mut outcome,
+                        format!("검증자 실행 전 변경 추적 실패: {detail}"),
+                    );
+                    return outcome;
+                }
+            };
+            let review_result = run_review_once(
                 cfg,
                 &reviewer,
                 &prompt,
@@ -2283,8 +2310,30 @@ async fn run_review_gate(
                 local_ask.clone(),
                 run_context.clone(),
             )
-            .await
-            {
+            .await;
+            match record_reviewer_workspace_delta(reviewer_snapshot, &run_context) {
+                Ok(false) => {}
+                Ok(true) => {
+                    mark_verification_failure(
+                        &mut outcome,
+                        "읽기 전용 검증자가 워크스페이스를 변경했습니다".into(),
+                    );
+                    return outcome;
+                }
+                Err(error) => {
+                    run_context.mark_change_tracking_incomplete();
+                    let detail = crate::quality::redact_local_output(
+                        &error.to_string(),
+                        &cfg.workspace,
+                    );
+                    mark_verification_failure(
+                        &mut outcome,
+                        format!("검증자 실행 후 변경 추적 실패: {detail}"),
+                    );
+                    return outcome;
+                }
+            }
+            let review = match review_result {
                 Ok(review) => review,
                 Err(e) => {
                     let detail =
@@ -3028,6 +3077,28 @@ mod tests {
             auto_verify_command(&cfg, &["$(touch PWNED).py".into(), "it's fine.py".into()]);
         assert!(command.contains("'$(touch PWNED).py'"));
         assert!(command.contains("'it'\"'\"'s fine.py'"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reviewer_workspace_mutation_is_recorded() {
+        let dir = std::env::temp_dir().join(format!(
+            "rafikx-reviewer-delta-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("workspace");
+        let source = dir.join("game.js");
+        std::fs::write(&source, "before").expect("source");
+        let run = RunContext::isolated(crate::run::RunId::new("reviewer-delta"), dir.clone());
+        let snapshot = crate::tools::workspace_delta::WorkspaceSnapshot::capture(&dir)
+            .expect("reviewer snapshot");
+        std::fs::write(&source, "after").expect("reviewer mutation");
+
+        assert!(record_reviewer_workspace_delta(snapshot, &run).expect("delta"));
+        assert_eq!(
+            run.committed_paths(),
+            vec![source.canonicalize().expect("canonical source")]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

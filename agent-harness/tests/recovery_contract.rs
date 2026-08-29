@@ -133,7 +133,11 @@ async fn bash_created_files_are_recorded_as_execution_evidence() {
 
     assert_eq!(
         run.committed_paths(),
-        vec![workspace.path().join("game.html")]
+        vec![workspace
+            .path()
+            .join("game.html")
+            .canonicalize()
+            .expect("canonical game")]
     );
 }
 
@@ -157,7 +161,11 @@ async fn reverted_bash_changes_are_not_execution_evidence() {
     .expect("bash change");
     assert_eq!(
         run.committed_paths(),
-        vec![workspace.path().join("game.js")]
+        vec![workspace
+            .path()
+            .join("game.js")
+            .canonicalize()
+            .expect("canonical game")]
     );
 
     bash.run(
@@ -190,6 +198,62 @@ async fn untrackable_workspace_prevents_bash_execution() {
         .expect_err("untrackable workspace must block bash");
     assert!(error.to_string().contains("실행 전 변경 추적 실패"));
     assert!(!workspace.path().join("marker.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_workspace_symlink_prevents_bash_execution() {
+    let workspace = TestWorkspace::new("bash-external-link");
+    let outside = TestWorkspace::new("bash-external-target");
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join("linked"))
+        .expect("external symlink");
+    let run = RunContext::isolated(
+        RunId::new("bash-external-link-test"),
+        workspace.path().to_path_buf(),
+    );
+    let mut context = ToolCtx::new(workspace.path().to_path_buf());
+    context.run = Some(run);
+    let registry = ToolRegistry::all();
+    let bash = registry.get("bash").expect("bash tool");
+
+    let error = bash
+        .run(
+            json!({"command": "printf escaped > linked/outside.txt"}),
+            &context,
+        )
+        .expect_err("external symlink must block bash before execution");
+    assert!(error.to_string().contains("실행 전 변경 추적 실패"));
+    assert!(!outside.path().join("outside.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_symlink_alias_tools_share_one_final_baseline() {
+    let workspace = TestWorkspace::new("mixed-alias-real");
+    let alias = workspace.path().with_extension("alias");
+    std::os::unix::fs::symlink(workspace.path(), &alias).expect("workspace alias");
+    fs::write(workspace.path().join("game.js"), "original").expect("seed source");
+    let run = RunContext::isolated(RunId::new("mixed-alias-test"), alias.clone());
+    let mut context = ToolCtx::new(alias.clone());
+    context.run = Some(run.clone());
+    let registry = ToolRegistry::all();
+
+    registry
+        .get("bash")
+        .expect("bash tool")
+        .run(json!({"command": "printf changed > game.js"}), &context)
+        .expect("bash change");
+    registry
+        .get("write_file")
+        .expect("write tool")
+        .run(
+            json!({"path": "game.js", "content": "original"}),
+            &context,
+        )
+        .expect("file-tool revert");
+
+    assert!(run.committed_paths().is_empty());
+    let _ = fs::remove_file(alias);
 }
 
 #[tokio::test]

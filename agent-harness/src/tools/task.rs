@@ -189,7 +189,7 @@ impl TaskTool {
             child.clone(),
         )
         .await;
-        let outcome = match result {
+        let outcome = match propagate_child_result(&parent, &child, result) {
             Ok(outcome) => outcome,
             Err(error) => {
                 finish_parent(&parent, &child, 0, 0);
@@ -207,12 +207,6 @@ impl TaskTool {
                 return Err(error);
             }
         };
-        if let Some(parent) = &parent {
-            if !child.change_tracking_complete() {
-                parent.mark_change_tracking_incomplete();
-            }
-            parent.record_committed_changes(child.committed_changes());
-        }
         finish_parent(&parent, &child, outcome.input_tokens, outcome.output_tokens);
         if !team_tag.is_empty() {
             crate::ui::live_line_in(
@@ -251,6 +245,20 @@ impl TaskTool {
             serde_json::to_string(&metadata)?
         ))
     }
+}
+
+fn propagate_child_result<T>(
+    parent: &Option<RunContext>,
+    child: &RunContext,
+    result: Result<T>,
+) -> Result<T> {
+    if let Some(parent) = parent {
+        if !child.change_tracking_complete() {
+            parent.mark_change_tracking_incomplete();
+        }
+        parent.record_committed_changes(child.committed_changes());
+    }
+    result
 }
 
 fn finish_parent(parent: &Option<RunContext>, child: &RunContext, input: u32, output: u32) {
@@ -314,6 +322,38 @@ pub(crate) fn resolve_category_model<'a>(
 #[cfg(test)]
 mod category_tests {
     use super::*;
+
+    #[test]
+    fn failed_child_result_still_propagates_mutations() {
+        let workspace = std::env::temp_dir().join(format!(
+            "rafikx-task-failed-child-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let source = workspace.join("game.js");
+        std::fs::write(&source, "before").expect("source");
+        let parent = RunContext::isolated(
+            crate::run::RunId::new("failed-child-parent"),
+            workspace.clone(),
+        );
+        let child = parent.child(
+            crate::run::RunId::new("failed-child"),
+            crate::run::AgentId::new("worker"),
+        );
+        child.record_committed_changes([crate::tools::workspace_delta::FileBaseline {
+            path: source.clone(),
+            fingerprint: Some(crate::tools::workspace_delta::fingerprint_bytes(b"before")),
+        }]);
+        std::fs::write(&source, "after").expect("child mutation");
+
+        let result: Result<()> = Err(anyhow::anyhow!("child provider failed"));
+        assert!(propagate_child_result(&Some(parent.clone()), &child, result).is_err());
+        assert_eq!(
+            parent.committed_paths(),
+            vec![source.canonicalize().expect("canonical source")]
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
 
     fn cfg_with_categories(tag: &str) -> crate::config::Config {
         let dir = std::env::temp_dir().join(format!("rafikx-cat-{tag}-{}", std::process::id()));

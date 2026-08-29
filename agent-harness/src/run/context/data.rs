@@ -29,9 +29,20 @@ impl RunContext {
         &self,
         changes: impl IntoIterator<Item = FileBaseline>,
     ) {
+        let mut normalized = Vec::new();
+        for change in changes {
+            let Some(path) = self.normalize_workspace_path(&change.path) else {
+                self.mark_change_tracking_incomplete();
+                return;
+            };
+            normalized.push(FileBaseline {
+                path,
+                fingerprint: change.fingerprint,
+            });
+        }
         match self.committed_baselines.lock() {
             Ok(mut committed) => {
-                for change in changes {
+                for change in normalized {
                     committed
                         .entry(change.path)
                         .or_insert(change.fingerprint);

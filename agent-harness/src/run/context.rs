@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -132,12 +132,47 @@ impl RunContext {
             .workspace
             .canonicalize()
             .unwrap_or_else(|_| self.workspace.as_ref().clone());
-        let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let normalized = self
+            .normalize_workspace_path(path)
+            .unwrap_or_else(|| path.to_path_buf());
         normalized
             .strip_prefix(&canonical)
             .or_else(|_| path.strip_prefix(self.workspace.as_path()))
             .unwrap_or(&normalized)
             .to_path_buf()
+    }
+
+    pub(crate) fn normalize_workspace_path(&self, path: &Path) -> Option<PathBuf> {
+        let workspace = self.workspace.canonicalize().ok()?;
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace.join(path)
+        };
+        if joined
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return None;
+        }
+        let normalized = match joined.canonicalize() {
+            Ok(path) => path,
+            Err(_) => {
+                let mut ancestor = joined.parent();
+                let mut resolved = None;
+                while let Some(path) = ancestor {
+                    if path.exists() {
+                        let canonical = path.canonicalize().ok()?;
+                        let suffix = joined.strip_prefix(path).ok()?;
+                        resolved = Some(canonical.join(suffix));
+                        break;
+                    }
+                    ancestor = path.parent();
+                }
+                resolved?
+            }
+        };
+        normalized.starts_with(&workspace).then_some(normalized)
     }
 
     pub fn config(&self) -> Option<Arc<crate::config::Config>> {

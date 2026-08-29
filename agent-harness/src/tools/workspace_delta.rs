@@ -238,9 +238,15 @@ impl WorkspaceSnapshot {
     }
 
     fn capture_with_limits(root: &Path, limits: SnapshotLimits) -> Result<Self> {
+        let root = root
+            .canonicalize()
+            .map_err(|error| anyhow!("워크스페이스를 확인할 수 없습니다: {error}"))?;
+        if !root.is_dir() {
+            return Err(anyhow!("워크스페이스가 디렉터리가 아닙니다"));
+        }
         let mut files = BTreeMap::new();
         let mut budget = SnapshotBudget::new(limits);
-        let mut builder = ignore::WalkBuilder::new(root);
+        let mut builder = ignore::WalkBuilder::new(&root);
         builder
             .hidden(false)
             .ignore(false)
@@ -277,15 +283,45 @@ impl WorkspaceSnapshot {
         for entry in builder.build() {
             budget.record_entry()?;
             let entry = entry.map_err(|error| anyhow!("워크스페이스 순회 실패: {error}"))?;
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.into_path();
+            if file_type.is_symlink() {
+                let target = path.canonicalize().map_err(|error| {
+                    anyhow!("워크스페이스 심볼릭 링크를 확인할 수 없습니다: {error}")
+                })?;
+                if !target.starts_with(&root) {
+                    return Err(anyhow!(
+                        "워크스페이스 밖을 가리키는 심볼릭 링크가 있습니다 ({})",
+                        path.display()
+                    ));
+                }
+                if target.is_file() && !files.contains_key(&target) {
+                    let fingerprint = fingerprint_file(&target, &mut budget)?;
+                    files.insert(target, fingerprint);
+                }
                 continue;
             }
-            let path = entry.into_path();
-            let fingerprint = fingerprint_file(&path, &mut budget)?;
-            files.insert(path, fingerprint);
+            if !file_type.is_file() {
+                continue;
+            }
+            let normalized = path.canonicalize().map_err(|error| {
+                anyhow!("워크스페이스 파일을 확인할 수 없습니다: {error}")
+            })?;
+            if !normalized.starts_with(&root) {
+                return Err(anyhow!(
+                    "워크스페이스 파일이 경계를 벗어났습니다 ({})",
+                    path.display()
+                ));
+            }
+            if !files.contains_key(&normalized) {
+                let fingerprint = fingerprint_file(&normalized, &mut budget)?;
+                files.insert(normalized, fingerprint);
+            }
         }
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             files,
             limits,
         })
@@ -356,9 +392,16 @@ mod tests {
             .iter()
             .map(|change| change.path.as_path())
             .collect::<Vec<_>>();
-        assert!(paths.contains(&root.0.join("game.js").as_path()));
-        assert!(paths.contains(&root.0.join(".env").as_path()));
-        assert!(!paths.contains(&root.0.join(".cache/blob").as_path()));
+        let game = root.0.join("game.js").canonicalize().expect("canonical game");
+        let env = root.0.join(".env").canonicalize().expect("canonical env");
+        let cache = root
+            .0
+            .join(".cache/blob")
+            .canonicalize()
+            .expect("canonical cache");
+        assert!(paths.contains(&game.as_path()));
+        assert!(paths.contains(&env.as_path()));
+        assert!(!paths.contains(&cache.as_path()));
     }
 
     #[test]
@@ -410,5 +453,20 @@ mod tests {
             .err()
             .expect("oversized snapshot must fail");
         assert!(error.to_string().contains("해시 양"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_symlink_fails_before_a_command_can_run() {
+        let workspace = TestDir::new("external-link-workspace");
+        let outside = TestDir::new("external-link-target");
+        std::fs::write(outside.0.join("target.txt"), "outside").expect("outside fixture");
+        std::os::unix::fs::symlink(&outside.0, workspace.0.join("linked"))
+            .expect("external symlink");
+
+        let error = WorkspaceSnapshot::capture(&workspace.0)
+            .err()
+            .expect("external symlink must fail closed");
+        assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
     }
 }
