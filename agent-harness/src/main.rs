@@ -79,6 +79,12 @@ enum Commands {
     InitDeep,
     /// 계정·프로바이더 쿼터 상태
     Quota,
+    /// 변경 파일의 품질 게이트(S3 포맷·린트·테스트 + S5 보안)를 실행한다.
+    QualityGate {
+        /// 변경 파일 목록 (공백 구분). 비우면 언어 감지+전체 게이트.
+        #[arg(default_value = "")]
+        changed: String,
+    },
     /// 태스크 문서(JSON)의 검증 명령을 직접 실행해 증거를 남긴다 — 완료 판정은 이 결과만.
     VerifyTask {
         /// 태스크 문서 경로 (JSON)
@@ -309,6 +315,13 @@ async fn main() -> ExitCode {
         Some(Commands::Facts) => cmd_facts(&cli),
         Some(Commands::InitDeep) => cmd_init_deep(&cli),
         Some(Commands::Quota) => cmd_quota(&cli),
+        Some(Commands::QualityGate { changed }) => {
+            let files: Vec<String> = changed
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            cmd_quality_gate(&files).await
+        }
         Some(Commands::VerifyTask { path }) => cmd_verify_task(path).await,
         Some(Commands::VerifyPlan { path }) => cmd_verify_plan(path),
         Some(Commands::SpecFreeze { path }) => cmd_spec_freeze(path),
@@ -1019,6 +1032,18 @@ fn cmd_search(cli: &Cli, query: &str) -> Result<()> {
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let cfg = Config::load(cli.config.as_deref())?;
     obsidian::watch_vault(&cfg).await
+}
+
+/// quality-gate — S0 감지 → S3 기계 게이트 → S5 보안 게이트 (지시서 §2·§5).
+async fn cmd_quality_gate(changed: &[String]) -> Result<()> {
+    let workspace = std::env::current_dir()?;
+    let report = rafikx::quality::run_quality_gate(&workspace, changed).await;
+    print!("{}", rafikx::quality::render_report(&report));
+    if report.passed {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("품질 게이트 실패 — 위 지적을 수정한 뒤 재실행"))
+    }
 }
 
 /// verify-task — 태스크 문서의 verification 을 시스템이 직접 실행한다.

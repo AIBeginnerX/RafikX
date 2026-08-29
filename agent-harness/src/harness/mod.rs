@@ -968,3 +968,25 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod committee_tests {
+    #[test]
+    fn committee_verdicts_require_all_five_groups() {
+        use crate::harness::parse_committee_verdicts;
+        let full = "[판정-정확성] pass\n[판정-보안] pass\n[판정-성능] pass\n[판정-가독성] pass\n[판정-API설계] pass";
+        let (ok, fails) = parse_committee_verdicts(full);
+        assert!(ok, "전원 통과: {fails:?}");
+
+        let one_fail = "[판정-정확성] pass\n[판정-보안] pass\n[판정-성능] pass\n[판정-가독성] fail — src/a.rs:12 중복\n[판정-API설계] pass";
+        let (ok, fails) = parse_committee_verdicts(one_fail);
+        assert!(!ok);
+        assert!(fails[0].contains("가독성"));
+
+        // 그룹 누락도 실패다 — 판정 없음은 통과가 아니다.
+        let missing = "[판정-정확성] pass\n[판정-보안] pass";
+        let (ok, fails) = parse_committee_verdicts(missing);
+        assert!(!ok);
+        assert_eq!(fails.len(), 3, "누락 그룹만큼 사유: {fails:?}");
+    }
+}

@@ -1649,6 +1649,40 @@ pub(crate) fn parse_review_verdict(text: &str) -> ReviewVerdict {
     }
 }
 
+/// 리뷰 위원회(S7) 그룹별 판정 파싱 — [판정-그룹] 줄을 모아 전원 통과 여부를 반환.
+/// 그룹 중 하나라도 fail·누락이면 (false, 사유 목록). (M4 통합: 5 독립 관점 구조화.)
+pub(crate) fn parse_committee_verdicts(text: &str) -> (bool, Vec<String>) {
+    const GROUPS: &[&str] = &["정확성", "보안", "성능", "가독성", "API설계"];
+    let mut failed: Vec<String> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("[판정-") else {
+            continue;
+        };
+        let Some((group, tail)) = rest.split_once(']') else {
+            continue;
+        };
+        let Some(group) = GROUPS.iter().find(|g| **g == group.trim()) else {
+            continue;
+        };
+        seen.push(group);
+        if verdict_token(&tail.trim().to_ascii_lowercase()) == Some(true) {
+            failed.push(format!(
+                "[{}] {}",
+                group,
+                tail.trim().chars().take(200).collect::<String>()
+            ));
+        }
+    }
+    for g in GROUPS {
+        if !seen.contains(g) {
+            failed.push(format!("[{g}] 판정 줄이 없다 — 위원회 그룹 누락"));
+        }
+    }
+    (failed.is_empty(), failed)
+}
+
 /// 판정 뒤 게이트가 취할 동작 — 재개는 1회만, 2번째 미통과면 기록 후 종료한다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GateAction {
@@ -1720,6 +1754,13 @@ pub(crate) fn review_prompt(task: &str, dod: &str, rebuttal: &str, changed: &[St
         "\n변경 내용은 첨부하지 않았다. read_file·grep 으로 직접 읽어 확인하고, 필요하면 \
          bash 로 빌드·테스트를 직접 실행하라. 확인하지 않은 파일에 대해서는 판정하지 않는다(NEVER).\n\
          완료 기준은 실행 모델이 세운 것이다 — 원 작업 요구와 어긋나면 원 작업이 우선한다.\n\
+         \n리뷰 위원회(S7) — 너는 5개 독립 관점을 순서대로 심사하고 각 그룹별 판정 줄을 반드시 남긴다:\n\
+         [판정-정확성] pass|fail — 경계값·오류 경로·요구 일치\n\
+         [판정-보안] pass|fail — 입력 검증·인젝션·시크릿·정보 노출\n\
+         [판정-성능] pass|fail — 복잡도·불필요 복제·블로킹\n\
+         [판정-가독성] pass|fail — 중복(3중 이상 복붙은 무조건 fail)·함수 길이·네이밍\n\
+         [판정-API설계] pass|fail — 최소 표면적·오용 방지·관례 일관성\n\
+         fail 그룹에는 파일:줄과 수정 지시를 함께 쓴다.\n\
          \n판정 전 필수 검사:\n\
          1. 테스트 무결성 — diff 에서 #[ignore] 추가·테스트 함수 삭제·어서션 감소가 있으면 무조건 fail.\n\
          2. 하드코딩 탐지 — 구현이 테스트 입력에만 특화돼 있지 않은가? 의심되면 입력을 변형한\n\

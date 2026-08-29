@@ -1,3 +1,3 @@
-완료: v1.1.6 기능 릴리스 — 에이전트 강화 6 마일스톤+잔여 갭(검증 인프라·스펙 동결·verify-plan·run-plan·calibrate·plan-rollback/report·2차원 하네스·내부 프롬프트 강화). master·태그 푸시, GitHub Release 생성, rafikx update 검증. 테스트 379개 통과.
+완료: 코드 품질 엔진 구축 — quality 모듈(언어 프로파일 8종 감지·S3 기계 게이트 실행기·S5 내장 보안 스캐너 4종·S1 설계 노트·루브릭 동결·S7 리뷰 위원회 5그룹 판정 파서·중복 블록 감지), quality-gate CLI, 스킬 3종(security·design·api-design). 레드팀 실증 7/설계 추적 3. 테스트 396개 통과.
 다음: 실사용 관찰 — 자동 진단이 붙는 편집 확인(rust-analyzer 는 콜드 스타트라 조용히 건너뜀), 탐색기 UX 피드백.
 이슈: 없음.
