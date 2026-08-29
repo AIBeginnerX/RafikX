@@ -776,9 +776,6 @@ fn build_codex_body(req: &ChatRequest, stream: bool) -> Value {
                 .collect(),
         );
     }
-    if req.max_tokens > 0 {
-        body["max_output_tokens"] = json!(req.max_tokens);
-    }
     body
 }
 
@@ -953,6 +950,22 @@ fn take_stream_usage(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn codex_backend_body_omits_unsupported_output_limit() {
+        let request = ChatRequest {
+            model: "gpt-5.6-sol".into(),
+            system: "system".into(),
+            messages: vec![Message::user_text("build it")],
+            tools: Vec::new(),
+            max_tokens: 32_768,
+            stream: true,
+        };
+        let body = build_codex_body(&request, true);
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["stream"], true);
+    }
 
     #[test]
     fn tool_args_progress_fires_every_step_per_tool() {

@@ -890,6 +890,7 @@ async fn run_pipeline_inner(
             run_context.clone(),
         )
         .await?;
+        refresh_change_evidence(binding.class, &run_context, &mut outcome);
         mark_missing_dev_change(binding.class, &mut outcome);
         outcome = finish_verification(
             cfg,
@@ -927,7 +928,6 @@ async fn run_pipeline_inner(
     let mut total_input = 0u32;
     let mut total_output = 0u32;
     let mut total_iterations = 0u32;
-    let mut all_changed = Vec::new();
     let mut all_tool_errors = Vec::new();
     let mut all_denials = Vec::new();
     if staged {
@@ -993,11 +993,6 @@ async fn run_pipeline_inner(
         total_input = total_input.saturating_add(current.input_tokens);
         total_output = total_output.saturating_add(current.output_tokens);
         total_iterations = total_iterations.saturating_add(current.iterations);
-        for path in &current.changed_files {
-            if !all_changed.contains(path) {
-                all_changed.push(path.clone());
-            }
-        }
         all_tool_errors.extend(current.tool_errors.clone());
         all_denials.extend(current.deny_reasons.clone());
 
@@ -1147,7 +1142,7 @@ async fn run_pipeline_inner(
             // ok 로 끝난 턴은 모델이 단계화가 불필요한 작업으로 판단한 것 —
             // 검증된 산출물이 있으면 완료로 인정한다 (성공을 실패로 오표시 금지).
             let unfinished_todos = progress.total > 0 && progress.completed < progress.total;
-            let no_execution_evidence = all_changed.is_empty()
+            let no_execution_evidence = current.changed_files.is_empty()
                 && (progress.total == 0 || binding.class == TaskClass::Dev);
             if staged && continuation_eligible && (unfinished_todos || no_execution_evidence) {
                 current.status = "incomplete".into();
@@ -1182,7 +1177,6 @@ async fn run_pipeline_inner(
             current.input_tokens = total_input;
             current.output_tokens = total_output;
             current.iterations = total_iterations;
-            current.changed_files = all_changed;
             current.tool_errors = all_tool_errors;
             current.deny_reasons = all_denials;
             break current;
@@ -1310,6 +1304,7 @@ async fn finish_verification(
     local_ask: Option<agent::LocalAsk>,
     run_context: RunContext,
 ) -> Result<AgentOutcome> {
+    refresh_change_evidence(binding.class, &run_context, &mut outcome);
     // 검증 강도 — Auto/Strict 는 프로파일의 verify 가 꺼져 있어도 자동 감지 명령으로 검증한다.
     // 2차원 하네스(§6.7): 보정된 모델 능력이 낮으면 검증 강도를 상향한다(상향만, 하향 없음).
     let capability = crate::calibrate::capability_for(cfg, &binding.model);
@@ -1334,11 +1329,11 @@ async fn finish_verification(
             run_context.clone(),
         )
         .await?;
+        refresh_change_evidence(binding.class, &run_context, &mut outcome);
         crate::graph::node_in(&run_context, "verify", &outcome.status, "", Some("verify"));
     }
     // 독립 검증자 게이트 (§5) — 자기평가 편향을 막기 위해 신선한 컨텍스트의 리뷰어가
-    // 완료 기준과 대조한다. 게이트가 가용성을 해치면 안 되므로 게이트 자체의 실패는
-    // 경고 한 줄 후 통과로 취급한다.
+    // 완료 기준과 대조한다. 검증 인프라가 실패해 판정할 수 없는 상태도 완료가 아니다.
     if effective_policy == crate::engine::VerifyPolicy::Strict
         && cfg.file.harness.strict_gate
         && matches!(binding.class, TaskClass::Dev | TaskClass::Advanced)
@@ -1417,6 +1412,7 @@ async fn finish_verification(
             .await?;
         }
     }
+    refresh_change_evidence(binding.class, &run_context, &mut outcome);
     Ok(outcome)
 }
 
@@ -1501,6 +1497,20 @@ pub(crate) fn mark_missing_dev_change(class: TaskClass, outcome: &mut AgentOutco
         outcome.status = "incomplete".into();
         outcome.error = Some("개발 작업에 변경 파일 증거가 없습니다.".into());
     }
+}
+
+fn refresh_change_evidence(class: TaskClass, run: &RunContext, outcome: &mut AgentOutcome) {
+    outcome.changed_files = run
+        .committed_paths()
+        .into_iter()
+        .map(|path| run.workspace_relative(&path).to_string_lossy().into_owned())
+        .collect();
+    if !run.change_tracking_complete() {
+        outcome.status = "incomplete".into();
+        outcome.error = Some("워크스페이스 변경 추적 상한을 초과해 완료를 증명할 수 없습니다.".into());
+        return;
+    }
+    mark_missing_dev_change(class, outcome);
 }
 
 pub(crate) fn turn_iteration_budget(per_cycle: u32) -> u32 {
@@ -1720,6 +1730,7 @@ async fn run_quality_repair(
             next.verify_fail = Some(summary);
         }
         outcome = merge_agent_outcomes(outcome, next);
+        refresh_change_evidence(binding.class, run_context, &mut outcome);
     }
     Ok(outcome)
 }
@@ -1895,6 +1906,7 @@ async fn run_verify(
                     next.verify_fail = Some(cause);
                 }
                 outcome = merge_agent_outcomes(outcome, next);
+                refresh_change_evidence(binding.class, &run_context, &mut outcome);
             }
         }
     }
@@ -2117,7 +2129,7 @@ pub(crate) fn review_prompt(task: &str, dod: &str, rebuttal: &str, changed: &[St
     s
 }
 
-/// 리뷰어 미니 루프 1회. 게이트 자체의 오류는 호출자가 통과로 처리한다.
+/// 리뷰어 미니 루프 1회. 게이트 자체의 오류도 호출자가 검증 실패로 처리한다.
 /// `engine_block` 은 실행 엔진의 prompt_block — 리뷰어도 같은 품질 기준으로 보게 한다
 /// (약점 보정 지시 없이 판정만 시키던 교차 누수 제거, 설계 §15.2).
 /// `resume` 이 있으면 그 대화를 이어 재질의한다.
@@ -2202,9 +2214,14 @@ async fn run_review_gate(
     ) {
         Ok(reviewer) => reviewer,
         Err(e) => {
+            let detail = crate::quality::redact_local_output(&e.to_string(), &cfg.workspace);
             crate::ui::live_warn_in(
                 &run_context,
-                &format!("검증자 게이트 생략(바인딩 실패): {e}"),
+                &format!("검증자 게이트 실패(바인딩): {detail}"),
+            );
+            mark_verification_failure(
+                &mut outcome,
+                format!("검증자 바인딩 실패: {detail}"),
             );
             return outcome;
         }
@@ -2270,16 +2287,22 @@ async fn run_review_gate(
             {
                 Ok(review) => review,
                 Err(e) => {
+                    let detail =
+                        crate::quality::redact_local_output(&e.to_string(), &cfg.workspace);
                     crate::ui::live_warn_in(
                         &run_context,
-                        &format!("검증자 게이트 실패(통과 처리): {e}"),
+                        &format!("검증자 게이트 실행 실패: {detail}"),
                     );
                     crate::graph::node_in(
                         &run_context,
                         "critic",
                         "error",
-                        &e.to_string(),
+                        &detail,
                         Some("verify"),
+                    );
+                    mark_verification_failure(
+                        &mut outcome,
+                        format!("검증자 실행 실패: {detail}"),
                     );
                     return outcome;
                 }
@@ -2394,6 +2417,7 @@ async fn run_review_gate(
         match resumed {
             Ok(next) => {
                 outcome = merge_agent_outcomes(outcome, next);
+                refresh_change_evidence(binding.class, &run_context, &mut outcome);
                 // 재개가 정상 종료하지 못했으면 재검증 없이 그 상태를 그대로 보고한다.
                 if outcome.status != "ok" || run_context.is_cancelled() {
                     crate::ui::live_warn_in(
@@ -2407,11 +2431,15 @@ async fn run_review_gate(
                 }
             }
             Err(e) => {
+                let detail = crate::quality::redact_local_output(&e.to_string(), &cfg.workspace);
                 crate::ui::live_warn_in(
                     &run_context,
-                    &format!("검증자 재개 실패(직전 상태 유지): {e}"),
+                    &format!("검증자 지적 수정 재개 실패: {detail}"),
                 );
-                outcome.error = Some(format!("검증자 미통과: {headline}"));
+                mark_verification_failure(
+                    &mut outcome,
+                    format!("검증자 미통과 후 수정 재개 실패: {headline}; {detail}"),
+                );
                 return outcome;
             }
         }
@@ -2867,6 +2895,7 @@ async fn run_graph_discipline(
                 .clone()
                 .unwrap_or_else(|| format!("status={}", outcome.status));
             merge_node_outcome(&mut agg, &outcome);
+            agg.changed_files = outcome.changed_files.clone();
             // 취소는 실패가 아니다 — 재시도하지 않고 그대로 끝낸다.
             if outcome.status == "cancelled" || run_context.is_cancelled() {
                 return Ok(cancelled_outcome());

@@ -208,7 +208,10 @@ impl TaskTool {
             }
         };
         if let Some(parent) = &parent {
-            parent.record_committed_paths(child.committed_paths());
+            if !child.change_tracking_complete() {
+                parent.mark_change_tracking_incomplete();
+            }
+            parent.record_committed_changes(child.committed_changes());
         }
         finish_parent(&parent, &child, outcome.input_tokens, outcome.output_tokens);
         if !team_tag.is_empty() {

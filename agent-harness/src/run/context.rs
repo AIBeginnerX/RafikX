@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ use super::{
     TodoStore,
 };
 use crate::lifecycle::{LifecycleRuntime, LifecycleStore};
+use crate::tools::workspace_delta::FileFingerprint;
 
 pub type RunLiveSink = Arc<dyn Fn(crate::ui::Live) + Send + Sync>;
 
@@ -53,7 +55,8 @@ pub struct RunContext {
     progress: Arc<ProgressState>,
     metrics: Arc<RunMetrics>,
     live_sink: Option<RunLiveSink>,
-    committed_paths: Arc<Mutex<Vec<PathBuf>>>,
+    committed_baselines: Arc<Mutex<BTreeMap<PathBuf, Option<FileFingerprint>>>>,
+    change_tracking_complete: Arc<AtomicBool>,
     context_sources: Arc<Mutex<Vec<ContextSourceRecord>>>,
     lifecycle: Arc<LifecycleRuntime>,
     approval_all: Arc<AtomicBool>,
@@ -100,7 +103,8 @@ impl RunContext {
             progress: Arc::new(ProgressState::new()),
             metrics: Arc::new(RunMetrics::default()),
             live_sink: self.live_sink.clone(),
-            committed_paths: Arc::new(Mutex::new(Vec::new())),
+            committed_baselines: Arc::new(Mutex::new(BTreeMap::new())),
+            change_tracking_complete: Arc::new(AtomicBool::new(true)),
             context_sources: Arc::new(Mutex::new(Vec::new())),
             lifecycle,
             approval_all: Arc::clone(&self.approval_all),
@@ -121,6 +125,19 @@ impl RunContext {
 
     pub fn workspace(&self) -> &Path {
         self.workspace.as_path()
+    }
+
+    pub(crate) fn workspace_relative(&self, path: &Path) -> PathBuf {
+        let canonical = self
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace.as_ref().clone());
+        let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        normalized
+            .strip_prefix(&canonical)
+            .or_else(|_| path.strip_prefix(self.workspace.as_path()))
+            .unwrap_or(&normalized)
+            .to_path_buf()
     }
 
     pub fn config(&self) -> Option<Arc<crate::config::Config>> {
@@ -182,10 +199,34 @@ impl RunContext {
             progress: Arc::new(ProgressState::new()),
             metrics: Arc::new(RunMetrics::default()),
             live_sink,
-            committed_paths: Arc::new(Mutex::new(Vec::new())),
+            committed_baselines: Arc::new(Mutex::new(BTreeMap::new())),
+            change_tracking_complete: Arc::new(AtomicBool::new(true)),
             context_sources: Arc::new(Mutex::new(Vec::new())),
             lifecycle,
             approval_all: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_relative_resolves_a_symlinked_workspace_root() {
+        let parent = std::env::temp_dir().join(format!(
+            "rafikx-context-relative-{}",
+            crate::db::Db::new_id()
+        ));
+        let real = parent.join("real");
+        let alias = parent.join("alias");
+        std::fs::create_dir_all(&real).expect("real workspace");
+        std::os::unix::fs::symlink(&real, &alias).expect("workspace alias");
+        let source = real.join("game.js");
+        std::fs::write(&source, "game").expect("source");
+        let run = RunContext::isolated(crate::run::RunId::new("relative-test"), alias);
+
+        assert_eq!(run.workspace_relative(&source), PathBuf::from("game.js"));
+        let _ = std::fs::remove_dir_all(parent);
     }
 }

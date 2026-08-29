@@ -886,12 +886,7 @@ fn tool_output_summary(name: &str, out: &str) -> String {
 fn committed_files(run: &RunContext) -> Vec<String> {
     run.committed_paths()
         .into_iter()
-        .map(|path| {
-            path.strip_prefix(run.workspace())
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned()
-        })
+        .map(|path| run.workspace_relative(&path).to_string_lossy().into_owned())
         .collect()
 }
 

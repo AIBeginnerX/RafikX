@@ -174,3 +174,32 @@ fn mutation_tools_commit_receipts_and_failed_patch_is_atomic() {
     );
     assert_eq!(run.committed_paths().len(), 3);
 }
+
+#[test]
+fn reverted_mutation_is_not_execution_evidence() {
+    let workspace = TestDir::new("mutation-revert");
+    let source = workspace.path().join("game.js");
+    fs::write(&source, "original").expect("seed source");
+    let run = RunContext::isolated(RunId::new("mutation-revert"), workspace.path().to_path_buf());
+    let mut ctx = ToolCtx::new(workspace.path().to_path_buf());
+    ctx.run = Some(run.clone());
+    let registry = ToolRegistry::all();
+    let edit = registry.get("edit_file").expect("edit tool");
+
+    edit.run(
+        json!({"path":"game.js","old_str":"original","new_str":"changed"}),
+        &ctx,
+    )
+    .expect("change source");
+    assert_eq!(
+        run.committed_paths(),
+        vec![source.canonicalize().expect("canonical source")]
+    );
+
+    edit.run(
+        json!({"path":"game.js","old_str":"changed","new_str":"original"}),
+        &ctx,
+    )
+    .expect("revert source");
+    assert!(run.committed_paths().is_empty());
+}

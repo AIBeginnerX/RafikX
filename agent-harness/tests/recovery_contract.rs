@@ -137,6 +137,61 @@ async fn bash_created_files_are_recorded_as_execution_evidence() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverted_bash_changes_are_not_execution_evidence() {
+    let workspace = TestWorkspace::new("bash-revert");
+    fs::write(workspace.path().join("game.js"), "original").expect("seed source");
+    let run = RunContext::isolated(
+        RunId::new("bash-revert-test"),
+        workspace.path().to_path_buf(),
+    );
+    let mut context = ToolCtx::new(workspace.path().to_path_buf());
+    context.run = Some(run.clone());
+    let registry = ToolRegistry::all();
+    let bash = registry.get("bash").expect("bash tool");
+
+    bash.run(
+        json!({"command": "printf changed > game.js"}),
+        &context,
+    )
+    .expect("bash change");
+    assert_eq!(
+        run.committed_paths(),
+        vec![workspace.path().join("game.js")]
+    );
+
+    bash.run(
+        json!({"command": "printf original > game.js"}),
+        &context,
+    )
+    .expect("bash revert");
+    assert!(run.committed_paths().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrackable_workspace_prevents_bash_execution() {
+    let workspace = TestWorkspace::new("bash-tracking-cap");
+    let oversized = fs::File::create(workspace.path().join("oversized.bin"))
+        .expect("oversized fixture");
+    oversized
+        .set_len(64 * 1024 * 1024 + 1)
+        .expect("sparse oversized fixture");
+    let run = RunContext::isolated(
+        RunId::new("bash-tracking-cap-test"),
+        workspace.path().to_path_buf(),
+    );
+    let mut context = ToolCtx::new(workspace.path().to_path_buf());
+    context.run = Some(run);
+    let registry = ToolRegistry::all();
+    let bash = registry.get("bash").expect("bash tool");
+
+    let error = bash
+        .run(json!({"command": "printf ran > marker.txt"}), &context)
+        .expect_err("untrackable workspace must block bash");
+    assert!(error.to_string().contains("실행 전 변경 추적 실패"));
+    assert!(!workspace.path().join("marker.txt").exists());
+}
+
 #[tokio::test]
 async fn duplicate_advice_does_not_fail_a_valid_artifact() {
     // Given: a valid artifact with a substantial repeated implementation.

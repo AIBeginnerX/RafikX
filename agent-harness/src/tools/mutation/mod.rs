@@ -5,6 +5,8 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 
+use super::workspace_delta::{FileBaseline, fingerprint_bytes};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationState {
     Missing,
@@ -63,6 +65,19 @@ impl MutationPlan {
 
     pub fn commit(self) -> Result<MutationReceipt> {
         commit::execute(self, None)
+    }
+
+    pub(crate) fn baselines(&self) -> Vec<FileBaseline> {
+        self.operations
+            .iter()
+            .map(|operation| FileBaseline {
+                path: operation.target.clone(),
+                fingerprint: match &operation.before {
+                    MutationState::Missing => None,
+                    MutationState::Present(bytes) => Some(fingerprint_bytes(bytes)),
+                },
+            })
+            .collect()
     }
 
     fn push(&mut self, target: &Path, before: MutationState, after: Option<Vec<u8>>) -> Result<()> {

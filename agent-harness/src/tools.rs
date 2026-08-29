@@ -26,7 +26,7 @@ pub(crate) mod hashline;
 mod lsp_tools;
 pub mod mutation;
 mod task;
-mod workspace_delta;
+pub(crate) mod workspace_delta;
 
 use lsp_tools::{LspDefinition, LspDiagnostics, LspHover, LspReferences};
 pub use task::{TaskArgs, TaskResult, TaskTool};
@@ -74,9 +74,10 @@ impl ToolCtx {
         &self,
         plan: mutation::MutationPlan,
     ) -> Result<mutation::MutationReceipt> {
+        let baselines = plan.baselines();
         let receipt = plan.commit()?;
         if let Some(run) = &self.run {
-            run.record_committed_paths(receipt.changed.iter().cloned());
+            run.record_committed_changes(baselines);
             run.emit(
                 RunEventKind::Mutation,
                 json!({
@@ -863,21 +864,39 @@ impl Tool for Bash {
         let workspace = ctx.workspace.clone();
         let run = ctx.run.clone();
         let track_changes = run.is_some();
-        let (result, changed_paths) = tokio::task::block_in_place(|| {
-            let snapshot = track_changes
-                .then(|| workspace_delta::WorkspaceSnapshot::capture(&workspace));
+        let tracked = tokio::task::block_in_place(|| -> Result<_> {
+            let snapshot = if track_changes {
+                Some(
+                    workspace_delta::WorkspaceSnapshot::capture(&workspace)
+                        .map_err(|error| anyhow!("명령 실행 전 변경 추적 실패: {error}"))?,
+                )
+            } else {
+                None
+            };
             let result = tokio::runtime::Handle::current().block_on(run_bash(
                 command,
                 workspace,
                 timeout_secs,
             ));
-            let changed_paths = snapshot
-                .map(|snapshot| snapshot.changed_paths())
-                .unwrap_or_default();
-            (result, changed_paths)
+            let changes = match snapshot {
+                Some(snapshot) => snapshot
+                    .changed_baselines()
+                    .map_err(|error| anyhow!("명령 실행 후 변경 추적 실패: {error}"))?,
+                None => Vec::new(),
+            };
+            Ok((result, changes))
         });
+        let (result, changes) = match tracked {
+            Ok(tracked) => tracked,
+            Err(error) => {
+                if let Some(run) = &run {
+                    run.mark_change_tracking_incomplete();
+                }
+                return Err(error);
+            }
+        };
         if let Some(run) = run {
-            run.record_committed_paths(changed_paths);
+            run.record_committed_changes(changes);
         }
         result
     }

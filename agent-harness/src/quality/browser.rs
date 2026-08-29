@@ -15,7 +15,7 @@ const READY_MARKER: &str = "__RAFIKX_BROWSER_READY__";
 const PROBE_PATH: &str = "/__rafikx_probe.js";
 const MAX_STAGED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
+const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; sandbox allow-same-origin allow-scripts; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
 const PROBE_SCRIPT: &str = r#"(() => {
   const emit = (kind, value) => console.log('__RAFIKX_BROWSER_ERROR__' + kind + ': ' + String(value));
   const originalError = console.error.bind(console);
@@ -95,6 +95,18 @@ pub fn detect_browser() -> Option<&'static str> {
         .iter()
         .find(|p| std::path::Path::new(p).exists())
         .copied()
+}
+
+fn network_isolation_flags(address: std::net::SocketAddr) -> [String; 4] {
+    [
+        format!(
+            "--proxy-bypass-list=<-loopback>;http://127.0.0.1:{}",
+            address.port()
+        ),
+        "--proxy-server=http://127.0.0.1:9".into(),
+        "--host-resolver-rules=MAP * 0.0.0.0, EXCLUDE 127.0.0.1".into(),
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
+    ]
 }
 
 fn evaluate_browser_output(
@@ -517,6 +529,7 @@ pub async fn smoke_test(
         .filter(|flag| safe_extra_browser_flag(flag))
         .map(str::to_string)
         .collect();
+    let isolation = network_isolation_flags(address);
     let mut command = tokio::process::Command::new(browser);
     command
         .args([
@@ -533,12 +546,7 @@ pub async fn smoke_test(
         ])
         .arg(profile_flag)
         .args(&extra)
-        .args([
-            "--proxy-bypass-list=127.0.0.1",
-            "--proxy-server=http://127.0.0.1:9",
-            "--host-resolver-rules=MAP * 0.0.0.0, EXCLUDE 127.0.0.1",
-            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-        ])
+        .args(&isolation)
         .arg(&url)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
@@ -724,12 +732,44 @@ mod tests {
         assert!(SECURITY_HEADERS.contains("connect-src 'self'"));
         assert!(SECURITY_HEADERS.contains("form-action 'none'"));
         assert!(SECURITY_HEADERS.contains("frame-ancestors 'none'"));
+        assert!(SECURITY_HEADERS.contains("sandbox allow-same-origin allow-scripts"));
         assert!(SECURITY_HEADERS.contains("X-Content-Type-Options: nosniff"));
         assert!(SECURITY_HEADERS.contains("X-DNS-Prefetch-Control: off"));
+        let flags = network_isolation_flags("127.0.0.1:43123".parse().expect("address"));
+        assert_eq!(
+            flags[0],
+            "--proxy-bypass-list=<-loopback>;http://127.0.0.1:43123"
+        );
+        assert!(!flags[0].ends_with("127.0.0.1"));
         assert!(safe_extra_browser_flag("--no-sandbox"));
         assert!(!safe_extra_browser_flag("https://example.com"));
         assert!(!safe_extra_browser_flag("--no-proxy-server"));
         assert!(!safe_extra_browser_flag("--disable-web-security"));
         assert!(!safe_extra_browser_flag("--user-data-dir=/tmp/shared"));
+    }
+
+    #[tokio::test]
+    async fn smoke_page_cannot_reach_another_loopback_service() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("rafikx-browser-loopback-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&root).expect("browser fixture");
+        let trap = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback trap");
+        let trap_url = format!("http://{}/private", trap.local_addr().expect("trap address"));
+        let html = format!(
+            "<script>fetch('{trap_url}').catch(() => {{}});</script><canvas></canvas>"
+        );
+        let entry = root.join("index.html");
+        std::fs::write(&entry, html).expect("browser fixture html");
+
+        let result = smoke_test(&root, &entry).await.expect("browser smoke");
+        assert!(result.is_some());
+        let reached = tokio::time::timeout(std::time::Duration::from_millis(300), trap.accept()).await;
+        assert!(reached.is_err(), "page reached a different loopback port");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
