@@ -392,6 +392,7 @@ fn resolve_html_reference(root: &Path, entry: &Path, raw: &str) -> Option<PathBu
 enum ReferenceToken {
     Identifier(String),
     Punctuation(u8),
+    ControlClose,
     Value,
 }
 
@@ -488,6 +489,7 @@ fn regex_literal_can_start(tokens: &[ReferenceToken]) -> bool {
                     | "yield"
             )
         }
+        Some(ReferenceToken::ControlClose) => true,
         Some(ReferenceToken::Value) => false,
     }
 }
@@ -524,6 +526,7 @@ fn code_reference_values(text: &str, css: bool) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut values = Vec::new();
     let mut tokens = Vec::new();
+    let mut control_parentheses = Vec::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
         if bytes[cursor].is_ascii_whitespace() {
@@ -577,7 +580,20 @@ fn code_reference_values(text: &str, css: bool) -> Vec<String> {
             );
             continue;
         }
-        push_reference_token(&mut tokens, ReferenceToken::Punctuation(bytes[cursor]));
+        let token = match bytes[cursor] {
+            b'(' => {
+                let control = matches!(
+                    tokens.last(),
+                    Some(ReferenceToken::Identifier(value))
+                        if matches!(value.as_str(), "catch" | "for" | "if" | "switch" | "while" | "with")
+                );
+                control_parentheses.push(control);
+                ReferenceToken::Punctuation(b'(')
+            }
+            b')' if control_parentheses.pop().unwrap_or(false) => ReferenceToken::ControlClose,
+            punctuation => ReferenceToken::Punctuation(punctuation),
+        };
+        push_reference_token(&mut tokens, token);
         cursor += 1;
     }
     values
@@ -773,6 +789,10 @@ fn entry_reaches_changed_sources(
             anyhow::anyhow!("브라우저 참조 그래프 파일을 읽을 수 없습니다: {error}")
         })?;
         for reference in local_references(root, &source, &text) {
+            let reference = reference.canonicalize().unwrap_or(reference);
+            if !reference.starts_with(root) {
+                anyhow::bail!("브라우저 참조 그래프가 워크스페이스 밖을 가리킵니다");
+            }
             for (absolute, changed) in &targets {
                 if reference == *absolute {
                     matched.insert((*changed).clone());
@@ -1245,7 +1265,21 @@ async fn start_server(
 
 /// 엔트리 HTML 을 실제 브라우저로 로드해 콘솔 오류를 수집한다.
 /// 브라우저가 없으면 Ok(None) — 호출자가 HTML 런타임 검증 불가로 처리한다.
-pub async fn smoke_test(
+pub async fn smoke_test(entry_html: &std::path::Path) -> anyhow::Result<Option<Vec<String>>> {
+    let entry = entry_html.canonicalize()?;
+    let current = std::env::current_dir()?.canonicalize()?;
+    let workspace = if entry.starts_with(&current) {
+        current
+    } else {
+        entry
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("브라우저 엔트리의 상위 폴더가 없습니다"))?
+            .to_path_buf()
+    };
+    smoke_test_in_workspace(&workspace, &entry).await
+}
+
+pub(crate) async fn smoke_test_in_workspace(
     workspace: &std::path::Path,
     entry_html: &std::path::Path,
 ) -> anyhow::Result<Option<Vec<String>>> {
@@ -1604,7 +1638,7 @@ mod tests {
         .expect("root module");
         std::fs::write(
             root.join("js/events.js"),
-            "const contraction = () => /don't/; import './state.js';",
+            "const contraction = () => /isn't/; if (true) /don't/.test('x'); import './state.js';",
         )
         .expect("intermediate module");
         std::fs::write(root.join("js/state.js"), "missingFunction();").expect("changed module");
@@ -1636,6 +1670,18 @@ mod tests {
 
         let entries = discover_entries(&root, &["RUNTIME-BROKEN.JS".into()])
             .expect("discover case-variant source");
+        assert_eq!(
+            entries,
+            vec![root.join("launch.html").canonicalize().expect("entry")]
+        );
+
+        std::fs::write(
+            root.join("launch.html"),
+            "<script src=\"./RUNTIME-BROKEN.JS\"></script>",
+        )
+        .expect("case-variant entry fixture");
+        let entries = discover_entries(&root, &["runtime-broken.js".into()])
+            .expect("discover case-variant reference");
         assert_eq!(
             entries,
             vec![root.join("launch.html").canonicalize().expect("entry")]
@@ -1783,7 +1829,7 @@ mod tests {
         std::fs::write(root.join("src/app.js"), "window.rafikxLoaded = true;")
             .expect("sibling source");
 
-        let errors = smoke_test(&root, &root.join("public/index.html"))
+        let errors = smoke_test_in_workspace(&root, &root.join("public/index.html"))
             .await
             .expect("browser smoke")
             .expect("installed browser");
@@ -1863,7 +1909,9 @@ mod tests {
         let entry = root.join("index.html");
         std::fs::write(&entry, html).expect("browser fixture html");
 
-        let result = smoke_test(&root, &entry).await.expect("browser smoke");
+        let result = smoke_test_in_workspace(&root, &entry)
+            .await
+            .expect("browser smoke");
         assert!(result.is_some());
         let reached =
             tokio::time::timeout(std::time::Duration::from_millis(300), trap.accept()).await;

@@ -320,3 +320,77 @@ renderPlayer(player.position, player.velocity);
             .any(|step| step.stage == "S7-duplication")
     );
 }
+
+#[tokio::test]
+async fn browser_game_runtime_failure_and_repair_are_reproducible() {
+    let workspace = TestWorkspace::new("browser-game-e2e");
+    fs::write(
+        workspace.path().join("index.html"),
+        r#"<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body><main><h1>Rafik Run</h1><canvas id="game" width="640" height="360"></canvas><p id="status">READY</p></main><script src="game.js"></script></body></html>"#,
+    )
+    .expect("game html");
+    fs::write(
+        workspace.path().join("style.css"),
+        "body{margin:0;background:#101828;color:#fff}main{max-width:720px;margin:auto}canvas{width:100%;background:#d9f2ff}",
+    )
+    .expect("game css");
+    fs::write(
+        workspace.path().join("game.js"),
+        "const canvas = document.querySelector('#game'); missingGameLoop(canvas);",
+    )
+    .expect("broken game source");
+    let changed = vec!["index.html".into(), "style.css".into(), "game.js".into()];
+
+    let broken = run_quality_gate(workspace.path(), &changed).await;
+    assert!(!broken.passed, "runtime failure passed: {broken:?}");
+
+    fs::write(
+        workspace.path().join("game.js"),
+        r#"const canvas = document.querySelector('#game');
+const context = canvas.getContext('2d');
+const status = document.querySelector('#status');
+const game = { mode: 'ready', x: 24, y: 280, velocity: 0 };
+function reset() { game.mode = 'ready'; game.x = 24; game.y = 280; game.velocity = 0; }
+function render() {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#4f46e5';
+  context.fillRect(game.x, game.y, 24, 24);
+  status.textContent = game.mode.toUpperCase();
+}
+function frame() {
+  if (game.mode === 'playing') {
+    game.x += 2;
+    game.velocity += 0.4;
+    game.y = Math.min(280, game.y + game.velocity);
+    if (game.x > canvas.width) game.mode = 'lost';
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+document.addEventListener('keydown', (event) => {
+  if (event.code === 'Space' && game.mode === 'ready') game.mode = 'playing';
+  if (event.code === 'KeyP' && game.mode === 'playing') game.mode = 'paused';
+  else if (event.code === 'KeyP' && game.mode === 'paused') game.mode = 'playing';
+  if (event.code === 'KeyR') reset();
+  if (event.code === 'ArrowUp' && game.mode === 'playing' && game.y === 280) game.velocity = -8;
+});
+reset();
+frame();"#,
+    )
+    .expect("repaired game source");
+
+    let repaired = run_quality_gate(workspace.path(), &changed).await;
+    let node_available = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if rafikx::quality::browser::detect_browser().is_some() && node_available {
+        assert!(
+            repaired.passed,
+            "repaired browser game failed: {:?} {:?}",
+            repaired.steps, repaired.findings
+        );
+    } else {
+        assert!(!repaired.passed, "missing validator must fail closed");
+    }
+}

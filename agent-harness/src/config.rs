@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -569,13 +572,14 @@ pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
             false,
             "20년 경력 수석 리뷰어다. 신선한 시각으로 산출물을 완료 기준과 대조하고 결함을 찾는다. \
                  우선순위는 정확성 > 보안 > 성능이다.\n\
+                 명령 실행은 상위 하네스의 기계 검증이 담당한다. 너는 읽기 전용 도구로 코드·계약을 독립 심사한다.\n\
                  주장하기 전에 도구로 실제 파일을 읽어 확인한다(MUST). 읽지 않은 파일에 대해 판단하지 않는다(NEVER).\n\
                  코드를 수정하지 않는다(NEVER) — 판정과 근거만 낸다. 칭찬·요약·격려는 쓰지 않고 사실만 적는다.\n\
                  출력은 반드시 아래 구조로만 낸다. 머리표는 대괄호 그대로 쓴다.\n\
                  [판정] pass 또는 fail 한 단어.\n\
                  [미충족 항목] 완료 기준 중 충족되지 않은 항목을 그대로 인용하고 왜 미충족인지 한 줄씩. 없으면 '없음'.\n\
                  [결함] 파일:줄 — 문제 — 근거 형식으로 한 줄씩. 없으면 '없음'.\n\
-                 직접 읽고 실행해 얻은 외부 근거 없이 pass 를 주지 마라. 작성 맥락을 모르는 낯선 눈으로 본다.",
+                 시스템이 제공한 기계 검증 상태와 직접 읽은 코드 근거 없이 pass 를 주지 마라. 작성 맥락을 모르는 낯선 눈으로 본다.",
         ),
         _ => return None,
     };
@@ -779,6 +783,53 @@ pub struct Config {
     pub loaded_at: Option<std::time::SystemTime>,
 }
 
+static DEFAULT_CONFIG_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+fn ensure_default_config(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.toml");
+    let (temporary, mut file) = loop {
+        let id = DEFAULT_CONFIG_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".{name}.{}.{id}.tmp", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("{} 파일을 만들 수 없습니다", path.display()));
+            }
+        }
+    };
+    file.write_all(DEFAULT_CONFIG.as_bytes())
+        .with_context(|| format!("{} 파일을 만들 수 없습니다", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("{} 파일을 저장할 수 없습니다", path.display()))?;
+    drop(file);
+    set_owner_only_mode(&temporary);
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.is_file() => {
+            let _ = fs::remove_file(temporary);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(error).with_context(|| format!("{} 파일을 만들 수 없습니다", path.display()))
+        }
+    }
+}
+
 impl Config {
     pub fn data_dir() -> Result<PathBuf> {
         if let Some(p) = env_nonempty("RAFIKX_HOME") {
@@ -805,14 +856,7 @@ impl Config {
             None => Self::default_path()?,
         };
 
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&path, DEFAULT_CONFIG)
-                .with_context(|| format!("{} 파일을 만들 수 없습니다", path.display()))?;
-            set_owner_only_mode(&path);
-        }
+        ensure_default_config(&path)?;
 
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("{} 파일을 읽을 수 없습니다", path.display()))?;
@@ -1135,6 +1179,36 @@ mod tests {
         let raw = DEFAULT_CONFIG.replace("[harness]\n", "[harness]\nstrict_gate = false\n");
         let file: ConfigFile = toml::from_str(&raw).expect("parse");
         assert!(!file.harness.strict_gate);
+    }
+
+    #[test]
+    fn first_run_config_creation_is_atomic_under_concurrency() {
+        let root =
+            std::env::temp_dir().join(format!("rafikx-config-race-{}", crate::db::Db::new_id()));
+        fs::create_dir_all(&root).expect("test directory");
+        let path = root.join("config.toml");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_default_config(&path).expect("default config");
+                    let raw = fs::read_to_string(&path).expect("complete config");
+                    toml::from_str::<ConfigFile>(&raw).expect("valid config")
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let file = handle.join().expect("config writer");
+            assert_eq!(file.general.default_provider, "minimax");
+        }
+        assert_eq!(
+            fs::read_to_string(&path).expect("final config"),
+            DEFAULT_CONFIG
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

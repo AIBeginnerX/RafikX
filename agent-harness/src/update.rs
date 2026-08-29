@@ -49,7 +49,11 @@ pub(super) fn owner_token() -> Option<String> {
 /// 기존 helper(osxkeychain/gh 등)를 끄고 env 의 토큰만 쓴다.
 /// 토큰은 argv 가 아니라 env 로만 흘러 프로세스 목록에 노출되지 않는다.
 fn apply_git_credentials(cmd: &mut std::process::Command) {
-    let Some(token) = owner_token() else {
+    apply_git_credentials_with(cmd, owner_token());
+}
+
+fn apply_git_credentials_with(cmd: &mut std::process::Command, token: Option<String>) {
+    let Some(token) = token else {
         return;
     };
     cmd.args([
@@ -60,6 +64,13 @@ fn apply_git_credentials(cmd: &mut std::process::Command) {
     ]);
     cmd.env(GIT_UPD_USER_ENV, repo_owner().unwrap_or_default());
     cmd.env(GIT_UPD_TOKEN_ENV, token);
+}
+
+fn tag_lookup_command(token: Option<String>) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    apply_git_credentials_with(&mut command, token);
+    command.args(["ls-remote", "--tags", GIT_URL]);
+    command
 }
 
 /// git 프로세스에 주입할 자격증명 환경변수 이름. install 쪽 스크립트와 공유한다.
@@ -88,11 +99,7 @@ pub fn latest_release() -> Result<Release> {
             url: gh.html_url,
         });
     }
-    let mut cmd = Command::new("git");
-    cmd.arg("ls-remote");
-    apply_git_credentials(&mut cmd);
-    let out = cmd
-        .args(["--tags", GIT_URL])
+    let out = tag_lookup_command(owner_token())
         .output()
         .map_err(|e| anyhow!("git ls-remote 실패: {e}"))?;
     if !out.status.success() {
@@ -301,6 +308,30 @@ mod tests {
                 assert!(args.iter().all(|a| !a.starts_with("credential.helper")));
             }
         }
+    }
+
+    #[test]
+    fn tag_lookup_places_git_options_before_the_subcommand() {
+        let command = tag_lookup_command(Some("synthetic-credential".into()));
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let subcommand = args
+            .iter()
+            .position(|argument| argument == "ls-remote")
+            .expect("ls-remote subcommand");
+        assert!(
+            args[..subcommand]
+                .windows(2)
+                .any(|pair| { pair[0] == "-c" && pair[1].starts_with("credential.helper") })
+        );
+        assert_eq!(&args[subcommand..], &["ls-remote", "--tags", GIT_URL]);
+        assert!(
+            !args
+                .iter()
+                .any(|argument| argument.contains("synthetic-credential"))
+        );
     }
 
     #[test]

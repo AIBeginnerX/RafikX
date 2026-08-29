@@ -534,7 +534,7 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
                     .display()
                     .to_string();
                 let command = format!("browser smoke (headless): {display_entry}");
-                match browser::smoke_test(workspace, &entry).await {
+                match browser::smoke_test_in_workspace(workspace, &entry).await {
                     Ok(Some(errors)) if !errors.is_empty() => {
                         let count = errors.len();
                         for error in errors {
@@ -864,7 +864,8 @@ fn redact_spaced_assignments(text: &str) -> String {
 }
 
 pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
-    let mut normalized = text.replace(&workspace.display().to_string(), "<workspace>");
+    let cleaned = strip_ansi_sequences(text);
+    let mut normalized = cleaned.replace(&workspace.display().to_string(), "<workspace>");
     if let Some(home) = std::env::var_os("HOME") {
         normalized = normalized.replace(&Path::new(&home).display().to_string(), "<home>");
     }
@@ -1094,6 +1095,7 @@ mod tests {
             "Cookie: first=COOKIE-FIRST; second=COOKIE-SECOND\n",
             "[Bearer STANDALONE-DECORATED]\n",
             "\x1b[31mBearer\x1b[0m ANSI-AUTH\n",
+            "TO\x1b[31mKEN\x1b[0m=ANSI-SPLIT-KEY\n",
             "AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret ",
             "API_KEY = \"hunter2\" {\"api_key\" : \"space secret\"}\n",
             "https://evil.test/x?value=query-secret postgres://user:password@host/db",
@@ -1120,6 +1122,7 @@ mod tests {
             "COOKIE-SECOND",
             "STANDALONE-DECORATED",
             "ANSI-AUTH",
+            "ANSI-SPLIT-KEY",
         ] {
             assert!(!redacted.contains(marker), "leaked marker: {marker}");
         }

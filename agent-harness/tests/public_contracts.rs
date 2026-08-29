@@ -174,6 +174,8 @@ fn legacy_live_variants_and_task_schema_remain_available() {
 fn legacy_change_and_patch_methods_keep_the_v118_signatures() {
     let dry_run: fn(&Path, &[PatchOp]) -> Result<String> = ApplyPatch::dry_run;
     let _ = dry_run;
+    let smoke = rafikx::quality::browser::smoke_test(Path::new("index.html"));
+    drop(smoke);
 
     let root = std::env::temp_dir().join(format!("rafikx-public-contract-{}", std::process::id()));
     let run = RunContext::isolated(RunId::new("public-contract"), root);

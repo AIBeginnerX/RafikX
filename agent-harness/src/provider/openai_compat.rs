@@ -9,7 +9,6 @@ use super::{
 
 const CODEX_RESPONSES: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-const CODEX_MAX_OUTPUT_BYTES_PER_TOKEN: usize = 4;
 
 enum CompatMode {
     ChatCompletions,
@@ -452,57 +451,18 @@ fn parse_tool_args(args: &str) -> Option<Value> {
     serde_json::from_str(trimmed).ok()
 }
 
-fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
-    let mut end = value.len().min(max_bytes);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-fn codex_buffered_output_bytes(full_text: &str, tools: &[(String, String, String)]) -> usize {
-    tools
-        .iter()
-        .fold(full_text.len(), |total, (_, name, args)| {
-            total.saturating_add(name.len()).saturating_add(args.len())
-        })
-}
-
-fn codex_response_output_bytes(response: &ChatResponse) -> usize {
-    response.content.iter().fold(0usize, |total, block| {
-        let bytes = match block {
-            ContentBlock::Text { text } => text.len(),
-            ContentBlock::ToolUse { name, input, .. } => {
-                name.len().saturating_add(input.to_string().len())
-            }
-            ContentBlock::ToolResult { content, .. } => content.len(),
-        };
-        total.saturating_add(bytes)
-    })
-}
-
-fn codex_output_byte_limit(max_tokens: u32) -> usize {
-    (max_tokens as usize).saturating_mul(CODEX_MAX_OUTPUT_BYTES_PER_TOKEN)
-}
-
 fn enforce_codex_output_limit(mut response: ChatResponse, max_tokens: u32) -> ChatResponse {
-    let max_output_bytes = codex_output_byte_limit(max_tokens);
-    if max_tokens == 0
-        || (response.output_tokens <= max_tokens
-            && codex_response_output_bytes(&response) <= max_output_bytes)
-    {
+    let has_output = !response.content.is_empty();
+    let usage_missing = has_output && response.output_tokens == 0;
+    if max_tokens == 0 || (!usage_missing && response.output_tokens <= max_tokens) {
         return response;
     }
-    let mut remaining = max_output_bytes;
-    response.content.retain_mut(|block| match block {
-        ContentBlock::Text { text } if remaining > 0 => {
-            let keep = utf8_prefix(text, remaining).len();
-            text.truncate(keep);
-            remaining = remaining.saturating_sub(keep);
-            !text.is_empty()
-        }
-        _ => false,
-    });
+    // ChatGPT Codex Responses 는 max_output_tokens 를 받지 않는다. 바이트 수를
+    // 토큰으로 추정하면 정상 응답을 자르므로, 서버가 보고한 실제 사용량만 판정한다.
+    // 상한을 넘긴 응답의 텍스트는 증거로 보존하되 도구 호출은 실행하지 않는다.
+    response
+        .content
+        .retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
     response.stop_reason = StopReason::MaxTokens;
     response
 }
@@ -893,31 +853,23 @@ fn apply_codex_event<F>(
 where
     F: FnMut(StreamEvent),
 {
-    let max_output_bytes = if max_tokens == 0 {
-        usize::MAX
-    } else {
-        codex_output_byte_limit(max_tokens)
-    };
-    let mut output_limit_reached = false;
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     if (kind.ends_with("output_text.delta") || kind == "response.output_text.delta")
         && let Some(delta) = v.get("delta").and_then(|x| x.as_str())
         && !delta.is_empty()
     {
-        let used = codex_buffered_output_bytes(full_text, tools);
-        let piece = utf8_prefix(delta, max_output_bytes.saturating_sub(used));
-        full_text.push_str(piece);
+        full_text.push_str(delta);
         if let Some(cb) = on_event.as_mut() {
-            cb(StreamEvent::Text(piece));
+            cb(StreamEvent::Text(delta));
         }
-        output_limit_reached = piece.len() != delta.len();
     }
     if (kind.ends_with("output_item.done") || kind == "response.output_item.done")
         && let Some(item) = v.get("item")
     {
         collect_codex_item(item, full_text, tools);
     }
-    if kind.ends_with("completed") || kind == "response.completed" {
+    let completed = kind.ends_with("completed") || kind == "response.completed";
+    if completed {
         *finish = Some("completed".into());
         if let Some(resp) = v.get("response") {
             take_stream_usage(
@@ -943,8 +895,9 @@ where
         cached_tokens,
         cache_reported,
     );
-    output_limit_reached |= codex_buffered_output_bytes(full_text, tools) > max_output_bytes;
-    output_limit_reached |= max_tokens > 0 && *output_tokens > max_tokens;
+    let output_limit_reached = max_tokens > 0
+        && (*output_tokens > max_tokens
+            || (completed && *output_tokens == 0 && (!full_text.is_empty() || !tools.is_empty())));
     if output_limit_reached {
         *finish = Some("max_tokens".into());
     }
@@ -1054,7 +1007,7 @@ mod usage_tests {
     }
 
     #[test]
-    fn codex_client_limit_drops_over_budget_tools_and_truncates_utf8() {
+    fn codex_client_limit_uses_reported_tokens_and_drops_over_budget_tools() {
         let response = ChatResponse {
             content: vec![
                 ContentBlock::Text {
@@ -1079,12 +1032,59 @@ mod usage_tests {
         assert_eq!(guarded.content.len(), 1);
         assert!(matches!(
             &guarded.content[0],
-            ContentBlock::Text { text } if text == "가나"
+            ContentBlock::Text { text } if text == "가나다"
         ));
     }
 
     #[test]
-    fn codex_stream_stops_before_emitting_past_the_client_limit() {
+    fn codex_client_limit_does_not_reinterpret_utf8_bytes_as_tokens() {
+        let response = ChatResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "한 토큰으로 보고된 긴 텍스트".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "write_file".into(),
+                    input: json!({"path": "valid.txt", "content": "ok"}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+            model: "gpt-5.6-sol".into(),
+            cache_reported: false,
+            limit: LimitHint::default(),
+        };
+        let guarded = enforce_codex_output_limit(response, 1);
+        assert_eq!(guarded.stop_reason, StopReason::ToolUse);
+        assert_eq!(guarded.content.len(), 2);
+    }
+
+    #[test]
+    fn codex_client_fails_closed_when_output_usage_is_missing() {
+        let response = ChatResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: json!({"command": "true"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 0,
+            cached_tokens: 0,
+            model: "gpt-5.6-sol".into(),
+            cache_reported: false,
+            limit: LimitHint::default(),
+        };
+        let guarded = enforce_codex_output_limit(response, 1);
+        assert_eq!(guarded.stop_reason, StopReason::MaxTokens);
+        assert!(guarded.content.is_empty());
+    }
+
+    #[test]
+    fn codex_stream_waits_for_authoritative_usage_before_limiting() {
         let event = json!({"type": "response.output_text.delta", "delta": "가나다"});
         let mut full_text = String::new();
         let mut tools = Vec::new();
@@ -1107,8 +1107,28 @@ mod usage_tests {
             Some(&mut callback),
             2,
         );
+        assert!(!limited);
+        assert_eq!(full_text, "가나다");
+        assert_eq!(finish, None);
+
+        let completed = json!({
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 1, "output_tokens": 3}}
+        });
+        let limited = apply_codex_event(
+            &completed,
+            &mut full_text,
+            &mut tools,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_tokens,
+            &mut cache_reported,
+            &mut finish,
+            Some(&mut callback),
+            2,
+        );
         assert!(limited);
-        assert_eq!(full_text, "가나");
+        assert_eq!(output_tokens, 3);
         assert_eq!(finish.as_deref(), Some("max_tokens"));
     }
 

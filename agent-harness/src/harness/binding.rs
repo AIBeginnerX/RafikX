@@ -1642,7 +1642,7 @@ mod combo_tests {
     use super::*;
 
     fn cfg_with_combos() -> crate::config::Config {
-        let dir = std::env::temp_dir().join(format!("rafikx-combo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rafikx-combo-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
         cfg.file.combos.insert(
@@ -1681,7 +1681,7 @@ mod combo_tests {
 
     #[test]
     fn no_combos_means_no_regression() {
-        let dir = std::env::temp_dir().join(format!("rafikx-nocombo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rafikx-nocombo-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).unwrap();
         assert!(cfg.file.combos.is_empty());

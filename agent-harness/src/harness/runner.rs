@@ -2128,8 +2128,8 @@ pub(crate) fn review_prompt(task: &str, dod: &str, rebuttal: &str, changed: &[St
         }
     }
     s.push_str(
-        "\n변경 내용은 첨부하지 않았다. read_file·grep 으로 직접 읽어 확인하고, 필요하면 \
-         bash 로 빌드·테스트를 직접 실행하라. 확인하지 않은 파일에 대해서는 판정하지 않는다(NEVER).\n\
+        "\n[기계 검증]\n이 게이트는 상위 하네스의 빌드·테스트·품질 검증이 성공한 뒤에만 호출됐다. \
+         너는 실행 도구가 없는 읽기 전용 리뷰어다. read_file·grep 으로 직접 읽고, 확인하지 않은 파일은 판정하지 않는다(NEVER).\n\
          완료 기준은 실행 모델이 세운 것이다 — 원 작업 요구와 어긋나면 원 작업이 우선한다.\n\
          \n리뷰 위원회(S7) — 너는 5개 독립 관점을 순서대로 심사하고 각 그룹별 판정 줄을 반드시 남긴다:\n\
          [판정-정확성] pass|fail — 경계값·오류 경로·요구 일치\n\
@@ -2143,8 +2143,8 @@ pub(crate) fn review_prompt(task: &str, dod: &str, rebuttal: &str, changed: &[St
          2. 하드코딩 탐지 — 구현이 테스트 입력에만 특화돼 있지 않은가? 의심되면 입력을 변형한\n\
             추가 테스트 작성을 재작업 지시에 포함하라.\n\
          3. AC 커버리지 — 완료 기준 항목 하나라도 구현으로 확인되지 않으면 fail 이다.\n\
-         4. 자기 보고 배제 — 실행 모델의 완료 주장은 증거가 아니다. 네가 직접 실행한 명령의\n\
-            exit code 만이 증거다.",
+         4. 자기 보고 배제 — 실행 모델의 완료 주장은 증거가 아니다. 시스템의 기계 검증 상태와\n\
+            네가 직접 읽은 코드·계약만 증거다.",
     );
     s
 }
@@ -3129,5 +3129,16 @@ mod tests {
             vec![source.canonicalize().expect("canonical source")]
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reviewer_prompt_matches_the_read_only_tool_contract() {
+        let prompt = review_prompt("작업", "완료 기준", "위험", &["src/main.rs".into()]);
+        assert!(prompt.contains("[기계 검증]"));
+        assert!(prompt.contains("읽기 전용 리뷰어"));
+        assert!(!prompt.contains("bash 로"));
+        assert!(!prompt.contains("직접 실행한 명령"));
+        let reviewer = crate::config::builtin_profile("reviewer").expect("reviewer profile");
+        assert!(!reviewer.tools.iter().any(|tool| tool == "bash"));
     }
 }
