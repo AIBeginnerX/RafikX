@@ -109,6 +109,37 @@ pub async fn run_plan(
         return reports;
     };
     let total = work.plan.task_docs().len();
+    // 체크포인트 재검증 (M6) — 재개 직전에 마지막 Done 태스크의 검증을 재실행해
+    // 상태 파일과 실제 코드의 불일치를 감지한다 (설계 §6.9).
+    if start > 0 {
+        let prev_rel = &work.plan.tasks[start - 1];
+        let prev_path = work
+            .plan_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(prev_rel);
+        if let Ok(prev) = TaskDoc::load_trusting_state(&prev_path) {
+            let outcome = run_task_verification(&prev, workspace).await;
+            if let TaskOutcome::Rework(reason) = outcome {
+                let msg = format!(
+                    "체크포인트 불일치: {} 재검증 실패 — {reason}",
+                    prev.id
+                );
+                crate::applog::error(&msg);
+                reports.push(super::orchestrator::TaskReport {
+                    id: prev.id.clone(),
+                    state: TaskState::Escalated,
+                    attempts: 0,
+                    reason: Some(msg),
+                });
+                return reports_with_stop(reports);
+            }
+            crate::applog::info(&format!(
+                "[run-plan] 체크포인트 재검증 통과: {}",
+                prev.id
+            ));
+        }
+    }
     for index in start..total {
         let task_path = {
             // plan.tasks 상대경로를 다시 resolve 한다 — save 대상 파일.
@@ -170,6 +201,15 @@ pub async fn run_plan(
             }
             // Verifier — 시스템이 직접 판정한다.
             let outcome = run_task_verification(&task, workspace).await;
+            let _ = append_ledger(
+                ledger_path,
+                &serde_json::json!({
+                    "event": "verification",
+                    "task_id": task.id,
+                    "attempt": attempts,
+                    "ok": matches!(outcome, TaskOutcome::Done(_))
+                }),
+            );
             match outcome {
                 TaskOutcome::Done(report) => {
                     let passed: u32 = report
@@ -236,7 +276,33 @@ pub async fn run_plan(
             }
         }
     }
+    write_progress(work, &reports);
     reports
+}
+
+/// 워크 디렉터 PROGRESS.md — 사람이 읽는 요약을 시스템이 갱신한다 (설계 §6.9 매핑).
+fn write_progress(work: &WorkRun, reports: &[TaskReport]) {
+    let Some(dir) = work.plan_path.parent() else { return };
+    let mut out = format!(
+        "# run-plan {} — {}
+
+| 태스크 | 상태 | 시도 | 사유 |\n|---|---|---|---|\n",
+        work.plan.id,
+        work.plan.title
+    );
+    for r in reports {
+        let reason = r.reason.as_deref().unwrap_or("");
+        out.push_str(&format!(
+            "| {} | {:?} | {}회 | {reason} |\n",
+            r.id, r.state, r.attempts
+        ));
+    }
+    let done = work.done_count();
+    out.push_str(&format!(
+        "\n진행: {done}/{} 태스크 완료 (모두 시스템 검증 통과)\n",
+        work.plan.task_docs().len()
+    ));
+    let _ = std::fs::write(dir.join("PROGRESS.md"), out);
 }
 
 /// 중단 시 이후 태스크들을 보고에 남긴다 — 멈춘 지점이 명확히 보이게.

@@ -80,6 +80,31 @@ async fn run_cmd(cmd: &str, timeout_secs: u64) -> Evidence {
     }
 }
 
+/// `git diff --stat` 꼬리줄("2 files changed, 10 insertions(+), 3 deletions(-)")에서
+/// 총 변경 줄 수를 뽑는다.
+pub(crate) fn parse_changed_lines(stat: &str) -> usize {
+    let Some(last) = stat.lines().last() else {
+        return 0;
+    };
+    let mut total = 0usize;
+    for (word, next_word) in [("insertion", "insertions"), ("deletion", "deletions")] {
+        let _ = next_word;
+        if let Some(idx) = last.find(word) {
+            let before = &last[..idx];
+            let num: String = before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit() || *c == ' ')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            total += num.trim().parse::<usize>().unwrap_or(0);
+        }
+    }
+    total
+}
+
 /// cargo/go 스타일 출력에서 통과 테스트 수를 뽑는다 ("test result: ok. 12 passed…").
 pub(crate) fn parse_tests_passed(output: &str) -> Option<u32> {
     for line in output.lines() {
@@ -207,6 +232,16 @@ pub async fn run_task_verification(
             "변경된 파일이 없다 — 수정 없이 완료될 수 없다 (diff 부재)".into(),
         );
     }
+    // 변경 크기 제한 (G16) — 큰 diff 는 분해를 강제한다 (설계 §6.2 constraints).
+    if let Some(stat) = &diff.stat {
+        let total = parse_changed_lines(stat);
+        if total > task.constraints.max_diff_lines {
+            return TaskOutcome::Rework(format!(
+                "변경 크기 초과: {total}줄 > 상한 {}줄 — 태스크를 더 작게 분해하라",
+                task.constraints.max_diff_lines
+            ));
+        }
+    }
     if !violations.is_empty() {
         return TaskOutcome::Rework(violations.join("; "));
     }
@@ -310,6 +345,67 @@ mod ratchet_tests {
         assert!(ratchet_check(&ledger, 20).is_none(), "동점은 통과");
         assert!(ratchet_check(&ledger, 21).is_none(), "진행은 통과");
         assert!(ratchet_check(&dir.join("none.jsonl"), 1).is_none(), "원장 없음 = 래칫 없음");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+
+    #[test]
+    fn parses_changed_lines_from_stat() {
+        let stat = " app.ts | 2 +-\n t.rs | 18 ++++++++++++++++\n 2 files changed, 20 insertions(+), 2 deletions(-)";
+        assert_eq!(parse_changed_lines(stat), 22);
+        assert_eq!(parse_changed_lines(" 1 file changed, 5 insertions(+)"), 5);
+        assert_eq!(parse_changed_lines(""), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_diff_fails_task() {
+        let t: TaskDoc = serde_json::from_value(serde_json::json!({
+            "id": "T-BIG", "title": "큰 변경",
+            "constraints": {"max_diff_lines": 5},
+            "require_diff": false,
+            "verification": [{"cmd": "true"}],
+            "state": "PENDING"
+        }))
+        .unwrap();
+        // 임시 git 저장소에 10줄 변경 → 상한 5줄 초과.
+        let dir = std::env::temp_dir().join(format!("rk-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        for arg in ["add", "-A"].iter() {
+            std::process::Command::new("git")
+                .args(["config", "user.email", "t@t"])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            break;
+        }
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&dir)
+            .status();
+        let mut big = String::new();
+        for i in 0..10 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(dir.join("f.txt"), big).unwrap();
+        let outcome = run_task_verification(&t, &dir).await;
+        let mut t = t;
+        let state = t.apply(outcome);
+        assert_eq!(*state, crate::verify::TaskState::Rework, "상한 초과는 Rework");
+        assert!(t.evidence.last().unwrap().output_tail.contains("변경 크기 초과"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
 use rafikx::accounts;
@@ -92,6 +92,18 @@ enum Commands {
     /// SPEC 문서(JSON)를 검증하고 동결한다 — 동결 후 변경은 재승인으로만.
     SpecFreeze {
         /// SPEC 문서 경로 (JSON)
+        path: String,
+    },
+    /// 연결된 모델의 능력을 보정 스위트(9 프로브)로 측정한다 — 결과는 하네스가 쓴다.
+    Calibrate {
+        /// 프로바이더 (기본: 기본 연결)
+        provider: Option<String>,
+        /// 모델 (기본: 프로바이더 기본 모델)
+        model: Option<String>,
+    },
+    /// LEDGER 원장을 집계해 실행 리포트를 출력한다.
+    PlanReport {
+        /// LEDGER.jsonl 경로
         path: String,
     },
     /// 계획을 실행한다 — Executor(서브프로세스·격리) → 검증 → 체크포인트 → 재개.
@@ -293,6 +305,10 @@ async fn main() -> ExitCode {
         Some(Commands::VerifyTask { path }) => cmd_verify_task(path).await,
         Some(Commands::VerifyPlan { path }) => cmd_verify_plan(path),
         Some(Commands::SpecFreeze { path }) => cmd_spec_freeze(path),
+        Some(Commands::Calibrate { provider, model }) => {
+            cmd_calibrate(provider.as_deref(), model.as_deref()).await
+        }
+        Some(Commands::PlanReport { path }) => cmd_plan_report(path),
         Some(Commands::RunPlan {
             path,
             yes,
@@ -1084,6 +1100,91 @@ fn cmd_spec_freeze(path: &str) -> Result<()> {
         spec.acceptance.len(),
         spec.assumptions.len()
     );
+    Ok(())
+}
+
+/// calibrate — 보정 스위트 실행 (M5). 능력 점수는 model_profiles.json 에 저장되고
+/// 검증 강도 상향에 쓰인다.
+async fn cmd_calibrate(provider: Option<&str>, model: Option<&str>) -> Result<()> {
+    let cfg = Config::load(None)?;
+    let provider = provider
+        .map(str::to_string)
+        .unwrap_or_else(|| cfg.file.general.default_provider.clone());
+    let model = match model {
+        Some(m) => m.to_string(),
+        None => cfg
+            .provider(&provider)
+            .ok()
+            .map(|p| p.model.clone())
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("모델을 지정하거나 기본 모델을 설정하세요"))?,
+    };
+    println!("[calibrate] {provider}/{model} — 9 프로브 실행 중…");
+    let cal = rafikx::calibrate::run_calibration(&cfg, &provider, &model).await?;
+    for (group, (passed, total)) in &cal.detail {
+        println!("  {group}: {passed}/{total}");
+    }
+    println!(
+        "[calibrate] 능력 점수: {:.2} — {}",
+        cal.capability,
+        if cal.capability < 0.5 {
+            "검증 Strict 강제"
+        } else if cal.capability < 0.8 {
+            "검증 Auto 상향"
+        } else {
+            "기존 정책 유지"
+        }
+    );
+    rafikx::calibrate::save_profile(&cfg, &cal)?;
+    Ok(())
+}
+
+/// plan-report — LEDGER 원장 집계 (M6).
+fn cmd_plan_report(path: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("원장을 읽을 수 없습니다: {path}"))?;
+    let mut done = 0usize;
+    let mut escalated: Vec<(String, String)> = Vec::new();
+    let mut peak_tests: u32 = 0;
+    let mut verifications = 0usize;
+    for line in raw.lines() {
+        let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match ev.get("event").and_then(|v| v.as_str()) {
+            Some("verification") => verifications += 1,
+            Some("metric") => {
+                if let Some(n) = ev.get("tests_passed").and_then(|v| v.as_u64()) {
+                    peak_tests = peak_tests.max(n as u32);
+                }
+            }
+            Some("state") => {
+                let id = ev.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+                match ev.get("state").and_then(|v| v.as_str()) {
+                    Some("DONE") => done += 1,
+                    Some("ESCALATED") => escalated.push((
+                        id.to_string(),
+                        ev.get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("사유 미상")
+                            .to_string(),
+                    )),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    println!("=== 원장 리포트 ({path}) ===");
+    println!("검증 실행: {verifications}회 · 완료 태스크: {done}개 · 최고 통과 테스트: {peak_tests}개");
+    if escalated.is_empty() {
+        println!("에스컬레이션: 없음");
+    } else {
+        println!("에스컬레이션 {}건:", escalated.len());
+        for (id, reason) in &escalated {
+            println!("  - {id}: {reason}");
+        }
+    }
     Ok(())
 }
 

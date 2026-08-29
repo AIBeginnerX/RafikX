@@ -1258,8 +1258,11 @@ async fn finish_verification(
     run_context: RunContext,
 ) -> Result<AgentOutcome> {
     // 검증 강도 — Auto/Strict 는 프로파일의 verify 가 꺼져 있어도 자동 감지 명령으로 검증한다.
+    // 2차원 하네스(§6.7): 보정된 모델 능력이 낮으면 검증 강도를 상향한다(상향만, 하향 없음).
+    let capability = crate::calibrate::capability_for(cfg, &binding.model);
+    let effective_policy = crate::calibrate::verify_upgrade(spec.verify_policy, capability);
     let verify_forced = matches!(
-        spec.verify_policy,
+        effective_policy,
         crate::engine::VerifyPolicy::Auto | crate::engine::VerifyPolicy::Strict
     );
     if (binding.verify || verify_forced) && outcome.status != "incomplete" {
@@ -1282,7 +1285,7 @@ async fn finish_verification(
     // 독립 검증자 게이트 (§5) — 자기평가 편향을 막기 위해 신선한 컨텍스트의 리뷰어가
     // 완료 기준과 대조한다. 게이트가 가용성을 해치면 안 되므로 게이트 자체의 실패는
     // 경고 한 줄 후 통과로 취급한다.
-    if spec.verify_policy == crate::engine::VerifyPolicy::Strict
+    if effective_policy == crate::engine::VerifyPolicy::Strict
         && cfg.file.harness.strict_gate
         && matches!(binding.class, TaskClass::Dev | TaskClass::Advanced)
         && outcome.status == "ok"

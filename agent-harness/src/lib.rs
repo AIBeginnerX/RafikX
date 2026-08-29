@@ -5,6 +5,7 @@ pub mod anomaly;
 pub mod api;
 pub mod applog;
 pub mod auth;
+pub mod calibrate;
 pub mod chat;
 pub mod config;
 pub mod context;

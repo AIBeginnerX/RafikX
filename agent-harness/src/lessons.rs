@@ -199,7 +199,7 @@ async fn reflect_and_save(cfg: &Config, task: &str, trigger: &str, detail: &str)
     };
     // 백그라운드 반성 실패는 사용자 화면에 오류로 보이면 안 된다 — 로그로만.
     harness::set_fallback_quiet(true);
-    let call = harness::chat_with_fallback(cfg, &order, "small", req).await;
+    let call = harness::chat_with_fallback(cfg, &order, "small", req.clone()).await;
     harness::set_fallback_quiet(false);
     let (_name, resp) = call?;
     let text = resp
@@ -210,8 +210,37 @@ async fn reflect_and_save(cfg: &Config, task: &str, trigger: &str, detail: &str)
             _ => None,
         })
         .unwrap_or("");
-    let Some((keywords, lesson)) = parse_reflection_json(text) else {
-        return Ok(());
+    // G13 — 구조화 출력 파싱 실패 시 오류를 첨부해 1회 재요청한다.
+    let (keywords, lesson) = match parse_reflection_json(text) {
+        Some(ok) => ok,
+        None => {
+            let retry_req = ChatRequest {
+                max_tokens: 256,
+                messages: vec![
+                    Message::user_text(format!(
+                        "[작업 요약]\n{task}\n\n[오류/사유]\n{detail}"
+                    )),
+                    Message::user_text(format!(
+                        "네 출력은 JSON 형식이 아니었다: {text}\n형식 오류를 고쳐 같은 스키마로 다시만 출력하라."
+                    )),
+                ],
+                ..req.clone()
+            };
+            let retry = harness::chat_with_fallback(cfg, &order, "small", retry_req).await;
+            let retry_text = retry
+                .ok()
+                .and_then(|(_, resp)| {
+                    resp.content.iter().find_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default();
+            match parse_reflection_json(&retry_text) {
+                Some(ok) => ok,
+                None => return Ok(()),
+            }
+        }
     };
     let db = Db::open(&Db::db_path()?)?;
     let _ = db.add_project_lesson(
