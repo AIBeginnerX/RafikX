@@ -567,6 +567,7 @@ async fn run_pipeline_inner(
             effective_max_iter = effective_max_iter.min(cap).max(1);
         }
     }
+    let turn_iteration_limit = turn_iteration_budget(effective_max_iter);
 
     // 계획 단계 — 메인 system 을 그대로 이어받아 lessons·system_extra·프로젝트 규칙·
     // 엔진 지시가 계획에도 반영되게 한다 (system 을 통째로 교체하던 결함 수정).
@@ -858,6 +859,8 @@ async fn run_pipeline_inner(
         let mut outcome = run_graph_discipline(
             cfg,
             binding,
+            effective_max_iter,
+            turn_iteration_limit,
             task,
             &nodes,
             &node_order,
@@ -871,6 +874,7 @@ async fn run_pipeline_inner(
         outcome = finish_verification(
             cfg,
             binding,
+            turn_iteration_limit,
             &spec,
             task,
             &dod_checklist,
@@ -903,7 +907,6 @@ async fn run_pipeline_inner(
     let mut total_input = 0u32;
     let mut total_output = 0u32;
     let mut total_iterations = 0u32;
-    let turn_iteration_limit = turn_iteration_budget(effective_max_iter);
     let mut all_changed = Vec::new();
     let mut all_tool_errors = Vec::new();
     let mut all_denials = Vec::new();
@@ -931,7 +934,7 @@ async fn run_pipeline_inner(
             AgentRun {
                 cfg,
                 provider_name: &binding.provider_name,
-                    combo_chain: binding.combo_chain.clone(),
+                combo_chain: binding.combo_chain.clone(),
                 model: &binding.model,
                 task: &agent_task,
                 yes,
@@ -1207,6 +1210,7 @@ async fn run_pipeline_inner(
     outcome = finish_verification(
         cfg,
         binding,
+        turn_iteration_limit,
         &spec,
         task,
         &dod_checklist,
@@ -1282,6 +1286,7 @@ async fn run_pipeline_inner(
 async fn finish_verification(
     cfg: &Config,
     binding: &Binding,
+    turn_iteration_limit: u32,
     spec: &crate::engine::EngineSpec,
     task: &str,
     dod: &str,
@@ -1307,6 +1312,7 @@ async fn finish_verification(
         outcome = run_verify(
             cfg,
             binding,
+            turn_iteration_limit,
             task,
             yes,
             system.to_string(),
@@ -1342,6 +1348,7 @@ async fn finish_verification(
                 outcome = run_review_gate(
                     cfg,
                     binding,
+                    turn_iteration_limit,
                     spec,
                     task,
                     dod,
@@ -1361,6 +1368,7 @@ async fn finish_verification(
             outcome = run_review_gate(
                 cfg,
                 binding,
+                turn_iteration_limit,
                 spec,
                 task,
                 dod,
@@ -1369,14 +1377,33 @@ async fn finish_verification(
                 yes,
                 system,
                 outcome,
-                remote,
-                local_ask,
+                remote.clone(),
+                local_ask.clone(),
                 run_context.clone(),
             )
             .await;
         }
         // 게이트는 중간에 여러 경로로 빠져나간다 — 워커 줄은 호출부에서 한 번에 닫는다.
         crate::ui::live_worker_in(&run_context, &review_worker, "", "", "", true);
+        if outcome.status == "ok" && outcome.verify_fail.is_some() {
+            crate::ui::live_line_in(
+                &run_context,
+                "검증자 수정 뒤 최신 파일을 기계 검증으로 다시 확인합니다.",
+            );
+            outcome = run_verify(
+                cfg,
+                binding,
+                turn_iteration_limit,
+                task,
+                yes,
+                system.to_string(),
+                outcome,
+                remote,
+                local_ask,
+                run_context.clone(),
+            )
+            .await?;
+        }
     }
     Ok(outcome)
 }
@@ -1474,6 +1501,12 @@ pub(crate) fn mark_verify_recovered(outcome: &mut AgentOutcome) {
     }
 }
 
+pub(crate) fn mark_verification_failure(outcome: &mut AgentOutcome, failure: String) {
+    outcome.status = "fail".into();
+    outcome.error = Some(failure.clone());
+    outcome.verify_fail = Some(failure);
+}
+
 pub(crate) fn merge_agent_outcomes(
     previous: AgentOutcome,
     mut next: AgentOutcome,
@@ -1554,7 +1587,7 @@ async fn approve_bash_command(
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
         let t = line.trim().to_lowercase();
-        t == "n" || t == "no"
+        !matches!(t.as_str(), "y" | "yes" | "a" | "always")
     };
     Ok(if denied {
         BashApproval::Denied
@@ -1563,10 +1596,114 @@ async fn approve_bash_command(
     })
 }
 
+fn is_web_change(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("html" | "js" | "mjs" | "cjs" | "css")
+    )
+}
+
+fn has_web_changes(changed: &[String]) -> bool {
+    changed.iter().any(|path| is_web_change(path))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_quality_repair(
+    cfg: &Config,
+    binding: &Binding,
+    turn_iteration_limit: u32,
+    task: &str,
+    yes: bool,
+    system: &str,
+    mut outcome: AgentOutcome,
+    remote: &Option<agent::RemoteApproval>,
+    local_ask: &Option<agent::LocalAsk>,
+    run_context: &RunContext,
+    web_only: bool,
+) -> Result<AgentOutcome> {
+    for round in 0..3 {
+        let gate_files = if web_only {
+            outcome
+                .changed_files
+                .iter()
+                .filter(|path| is_web_change(path))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            outcome.changed_files.clone()
+        };
+        let report = crate::quality::run_quality_gate(&cfg.workspace, &gate_files).await;
+        let rendered = crate::quality::render_report(&report);
+        for line in rendered.lines().take(24) {
+            crate::ui::live_line_in(run_context, line);
+        }
+        if report.passed {
+            mark_verify_recovered(&mut outcome);
+            return Ok(outcome);
+        }
+        let evidence = crate::quality::repair_evidence(&report, &cfg.workspace);
+        let summary = evidence
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+            .unwrap_or("품질 게이트 실패")
+            .to_string();
+        let remaining = remaining_iteration_budget(
+            turn_iteration_limit,
+            outcome.iterations,
+            binding.max_iterations,
+        );
+        if round >= 2 || remaining == 0 {
+            outcome.status = "fail".into();
+            outcome.error = Some(summary.clone());
+            outcome.verify_fail = Some(summary);
+            return Ok(outcome);
+        }
+        crate::ui::live_line_in(
+            run_context,
+            &format!("품질 게이트 실패, 수정 후 재검증합니다 ({}/2)", round + 1),
+        );
+        let mut messages = outcome.messages.clone();
+        if messages.is_empty() {
+            messages.push(Message::user_text(task));
+        }
+        messages.push(Message::user_text(format!(
+            "품질 게이트가 실패했습니다. 아래 구조화·정제된 실행 증거를 바탕으로 실제 파일을 수정하세요.\n{evidence}"
+        )));
+        let mut next = agent::run_agent_with_context(
+            AgentRun {
+                cfg,
+                provider_name: &binding.provider_name,
+                combo_chain: binding.combo_chain.clone(),
+                model: binding.verify_model.as_deref().unwrap_or(&binding.model),
+                task,
+                yes,
+                max_iterations: remaining,
+                system: system.to_string(),
+                registry: ToolRegistry::with_names(&binding.tools),
+                resume: Some(messages),
+                remote: remote.clone(),
+                local_ask: local_ask.clone(),
+                context_window: binding.context_window,
+            },
+            run_context.clone(),
+        )
+        .await?;
+        if next.verify_fail.is_none() {
+            next.verify_fail = Some(summary);
+        }
+        outcome = merge_agent_outcomes(outcome, next);
+    }
+    Ok(outcome)
+}
+
 #[allow(clippy::too_many_arguments)] // 검증 파이프라인: 각 인자가 독립적 실행 축이라 유지
 async fn run_verify(
     cfg: &Config,
     binding: &Binding,
+    turn_iteration_limit: u32,
     task: &str,
     yes: bool,
     system: String,
@@ -1592,86 +1729,27 @@ async fn run_verify(
             &run_context,
             "빌드 명령 자동 감지 없음 — 품질 게이트(구문·보안·런타임 스모크)로 대체 검증한다.",
         );
-        for round in 0..3 {
-            let report =
-                crate::quality::run_quality_gate(&cfg.workspace, &outcome.changed_files).await;
-            let rendered = crate::quality::render_report(&report);
-            for line in rendered.lines().take(24) {
-                crate::ui::live_line_in(&run_context, line);
-            }
-            if report.passed {
-                mark_verify_recovered(&mut outcome);
-                return Ok(outcome);
-            }
-            let summary = report
-                .findings
-                .first()
-                .map(|finding| {
-                    format!("{}:{} {}", finding.file, finding.line, finding.detail)
-                })
-                .or_else(|| {
-                    report.steps.iter().find(|step| !step.passed).map(|step| {
-                        format!(
-                            "{} 실패: {}",
-                            step.stage,
-                            step.note.as_deref().unwrap_or(&step.command)
-                        )
-                    })
-                })
-                .unwrap_or_else(|| "품질 게이트 실패".into());
-            let remaining = remaining_iteration_budget(
-                turn_iteration_budget(binding.max_iterations),
-                outcome.iterations,
-                binding.max_iterations,
-            );
-            if round >= 2 || remaining == 0 {
-                outcome.status = "fail".into();
-                outcome.error = Some(summary.clone());
-                outcome.verify_fail = Some(summary);
-                return Ok(outcome);
-            }
-            crate::ui::live_line_in(
-                &run_context,
-                &format!("품질 게이트 실패, 수정 후 재검증합니다 ({}/2)", round + 1),
-            );
-            let mut messages = outcome.messages.clone();
-            if messages.is_empty() {
-                messages.push(Message::user_text(task));
-            }
-            messages.push(Message::user_text(format!(
-                "품질 게이트가 실패했습니다. 아래 실행 증거를 바탕으로 실제 파일을 수정하세요.\n{}",
-                rendered.chars().take(4000).collect::<String>()
-            )));
-            let mut next = agent::run_agent_with_context(
-                AgentRun {
-                    cfg,
-                    provider_name: &binding.provider_name,
-                    combo_chain: binding.combo_chain.clone(),
-                    model: binding.verify_model.as_deref().unwrap_or(&binding.model),
-                    task,
-                    yes,
-                    max_iterations: remaining,
-                    system: system.clone(),
-                    registry: ToolRegistry::with_names(&binding.tools),
-                    resume: Some(messages),
-                    remote: remote.clone(),
-                    local_ask: local_ask.clone(),
-                    context_window: binding.context_window,
-                },
-                run_context.clone(),
-            )
-            .await?;
-            if next.verify_fail.is_none() {
-                next.verify_fail = Some(summary);
-            }
-            outcome = merge_agent_outcomes(outcome, next);
-        }
-        return Ok(outcome);
+        return run_quality_repair(
+            cfg,
+            binding,
+            turn_iteration_limit,
+            task,
+            yes,
+            &system,
+            outcome,
+            &remote,
+            &local_ask,
+            &run_context,
+            false,
+        )
+        .await;
     }
 
     let bash = ToolRegistry::all();
     let Some(tool) = bash.get("bash") else {
-        crate::ui::live_line_in(&run_context, "검증 생략: bash 도구가 없습니다.");
+        let failure = "검증 실패: bash 도구가 없습니다.";
+        crate::ui::live_line_in(&run_context, failure);
+        mark_verification_failure(&mut outcome, failure.into());
         return Ok(outcome);
     };
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
@@ -1697,10 +1775,12 @@ async fn run_verify(
                 return Ok(outcome);
             }
             BashApproval::Blocked(e) => {
+                let failure = format!("검증 명령이 안전 정책에 차단되었습니다: {e}");
                 crate::ui::live_line_in(
                     &run_context,
-                    &format!("검증 명령을 실행할 수 없습니다: {e}"),
+                    &failure,
                 );
+                mark_verification_failure(&mut outcome, failure);
                 return Ok(outcome);
             }
         }
@@ -1709,6 +1789,22 @@ async fn run_verify(
                 // 성공 시 원문 대신 요약 한 줄 — 실패했을 때만 상세가 필요하다.
                 let lines = out.trim().lines().count();
                 crate::ui::live_line_in(&run_context, &format!("검증 성공 ({lines}줄 출력)"));
+                if has_web_changes(&outcome.changed_files) {
+                    return run_quality_repair(
+                        cfg,
+                        binding,
+                        turn_iteration_limit,
+                        task,
+                        yes,
+                        &system,
+                        outcome,
+                        &remote,
+                        &local_ask,
+                        &run_context,
+                        true,
+                    )
+                    .await;
+                }
                 mark_verify_recovered(&mut outcome);
                 return Ok(outcome);
             }
@@ -1717,21 +1813,22 @@ async fn run_verify(
                     Ok(o) => o,
                     Err(e) => e.to_string(),
                 };
+                let safe_err = crate::quality::redact_local_output(&err, &cfg.workspace);
                 if round >= 2 {
                     crate::ui::live_line_in(&run_context, "검증이 2회 재시도 후에도 실패했습니다.");
                     crate::ui::live_line_in(&run_context, &err);
                     outcome.status = "fail".into();
-                    outcome.error = Some(err.chars().take(500).collect());
-                    outcome.verify_fail = Some(err.chars().take(500).collect());
+                    outcome.error = Some(safe_err.chars().take(500).collect());
+                    outcome.verify_fail = Some(safe_err.chars().take(500).collect());
                     return Ok(outcome);
                 }
                 crate::ui::live_line_in(
                     &run_context,
                     &format!("검증 실패, 오류를 되먹여 재시도합니다 ({}/2)", round + 1),
                 );
-                let cause: String = err.chars().take(500).collect();
+                let cause: String = safe_err.chars().take(500).collect();
                 let remaining = remaining_iteration_budget(
-                    turn_iteration_budget(binding.max_iterations),
+                    turn_iteration_limit,
                     outcome.iterations,
                     binding.max_iterations,
                 );
@@ -1748,13 +1845,13 @@ async fn run_verify(
                     msgs.push(Message::user_text(task));
                 }
                 msgs.push(Message::user_text(format!(
-                    "검증 명령이 실패했습니다. 오류를 고치세요.\n{err}"
+                    "검증 명령이 실패했습니다. 아래 정제된 오류를 고치세요.\n{safe_err}"
                 )));
                 let mut next = agent::run_agent_with_context(
                     AgentRun {
                         cfg,
                         provider_name: &binding.provider_name,
-                    combo_chain: binding.combo_chain.clone(),
+                        combo_chain: binding.combo_chain.clone(),
                         model: binding.verify_model.as_deref().unwrap_or(&binding.model),
                         task,
                         yes,
@@ -2005,6 +2102,7 @@ async fn run_review_once(
     reviewer: &Binding,
     prompt: &str,
     engine_block: &str,
+    max_iterations: u32,
     resume: Option<Vec<Message>>,
     yes: bool,
     remote: Option<agent::RemoteApproval>,
@@ -2022,7 +2120,7 @@ async fn run_review_once(
             model: &reviewer.model,
             task: prompt,
             yes,
-            max_iterations: reviewer.max_iterations.clamp(1, REVIEW_GATE_MAX_ITER),
+            max_iterations,
             system,
             registry: ToolRegistry::with_names(&reviewer.tools),
             resume,
@@ -2041,6 +2139,7 @@ async fn run_review_once(
 async fn run_review_gate(
     cfg: &Config,
     binding: &Binding,
+    turn_iteration_limit: u32,
     spec: &crate::engine::EngineSpec,
     task: &str,
     dod: &str,
@@ -2120,11 +2219,22 @@ async fn run_review_gate(
         // 안쪽 루프는 "판정 불능 → 결론만 재질의" 1회를 흡수한다.
         let mut resume: Option<Vec<Message>> = None;
         let action = loop {
+            let review_iterations = remaining_iteration_budget(
+                turn_iteration_limit,
+                outcome.iterations,
+                reviewer.max_iterations.clamp(1, REVIEW_GATE_MAX_ITER),
+            );
+            if review_iterations == 0 {
+                outcome.status = "incomplete".into();
+                outcome.error = Some("독립 검증 전 턴 반복 예산을 모두 사용했습니다.".into());
+                return outcome;
+            }
             let review = match run_review_once(
                 cfg,
                 &reviewer,
                 &prompt,
                 &spec.prompt_block,
+                review_iterations,
                 resume.take(),
                 yes,
                 remote.clone(),
@@ -2149,6 +2259,7 @@ async fn run_review_gate(
                     return outcome;
                 }
             };
+            outcome.iterations = outcome.iterations.saturating_add(review.iterations);
             outcome.input_tokens = outcome.input_tokens.saturating_add(review.input_tokens);
             outcome.output_tokens = outcome.output_tokens.saturating_add(review.output_tokens);
 
@@ -2209,6 +2320,7 @@ async fn run_review_gate(
             GateAction::Resume(summary) => summary,
         };
         let headline = verdict_headline(&summary);
+        outcome.verify_fail = Some(headline.clone());
         crate::graph::node_in(&run_context, "critic", "fail", &headline, Some("verify"));
         crate::ui::live_line_in(
             &run_context,
@@ -2225,7 +2337,7 @@ async fn run_review_gate(
              해소하라. 재설명·변명은 금지(NEVER)다. 고친 뒤 스스로 확인하고 무엇을 바꿨는지 보고하라.\n{summary}"
         )));
         let remaining = remaining_iteration_budget(
-            turn_iteration_budget(binding.max_iterations),
+            turn_iteration_limit,
             outcome.iterations,
             binding.max_iterations,
         );
@@ -2239,7 +2351,7 @@ async fn run_review_gate(
             AgentRun {
                 cfg,
                 provider_name: &binding.provider_name,
-                    combo_chain: binding.combo_chain.clone(),
+                combo_chain: binding.combo_chain.clone(),
                 model: &binding.model,
                 task,
                 yes,
@@ -2385,7 +2497,7 @@ fn extract_json_object(text: &str) -> Option<&str> {
 pub(crate) fn parse_dag(text: &str) -> Option<Vec<DagNode>> {
     let json = extract_json_object(text)?;
     let plan: DagPlan = serde_json::from_str(json).ok()?;
-    if plan.nodes.is_empty() {
+    if !(3..=7).contains(&plan.nodes.len()) {
         return None;
     }
     let mut seen: Vec<&str> = Vec::with_capacity(plan.nodes.len());
@@ -2606,7 +2718,10 @@ async fn graph_node_boundary_check(
             );
             Some(format!(
                 "노드 경계 검증 실패 ({cmd}):\n{}",
-                err.chars().take(1500).collect::<String>()
+                crate::quality::redact_local_output(&err, &cfg.workspace)
+                    .chars()
+                    .take(1500)
+                    .collect::<String>()
             ))
         }
     }
@@ -2642,6 +2757,8 @@ fn merge_node_outcome(agg: &mut AgentOutcome, node: &AgentOutcome) {
 async fn run_graph_discipline(
     cfg: &Config,
     binding: &Binding,
+    per_cycle_max: u32,
+    turn_iteration_limit: u32,
     task: &str,
     nodes: &[DagNode],
     order: &[usize],
@@ -2652,7 +2769,9 @@ async fn run_graph_discipline(
     run_context: RunContext,
 ) -> Result<AgentOutcome> {
     let total = order.len();
-    let node_iter = (binding.max_iterations / 2).max(GRAPH_NODE_MIN_ITER);
+    let node_iter = (per_cycle_max / 2)
+        .max(GRAPH_NODE_MIN_ITER)
+        .min(per_cycle_max);
     let mut produced: Vec<(String, String)> = Vec::with_capacity(total);
     let mut agg = AgentOutcome::default();
     for (step, &i) in order.iter().enumerate() {
@@ -2682,6 +2801,18 @@ async fn run_graph_discipline(
         let node_system = graph_node_system(system, step + 1, total, node, &produced);
         let mut prompt = graph_node_prompt(task, node);
         for attempt in 0..2u8 {
+            let attempt_iterations =
+                remaining_iteration_budget(turn_iteration_limit, agg.iterations, node_iter);
+            if attempt_iterations == 0 {
+                agg.status = "incomplete".into();
+                agg.error = Some(format!(
+                    "그래프 미완료: {}/{} 노드 뒤 턴 반복 예산 {}회 소진",
+                    produced.len(),
+                    total,
+                    turn_iteration_limit
+                ));
+                return Ok(agg);
+            }
             let outcome = agent::run_agent_with_context(
                 AgentRun {
                     cfg,
@@ -2690,7 +2821,7 @@ async fn run_graph_discipline(
                     model: &binding.model,
                     task: &prompt,
                     yes,
-                    max_iterations: node_iter,
+                    max_iterations: attempt_iterations,
                     system: node_system.clone(),
                     registry: ToolRegistry::with_names(&binding.tools),
                     // 신선한 컨텍스트: 앞 노드의 대화를 물려받지 않는다.
@@ -2788,7 +2919,11 @@ pub(crate) fn auto_verify_command(cfg: &Config, changed: &[String]) -> String {
         if py_changed.is_empty() {
             return String::new();
         }
-        let files = py_changed.join(" ");
+        let files = py_changed
+            .iter()
+            .map(|path| shell_quote_arg(path))
+            .collect::<Vec<_>>()
+            .join(" ");
         #[cfg(windows)]
         {
             return format!("python -m py_compile {files}");
@@ -2799,6 +2934,16 @@ pub(crate) fn auto_verify_command(cfg: &Config, changed: &[String]) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(not(windows))]
+fn shell_quote_arg(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn shell_quote_arg(argument: &str) -> String {
+    format!("\"{}\"", argument.replace('%', "%%").replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -2815,7 +2960,20 @@ mod tests {
         assert!(s.contains("작업 진행 설명은 영어로 쓴다"));
         assert!(s.contains("제목(헤더·섹션 제목)은 한국어로 쓴다"));
         assert!(s.contains("최종 답변(작업 결과 브리핑)은 한국어로 쓴다"));
-        assert!(s.contains("요청에 없던 스트레치 목표·보너스 테스트·추가 리팩터링"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn python_verify_paths_are_shell_quoted() {
+        let dir = std::env::temp_dir().join(format!("rafikx-verify-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp workspace");
+        let mut cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).expect("config");
+        cfg.workspace = dir.clone();
+        let command =
+            auto_verify_command(&cfg, &["$(touch PWNED).py".into(), "it's fine.py".into()]);
+        assert!(command.contains("'$(touch PWNED).py'"));
+        assert!(command.contains("'it'\"'\"'s fine.py'"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

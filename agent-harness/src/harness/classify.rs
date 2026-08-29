@@ -57,7 +57,8 @@ const MEDIUM_KEYWORDS: &[&str] = &[
 const TOOL_HINTS: &[&str] = &["~/", "./", "src/", "/tmp", ".txt", ".log", ".csv"];
 
 const ENGLISH_DEV_ACTIONS: &[&str] = &[
-    "build", "create", "develop", "generate", "implement", "make", "repair", "update",
+    "build", "code", "create", "develop", "edit", "fix", "generate", "implement", "make",
+    "modify", "program", "repair", "update", "write",
 ];
 
 const ENGLISH_ARTIFACTS: &[&str] = &[
@@ -298,27 +299,44 @@ pub(crate) fn continuation_class(
             "이어서",
             "재시도",
             "continue",
+            "finish it",
+            "fix it",
+            "keep going",
+            "make it work",
             "resume",
             "retry",
             "try again",
         ],
     );
-    let had_dev_tools = history.iter().flat_map(|message| &message.content).any(|block| {
-        matches!(
-            block,
-            ContentBlock::ToolUse { name, .. }
-                if matches!(
-                    name.as_str(),
-                    "apply_patch"
-                        | "bash"
-                        | "edit_file"
-                        | "multi_edit"
-                        | "task"
-                        | "todo_write"
-                        | "write_file"
-                )
-        )
-    });
+    let current_turn_start = history
+        .iter()
+        .rposition(|message| {
+            message.role == crate::provider::Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { .. }))
+        })
+        .unwrap_or(0);
+    let had_dev_tools = history[current_turn_start..]
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { name, .. }
+                    if matches!(
+                        name.as_str(),
+                        "apply_patch"
+                            | "bash"
+                            | "edit_file"
+                            | "multi_edit"
+                            | "task"
+                            | "todo_write"
+                            | "write_file"
+                    )
+            )
+        });
     if continues && had_dev_tools {
         TaskClass::Dev
     } else {

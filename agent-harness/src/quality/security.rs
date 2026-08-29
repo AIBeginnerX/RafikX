@@ -140,11 +140,19 @@ pub async fn run_dependency_audit(
     let (runnable, missing) = runnable_commands_in(workspace, &profile.audit);
     let mut results = Vec::new();
     for cmd in runnable {
+        let argv = super::command_argv(&cmd, workspace, &[]);
+        let (program, args) = match argv {
+            Ok(Some(command)) => command,
+            Ok(None) => continue,
+            Err(error) => {
+                results.push((cmd, Some(false), error));
+                continue;
+            }
+        };
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
+            tokio::process::Command::new(program)
+                .args(args)
                 .current_dir(workspace)
                 .output(),
         )

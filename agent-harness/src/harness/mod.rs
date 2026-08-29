@@ -178,9 +178,37 @@ mod tests {
             TaskClass::Dev
         );
         assert_eq!(
+            continuation_class("fix it", TaskClass::Simple, &history),
+            TaskClass::Dev
+        );
+        assert_eq!(
             continuation_class("원리를 설명해줘", TaskClass::Simple, &history),
             TaskClass::Simple
         );
+
+        let stale_history = vec![
+            history[0].clone(),
+            Message::user_text("이제 다른 주제를 설명해줘"),
+            Message {
+                role: crate::provider::Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "다른 주제의 답변".into(),
+                }],
+            },
+        ];
+        assert_eq!(
+            continuation_class("continue", TaskClass::Simple, &stale_history),
+            TaskClass::Simple
+        );
+    }
+
+    #[test]
+    fn common_english_write_and_fix_requests_route_to_dev() {
+        assert_eq!(classify_rules("write a browser game", false), TaskClass::Dev);
+        assert_eq!(classify_rules("fix my browser game", false), TaskClass::Dev);
+        assert_eq!(classify_rules("edit the app", false), TaskClass::Dev);
+        assert_eq!(classify_rules("code a game", false), TaskClass::Dev);
+        assert_eq!(classify_rules("write a poem", false), TaskClass::Simple);
     }
 
     #[test]
@@ -201,6 +229,7 @@ mod tests {
         assert_eq!(turn_iteration_budget(50), agent::HARD_CAP);
         assert_eq!(remaining_iteration_budget(50, 49, 25), 1);
         assert_eq!(remaining_iteration_budget(50, 50, 25), 0);
+        assert_eq!(remaining_iteration_budget(50, 48, 8), 2);
     }
 
     #[test]
@@ -209,6 +238,15 @@ mod tests {
         assert_eq!(goal_persist_status("ok", 2, 2, true), "complete");
         assert_eq!(goal_persist_status("fail", 2, 2, true), "failed");
         assert_eq!(goal_persist_status("incomplete", 1, 2, true), "blocked");
+
+        let mut blocked = AgentOutcome {
+            status: "ok".into(),
+            ..AgentOutcome::default()
+        };
+        mark_verification_failure(&mut blocked, "안전 정책 차단".into());
+        assert_eq!(blocked.status, "fail");
+        assert_eq!(blocked.verify_fail.as_deref(), Some("안전 정책 차단"));
+        assert_eq!(goal_persist_status(&blocked.status, 2, 2, true), "failed");
     }
 
     #[test]
@@ -671,10 +709,11 @@ mod tests {
         let fenced = "[완료 기준]\n1. cargo test 통과 — `cargo test`\n\n\
              ```json\n\
              {\"nodes\":[{\"id\":\"n1\",\"goal\":\"스키마 정의\",\"deps\":[],\"produces\":\"타입 3종\"},\
-             {\"id\":\"n2\",\"goal\":\"구현\",\"deps\":[\"n1\"],\"produces\":\"모듈\"}]}\n\
+             {\"id\":\"n2\",\"goal\":\"구현\",\"deps\":[\"n1\"],\"produces\":\"모듈\"},\
+             {\"id\":\"n3\",\"goal\":\"검증\",\"deps\":[\"n2\"],\"produces\":\"테스트\"}]}\n\
              ```";
         let nodes = parse_dag(fenced).expect("펜스 JSON");
-        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0].id, "n1");
         assert_eq!(nodes[0].goal, "스키마 정의");
         assert_eq!(nodes[1].deps, vec!["n1".to_string()]);
@@ -685,9 +724,10 @@ mod tests {
 
         // 펜스가 없어도 첫 `{` 부터 균형 매칭으로 찾는다. 뒤에 산문이 붙어도 된다.
         let bare = "계획입니다.\n{\"nodes\":[{\"id\":\"a\",\"goal\":\"조사 {중괄호} 포함\",\
-                    \"deps\":[]}]}\n이상.";
+                    \"deps\":[]},{\"id\":\"b\",\"goal\":\"구현\",\"deps\":[\"a\"]},\
+                    {\"id\":\"c\",\"goal\":\"검증\",\"deps\":[\"b\"]}]}\n이상.";
         let nodes = parse_dag(bare).expect("맨 JSON");
-        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0].goal, "조사 {중괄호} 포함");
         assert!(nodes[0].deps.is_empty());
         assert!(nodes[0].produces.is_empty());
@@ -703,6 +743,18 @@ mod tests {
         assert!(parse_dag("{\"steps\":[{\"id\":\"n1\",\"goal\":\"x\"}]}").is_none());
         // 빈 목록.
         assert!(parse_dag("{\"nodes\":[]}").is_none());
+        assert!(
+            parse_dag(
+                "{\"nodes\":[{\"id\":\"n1\",\"goal\":\"a\"},{\"id\":\"n2\",\"goal\":\"b\"}]}"
+            )
+            .is_none()
+        );
+        let eight_nodes = serde_json::json!({
+            "nodes": (1..=8)
+                .map(|index| serde_json::json!({"id": format!("n{index}"), "goal": "work"}))
+                .collect::<Vec<_>>()
+        });
+        assert!(parse_dag(&eight_nodes.to_string()).is_none());
         // id·goal 이 비었거나 id 가 중복이면 실행 순서를 정의할 수 없다.
         assert!(parse_dag("{\"nodes\":[{\"id\":\" \",\"goal\":\"x\"}]}").is_none());
         assert!(parse_dag("{\"nodes\":[{\"id\":\"n1\",\"goal\":\"  \"}]}").is_none());

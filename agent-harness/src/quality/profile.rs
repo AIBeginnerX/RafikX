@@ -150,7 +150,7 @@ pub fn profile_for(lang: Language) -> LanguageProfile {
         ),
         Language::Shell => (
             vec!["shfmt -d .".into()],
-            vec!["shellcheck -S error **/*.sh".into()],
+            vec!["shellcheck -S error {files}".into()],
             vec![],
             vec![],
             vec![(
@@ -236,12 +236,27 @@ pub fn tool_available(binary: &str) -> bool {
     if binary == "cargo" {
         return true; // 자기 자신의 빌드 환경
     }
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {binary} >/dev/null 2>&1"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let candidate = std::path::Path::new(binary);
+    if candidate.components().count() > 1 {
+        return candidate.is_file();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let direct = directory.join(binary);
+        if direct.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            return ["exe", "cmd", "bat"]
+                .iter()
+                .any(|extension| direct.with_extension(extension).is_file());
+        }
+        #[cfg(not(windows))]
+        false
+    })
 }
 
 #[cfg(test)]

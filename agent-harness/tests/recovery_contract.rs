@@ -41,6 +41,8 @@ fn english_game_creation_routes_to_dev_tools() {
 
     // Then: it must receive the tool-capable development profile.
     assert_eq!(class, TaskClass::Dev);
+    assert_eq!(classify_rules("write a browser game", false), TaskClass::Dev);
+    assert_eq!(classify_rules("fix my browser game", false), TaskClass::Dev);
     assert_eq!(classify_rules("make me happy", false), TaskClass::Simple);
 }
 

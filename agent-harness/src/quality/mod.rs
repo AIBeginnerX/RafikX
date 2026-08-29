@@ -15,9 +15,9 @@ use std::path::Path;
 use serde::Serialize;
 use tokio::process::Command;
 
+pub use browser::parse_console_errors;
 pub use design_note::DesignNote;
 pub use profile::{Language, LanguageProfile};
-pub use browser::parse_console_errors;
 pub use rubric::Rubric;
 pub use security::Finding;
 
@@ -41,13 +41,81 @@ pub struct QualityReport {
     pub passed: bool,
 }
 
-/// S3 — 한 명령을 실행해 게이트 스텝으로 변환한다.
-async fn run_step(stage: &'static str, cmd: &str, workspace: &Path) -> GateStep {
+fn validated_changed_arg(workspace: &Path, file: &str) -> Result<Option<String>, String> {
+    let relative = Path::new(file);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("워크스페이스 밖 변경 경로: {file}"));
+    }
+    let joined = workspace.join(relative);
+    if !joined.exists() {
+        return Ok(None);
+    }
+    let root = workspace
+        .canonicalize()
+        .map_err(|error| format!("워크스페이스 확인 실패: {error}"))?;
+    let resolved = joined
+        .canonicalize()
+        .map_err(|error| format!("변경 경로 확인 실패({file}): {error}"))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!("워크스페이스 밖 변경 경로: {file}"));
+    }
+    Ok(Some(file.to_string()))
+}
+
+fn command_argv(
+    cmd: &str,
+    workspace: &Path,
+    changed: &[String],
+) -> Result<Option<(String, Vec<String>)>, String> {
+    let mut words = cmd.split_whitespace();
+    let program = words
+        .next()
+        .filter(|word| !word.is_empty())
+        .ok_or_else(|| "빈 품질 명령".to_string())?
+        .to_string();
+    let mut args = Vec::new();
+    let mut had_files_placeholder = false;
+    let mut file_args = 0usize;
+    for word in words {
+        if word == "{files}" {
+            had_files_placeholder = true;
+            for file in changed {
+                if let Some(file) = validated_changed_arg(workspace, file)? {
+                    args.push(file);
+                    file_args += 1;
+                }
+            }
+        } else {
+            args.push(word.to_string());
+        }
+    }
+    if had_files_placeholder && file_args == 0 {
+        return Ok(None);
+    }
+    Ok(Some((program, args)))
+}
+
+/// S3 — 셸을 거치지 않고 프로그램과 인자를 분리해 게이트 스텝으로 변환한다.
+async fn run_argv_step(
+    stage: &'static str,
+    display: String,
+    program: String,
+    args: Vec<String>,
+    workspace: &Path,
+) -> GateStep {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(600),
-        Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
+        Command::new(&program)
+            .args(&args)
             .current_dir(workspace)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -57,14 +125,14 @@ async fn run_step(stage: &'static str, cmd: &str, workspace: &Path) -> GateStep 
     match out {
         Err(_) => GateStep {
             stage,
-            command: cmd.into(),
+            command: display,
             passed: false,
             exit_code: None,
             note: Some("시간 초과 (600초)".into()),
         },
         Ok(Err(e)) => GateStep {
             stage,
-            command: cmd.into(),
+            command: display,
             passed: false,
             exit_code: None,
             note: Some(format!("실행 실패: {e}")),
@@ -84,12 +152,38 @@ async fn run_step(stage: &'static str, cmd: &str, workspace: &Path) -> GateStep 
             };
             GateStep {
                 stage,
-                command: cmd.into(),
+                command: display,
                 passed: !failed,
                 exit_code: code,
                 note: failed.then_some(tail),
             }
         }
+    }
+}
+
+async fn run_step(
+    stage: &'static str,
+    cmd: &str,
+    workspace: &Path,
+    changed: &[String],
+) -> GateStep {
+    let display = cmd.replace("{files}", "<changed files>");
+    match command_argv(cmd, workspace, changed) {
+        Ok(Some((program, args))) => run_argv_step(stage, display, program, args, workspace).await,
+        Ok(None) => GateStep {
+            stage,
+            command: display,
+            passed: true,
+            exit_code: None,
+            note: Some("실행할 변경 파일 없음".into()),
+        },
+        Err(error) => GateStep {
+            stage,
+            command: display,
+            passed: false,
+            exit_code: None,
+            note: Some(error),
+        },
     }
 }
 
@@ -121,12 +215,7 @@ pub async fn run_quality_gate(
             });
         }
         for cmd in runnable {
-            let cmd = if changed.is_empty() {
-                cmd
-            } else {
-                cmd.replace("{files}", &changed.join(" "))
-            };
-            steps.push(run_step(stage, &cmd, workspace).await);
+            steps.push(run_step(stage, &cmd, workspace, changed).await);
         }
     }
 
@@ -135,9 +224,28 @@ pub async fn run_quality_gate(
         if profile::tool_available("node") {
             for file in changed {
                 if file.ends_with(".js") || file.ends_with(".mjs") || file.ends_with(".cjs") {
-                    steps.push(
-                        run_step("S3-syntax", &format!("node --check {file:?}"), workspace).await,
-                    );
+                    match validated_changed_arg(workspace, file) {
+                        Ok(Some(file)) => {
+                            steps.push(
+                                run_argv_step(
+                                    "S3-syntax",
+                                    format!("node --check {file:?}"),
+                                    "node".into(),
+                                    vec!["--check".into(), file],
+                                    workspace,
+                                )
+                                .await,
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => steps.push(GateStep {
+                            stage: "S3-syntax",
+                            command: format!("node --check {file:?}"),
+                            passed: false,
+                            exit_code: None,
+                            note: Some(error),
+                        }),
+                    }
                 }
             }
         }
@@ -206,7 +314,7 @@ pub async fn run_quality_gate(
             idx.exists().then_some(idx)
         });
     if let Some(entry) = entry {
-        match browser::smoke_test(&entry).await {
+        match browser::smoke_test(workspace, &entry).await {
             Ok(Some(errors)) if !errors.is_empty() => {
                 for e in errors {
                     findings.push(security::Finding {
@@ -322,4 +430,161 @@ pub fn render_report(report: &QualityReport) -> String {
         ));
     }
     out
+}
+
+fn looks_like_high_entropy_secret(token: &str) -> bool {
+    let value = token.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+    });
+    value.len() >= 32
+        && !value.contains('/')
+        && value
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+        && value.chars().any(|character| character.is_ascii_digit())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn looks_like_sensitive_key(key: &str) -> bool {
+    let key = key
+        .trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+        })
+        .to_ascii_lowercase();
+    [
+        "api_key",
+        "apikey",
+        "access_key",
+        "authorization",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "private_key",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|marker| key.contains(marker))
+}
+
+pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
+    let mut normalized = text.replace(&workspace.display().to_string(), "<workspace>");
+    if let Some(home) = std::env::var_os("HOME") {
+        normalized = normalized.replace(&Path::new(&home).display().to_string(), "<home>");
+    }
+    let mut redacted = Vec::new();
+    let mut redact_next = false;
+    for token in normalized.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        if redact_next {
+            if matches!(lower.as_str(), "basic" | "bearer") {
+                redacted.push(token.to_string());
+            } else {
+                redacted.push("[redacted]".to_string());
+                redact_next = false;
+            }
+        } else if matches!(lower.as_str(), "authorization:" | "basic" | "bearer") {
+            redacted.push(token.to_string());
+            redact_next = true;
+        } else if let Some(at) = token.find(['=', ':'])
+            && looks_like_sensitive_key(&token[..at])
+        {
+            redacted.push(format!("{}[redacted]", &token[..=at]));
+            redact_next = at + 1 == token.len();
+        } else if lower.starts_with("sk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("xoxb-")
+            || looks_like_high_entropy_secret(token)
+        {
+            redacted.push("[redacted]".to_string());
+        } else {
+            redacted.push(token.to_string());
+        }
+    }
+    redacted.join(" ")
+}
+
+pub(crate) fn repair_evidence(report: &QualityReport, workspace: &Path) -> String {
+    let mut evidence = String::new();
+    for step in report.steps.iter().filter(|step| !step.passed) {
+        evidence.push_str(&format!(
+            "[{}] {}",
+            step.stage,
+            redact_local_output(&step.command, workspace)
+        ));
+        if let Some(note) = &step.note {
+            evidence.push_str(": ");
+            evidence.push_str(&redact_local_output(note, workspace));
+        }
+        evidence.push('\n');
+    }
+    for finding in &report.findings {
+        evidence.push_str(&format!(
+            "[{}] {}:{} {}\n",
+            finding.kind,
+            redact_local_output(&finding.file, workspace),
+            finding.line,
+            redact_local_output(&finding.detail, workspace)
+        ));
+    }
+    evidence.chars().take(4000).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn changed_javascript_paths_are_argv_not_shell_source() {
+        if !profile::tool_available("node") {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-argv-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp workspace");
+        let names = [
+            "$(touch PWNED).js",
+            "`touch ALSO_PWNED`.js",
+            "quote' and space.js",
+            "line\nbreak.js",
+        ];
+        for name in names {
+            std::fs::write(root.join(name), "const value = 1;\n").expect("fixture");
+        }
+
+        let changed = names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let report = run_quality_gate(&root, &changed).await;
+        assert!(
+            report
+                .steps
+                .iter()
+                .filter(|step| step.stage == "S3-syntax")
+                .all(|step| step.passed),
+            "syntax steps: {:?}",
+            report.steps
+        );
+        assert!(!root.join("PWNED").exists());
+        assert!(!root.join("ALSO_PWNED").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repair_output_redacts_paths_and_credentials() {
+        let workspace = Path::new("/tmp/private-workspace");
+        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value {\"api_key\":\"json-value\"} Cookie: session-value";
+        let redacted = redact_local_output(text, workspace);
+        assert!(!redacted.contains("private-workspace"));
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("sk-example"));
+        assert!(!redacted.contains("visible-credential"));
+        assert!(!redacted.contains("aws-value"));
+        assert!(!redacted.contains("json-value"));
+        assert!(!redacted.contains("session-value"));
+    }
 }
