@@ -145,11 +145,20 @@ pub enum TaskOutcome {
 
 impl TaskDoc {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::load_with(path, true)
+    }
+
+    /// 계획 재개용 — 저장된 DONE 을 신뢰한다(이미 검증 통과한 체크포인트).
+    /// 단독 재검증(verify-task)은 load 를 써야 한다: DONE 도 다시 검증된다.
+    pub fn load_trusting_state(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::load_with(path, false)
+    }
+
+    fn load_with(path: &std::path::Path, reset_done: bool) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
         let mut doc: TaskDoc = serde_json::from_str(&raw)?;
-        // 파일의 state 는 신뢰하지 않고 세션 시작 상태로 정규화한다 —
-        // DONE 으로 저장된 파일을 다시 돌려도 검증이 재실행된다.
-        if doc.state == TaskState::Done {
+        // 파일의 state 를 신뢰하지 않으면(단독 재검증) DONE 도 다시 돌려진다.
+        if reset_done && doc.state == TaskState::Done {
             doc.state = TaskState::Pending;
         }
         Ok(doc)

@@ -45,7 +45,7 @@ impl PlanDoc {
             .iter()
             .map(|rel| {
                 let p = base.join(rel);
-                TaskDoc::load(&p)
+                TaskDoc::load_trusting_state(&p)
                     .with_context(|| format!("태스크 문서 로드 실패: {}", p.display()))
             })
             .collect::<Result<Vec<_>>>()?;

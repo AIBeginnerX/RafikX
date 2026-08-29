@@ -94,6 +94,17 @@ enum Commands {
         /// SPEC 문서 경로 (JSON)
         path: String,
     },
+    /// 계획을 실행한다 — Executor(서브프로세스·격리) → 검증 → 체크포인트 → 재개.
+    RunPlan {
+        /// 계획 문서 경로 (JSON)
+        path: String,
+        /// 도구 승인 자동 (executor 서브프로세스에도 전달)
+        #[arg(long)]
+        yes: bool,
+        /// git 체크포인트 커밋 생략
+        #[arg(long)]
+        no_checkpoint: bool,
+    },
     /// MCP 서버 모드 (facts 메모리 remember/recall/forget/list 를 stdio MCP로 노출)
     McpServe,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
@@ -282,6 +293,11 @@ async fn main() -> ExitCode {
         Some(Commands::VerifyTask { path }) => cmd_verify_task(path).await,
         Some(Commands::VerifyPlan { path }) => cmd_verify_plan(path),
         Some(Commands::SpecFreeze { path }) => cmd_spec_freeze(path),
+        Some(Commands::RunPlan {
+            path,
+            yes,
+            no_checkpoint,
+        }) => cmd_run_plan(path, *yes, *no_checkpoint).await,
         Some(Commands::McpServe) => rafikx::mcp_serve::stdio().await,
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
@@ -1069,6 +1085,54 @@ fn cmd_spec_freeze(path: &str) -> Result<()> {
         spec.assumptions.len()
     );
     Ok(())
+}
+
+/// run-plan — 계획을 순서대로 실행한다 (M4). 재개 지점부터, 검증 통과분만 진행.
+async fn cmd_run_plan(path: &str, yes: bool, no_checkpoint: bool) -> Result<()> {
+    let mut work = rafikx::verify::WorkRun::load(std::path::Path::new(path))?;
+    work.spec_gate()?;
+    let violations = work.plan.coverage_violations();
+    if !violations.is_empty() {
+        for v in &violations {
+            println!("  ✗ {v}");
+        }
+        anyhow::bail!("계획 확정 거부 — verify-plan 으로 먼저 통과하세요");
+    }
+    if no_checkpoint {
+        work.config.checkpoint_commits = false;
+    }
+    let total = work.plan.task_docs().len();
+    let done_before = work.done_count();
+    println!(
+        "[run-plan] {} — 태스크 {}/{} 완료 상태에서 재개합니다 (executor: {})",
+        work.plan.id,
+        done_before,
+        total,
+        work.config.executor
+    );
+    let ledger = work
+        .plan_path
+        .parent()
+        .map(|d| d.join("LEDGER.jsonl"))
+        .unwrap_or_else(|| std::path::PathBuf::from("LEDGER.jsonl"));
+    let workspace = std::env::current_dir()?;
+    let reports = rafikx::verify::run_plan(&mut work, &workspace, yes, &ledger).await;
+    println!("[run-plan] 결과:");
+    for r in &reports {
+        let reason = r
+            .reason
+            .as_deref()
+            .map(|s| format!(" — {s}"))
+            .unwrap_or_default();
+        println!("  {:?} {} (시도 {}회){reason}", r.state, r.id, r.attempts);
+    }
+    let all_done = reports.iter().all(|r| r.state == rafikx::verify::TaskState::Done);
+    if all_done {
+        println!("[run-plan] 계획 전체 완료 — 각 태스크는 시스템 검증을 통과했다.");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("계획 미완료 — 위 보고를 확인하세요"))
+    }
 }
 
 fn cmd_verify_plan(path: &str) -> Result<()> {

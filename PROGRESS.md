@@ -1,3 +1,3 @@
-완료: M3 스펙 인터뷰 + acceptance 불변 — SpecDoc 동결(spec-freeze CLI, 동결 후 덮어쓰기 거부), 시스템 프롬프트 [스펙 우위] 섹션(질문 ≤5·가정 명시·동결 기준 임의 변경 금지), tests/acceptance 쓰기 경로 차단(파일 도구 전체, 읽기는 자유). 테스트 368개 통과.
+완료: M4 역할 분리·오케스트레이션·재개 — run-plan CLI(Executor 서브프로세스 격리=instructions만 env 전달, 검증→git 체크포인트 루프, 재시도 후 에스컬레이션·의존성 안전 중단, Done 신뢰 재개), WorkRun SPEC 게이트(미동결 실행 거부). 테스트 371개 통과.
 다음: 실사용 관찰 — 자동 진단이 붙는 편집 확인(rust-analyzer 는 콜드 스타트라 조용히 건너뜀), 탐색기 UX 피드백.
 이슈: 없음.

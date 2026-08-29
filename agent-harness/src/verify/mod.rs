@@ -8,11 +8,15 @@
 
 pub mod guard;
 pub mod plan;
+pub mod orchestrator;
 pub mod runner;
 pub mod spec;
+pub mod work;
 pub mod task;
 
+pub use orchestrator::run_plan;
 pub use plan::PlanDoc;
+pub use work::WorkRun;
 pub use spec::SpecDoc;
 pub use runner::{ratchet_check, run_task_verification};
 pub use task::{TaskDoc, TaskState};
