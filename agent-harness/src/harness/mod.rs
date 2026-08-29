@@ -808,13 +808,13 @@ mod tests {
         let nodes = dag(&[("a", &[]), ("b", &["a", "a"])]);
         assert_eq!(topo_order(&nodes).expect("중복 deps").len(), 2);
 
-        // 모르는 id 를 가리키는 deps 는 간선이 없다 (계획의 오타로 실행이 막히지 않게).
         let nodes = dag(&[("a", &["없음"])]);
-        assert_eq!(topo_order(&nodes).expect("미상 deps"), vec![0]);
+        let unknown = topo_order(&nodes).expect_err("미상 deps");
+        assert!(matches!(unknown, DagOrderError::UnknownDependency { node, dependency } if node == "a" && dependency == "없음"));
 
         // 순환·자기참조는 폴백 사유로 보고한다.
         let cycle = topo_order(&dag(&[("n1", &["n2"]), ("n2", &["n1"])])).expect_err("순환");
-        assert_eq!(cycle.remaining, vec!["n1".to_string(), "n2".to_string()]);
+        assert!(matches!(&cycle, DagOrderError::Cycle { remaining } if remaining == &vec!["n1".to_string(), "n2".to_string()]));
         assert!(cycle.to_string().contains("순환"));
         assert!(topo_order(&dag(&[("n1", &["n1"])])).is_err());
     }

@@ -10,9 +10,12 @@ pub mod review;
 pub mod rubric;
 pub mod security;
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::process::ExitStatus;
 
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 pub use browser::parse_console_errors;
@@ -39,6 +42,118 @@ pub struct QualityReport {
     pub findings: Vec<security::Finding>,
     /// 전 게이트 통과 — 이 값이 false 면 산출물은 완료가 아니다.
     pub passed: bool,
+}
+
+const MAX_QUALITY_STREAM_BYTES: usize = 128 * 1024;
+const QUALITY_READER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub(super) struct BoundedCommandOutput {
+    pub(super) status: ExitStatus,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    pub(super) overflow: bool,
+}
+
+async fn read_bounded_tail<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tail = VecDeque::with_capacity(limit);
+    let mut chunk = [0u8; 8 * 1024];
+    let mut overflow = false;
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        if read >= limit {
+            tail.clear();
+            tail.extend(&chunk[read - limit..read]);
+            overflow = true;
+            continue;
+        }
+        let excess = tail.len().saturating_add(read).saturating_sub(limit);
+        if excess > 0 {
+            tail.drain(..excess);
+            overflow = true;
+        }
+        tail.extend(&chunk[..read]);
+    }
+    Ok((tail.into_iter().collect(), overflow))
+}
+
+async fn await_bounded_reader(
+    mut reader: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+) -> Result<(Vec<u8>, bool), String> {
+    match tokio::time::timeout(QUALITY_READER_SHUTDOWN_TIMEOUT, &mut reader).await {
+        Ok(Ok(Ok(output))) => Ok(output),
+        Ok(Ok(Err(error))) => Err(format!("출력 수집 실패: {error}")),
+        Ok(Err(error)) => Err(format!("출력 수집 작업 실패: {error}")),
+        Err(_) => {
+            reader.abort();
+            let _ = reader.await;
+            Err("출력 수집 종료 시간 초과".into())
+        }
+    }
+}
+
+async fn await_bounded_readers(
+    stdout: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+    stderr: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
+    let (stdout, stderr) = tokio::join!(await_bounded_reader(stdout), await_bounded_reader(stderr));
+    let (stdout, stdout_overflow) = stdout?;
+    let (stderr, stderr_overflow) = stderr?;
+    Ok((stdout, stderr, stdout_overflow || stderr_overflow))
+}
+
+pub(super) async fn run_bounded_command(
+    program: &str,
+    args: &[String],
+    workspace: &Path,
+    deadline: std::time::Duration,
+) -> Result<BoundedCommandOutput, String> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(workspace)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("실행 실패: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "표준 출력 파이프를 열 수 없습니다".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "표준 오류 파이프를 열 수 없습니다".to_string())?;
+    let stdout_reader = tokio::spawn(read_bounded_tail(stdout, MAX_QUALITY_STREAM_BYTES));
+    let stderr_reader = tokio::spawn(read_bounded_tail(stderr, MAX_QUALITY_STREAM_BYTES));
+
+    let status = match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
+            return Err(format!("실행 대기 실패: {error}"));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
+            return Err(format!("시간 초과 ({}초)", deadline.as_secs()));
+        }
+    };
+    let (stdout, stderr, overflow) = await_bounded_readers(stdout_reader, stderr_reader).await?;
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+        overflow,
+    })
 }
 
 fn validated_changed_arg(workspace: &Path, file: &str) -> Result<Option<String>, String> {
@@ -112,51 +227,62 @@ async fn run_argv_step(
     args: Vec<String>,
     workspace: &Path,
 ) -> GateStep {
-    let out = tokio::time::timeout(
+    run_argv_step_with_timeout(
+        stage,
+        display,
+        program,
+        args,
+        workspace,
         std::time::Duration::from_secs(600),
-        Command::new(&program)
-            .args(&args)
-            .current_dir(workspace)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
     )
-    .await;
-    match out {
-        Err(_) => GateStep {
+    .await
+}
+
+async fn run_argv_step_with_timeout(
+    stage: &'static str,
+    display: String,
+    program: String,
+    args: Vec<String>,
+    workspace: &Path,
+    deadline: std::time::Duration,
+) -> GateStep {
+    match run_bounded_command(&program, &args, workspace, deadline).await {
+        Err(error) => GateStep {
             stage,
             command: display,
             passed: false,
             exit_code: None,
-            note: Some("시간 초과 (600초)".into()),
+            note: Some(redact_local_output(&error, workspace)),
         },
-        Ok(Err(e)) => GateStep {
-            stage,
-            command: display,
-            passed: false,
-            exit_code: None,
-            note: Some(redact_local_output(&format!("실행 실패: {e}"), workspace)),
-        },
-        Ok(Ok(o)) => {
-            let code = o.status.code();
-            let failed = code != Some(0);
+        Ok(output) => {
+            let code = output.status.code();
+            let failed = !output.status.success() || output.overflow;
             let tail = {
                 let text = format!(
                     "{}{}",
-                    String::from_utf8_lossy(&o.stderr),
-                    String::from_utf8_lossy(&o.stdout)
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
                 );
                 let lines: Vec<&str> = text.lines().collect();
                 let skip = lines.len().saturating_sub(10);
                 let tail: String = lines[skip..].join("\n").chars().take(1500).collect();
                 redact_local_output(&tail, workspace)
             };
+            let note = if output.overflow {
+                Some(if tail.is_empty() {
+                    "출력이 수집 상한을 초과했습니다".into()
+                } else {
+                    format!("출력이 수집 상한을 초과했습니다\n{tail}")
+                })
+            } else {
+                failed.then_some(tail)
+            };
             GateStep {
                 stage,
                 command: display,
                 passed: !failed,
                 exit_code: code,
-                note: failed.then_some(tail),
+                note,
             }
         }
     }
@@ -516,11 +642,105 @@ fn redact_url(token: &str) -> Option<String> {
     changed.then_some(sanitized)
 }
 
+fn redact_spaced_assignments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut copied_through = 0usize;
+    let mut search = 0usize;
+    while search < bytes.len() {
+        let Some(offset) = bytes[search..]
+            .iter()
+            .position(|byte| matches!(*byte, b'=' | b':'))
+        else {
+            break;
+        };
+        let separator = search + offset;
+        let mut key_end = separator;
+        while key_end > 0 && matches!(bytes[key_end - 1], b' ' | b'\t' | b'\r') {
+            key_end -= 1;
+        }
+        let mut key_start = key_end;
+        while key_start > 0
+            && (bytes[key_start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[key_start - 1], b'_' | b'-' | b'\'' | b'"'))
+        {
+            key_start -= 1;
+        }
+        let key = &text[key_start..key_end];
+        let sensitive =
+            looks_like_sensitive_key(key) || (bytes[separator] == b'=' && looks_like_env_key(key));
+        if !sensitive {
+            search = separator + 1;
+            continue;
+        }
+
+        let mut value_start = separator + 1;
+        while value_start < bytes.len() && matches!(bytes[value_start], b' ' | b'\t' | b'\r') {
+            value_start += 1;
+        }
+        if value_start >= bytes.len() || bytes[value_start] == b'\n' {
+            search = separator + 1;
+            continue;
+        }
+        let mut value_end = value_start;
+        if matches!(bytes[value_start], b'\'' | b'"') {
+            let quote = bytes[value_start];
+            value_end += 1;
+            while value_end < bytes.len() {
+                if bytes[value_end] == b'\\' {
+                    value_end = (value_end + 2).min(bytes.len());
+                } else if bytes[value_end] == quote {
+                    value_end += 1;
+                    break;
+                } else {
+                    value_end += 1;
+                }
+            }
+        } else {
+            while value_end < bytes.len()
+                && !bytes[value_end].is_ascii_whitespace()
+                && !matches!(bytes[value_end], b',' | b';' | b'}' | b']')
+            {
+                value_end += 1;
+            }
+            let first = &text[value_start..value_end];
+            if first.eq_ignore_ascii_case("basic") || first.eq_ignore_ascii_case("bearer") {
+                let mut credential_start = value_end;
+                while credential_start < bytes.len()
+                    && matches!(bytes[credential_start], b' ' | b'\t' | b'\r')
+                {
+                    credential_start += 1;
+                }
+                if credential_start < bytes.len() && bytes[credential_start] != b'\n' {
+                    value_end = credential_start;
+                    while value_end < bytes.len()
+                        && !bytes[value_end].is_ascii_whitespace()
+                        && !matches!(bytes[value_end], b',' | b';' | b'}' | b']')
+                    {
+                        value_end += 1;
+                    }
+                }
+            }
+        }
+        if value_end == value_start {
+            search = separator + 1;
+            continue;
+        }
+        output.push_str(&text[copied_through..value_start]);
+        output.push_str("[redacted]");
+        copied_through = value_end;
+        search = value_end;
+    }
+    output.push_str(&text[copied_through..]);
+    output
+}
+
 pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
     let mut normalized = text.replace(&workspace.display().to_string(), "<workspace>");
     if let Some(home) = std::env::var_os("HOME") {
         normalized = normalized.replace(&Path::new(&home).display().to_string(), "<home>");
     }
+    normalized = redact_spaced_assignments(&normalized);
     let mut redacted = Vec::new();
     let mut redact_next = false;
     for token in normalized.split_whitespace() {
@@ -624,10 +844,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quality_command_output_cap_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-output-cap-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp workspace");
+        let step = run_argv_step_with_timeout(
+            "S3-test",
+            "bounded fixture".into(),
+            "sh".into(),
+            vec![
+                "-c".into(),
+                "i=0; while [ \"$i\" -lt 20000 ]; do printf '0123456789abcdef\\n'; i=$((i + 1)); done"
+                    .into(),
+            ],
+            &root,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!step.passed);
+        assert!(
+            step.note
+                .as_deref()
+                .is_some_and(|note| note.contains("출력") && note.contains("상한"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quality_command_timeout_kills_the_process() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-timeout-kill-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp workspace");
+        let step = run_argv_step_with_timeout(
+            "S3-test",
+            "timeout fixture".into(),
+            "sh".into(),
+            vec!["-c".into(), "sleep 1; printf done > SURVIVED".into()],
+            &root,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(!step.passed);
+        assert!(
+            step.note
+                .as_deref()
+                .is_some_and(|note| note.contains("시간 초과"))
+        );
+        assert!(!root.join("SURVIVED").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn repair_output_redacts_paths_and_credentials() {
         let workspace = Path::new("/tmp/private-workspace");
-        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret {\"api_key\":\"json-value\"} Cookie: session-value https://evil.test/x?value=query-secret postgres://user:password@host/db";
+        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret API_KEY = \"hunter2\" {\"api_key\" : \"space secret\"} Cookie: session-value https://evil.test/x?value=query-secret postgres://user:password@host/db";
         let redacted = redact_local_output(text, workspace);
         assert!(!redacted.contains("private-workspace"));
         assert!(!redacted.contains("abc123"));
@@ -639,6 +916,8 @@ mod tests {
         assert!(!redacted.contains("short-secret"));
         assert!(!redacted.contains("query-secret"));
         assert!(!redacted.contains("user:password"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("space secret"));
         assert!(redacted.contains("postgres://[redacted]@host/db"));
     }
 }

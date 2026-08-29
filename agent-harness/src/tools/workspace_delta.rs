@@ -111,6 +111,7 @@ impl SnapshotBudget {
 pub(crate) struct FileFingerprint {
     len: u64,
     content_hash: u64,
+    link_target: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +133,7 @@ pub(crate) fn fingerprint_bytes(bytes: &[u8]) -> FileFingerprint {
     FileFingerprint {
         len: bytes.len() as u64,
         content_hash,
+        link_target: None,
     }
 }
 
@@ -191,12 +193,34 @@ fn fingerprint_file(path: &Path, budget: &mut SnapshotBudget) -> Result<FileFing
             path.display()
         ));
     }
-    Ok(FileFingerprint { len, content_hash })
+    Ok(FileFingerprint {
+        len,
+        content_hash,
+        link_target: None,
+    })
+}
+
+fn fingerprint_symlink(path: &Path, budget: &mut SnapshotBudget) -> Result<FileFingerprint> {
+    let target = std::fs::read_link(path).map_err(|error| {
+        anyhow!(
+            "심볼릭 링크 대상을 읽을 수 없습니다 ({}): {error}",
+            path.display()
+        )
+    })?;
+    budget.reserve_file(0)?;
+    Ok(FileFingerprint {
+        len: 0,
+        content_hash: 0,
+        link_target: Some(target),
+    })
 }
 
 fn fingerprint_path(path: &Path, budget: &mut SnapshotBudget) -> Result<Option<FileFingerprint>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => fingerprint_file(path, budget).map(Some),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fingerprint_symlink(path, budget).map(Some)
+        }
         Ok(_) => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(anyhow!(
@@ -317,6 +341,8 @@ impl WorkspaceSnapshot {
                 if under_excluded_directory {
                     continue;
                 }
+                let fingerprint = fingerprint_symlink(&path, &mut budget)?;
+                files.insert(path.clone(), fingerprint);
                 if target.is_file() && !files.contains_key(&target) {
                     let fingerprint = fingerprint_file(&target, &mut budget)?;
                     files.insert(target, fingerprint);
@@ -507,5 +533,35 @@ mod tests {
             .err()
             .expect("excluded-directory external symlink must fail closed");
         assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_symlink_create_retarget_and_delete_are_detected() {
+        let workspace = TestDir::new("internal-link-identity");
+        std::fs::write(workspace.0.join("one.txt"), "one").expect("first target");
+        std::fs::write(workspace.0.join("two.txt"), "two").expect("second target");
+        let link = workspace.0.join("current.txt");
+        let tracked_link = workspace
+            .0
+            .canonicalize()
+            .expect("canonical workspace")
+            .join("current.txt");
+
+        let before_create = WorkspaceSnapshot::capture(&workspace.0).expect("create baseline");
+        std::os::unix::fs::symlink("one.txt", &link).expect("create internal symlink");
+        let created = before_create.changed_baselines().expect("created delta");
+        assert!(created.iter().any(|change| change.path == tracked_link));
+
+        let before_retarget = WorkspaceSnapshot::capture(&workspace.0).expect("retarget baseline");
+        std::fs::remove_file(&link).expect("remove old symlink");
+        std::os::unix::fs::symlink("two.txt", &link).expect("retarget internal symlink");
+        let retargeted = before_retarget.changed_baselines().expect("retargeted delta");
+        assert!(retargeted.iter().any(|change| change.path == tracked_link));
+
+        let before_delete = WorkspaceSnapshot::capture(&workspace.0).expect("delete baseline");
+        std::fs::remove_file(&link).expect("delete internal symlink");
+        let deleted = before_delete.changed_baselines().expect("deleted delta");
+        assert!(deleted.iter().any(|change| change.path == tracked_link));
     }
 }

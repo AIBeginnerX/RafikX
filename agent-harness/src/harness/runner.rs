@@ -2546,16 +2546,20 @@ struct DagPlan {
     nodes: Vec<DagNode>,
 }
 
-/// deps 에 순환이 있어 위상 정렬이 불가능함 — 그래프 폴백 사유.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CycleError {
-    /// 정렬되지 못하고 남은 노드 id 들.
-    pub(crate) remaining: Vec<String>,
+pub(crate) enum DagOrderError {
+    UnknownDependency { node: String, dependency: String },
+    Cycle { remaining: Vec<String> },
 }
 
-impl std::fmt::Display for CycleError {
+impl std::fmt::Display for DagOrderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "노드 순환: {}", self.remaining.join(" → "))
+        match self {
+            Self::UnknownDependency { node, dependency } => {
+                write!(f, "알 수 없는 선행 노드: {node} → {dependency}")
+            }
+            Self::Cycle { remaining } => write!(f, "노드 순환: {}", remaining.join(" → ")),
+        }
     }
 }
 
@@ -2637,8 +2641,7 @@ pub(crate) fn parse_dag(text: &str) -> Option<Vec<DagNode>> {
     Some(plan.nodes)
 }
 
-/// Kahn 위상 정렬 → 실행 순서(노드 인덱스). 모르는 id 를 가리키는 deps 는 간선이 없다.
-pub(crate) fn topo_order(nodes: &[DagNode]) -> Result<Vec<usize>, CycleError> {
+pub(crate) fn topo_order(nodes: &[DagNode]) -> Result<Vec<usize>, DagOrderError> {
     let index: std::collections::HashMap<&str, usize> = nodes
         .iter()
         .enumerate()
@@ -2650,7 +2653,10 @@ pub(crate) fn topo_order(nodes: &[DagNode]) -> Result<Vec<usize>, CycleError> {
         let mut linked: Vec<usize> = Vec::new();
         for dep in &node.deps {
             let Some(&j) = index.get(dep.trim()) else {
-                continue;
+                return Err(DagOrderError::UnknownDependency {
+                    node: node.id.trim().to_string(),
+                    dependency: dep.trim().to_string(),
+                });
             };
             if linked.contains(&j) {
                 continue; // 같은 deps 가 두 번 적혀도 진입차수를 두 번 세지 않는다.
@@ -2673,7 +2679,7 @@ pub(crate) fn topo_order(nodes: &[DagNode]) -> Result<Vec<usize>, CycleError> {
         }
     }
     if order.len() != nodes.len() {
-        return Err(CycleError {
+        return Err(DagOrderError::Cycle {
             remaining: nodes
                 .iter()
                 .enumerate()

@@ -36,6 +36,11 @@ pub(super) fn perform_install(raw_tag: &str) -> anyhow::Result<()> {
     let tag = ValidatedTag::parse(raw_tag)?;
     let mut command = Command::new("sh");
     command.args(install_args(tag));
+    command
+        .env_remove(GIT_UPD_USER_ENV)
+        .env_remove(GIT_UPD_TOKEN_ENV)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN");
     if let (Some(owner), Some(token)) = (super::repo_owner(), super::owner_token()) {
         // 비공개 저장소 fetch 도 활성 계정 대신 소유자 자격으로 수행한다.
         command.env(GIT_UPD_USER_ENV, owner);
@@ -87,6 +92,9 @@ git init -q "$SRC"
 git -C "$SRC" remote add origin "$REPO"
 # shellcheck disable=SC2086 — CRED_FLAGS 의 의도적 word-splitting
 git -C "$SRC" $CRED_FLAGS fetch --depth 1 origin "$TAG_REF:$TAG_REF"
+unset GIT_UPD_USER GIT_UPD_TOKEN
+rm -f "$TMP_ROOT/cred.sh"
+CRED_FLAGS=""
 git -C "$SRC" checkout -q --detach "$TAG_REF"
 HEAD=$(git -C "$SRC" rev-parse --verify "HEAD^{commit}")
 TAG_HEAD=$(git -C "$SRC" rev-parse --verify "$TAG_REF^{commit}")
@@ -161,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn credentials_stay_in_env_and_precede_fetch() {
+    fn credentials_exist_only_until_the_authenticated_fetch() {
         let script = install_script();
         // 토큰이 없으면 플래그 주입도 헬퍼 생성도 없다(기존 동작 유지).
         assert!(script.contains("CRED_FLAGS=\"\""));
@@ -185,6 +193,14 @@ mod tests {
         let checkout = script
             .find("checkout -q --detach \"$TAG_REF\"")
             .expect("exact-ref checkout");
-        assert!(fetch < checkout);
+        let unset = script
+            .find("unset GIT_UPD_USER GIT_UPD_TOKEN")
+            .expect("credential environment cleanup");
+        let helper_cleanup = script
+            .find("rm -f \"$TMP_ROOT/cred.sh\"")
+            .expect("credential helper cleanup");
+        let cargo = script.find("cargo install").expect("cargo installation");
+        assert!(fetch < unset && unset < helper_cleanup && helper_cleanup < checkout);
+        assert!(helper_cleanup < cargo);
     }
 }

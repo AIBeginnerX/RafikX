@@ -149,25 +149,35 @@ pub async fn run_dependency_audit(
                 continue;
             }
         };
-        let mut command = tokio::process::Command::new(program);
-        command
-            .args(args)
-            .current_dir(workspace)
-            .kill_on_drop(true);
-        let out = tokio::time::timeout(std::time::Duration::from_secs(120), command.output()).await;
+        let out = super::run_bounded_command(
+            &program,
+            &args,
+            workspace,
+            std::time::Duration::from_secs(120),
+        )
+        .await;
         let (ok, summary) = match out {
-            Err(_) => (Some(false), "시간 초과".into()),
-            Ok(Err(e)) => (Some(false), format!("실행 실패: {e}")),
-            Ok(Ok(o)) => (
-                Some(o.status.success()),
-                String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("")
-                    .chars()
-                    .take(200)
-                    .collect(),
-            ),
+            Err(error) => (Some(false), error),
+            Ok(output) if output.overflow => {
+                (Some(false), "출력이 수집 상한을 초과했습니다".into())
+            }
+            Ok(output) => {
+                let raw = if output.stderr.is_empty() {
+                    &output.stdout
+                } else {
+                    &output.stderr
+                };
+                (
+                    Some(output.status.success()),
+                    String::from_utf8_lossy(raw)
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect(),
+                )
+            }
         };
         results.push((cmd, ok, summary));
     }

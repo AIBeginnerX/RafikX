@@ -25,6 +25,8 @@ const MAX_BROWSER_ERRORS: usize = 64;
 const MAX_DISCOVERY_ENTRIES: usize = 25_000;
 const MAX_BROWSER_ENTRIES: usize = 8;
 const MAX_DISCOVERY_DURATION: Duration = Duration::from_secs(3);
+const MAX_DISCOVERY_HTML_BYTES: u64 = 256 * 1024;
+const MAX_DISCOVERY_TOTAL_HTML_BYTES: u64 = 16 * 1024 * 1024;
 const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; sandbox allow-same-origin allow-scripts; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
 const PROBE_SCRIPT: &str = r#"(() => {
   const emit = (kind, value) => console.log('__RAFIKX_BROWSER_ERROR__' + kind + ': ' + String(value));
@@ -330,6 +332,94 @@ fn insert_browser_entry(
     Ok(())
 }
 
+fn project_root_for(root: &Path, path: &Path) -> Option<PathBuf> {
+    let mut directory = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    while directory.starts_with(root) {
+        if directory.join("package.json").is_file() {
+            return Some(directory);
+        }
+        if directory == root || !directory.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn resolve_html_reference(root: &Path, entry: &Path, raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.starts_with('#')
+        || raw.starts_with("//")
+        || raw.contains("://")
+        || raw.to_ascii_lowercase().starts_with("data:")
+        || raw.to_ascii_lowercase().starts_with("javascript:")
+    {
+        return None;
+    }
+    let raw = raw.split(['?', '#']).next().unwrap_or_default();
+    let mut relative = if raw.starts_with('/') {
+        PathBuf::new()
+    } else {
+        entry.parent()?.strip_prefix(root).ok()?.to_path_buf()
+    };
+    for component in Path::new(raw.trim_start_matches('/')).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !relative.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => relative.push(part),
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(root.join(relative))
+}
+
+fn referenced_changed_sources(
+    root: &Path,
+    entry: &Path,
+    html: &str,
+    changed_sources: &[PathBuf],
+) -> Vec<PathBuf> {
+    let changed = changed_sources
+        .iter()
+        .map(|source| (root.join(source), source))
+        .collect::<Vec<_>>();
+    let bytes = html.as_bytes();
+    let mut matched = BTreeSet::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let Some(offset) = bytes[cursor..]
+            .iter()
+            .position(|byte| matches!(*byte, b'\'' | b'"'))
+        else {
+            break;
+        };
+        let start = cursor + offset;
+        let quote = bytes[start];
+        let value_start = start + 1;
+        let Some(end_offset) = bytes[value_start..].iter().position(|byte| *byte == quote) else {
+            break;
+        };
+        let value_end = value_start + end_offset;
+        if let Some(resolved) = resolve_html_reference(root, entry, &html[value_start..value_end]) {
+            for (absolute, source) in &changed {
+                if resolved == *absolute {
+                    matched.insert((*source).clone());
+                }
+            }
+        }
+        cursor = value_end + 1;
+    }
+    matched.into_iter().collect()
+}
+
 pub(crate) fn discover_entries(
     workspace: &Path,
     changed: &[String],
@@ -337,6 +427,7 @@ pub(crate) fn discover_entries(
     let root = workspace.canonicalize()?;
     let mut entries = BTreeSet::new();
     let mut changed_sources = Vec::new();
+    let mut covered_sources = BTreeSet::new();
     for file in changed {
         let relative = Path::new(file);
         if relative.is_absolute()
@@ -363,6 +454,7 @@ pub(crate) fn discover_entries(
             "htm" | "html"
         ) {
             insert_browser_entry(&mut entries, &root, &root.join(relative))?;
+            covered_sources.insert(relative.to_path_buf());
         }
     }
     if changed_sources.is_empty() {
@@ -378,11 +470,49 @@ pub(crate) fn discover_entries(
             continue;
         };
         while directory.starts_with(&root) {
-            insert_browser_entry(&mut entries, &root, &directory.join("index.html"))?;
+            for candidate in [
+                directory.join("index.html"),
+                directory.join("public/index.html"),
+                directory.join("www/index.html"),
+            ] {
+                if candidate.is_file() {
+                    insert_browser_entry(&mut entries, &root, &candidate)?;
+                    covered_sources.insert(source.clone());
+                }
+            }
             if directory == root || !directory.pop() {
                 break;
             }
         }
+    }
+
+    for source in &changed_sources {
+        if covered_sources.contains(source) {
+            continue;
+        }
+        let Some(project_root) = project_root_for(&root, &root.join(source)) else {
+            continue;
+        };
+        for candidate in [
+            project_root.join("index.html"),
+            project_root.join("public/index.html"),
+            project_root.join("src/index.html"),
+            project_root.join("www/index.html"),
+            project_root.join("dist/index.html"),
+            project_root.join("build/index.html"),
+        ] {
+            if candidate.is_file() {
+                insert_browser_entry(&mut entries, &root, &candidate)?;
+                covered_sources.insert(source.clone());
+                break;
+            }
+        }
+    }
+    if changed_sources
+        .iter()
+        .all(|source| covered_sources.contains(source))
+    {
+        return Ok(entries.into_iter().collect());
     }
 
     let started = Instant::now();
@@ -406,6 +536,7 @@ pub(crate) fn discover_entries(
                 && !is_discovery_excluded_name(item.file_name())
         })
         .build();
+    let mut inspected_html_bytes = 0u64;
     for (index, item) in walker.enumerate() {
         if index >= MAX_DISCOVERY_ENTRIES {
             anyhow::bail!("브라우저 엔트리 탐색 항목 수가 상한을 넘었습니다");
@@ -417,7 +548,23 @@ pub(crate) fn discover_entries(
         if item.file_type().is_some_and(|kind| kind.is_file())
             && item.file_name() == std::ffi::OsStr::new("index.html")
         {
-            insert_browser_entry(&mut entries, &root, item.path())?;
+            let metadata = item
+                .metadata()
+                .map_err(|error| anyhow::anyhow!("브라우저 엔트리 상태 확인 실패: {error}"))?;
+            if metadata.len() <= MAX_DISCOVERY_HTML_BYTES
+                && inspected_html_bytes.saturating_add(metadata.len())
+                    <= MAX_DISCOVERY_TOTAL_HTML_BYTES
+            {
+                inspected_html_bytes = inspected_html_bytes.saturating_add(metadata.len());
+                if let Ok(html) = std::fs::read_to_string(item.path()) {
+                    let referenced =
+                        referenced_changed_sources(&root, item.path(), &html, &changed_sources);
+                    if !referenced.is_empty() {
+                        insert_browser_entry(&mut entries, &root, item.path())?;
+                        covered_sources.extend(referenced);
+                    }
+                }
+            }
         }
     }
     Ok(entries.into_iter().collect())
@@ -462,10 +609,7 @@ fn stage_web_root_with_limits(
     if !entry.starts_with(&workspace) || !entry.is_file() {
         anyhow::bail!("브라우저 엔트리가 워크스페이스 밖에 있습니다");
     }
-    let source_root = entry
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("브라우저 엔트리의 상위 폴더가 없습니다"))?
-        .to_path_buf();
+    let source_root = project_root_for(&workspace, &entry).unwrap_or_else(|| workspace.clone());
     std::fs::create_dir_all(stage)?;
     let mut staged_bytes = 0u64;
     let mut entries = 0usize;
@@ -487,10 +631,7 @@ fn stage_web_root_with_limits(
                 .unwrap_or(item.path());
             !has_hidden_component(relative)
                 && !has_sensitive_component(relative)
-                && !matches!(
-                    item.file_name().to_string_lossy().as_ref(),
-                    "node_modules" | "target"
-                )
+                && !is_discovery_excluded_name(item.file_name())
         })
         .build();
     for item in walker {
@@ -935,18 +1076,89 @@ mod tests {
 
     #[test]
     fn discovers_nested_entry_for_javascript_change() {
-        let root =
-            std::env::temp_dir().join(format!("rafikx-browser-discovery-{}", crate::db::Db::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-discovery-{}",
+            crate::db::Db::new_id()
+        ));
         std::fs::create_dir_all(root.join("src")).expect("source directory");
         std::fs::create_dir_all(root.join("public")).expect("public directory");
         std::fs::write(root.join("src/app.js"), "console.log('ok')").expect("source fixture");
-        std::fs::write(root.join("public/index.html"), "<canvas></canvas>")
-            .expect("entry fixture");
+        std::fs::write(
+            root.join("public/index.html"),
+            "<script src=\"../src/app.js\"></script><canvas></canvas>",
+        )
+        .expect("entry fixture");
 
         let entries = discover_entries(&root, &["src/app.js".into()]).expect("discover entries");
         assert_eq!(
             entries,
-            vec![root.join("public/index.html").canonicalize().expect("entry")]
+            vec![
+                root.join("public/index.html")
+                    .canonicalize()
+                    .expect("entry")
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unrelated_workspace_entries_do_not_consume_the_browser_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-related-entry-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("app/src")).expect("source directory");
+        std::fs::create_dir_all(root.join("app/public")).expect("entry directory");
+        std::fs::write(root.join("app/src/app.js"), "console.log('ok')").expect("source fixture");
+        std::fs::write(
+            root.join("app/public/index.html"),
+            "<script src=\"../src/app.js\"></script>",
+        )
+        .expect("related entry");
+        for index in 0..12 {
+            let directory = root.join(format!("examples/example-{index}"));
+            std::fs::create_dir_all(&directory).expect("unrelated directory");
+            std::fs::write(directory.join("index.html"), "<canvas></canvas>")
+                .expect("unrelated entry");
+        }
+
+        let entries = discover_entries(&root, &["app/src/app.js".into()])
+            .expect("discover only related entry");
+        assert_eq!(
+            entries,
+            vec![
+                root.join("app/public/index.html")
+                    .canonicalize()
+                    .expect("related entry")
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_nonconventional_entry_that_references_the_change() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-reference-entry-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("shared")).expect("source directory");
+        std::fs::create_dir_all(root.join("demos/custom/launch")).expect("entry directory");
+        std::fs::write(root.join("shared/runtime.js"), "console.log('ok')")
+            .expect("source fixture");
+        std::fs::write(
+            root.join("demos/custom/launch/index.html"),
+            "<script src=\"../../../shared/runtime.js\"></script>",
+        )
+        .expect("referencing entry");
+
+        let entries = discover_entries(&root, &["shared/runtime.js".into()])
+            .expect("discover referenced entry");
+        assert_eq!(
+            entries,
+            vec![root
+                .join("demos/custom/launch/index.html")
+                .canonicalize()
+                .expect("entry")]
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1010,6 +1222,59 @@ mod tests {
         assert!(!stage.join("notes.txt").exists());
         assert!(!stage.join("secret.js").exists());
         assert!(!stage.join("aws-secrets.js").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_preserves_project_relative_sibling_assets() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-project-stage-{}",
+            crate::db::Db::new_id()
+        ));
+        let workspace = root.join("workspace");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(workspace.join("public")).expect("public directory");
+        std::fs::create_dir_all(workspace.join("src")).expect("source directory");
+        std::fs::write(workspace.join("package.json"), "{}\n").expect("project marker");
+        std::fs::write(
+            workspace.join("public/index.html"),
+            "<script src=\"../src/app.js\"></script>",
+        )
+        .expect("entry fixture");
+        std::fs::write(workspace.join("src/app.js"), "console.log('ok')").expect("sibling source");
+
+        let staged_entry = stage_web_root(&workspace, &workspace.join("public/index.html"), &stage)
+            .expect("stage project root");
+        assert_eq!(staged_entry, stage.join("public/index.html"));
+        assert!(stage.join("src/app.js").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn nested_project_entry_loads_sibling_source_in_browser() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-project-smoke-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("public")).expect("public directory");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::write(root.join("package.json"), "{}\n").expect("project marker");
+        std::fs::write(
+            root.join("public/index.html"),
+            "<script src=\"../src/app.js\"></script><canvas></canvas>",
+        )
+        .expect("entry fixture");
+        std::fs::write(root.join("src/app.js"), "window.rafikxLoaded = true;")
+            .expect("sibling source");
+
+        let errors = smoke_test(&root, &root.join("public/index.html"))
+            .await
+            .expect("browser smoke")
+            .expect("installed browser");
+        assert!(errors.is_empty(), "browser errors: {errors:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 
