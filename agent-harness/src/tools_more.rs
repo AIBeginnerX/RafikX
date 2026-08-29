@@ -960,26 +960,26 @@ impl ApplyPatch {
     }
 
     /// 디스크에 쓰지 않고 문자열 위에서 미리 적용해본다 (승인 프리뷰용).
-    pub fn dry_run(root: &std::path::Path, ops: &[PatchOp]) -> Result<String> {
+    pub fn dry_run(ctx: &ToolCtx, ops: &[PatchOp]) -> Result<String> {
         let mut report = Vec::new();
         for op in ops {
             match op {
                 PatchOp::Add(p, content) => {
-                    let f = root.join(p);
+                    let f = crate::tools::resolve_tool_path(ctx, p)?;
                     if f.exists() {
                         return Err(anyhow!("Add File 이지만 이미 존재합니다: {p}"));
                     }
                     report.push(format!("+ {p} ({}줄)", content.lines().count()));
                 }
                 PatchOp::Delete(p) => {
-                    let f = root.join(p);
+                    let f = crate::tools::resolve_tool_path(ctx, p)?;
                     if !f.is_file() {
                         return Err(anyhow!("Delete 대상 파일이 없습니다: {p}"));
                     }
                     report.push(format!("- {p}"));
                 }
                 PatchOp::Update(p, changes) => {
-                    let f = root.join(p);
+                    let f = crate::tools::resolve_tool_path(ctx, p)?;
                     let body = fs::read_to_string(&f)
                         .map_err(|_| anyhow!("파일을 읽을 수 없습니다: {p}"))?;
                     for (i, (anchor, o, n)) in changes.iter().enumerate() {
@@ -1158,7 +1158,8 @@ mod tests {
         let dir = std::env::temp_dir().join("rafikx-apply-patch-test");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.txt"), "hello world\n").unwrap();
-        let report = ApplyPatch::dry_run(&dir, &ops).unwrap();
+        let ctx = ToolCtx::new(dir.clone());
+        let report = ApplyPatch::dry_run(&ctx, &ops).unwrap();
         assert!(report.contains("a.txt"));
         assert!(report.contains("b.txt"));
         // 중복·불일치 매칭은 dry_run 에서 거부
@@ -1166,11 +1167,20 @@ mod tests {
         let dup =
             ApplyPatch::parse("*** Begin Patch\n*** Update File: dup.txt\n-x\n-y\n*** End Patch")
                 .unwrap();
-        assert!(ApplyPatch::dry_run(&dir, &dup).is_err());
+        assert!(ApplyPatch::dry_run(&ctx, &dup).is_err());
         // Add 대상이 이미 존재하면 거부
         let bad =
             ApplyPatch::parse("*** Begin Patch\n*** Add File: dup.txt\n+z\n*** End Patch").unwrap();
-        assert!(ApplyPatch::dry_run(&dir, &bad).is_err());
+        assert!(ApplyPatch::dry_run(&ctx, &bad).is_err());
+        let outside = dir.with_file_name("rafikx-apply-patch-outside.txt");
+        fs::write(&outside, "outside\n").unwrap();
+        let escape = ApplyPatch::parse(
+            "*** Begin Patch\n*** Update File: ../rafikx-apply-patch-outside.txt\n@@\n-outside\n+escaped\n*** End Patch",
+        )
+        .unwrap();
+        assert!(ApplyPatch::dry_run(&ctx, &escape).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n");
+        let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(dir);
     }
 

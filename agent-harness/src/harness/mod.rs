@@ -174,15 +174,19 @@ mod tests {
         }];
 
         assert_eq!(
-            continuation_class("다시 해줘", TaskClass::Simple, &history),
+            continuation_class("다시 해줘", TaskClass::Simple, &history, false),
             TaskClass::Dev
         );
         assert_eq!(
-            continuation_class("fix it", TaskClass::Simple, &history),
+            continuation_class("fix it", TaskClass::Simple, &history, false),
             TaskClass::Dev
         );
         assert_eq!(
-            continuation_class("원리를 설명해줘", TaskClass::Simple, &history),
+            continuation_class("원리를 설명해줘", TaskClass::Simple, &history, false),
+            TaskClass::Simple
+        );
+        assert_eq!(
+            continuation_class("continue", TaskClass::Simple, &history, true),
             TaskClass::Simple
         );
 
@@ -197,7 +201,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            continuation_class("continue", TaskClass::Simple, &stale_history),
+            continuation_class("continue", TaskClass::Simple, &stale_history, false),
             TaskClass::Simple
         );
     }
@@ -230,6 +234,8 @@ mod tests {
         assert_eq!(remaining_iteration_budget(50, 49, 25), 1);
         assert_eq!(remaining_iteration_budget(50, 50, 25), 0);
         assert_eq!(remaining_iteration_budget(50, 48, 8), 2);
+        let promoted = promoted_dev_max_iterations(50);
+        assert!(1 + turn_iteration_budget(promoted) <= agent::HARD_CAP);
     }
 
     #[test]
@@ -247,6 +253,13 @@ mod tests {
         assert_eq!(blocked.status, "fail");
         assert_eq!(blocked.verify_fail.as_deref(), Some("안전 정책 차단"));
         assert_eq!(goal_persist_status(&blocked.status, 2, 2, true), "failed");
+
+        let mut no_change = AgentOutcome::default();
+        mark_missing_dev_change(TaskClass::Dev, &mut no_change);
+        assert_eq!(no_change.status, "incomplete");
+        let mut analysis = AgentOutcome::default();
+        mark_missing_dev_change(TaskClass::Advanced, &mut analysis);
+        assert_eq!(analysis.status, "ok");
     }
 
     #[test]

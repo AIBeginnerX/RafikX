@@ -13,6 +13,9 @@ use tokio::net::{TcpListener, TcpStream};
 const ERROR_MARKER: &str = "__RAFIKX_BROWSER_ERROR__";
 const READY_MARKER: &str = "__RAFIKX_BROWSER_READY__";
 const PROBE_PATH: &str = "/__rafikx_probe.js";
+const MAX_STAGED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
 const PROBE_SCRIPT: &str = r#"(() => {
   const emit = (kind, value) => console.log('__RAFIKX_BROWSER_ERROR__' + kind + ': ' + String(value));
   const originalError = console.error.bind(console);
@@ -190,6 +193,191 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
+fn is_web_asset(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "avif"
+            | "cjs"
+            | "css"
+            | "gif"
+            | "htm"
+            | "html"
+            | "ico"
+            | "jpeg"
+            | "jpg"
+            | "js"
+            | "m4a"
+            | "mjs"
+            | "mp3"
+            | "mp4"
+            | "ogg"
+            | "otf"
+            | "png"
+            | "svg"
+            | "ttf"
+            | "wasm"
+            | "wav"
+            | "webm"
+            | "webp"
+            | "woff"
+            | "woff2"
+    )
+}
+
+fn has_hidden_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(part) if part.to_string_lossy().starts_with('.')
+        )
+    })
+}
+
+fn has_sensitive_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        let name = part.to_string_lossy().to_ascii_lowercase();
+        let stem = Path::new(&*name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&name);
+        let normalized_stem = stem.replace('-', "_");
+        normalized_stem.contains("credential")
+            || normalized_stem.contains("secret")
+            || matches!(
+                normalized_stem.as_str(),
+                "id_ed25519" | "id_rsa" | "private_key"
+            )
+            || matches!(
+                Path::new(&*name)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+                Some("key" | "pem")
+            )
+    })
+}
+
+fn safe_extra_browser_flag(flag: &str) -> bool {
+    let flag = flag.to_ascii_lowercase();
+    flag.starts_with('-')
+        && ![
+            "allow-file-access-from-files",
+            "allow-running-insecure-content",
+            "disable-web-security",
+            "host-resolver-rules",
+            "host-rules",
+            "proxy",
+            "remote-debugging",
+            "user-data-dir",
+        ]
+        .iter()
+        .any(|blocked| flag.contains(blocked))
+}
+
+fn stage_web_root(workspace: &Path, entry_html: &Path, stage: &Path) -> anyhow::Result<PathBuf> {
+    let workspace = workspace.canonicalize()?;
+    let entry = entry_html.canonicalize()?;
+    if !entry.starts_with(&workspace) || !entry.is_file() {
+        anyhow::bail!("브라우저 엔트리가 워크스페이스 밖에 있습니다");
+    }
+    let source_root = entry
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("브라우저 엔트리의 상위 폴더가 없습니다"))?
+        .to_path_buf();
+    std::fs::create_dir_all(stage)?;
+    let mut staged_bytes = 0u64;
+    let filter_root = source_root.clone();
+    let walker = ignore::WalkBuilder::new(&source_root)
+        .hidden(false)
+        .ignore(false)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .filter_entry(move |item| {
+            if item.depth() == 0 {
+                return true;
+            }
+            let relative = item
+                .path()
+                .strip_prefix(&filter_root)
+                .unwrap_or(item.path());
+            !has_hidden_component(relative)
+                && !has_sensitive_component(relative)
+                && !matches!(
+                    item.file_name().to_string_lossy().as_ref(),
+                    "node_modules" | "target"
+                )
+        })
+        .build();
+    for item in walker.flatten() {
+        if !item.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let source = item.into_path();
+        if !is_web_asset(&source) {
+            continue;
+        }
+        let metadata = source.metadata()?;
+        if metadata.len() > MAX_STAGED_FILE_BYTES {
+            anyhow::bail!(
+                "브라우저 자산이 파일 상한을 넘었습니다: {}",
+                source.display()
+            );
+        }
+        staged_bytes = staged_bytes.saturating_add(metadata.len());
+        if staged_bytes > MAX_STAGED_TOTAL_BYTES {
+            anyhow::bail!("브라우저 자산 합계가 상한을 넘었습니다");
+        }
+        let relative = source.strip_prefix(&source_root)?;
+        let destination = stage.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&source, destination)?;
+    }
+    let relative_entry = entry.strip_prefix(&source_root)?;
+    let staged_entry = stage.join(relative_entry);
+    if !staged_entry.is_file() {
+        anyhow::bail!("브라우저 엔트리를 격리 스테이징하지 못했습니다");
+    }
+    Ok(staged_entry)
+}
+
+struct SmokeResources {
+    server: Option<tokio::task::JoinHandle<()>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+    run_dir: PathBuf,
+}
+
+impl SmokeResources {
+    fn new(run_dir: PathBuf) -> Self {
+        Self {
+            server: None,
+            reader: None,
+            run_dir,
+        }
+    }
+}
+
+impl Drop for SmokeResources {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.run_dir);
+    }
+}
+
 async fn write_response(
     stream: &mut TcpStream,
     status: &str,
@@ -197,7 +385,7 @@ async fn write_response(
     body: &[u8],
 ) -> std::io::Result<()> {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;
@@ -306,14 +494,18 @@ pub async fn smoke_test(
     let Some(browser) = detect_browser() else {
         return Ok(None);
     };
-    let (address, server, server_errors, root) = start_server(workspace, entry_html).await?;
-    let entry = entry_html.canonicalize()?;
+    let run_dir =
+        std::env::temp_dir().join(format!("rafikx-browser-smoke-{}", crate::db::Db::new_id()));
+    std::fs::create_dir_all(&run_dir)?;
+    let mut resources = SmokeResources::new(run_dir.clone());
+    let stage_dir = run_dir.join("web");
+    let profile_dir = run_dir.join("profile");
+    let staged_entry = stage_web_root(workspace, entry_html, &stage_dir)?;
+    let (address, server, server_errors, root) = start_server(&stage_dir, &staged_entry).await?;
+    resources.server = Some(server);
+    let entry = staged_entry.canonicalize()?;
     let relative = entry.strip_prefix(&root)?;
     let url = format!("http://{address}/{}", percent_encode_path(relative));
-    let profile_dir = std::env::temp_dir().join(format!(
-        "rafikx-browser-profile-{}",
-        crate::db::Db::new_id()
-    ));
     std::fs::create_dir_all(&profile_dir)?;
     let profile_flag = format!("--user-data-dir={}", profile_dir.display());
     // --no-sandbox 는 넣지 않는다 — 이 플래그가 있으면 콘솔 로그가 캡처되지
@@ -322,6 +514,7 @@ pub async fn smoke_test(
     let extra: Vec<String> = std::env::var("RAFIKX_BROWSER_EXTRA_FLAGS")
         .unwrap_or_default()
         .split_whitespace()
+        .filter(|flag| safe_extra_browser_flag(flag))
         .map(str::to_string)
         .collect();
     let mut command = tokio::process::Command::new(browser);
@@ -340,22 +533,21 @@ pub async fn smoke_test(
         ])
         .arg(profile_flag)
         .args(&extra)
+        .args([
+            "--proxy-bypass-list=127.0.0.1",
+            "--proxy-server=http://127.0.0.1:9",
+            "--host-resolver-rules=MAP * 0.0.0.0, EXCLUDE 127.0.0.1",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        ])
         .arg(&url)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            server.abort();
-            let _ = std::fs::remove_dir_all(&profile_dir);
-            anyhow::bail!("브라우저 실행 실패: {error}");
-        }
-    };
+    let mut child = command
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?;
     let Some(stderr) = child.stderr.take() else {
-        server.abort();
         let _ = child.kill().await;
-        let _ = std::fs::remove_dir_all(&profile_dir);
         anyhow::bail!("브라우저 stderr를 열 수 없습니다");
     };
     let stderr_log = Arc::new(Mutex::new(String::new()));
@@ -373,6 +565,7 @@ pub async fn smoke_test(
             }
         }
     });
+    resources.reader = Some(reader);
 
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(15));
     tokio::pin!(deadline);
@@ -410,22 +603,19 @@ pub async fn smoke_test(
     } else {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        let _ = reader.await;
-        server.abort();
-        let _ = std::fs::remove_dir_all(&profile_dir);
+        if let Some(reader) = resources.reader.take() {
+            let _ = reader.await;
+        }
         anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
     };
-    let _ = reader.await;
-    server.abort();
+    if let Some(reader) = resources.reader.take() {
+        let _ = reader.await;
+    }
     let captured_server_errors = server_errors
         .lock()
         .map(|errors| errors.clone())
         .unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&profile_dir);
-    let stderr = stderr_log
-        .lock()
-        .map(|log| log.clone())
-        .unwrap_or_default();
+    let stderr = stderr_log.lock().map(|log| log.clone()).unwrap_or_default();
     Ok(Some(evaluate_browser_output(
         success,
         code,
@@ -475,8 +665,8 @@ mod tests {
 
     #[test]
     fn successful_process_without_ready_probe_is_not_a_pass() {
-        let error = evaluate_browser_output(true, Some(0), "", &[])
-            .expect_err("missing probe must fail");
+        let error =
+            evaluate_browser_output(true, Some(0), "", &[]).expect_err("missing probe must fail");
         assert!(error.to_string().contains("프로브"));
     }
 
@@ -484,12 +674,62 @@ mod tests {
     fn detects_browser_or_returns_none() {
         // macOS 기본 경로에 Chrome 이 있는 환경에서는 Some, 없으면 None — 둘 다 유효.
         let found = detect_browser();
-        if std::path::Path::new(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        )
-        .exists()
+        if std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+            .exists()
         {
             assert!(found.is_some());
         }
+    }
+
+    #[test]
+    fn stages_only_non_sensitive_web_assets() {
+        let root =
+            std::env::temp_dir().join(format!("rafikx-browser-stage-{}", crate::db::Db::new_id()));
+        let stage = root.join("stage");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git fixture");
+        std::fs::create_dir_all(workspace.join("assets")).expect("asset fixture");
+        std::fs::write(
+            workspace.join("index.html"),
+            "<script src=\"app.js\"></script>",
+        )
+        .expect("entry fixture");
+        std::fs::write(workspace.join("app.js"), "console.log('ok')").expect("script fixture");
+        std::fs::write(workspace.join("tokens.css"), ":root { --ink: #111; }")
+            .expect("design tokens fixture");
+        std::fs::write(workspace.join("assets/pixel.png"), b"png").expect("image fixture");
+        std::fs::write(workspace.join(".env"), "PRIVATE_VALUE=short-secret").expect("env fixture");
+        std::fs::write(workspace.join(".git/config"), "credential=secret").expect("git fixture");
+        std::fs::write(workspace.join("notes.txt"), "short-secret").expect("text fixture");
+        std::fs::write(workspace.join("secret.js"), "short-secret").expect("secret fixture");
+        std::fs::write(workspace.join("aws-secrets.js"), "short-secret")
+            .expect("prefixed secret fixture");
+
+        let staged_entry = stage_web_root(&workspace, &workspace.join("index.html"), &stage)
+            .expect("stage web root");
+        assert_eq!(staged_entry, stage.join("index.html"));
+        assert!(stage.join("app.js").is_file());
+        assert!(stage.join("tokens.css").is_file());
+        assert!(stage.join("assets/pixel.png").is_file());
+        assert!(!stage.join(".env").exists());
+        assert!(!stage.join(".git/config").exists());
+        assert!(!stage.join("notes.txt").exists());
+        assert!(!stage.join("secret.js").exists());
+        assert!(!stage.join("aws-secrets.js").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_responses_restrict_network_and_embedding() {
+        assert!(SECURITY_HEADERS.contains("connect-src 'self'"));
+        assert!(SECURITY_HEADERS.contains("form-action 'none'"));
+        assert!(SECURITY_HEADERS.contains("frame-ancestors 'none'"));
+        assert!(SECURITY_HEADERS.contains("X-Content-Type-Options: nosniff"));
+        assert!(SECURITY_HEADERS.contains("X-DNS-Prefetch-Control: off"));
+        assert!(safe_extra_browser_flag("--no-sandbox"));
+        assert!(!safe_extra_browser_flag("https://example.com"));
+        assert!(!safe_extra_browser_flag("--no-proxy-server"));
+        assert!(!safe_extra_browser_flag("--disable-web-security"));
+        assert!(!safe_extra_browser_flag("--user-data-dir=/tmp/shared"));
     }
 }

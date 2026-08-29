@@ -135,12 +135,12 @@ async fn run_argv_step(
             command: display,
             passed: false,
             exit_code: None,
-            note: Some(format!("실행 실패: {e}")),
+            note: Some(redact_local_output(&format!("실행 실패: {e}"), workspace)),
         },
         Ok(Ok(o)) => {
             let code = o.status.code();
             let failed = code != Some(0);
-            let tail: String = {
+            let tail = {
                 let text = format!(
                     "{}{}",
                     String::from_utf8_lossy(&o.stderr),
@@ -148,7 +148,8 @@ async fn run_argv_step(
                 );
                 let lines: Vec<&str> = text.lines().collect();
                 let skip = lines.len().saturating_sub(10);
-                lines[skip..].join("\n").chars().take(1500).collect()
+                let tail: String = lines[skip..].join("\n").chars().take(1500).collect();
+                redact_local_output(&tail, workspace)
             };
             GateStep {
                 stage,
@@ -190,10 +191,7 @@ async fn run_step(
 /// 품질 게이트 전체 — S0 감지 → S3(포맷·린트·테스트) → S5(내장 스캔 + 의존성 감사).
 /// S3·S5 는 어떤 경우에도 생략되지 않는다: 도구가 없으면 "설치 권장" 기록 후
 /// 내장 스캐너가 최소 보장을 한다.
-pub async fn run_quality_gate(
-    workspace: &Path,
-    changed: &[String],
-) -> QualityReport {
+pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityReport {
     let lang = profile::detect(workspace, changed);
     let profile = profile::profile_for(lang);
     let mut steps = Vec::new();
@@ -220,7 +218,10 @@ pub async fn run_quality_gate(
     }
 
     // S3-syntax — node --check 파일별 구문 검사 (JS 계열, node 있을 때).
-    if matches!(lang, Language::JavaScript | Language::TypeScript | Language::Unknown) {
+    if matches!(
+        lang,
+        Language::JavaScript | Language::TypeScript | Language::Unknown
+    ) {
         if profile::tool_available("node") {
             for file in changed {
                 if file.ends_with(".js") || file.ends_with(".mjs") || file.ends_with(".cjs") {
@@ -284,7 +285,7 @@ pub async fn run_quality_gate(
             command: cmd.clone(),
             passed: ok.unwrap_or(true), // 미설치는 실패로 치지 않고 기록
             exit_code: None,
-            note: Some(format!("{summary}")),
+            note: Some(redact_local_output(&summary, workspace)),
         });
     }
 
@@ -314,14 +315,22 @@ pub async fn run_quality_gate(
             idx.exists().then_some(idx)
         });
     if let Some(entry) = entry {
+        let display_entry = entry
+            .strip_prefix(workspace)
+            .unwrap_or(&entry)
+            .display()
+            .to_string();
         match browser::smoke_test(workspace, &entry).await {
             Ok(Some(errors)) if !errors.is_empty() => {
                 for e in errors {
                     findings.push(security::Finding {
                         kind: "browser-error",
-                        file: entry.display().to_string(),
+                        file: display_entry.clone(),
                         line: 0,
-                        detail: format!("브라우저 런타임 오류 — {e}"),
+                        detail: redact_local_output(
+                            &format!("브라우저 런타임 오류 — {e}"),
+                            workspace,
+                        ),
                     });
                 }
             }
@@ -344,7 +353,7 @@ pub async fn run_quality_gate(
                 command: "browser smoke (headless)".into(),
                 passed: false,
                 exit_code: None,
-                note: Some(format!("{e:#}")),
+                note: Some(redact_local_output(&format!("{e:#}"), workspace)),
             }),
         }
     }
@@ -360,10 +369,7 @@ pub async fn run_quality_gate(
 
 /// 중복 블록 감지 (S7 가독성·간결성 보조) — 의미 있는 5줄 구현이
 /// 같은 파일에서 반복되면 지적한다 (레드팀 시나리오 6). 텍스트 기반 휴리스틱.
-pub fn detect_duplicate_blocks(
-    file: &str,
-    text: &str,
-) -> Vec<String> {
+pub fn detect_duplicate_blocks(file: &str, text: &str) -> Vec<String> {
     let mut findings = Vec::new();
     let lines: Vec<(usize, &str)> = text
         .lines()
@@ -388,15 +394,10 @@ pub fn detect_duplicate_blocks(
             let fresh_region = reported
                 .iter()
                 .all(|start| j >= *start + window || *start >= j + window);
-            if same
-                && content_chars >= 120
-                && fresh_region
-                && reported.insert(j)
-            {
+            if same && content_chars >= 120 && fresh_region && reported.insert(j) {
                 findings.push(format!(
                     "{file}:{} — 직전 블록({})과 동일한 5줄 중복",
-                    second[0].0,
-                    first[0].0
+                    second[0].0, first[0].0
                 ));
             }
         }
@@ -413,10 +414,7 @@ pub fn render_report(report: &QualityReport) -> String {
     );
     for s in &report.steps {
         let mark = if s.passed { "✓" } else { "✗" };
-        out.push_str(&format!(
-            "{mark} [{}] {}\n",
-            s.stage, s.command
-        ));
+        out.push_str(&format!("{mark} [{}] {}\n", s.stage, s.command));
         if let Some(note) = &s.note {
             for line in note.lines().take(4) {
                 out.push_str(&format!("    │ {line}\n"));
@@ -470,6 +468,25 @@ fn looks_like_sensitive_key(key: &str) -> bool {
     .any(|marker| key.contains(marker))
 }
 
+fn looks_like_env_key(key: &str) -> bool {
+    let key =
+        key.trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+    key.len() >= 3
+        && key
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_uppercase())
+        && key.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+fn redact_url_query(token: &str) -> Option<String> {
+    token.find("://")?;
+    let split = token.find(['?', '#'])?;
+    Some(format!("{}?[redacted]", &token[..split]))
+}
+
 pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
     let mut normalized = text.replace(&workspace.display().to_string(), "<workspace>");
     if let Some(home) = std::env::var_os("HOME") {
@@ -489,8 +506,11 @@ pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
         } else if matches!(lower.as_str(), "authorization:" | "basic" | "bearer") {
             redacted.push(token.to_string());
             redact_next = true;
+        } else if let Some(url) = redact_url_query(token) {
+            redacted.push(url);
         } else if let Some(at) = token.find(['=', ':'])
-            && looks_like_sensitive_key(&token[..at])
+            && (looks_like_sensitive_key(&token[..at])
+                || (token.as_bytes()[at] == b'=' && looks_like_env_key(&token[..at])))
         {
             redacted.push(format!("{}[redacted]", &token[..=at]));
             redact_next = at + 1 == token.len();
@@ -543,10 +563,8 @@ mod tests {
         if !profile::tool_available("node") {
             return;
         }
-        let root = std::env::temp_dir().join(format!(
-            "rafikx-quality-argv-{}",
-            crate::db::Db::new_id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rafikx-quality-argv-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&root).expect("temp workspace");
         let names = [
             "$(touch PWNED).js",
@@ -558,7 +576,10 @@ mod tests {
             std::fs::write(root.join(name), "const value = 1;\n").expect("fixture");
         }
 
-        let changed = names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let changed = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
         let report = run_quality_gate(&root, &changed).await;
         assert!(
             report
@@ -577,7 +598,7 @@ mod tests {
     #[test]
     fn repair_output_redacts_paths_and_credentials() {
         let workspace = Path::new("/tmp/private-workspace");
-        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value {\"api_key\":\"json-value\"} Cookie: session-value";
+        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret {\"api_key\":\"json-value\"} Cookie: session-value https://evil.test/x?value=query-secret";
         let redacted = redact_local_output(text, workspace);
         assert!(!redacted.contains("private-workspace"));
         assert!(!redacted.contains("abc123"));
@@ -586,5 +607,7 @@ mod tests {
         assert!(!redacted.contains("aws-value"));
         assert!(!redacted.contains("json-value"));
         assert!(!redacted.contains("session-value"));
+        assert!(!redacted.contains("short-secret"));
+        assert!(!redacted.contains("query-secret"));
     }
 }

@@ -1664,7 +1664,12 @@ pub async fn run_turn_observed(
     crate::spinner::set_label("질문 확인 중…");
     reload_cfg_if_changed(session);
     let decision = crate::harness::classify_gated(&session.cfg, prompt, obsidian_on, forced_class).await?;
-    let class = crate::harness::continuation_class(prompt, decision.class, &session.messages);
+    let class = crate::harness::continuation_class(
+        prompt,
+        decision.class,
+        &session.messages,
+        forced_class.is_some(),
+    );
     if decision.via == crate::harness::ClassSource::Judge && decision.rules_class != decision.class
         && let Ok(db) = Db::open(&Db::db_path()?)
     {

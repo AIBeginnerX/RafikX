@@ -284,8 +284,9 @@ pub(crate) fn continuation_class(
     text: &str,
     class: TaskClass,
     history: &[Message],
+    forced: bool,
 ) -> TaskClass {
-    if class != TaskClass::Simple {
+    if forced || class != TaskClass::Simple {
         return class;
     }
     let lower = text.to_ascii_lowercase();

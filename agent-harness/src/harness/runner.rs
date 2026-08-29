@@ -774,42 +774,8 @@ async fn run_pipeline_inner(
             role: crate::provider::Role::Assistant,
             content: resp.content.clone(),
         });
-        // 도구 없는 프로파일의 응답에 tool-call 문법이 텍스트로 새어 있으면 —
-        // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이다. 오염 응답을 걷어내고
-        // coder 로 1회 승격해 다시 실행한다. (아래 본 경로의 승격과 같은 규칙 —
-        // 이 조기 반환 경로는 그 검사에 도달하지 못해 v1.0 부터 누출이 그대로
-        // 화면에 노출됐다: 2026-08-27 실측.)
-        if leaked_tool_call(&agent::assistant_text(&messages)) {
-            crate::ui::live_line_in(
-                &run_context,
-                "도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.",
-            );
-            if let Ok(dev) = bind(cfg, TaskClass::Dev, cli_provider, None)
-                && !dev.tools.is_empty()
-            {
-                let mut clean = messages.clone();
-                while matches!(clean.last(), Some(m) if m.role == crate::provider::Role::Assistant)
-                {
-                    clean.pop();
-                }
-                return Box::pin(run_pipeline_inner(
-                    cfg,
-                    &dev,
-                    task,
-                    yes,
-                    cli_provider,
-                    Some(clean),
-                    remote,
-                    local_ask,
-                    run_context.clone(),
-                ))
-                .await;
-            }
-        }
-        let _ =
-            run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted);
         let hit_token_limit = resp.stop_reason == StopReason::MaxTokens;
-        return Ok(AgentOutcome {
+        let mut no_tool_outcome = AgentOutcome {
             status: if hit_token_limit {
                 "incomplete".into()
             } else {
@@ -822,13 +788,66 @@ async fn run_pipeline_inner(
             cached_tokens: resp.cached_tokens,
             cache_reported: resp.cache_reported,
             error: hit_token_limit.then(|| "모델 출력 토큰 상한에 도달했습니다.".into()),
-            messages,
+            messages: messages.clone(),
             changed_files: vec![],
             tool_errors: vec![],
             deny_reasons: vec![],
             verify_fail: None,
             verify_recovered: None,
-        });
+        };
+        // 도구 없는 프로파일의 응답에 tool-call 문법이 텍스트로 새어 있으면 —
+        // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이다. 오염 응답을 걷어내고
+        // coder 로 1회 승격해 다시 실행한다. (아래 본 경로의 승격과 같은 규칙 —
+        // 이 조기 반환 경로는 그 검사에 도달하지 못해 v1.0 부터 누출이 그대로
+        // 화면에 노출됐다: 2026-08-27 실측.)
+        if leaked_tool_call(&agent::assistant_text(&messages)) {
+            crate::ui::live_line_in(
+                &run_context,
+                "도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.",
+            );
+            let mut clean = messages.clone();
+            while matches!(clean.last(), Some(m) if m.role == crate::provider::Role::Assistant) {
+                clean.pop();
+            }
+            match bind(cfg, TaskClass::Dev, cli_provider, None) {
+                Ok(mut dev) if !dev.tools.is_empty() => {
+                    dev.max_iterations = promoted_dev_max_iterations(dev.max_iterations);
+                    let next = Box::pin(run_pipeline_inner(
+                        cfg,
+                        &dev,
+                        task,
+                        yes,
+                        cli_provider,
+                        Some(clean),
+                        remote,
+                        local_ask,
+                        run_context.clone(),
+                    ))
+                    .await?;
+                    return Ok(merge_agent_outcomes(no_tool_outcome, next));
+                }
+                Ok(_) => {
+                    no_tool_outcome.error = Some(
+                        "도구 호출이 필요하지만 coder 프로파일에 도구가 없습니다.".into(),
+                    );
+                }
+                Err(error) => {
+                    no_tool_outcome.error = Some(format!("coder 승격 실패: {error}"));
+                }
+            }
+            no_tool_outcome.status = "incomplete".into();
+            clean.push(Message {
+                role: crate::provider::Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: no_tool_outcome.error.clone().unwrap_or_default(),
+                }],
+            });
+            no_tool_outcome.messages = clean;
+        }
+        let _ =
+            run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted);
+        mark_missing_dev_change(binding.class, &mut no_tool_outcome);
+        return Ok(no_tool_outcome);
     }
 
     if !cfg.workspace.exists() {
@@ -871,6 +890,7 @@ async fn run_pipeline_inner(
             run_context.clone(),
         )
         .await?;
+        mark_missing_dev_change(binding.class, &mut outcome);
         outcome = finish_verification(
             cfg,
             binding,
@@ -1127,7 +1147,8 @@ async fn run_pipeline_inner(
             // ok 로 끝난 턴은 모델이 단계화가 불필요한 작업으로 판단한 것 —
             // 검증된 산출물이 있으면 완료로 인정한다 (성공을 실패로 오표시 금지).
             let unfinished_todos = progress.total > 0 && progress.completed < progress.total;
-            let no_execution_evidence = progress.total == 0 && all_changed.is_empty();
+            let no_execution_evidence = all_changed.is_empty()
+                && (progress.total == 0 || binding.class == TaskClass::Dev);
             if staged && continuation_eligible && (unfinished_todos || no_execution_evidence) {
                 current.status = "incomplete".into();
                 current.error = Some(if no_execution_evidence {
@@ -1207,7 +1228,8 @@ async fn run_pipeline_inner(
         next_resume = Some(messages);
     };
 
-    outcome = finish_verification(
+    let verification_resume = outcome.messages.clone();
+    outcome = match finish_verification(
         cfg,
         binding,
         turn_iteration_limit,
@@ -1222,7 +1244,27 @@ async fn run_pipeline_inner(
         local_ask.clone(),
         run_context.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if staged {
+                let progress = crate::tools_more::todo_progress(
+                    &crate::tools_more::current_todos_in(&run_context),
+                );
+                persist_goal_state(
+                    &run_context,
+                    task,
+                    "failed",
+                    progress.completed,
+                    progress.total,
+                    continuations,
+                    &verification_resume,
+                );
+            }
+            return Err(error);
+        }
+    };
     if staged {
         let progress = crate::tools_more::todo_progress(
             &crate::tools_more::current_todos_in(&run_context),
@@ -1241,36 +1283,6 @@ async fn run_pipeline_inner(
             continuations,
             &outcome.messages,
         );
-    }
-    // 도구 없는 프로파일(quick)의 응답에 tool-call 텍스트가 새어 있으면 —
-    // 분류가 낮게 잡혔지만 실제로는 도구가 필요한 작업이라는 뜻이다. 모델이
-    // 도구 문법을 텍스트로 흉내 낸 오염 응답을 걷어내고 coder 로 1회 승격해
-    // 다시 실행한다. (승격된 바인딩은 tools 가 비지 않으므로 재귀는 1회로 끝.)
-    if binding.tools.is_empty() && leaked_tool_call(&agent::assistant_text(&outcome.messages)) {
-        crate::ui::live_line_in(
-            &run_context,
-            "도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.",
-        );
-        if let Ok(dev) = bind(cfg, TaskClass::Dev, cli_provider, None)
-            && !dev.tools.is_empty()
-        {
-            let mut clean = outcome.messages.clone();
-            while matches!(clean.last(), Some(m) if m.role == crate::provider::Role::Assistant) {
-                clean.pop();
-            }
-            return Box::pin(run_pipeline_inner(
-                cfg,
-                &dev,
-                task,
-                yes,
-                cli_provider,
-                Some(clean),
-                remote,
-                local_ask,
-                run_context,
-            ))
-            .await;
-        }
     }
     // Self-Harness 에피소드 관찰 — TUI/CLI/텔레그램 세 진입 경로가 모두 여기를
     // 지나므로 이 지점 하나로 전 경로의 실행 증거가 수집된다. 백그라운드 실행.
@@ -1484,8 +1496,21 @@ pub(crate) fn goal_persist_status(
     }
 }
 
+pub(crate) fn mark_missing_dev_change(class: TaskClass, outcome: &mut AgentOutcome) {
+    if class == TaskClass::Dev && outcome.status == "ok" && outcome.changed_files.is_empty() {
+        outcome.status = "incomplete".into();
+        outcome.error = Some("개발 작업에 변경 파일 증거가 없습니다.".into());
+    }
+}
+
 pub(crate) fn turn_iteration_budget(per_cycle: u32) -> u32 {
     per_cycle.saturating_mul(2).min(agent::HARD_CAP).max(1)
+}
+
+pub(crate) fn promoted_dev_max_iterations(requested: u32) -> u32 {
+    requested
+        .min(agent::HARD_CAP.saturating_sub(1) / 2)
+        .max(1)
 }
 
 pub(crate) fn remaining_iteration_budget(limit: u32, used: u32, per_cycle: u32) -> u32 {
