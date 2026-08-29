@@ -380,22 +380,26 @@ mod size_limit_tests {
             .current_dir(&dir)
             .status()
             .unwrap();
-        for arg in ["add", "-A"].iter() {
-            std::process::Command::new("git")
-                .args(["config", "user.email", "t@t"])
+        for (key, value) in [("user.email", "t@t"), ("user.name", "RafikX Test")] {
+            let status = std::process::Command::new("git")
+                .args(["config", key, value])
                 .current_dir(&dir)
                 .status()
                 .unwrap();
-            break;
+            assert!(status.success(), "git config {key}");
         }
-        let _ = std::process::Command::new("git")
+        let status = std::process::Command::new("git")
             .args(["add", "-A"])
             .current_dir(&dir)
-            .status();
-        let _ = std::process::Command::new("git")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add");
+        let status = std::process::Command::new("git")
             .args(["commit", "-qm", "init"])
             .current_dir(&dir)
-            .status();
+            .status()
+            .unwrap();
+        assert!(status.success(), "git commit");
         let mut big = String::new();
         for i in 0..10 {
             big.push_str(&format!("line {i}\n"));

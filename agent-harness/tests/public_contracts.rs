@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rafikx::agent::{AgentOutcome, LocalAsk, RemoteApproval};
@@ -7,7 +8,9 @@ use rafikx::config::Config;
 use rafikx::graph::GraphNode;
 use rafikx::harness::{Binding, run_pipeline};
 use rafikx::provider::Message;
+use rafikx::run::{RunContext, RunId};
 use rafikx::tools::ToolRegistry;
+use rafikx::tools_more::{ApplyPatch, PatchOp};
 use rafikx::ui::{AgentProgress, Live};
 use serde_json::{Value, json};
 
@@ -165,4 +168,16 @@ fn legacy_live_variants_and_task_schema_remain_available() {
     assert!(schema["properties"].get("class").is_some());
     assert!(schema["properties"].get("role").is_some());
     assert!(schema["properties"].get("model").is_some());
+}
+
+#[test]
+fn legacy_change_and_patch_methods_keep_the_v118_signatures() {
+    let dry_run: fn(&Path, &[PatchOp]) -> Result<String> = ApplyPatch::dry_run;
+    let _ = dry_run;
+
+    let root = std::env::temp_dir().join(format!("rafikx-public-contract-{}", std::process::id()));
+    let run = RunContext::isolated(RunId::new("public-contract"), root);
+    let changed = PathBuf::from("legacy.txt");
+    run.record_committed_paths([changed.clone()]);
+    assert_eq!(run.committed_paths(), vec![changed]);
 }

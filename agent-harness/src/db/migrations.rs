@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 struct Migration {
@@ -138,9 +138,11 @@ pub(super) fn apply(connection: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
     for migration in MIGRATIONS {
-        apply_one(connection, migration)?;
+        apply_one(&transaction, migration)?;
     }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -173,13 +175,11 @@ fn apply_one(connection: &Connection, migration: &Migration) -> Result<()> {
         return Ok(());
     }
 
-    let transaction = connection.unchecked_transaction()?;
-    transaction.execute_batch(migration.sql)?;
-    transaction.execute(
+    connection.execute_batch(migration.sql)?;
+    connection.execute(
         "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (?1, ?2, ?3, unixepoch())",
         params![migration.version, migration.name, checksum],
     )?;
-    transaction.commit()?;
     Ok(())
 }
 

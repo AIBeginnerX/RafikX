@@ -28,7 +28,18 @@ impl Db {
         let conn = Connection::open(path)
             .with_context(|| format!("{} 를 열 수 없습니다", path.display()))?;
         conn.busy_timeout(Duration::from_millis(5000))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        if let Err(error) = conn.pragma_update(None, "journal_mode", "WAL")
+            && !matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(detail, _)
+                    if matches!(
+                        detail.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            )
+        {
+            return Err(error.into());
+        }
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS runs (
@@ -1475,6 +1486,29 @@ mod tests {
             })
             .expect("migration row count");
         assert_eq!(rows, 6);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_database_open_serializes_migrations() {
+        let dir = std::env::temp_dir().join(format!("rafikx-migration-race-{}", Db::new_id()));
+        std::fs::create_dir_all(&dir).expect("create migration race directory");
+        let path = dir.join("data.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let db = Db::open(&path).expect("concurrent database open");
+                    assert_eq!(db.schema_version().expect("schema version"), 6);
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("migration worker");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

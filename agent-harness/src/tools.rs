@@ -447,7 +447,7 @@ pub fn approval_preview(name: &str, input: &Value, ctx: &ToolCtx) -> Result<Stri
         "apply_patch" => {
             let patch = str_field(input, "patch")?;
             let ops = crate::tools_more::ApplyPatch::parse(patch)?;
-            let report = crate::tools_more::ApplyPatch::dry_run(ctx, &ops)?;
+            let report = crate::tools_more::ApplyPatch::dry_run_with_ctx(ctx, &ops)?;
             Ok(format!(
                 "[승인] apply_patch\n{report}\n--- patch ---\n{patch}"
             ))

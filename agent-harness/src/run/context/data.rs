@@ -25,6 +25,17 @@ impl RunContext {
         self.emit(RunEventKind::Todo, json!({"count": items.len()}));
     }
 
+    /// v1.1.8 공개 API 호환 경로. 새 내부 도구는 변경 전 fingerprint를 함께 기록한다.
+    pub fn record_committed_paths(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        if let Ok(mut committed) = self.legacy_committed_paths.lock() {
+            for path in paths {
+                if !committed.contains(&path) {
+                    committed.push(path);
+                }
+            }
+        }
+    }
+
     pub(crate) fn record_committed_changes(
         &self,
         changes: impl IntoIterator<Item = FileBaseline>,
@@ -95,12 +106,23 @@ impl RunContext {
                 return Vec::new();
             }
         };
-        baselines
+        let mut paths = baselines
             .into_iter()
-            .filter_map(|(path, original)| {
-                (current.get(&path) != Some(&original)).then_some(path)
-            })
-            .collect()
+            .filter_map(|(path, original)| (current.get(&path) != Some(&original)).then_some(path))
+            .collect::<Vec<_>>();
+        let legacy = match self.legacy_committed_paths.lock() {
+            Ok(paths) => paths.clone(),
+            Err(_) => {
+                self.mark_change_tracking_incomplete();
+                return Vec::new();
+            }
+        };
+        for path in legacy {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths
     }
 
     pub fn record_context_source(

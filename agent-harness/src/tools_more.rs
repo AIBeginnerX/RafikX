@@ -960,7 +960,11 @@ impl ApplyPatch {
     }
 
     /// 디스크에 쓰지 않고 문자열 위에서 미리 적용해본다 (승인 프리뷰용).
-    pub fn dry_run(ctx: &ToolCtx, ops: &[PatchOp]) -> Result<String> {
+    pub fn dry_run(root: &std::path::Path, ops: &[PatchOp]) -> Result<String> {
+        Self::dry_run_with_ctx(&ToolCtx::new(root.to_path_buf()), ops)
+    }
+
+    pub(crate) fn dry_run_with_ctx(ctx: &ToolCtx, ops: &[PatchOp]) -> Result<String> {
         let mut report = Vec::new();
         for op in ops {
             match op {
@@ -1159,7 +1163,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.txt"), "hello world\n").unwrap();
         let ctx = ToolCtx::new(dir.clone());
-        let report = ApplyPatch::dry_run(&ctx, &ops).unwrap();
+        let report = ApplyPatch::dry_run_with_ctx(&ctx, &ops).unwrap();
         assert!(report.contains("a.txt"));
         assert!(report.contains("b.txt"));
         // 중복·불일치 매칭은 dry_run 에서 거부
@@ -1167,18 +1171,18 @@ mod tests {
         let dup =
             ApplyPatch::parse("*** Begin Patch\n*** Update File: dup.txt\n-x\n-y\n*** End Patch")
                 .unwrap();
-        assert!(ApplyPatch::dry_run(&ctx, &dup).is_err());
+        assert!(ApplyPatch::dry_run_with_ctx(&ctx, &dup).is_err());
         // Add 대상이 이미 존재하면 거부
         let bad =
             ApplyPatch::parse("*** Begin Patch\n*** Add File: dup.txt\n+z\n*** End Patch").unwrap();
-        assert!(ApplyPatch::dry_run(&ctx, &bad).is_err());
+        assert!(ApplyPatch::dry_run_with_ctx(&ctx, &bad).is_err());
         let outside = dir.with_file_name("rafikx-apply-patch-outside.txt");
         fs::write(&outside, "outside\n").unwrap();
         let escape = ApplyPatch::parse(
             "*** Begin Patch\n*** Update File: ../rafikx-apply-patch-outside.txt\n@@\n-outside\n+escaped\n*** End Patch",
         )
         .unwrap();
-        assert!(ApplyPatch::dry_run(&ctx, &escape).is_err());
+        assert!(ApplyPatch::dry_run_with_ctx(&ctx, &escape).is_err());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n");
         let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(dir);

@@ -212,16 +212,21 @@ fn percent_decode_path(path: &str) -> Option<String> {
 }
 
 fn content_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("js" | "mjs") => "text/javascript; charset=utf-8",
-        Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("wasm") => "application/wasm",
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "htm" | "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "cjs" | "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
 }
@@ -383,31 +388,335 @@ fn resolve_html_reference(root: &Path, entry: &Path, raw: &str) -> Option<PathBu
     Some(root.join(relative))
 }
 
-fn quoted_local_references(root: &Path, source: &Path, text: &str) -> BTreeSet<PathBuf> {
+#[derive(Clone)]
+enum ReferenceToken {
+    Identifier(String),
+    Punctuation(u8),
+    Value,
+}
+
+fn push_reference_token(tokens: &mut Vec<ReferenceToken>, token: ReferenceToken) {
+    if tokens.len() == 3 {
+        tokens.remove(0);
+    }
+    tokens.push(token);
+}
+
+fn quoted_value(text: &str, start: usize, quote: u8) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
-    let mut references = BTreeSet::new();
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            cursor = (cursor + 2).min(bytes.len());
+        } else if bytes[cursor] == quote {
+            return Some((text[start..cursor].to_string(), cursor + 1));
+        } else {
+            cursor += 1;
+        }
+    }
+    None
+}
+
+fn reference_literal_context(tokens: &[ReferenceToken], css: bool) -> bool {
+    let last_identifier = |offset: usize| {
+        tokens
+            .len()
+            .checked_sub(offset + 1)
+            .and_then(|index| match &tokens[index] {
+                ReferenceToken::Identifier(value) => Some(value.as_str()),
+                _ => None,
+            })
+    };
+    if matches!(last_identifier(0), Some("import" | "from")) {
+        return true;
+    }
+    let called = matches!(tokens.last(), Some(ReferenceToken::Punctuation(b'(')))
+        .then(|| last_identifier(1))
+        .flatten();
+    if css {
+        called == Some("url")
+    } else {
+        matches!(
+            called,
+            Some("import" | "require" | "url" | "worker" | "sharedworker")
+        )
+    }
+}
+
+fn regex_literal_can_start(tokens: &[ReferenceToken]) -> bool {
+    match tokens.last() {
+        None => true,
+        Some(ReferenceToken::Punctuation(value)) => {
+            matches!(
+                *value,
+                b'(' | b'['
+                    | b'{'
+                    | b'='
+                    | b':'
+                    | b','
+                    | b';'
+                    | b'!'
+                    | b'?'
+                    | b'+'
+                    | b'-'
+                    | b'*'
+                    | b'%'
+                    | b'&'
+                    | b'|'
+                    | b'^'
+                    | b'~'
+                    | b'<'
+                    | b'>'
+            )
+        }
+        Some(ReferenceToken::Identifier(value)) => {
+            matches!(
+                value.as_str(),
+                "await"
+                    | "case"
+                    | "delete"
+                    | "do"
+                    | "else"
+                    | "in"
+                    | "instanceof"
+                    | "new"
+                    | "of"
+                    | "return"
+                    | "throw"
+                    | "typeof"
+                    | "void"
+                    | "yield"
+            )
+        }
+        Some(ReferenceToken::Value) => false,
+    }
+}
+
+fn skip_regex_literal(bytes: &[u8], start: usize) -> usize {
+    let mut cursor = start + 1;
+    let mut character_class = false;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = (cursor + 2).min(bytes.len()),
+            b'[' => {
+                character_class = true;
+                cursor += 1;
+            }
+            b']' => {
+                character_class = false;
+                cursor += 1;
+            }
+            b'/' if !character_class => {
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
+                    cursor += 1;
+                }
+                return cursor;
+            }
+            b'\n' | b'\r' => return start + 1,
+            _ => cursor += 1,
+        }
+    }
+    start + 1
+}
+
+fn code_reference_values(text: &str, css: bool) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut values = Vec::new();
+    let mut tokens = Vec::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        let Some(offset) = bytes[cursor..]
-            .iter()
-            .position(|byte| matches!(*byte, b'\'' | b'"' | b'`'))
-        else {
-            break;
-        };
-        let start = cursor + offset;
-        let quote = bytes[start];
-        let value_start = start + 1;
-        let Some(end_offset) = bytes[value_start..].iter().position(|byte| *byte == quote) else {
-            break;
-        };
-        let value_end = value_start + end_offset;
-        if let Some(resolved) = resolve_html_reference(root, source, &text[value_start..value_end])
-        {
-            references.insert(resolved);
+        if bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+            continue;
         }
-        cursor = value_end + 1;
+        if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+            cursor += 2;
+            while cursor + 1 < bytes.len() && !(bytes[cursor] == b'*' && bytes[cursor + 1] == b'/')
+            {
+                cursor += 1;
+            }
+            cursor = (cursor + 2).min(bytes.len());
+            continue;
+        }
+        if !css && bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'/') {
+            cursor += 2;
+            while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                cursor += 1;
+            }
+            continue;
+        }
+        if !css && bytes[cursor] == b'/' && regex_literal_can_start(&tokens) {
+            cursor = skip_regex_literal(bytes, cursor);
+            push_reference_token(&mut tokens, ReferenceToken::Value);
+            continue;
+        }
+        if matches!(bytes[cursor], b'\'' | b'"' | b'`') {
+            let quote = bytes[cursor];
+            if let Some((value, next)) = quoted_value(text, cursor + 1, quote) {
+                if reference_literal_context(&tokens, css) {
+                    values.push(value);
+                }
+                cursor = next;
+                push_reference_token(&mut tokens, ReferenceToken::Value);
+                continue;
+            }
+        }
+        if bytes[cursor].is_ascii_alphabetic() || matches!(bytes[cursor], b'_' | b'$') {
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric()
+                    || matches!(bytes[cursor], b'_' | b'$' | b'-'))
+            {
+                cursor += 1;
+            }
+            push_reference_token(
+                &mut tokens,
+                ReferenceToken::Identifier(text[start..cursor].to_ascii_lowercase()),
+            );
+            continue;
+        }
+        push_reference_token(&mut tokens, ReferenceToken::Punctuation(bytes[cursor]));
+        cursor += 1;
     }
-    references
+    values
+}
+
+fn html_tag_reference_values(tag: &str) -> Vec<String> {
+    let bytes = tag.as_bytes();
+    let mut values = Vec::new();
+    let mut cursor = 1usize;
+    while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b'>' {
+        cursor += 1;
+    }
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || matches!(bytes[cursor], b'-' | b'_'))
+        {
+            cursor += 1;
+        }
+        if name_start == cursor {
+            cursor += 1;
+            continue;
+        }
+        let name = &tag[name_start..cursor];
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let value = if let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() {
+            quoted_value(tag, cursor + 1, quote).map(|(value, next)| {
+                cursor = next;
+                value
+            })
+        } else {
+            let start = cursor;
+            while cursor < bytes.len()
+                && !bytes[cursor].is_ascii_whitespace()
+                && bytes[cursor] != b'>'
+            {
+                cursor += 1;
+            }
+            (start < cursor).then(|| tag[start..cursor].to_string())
+        };
+        if matches!(name.to_ascii_lowercase().as_str(), "src" | "href")
+            && let Some(value) = value
+        {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn html_reference_values(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    let mut values = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor..].starts_with(b"<!--") {
+            cursor = lower[cursor + 4..]
+                .find("-->")
+                .map(|offset| cursor + 4 + offset + 3)
+                .unwrap_or(bytes.len());
+            continue;
+        }
+        if bytes[cursor] != b'<' {
+            cursor += 1;
+            continue;
+        }
+        let mut end = cursor + 1;
+        let mut quote = None;
+        while end < bytes.len() {
+            if let Some(active) = quote {
+                if bytes[end] == b'\\' {
+                    end = (end + 2).min(bytes.len());
+                    continue;
+                }
+                if bytes[end] == active {
+                    quote = None;
+                }
+            } else if matches!(bytes[end], b'\'' | b'"') {
+                quote = Some(bytes[end]);
+            } else if bytes[end] == b'>' {
+                break;
+            }
+            end += 1;
+        }
+        if end >= bytes.len() {
+            break;
+        }
+        let tag = &text[cursor..=end];
+        values.extend(html_tag_reference_values(tag));
+        let tag_name = tag[1..]
+            .trim_start_matches('/')
+            .split(|character: char| character.is_ascii_whitespace() || character == '>')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(tag_name.as_str(), "script" | "style") && !tag.starts_with("</") {
+            let closing = format!("</{tag_name}");
+            if let Some(offset) = lower[end + 1..].find(&closing) {
+                let content_end = end + 1 + offset;
+                values.extend(code_reference_values(
+                    &text[end + 1..content_end],
+                    tag_name == "style",
+                ));
+                cursor = content_end;
+                continue;
+            }
+        }
+        cursor = end + 1;
+    }
+    values
+}
+
+fn local_references(root: &Path, source: &Path, text: &str) -> BTreeSet<PathBuf> {
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let values = match extension.as_str() {
+        "htm" | "html" => html_reference_values(text),
+        "css" => code_reference_values(text, true),
+        _ => code_reference_values(text, false),
+    };
+    values
+        .into_iter()
+        .filter_map(|value| resolve_html_reference(root, source, &value))
+        .collect()
 }
 
 fn is_reference_graph_source(path: &Path) -> bool {
@@ -463,7 +772,7 @@ fn entry_reaches_changed_sources(
         let text = std::fs::read_to_string(&source).map_err(|error| {
             anyhow::anyhow!("브라우저 참조 그래프 파일을 읽을 수 없습니다: {error}")
         })?;
-        for reference in quoted_local_references(root, &source, &text) {
+        for reference in local_references(root, &source, &text) {
             for (absolute, changed) in &targets {
                 if reference == *absolute {
                     matched.insert((*changed).clone());
@@ -501,7 +810,13 @@ pub(crate) fn discover_entries(
         if !is_changed_web_source(relative) {
             continue;
         }
-        changed_sources.push(relative.to_path_buf());
+        let normalized_relative = root
+            .join(relative)
+            .canonicalize()
+            .ok()
+            .and_then(|path| path.strip_prefix(&root).ok().map(Path::to_path_buf))
+            .unwrap_or_else(|| relative.to_path_buf());
+        changed_sources.push(normalized_relative.clone());
         if matches!(
             relative
                 .extension()
@@ -511,8 +826,8 @@ pub(crate) fn discover_entries(
                 .as_str(),
             "htm" | "html"
         ) {
-            insert_browser_entry(&mut entries, &root, &root.join(relative))?;
-            covered_sources.insert(relative.to_path_buf());
+            insert_browser_entry(&mut entries, &root, &root.join(&normalized_relative))?;
+            covered_sources.insert(normalized_relative);
         }
     }
     if changed_sources.is_empty() {
@@ -1282,9 +1597,16 @@ mod tests {
             "<script type=\"module\" src=\"./js/app.js\"></script>",
         )
         .expect("entry fixture");
-        std::fs::write(root.join("js/app.js"), "import './events.js';").expect("root module");
-        std::fs::write(root.join("js/events.js"), "import './state.js';")
-            .expect("intermediate module");
+        std::fs::write(
+            root.join("js/app.js"),
+            "// don't hide the next import\nimport './events.js';",
+        )
+        .expect("root module");
+        std::fs::write(
+            root.join("js/events.js"),
+            "const contraction = () => /don't/; import './state.js';",
+        )
+        .expect("intermediate module");
         std::fs::write(root.join("js/state.js"), "missingFunction();").expect("changed module");
 
         let entries =
@@ -1292,6 +1614,31 @@ mod tests {
         assert_eq!(
             entries,
             vec![root.join("index.html").canonicalize().expect("entry")]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn discovers_case_variant_changed_source_on_case_insensitive_filesystems() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-case-variant-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(root.join("runtime-broken.js"), "missingFunction();")
+            .expect("source fixture");
+        std::fs::write(
+            root.join("launch.html"),
+            "<script src=\"./runtime-broken.js\"></script>",
+        )
+        .expect("entry fixture");
+
+        let entries = discover_entries(&root, &["RUNTIME-BROKEN.JS".into()])
+            .expect("discover case-variant source");
+        assert_eq!(
+            entries,
+            vec![root.join("launch.html").canonicalize().expect("entry")]
         );
         let _ = std::fs::remove_dir_all(root);
     }

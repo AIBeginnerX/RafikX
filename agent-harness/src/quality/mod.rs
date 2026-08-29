@@ -184,7 +184,22 @@ fn validated_changed_arg(workspace: &Path, file: &str) -> Result<Option<String>,
     if !resolved.starts_with(&root) {
         return Err(format!("워크스페이스 밖 변경 경로: {file}"));
     }
-    Ok(Some(file.to_string()))
+    let relative = resolved
+        .strip_prefix(&root)
+        .map_err(|_| format!("워크스페이스 밖 변경 경로: {file}"))?;
+    Ok(Some(relative.to_string_lossy().into_owned()))
+}
+
+fn is_node_syntax_source(file: &str) -> bool {
+    matches!(
+        Path::new(file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "js" | "mjs" | "cjs"
+    )
 }
 
 fn command_argv(
@@ -383,7 +398,7 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     ) {
         let node_available = profile::tool_available("node");
         for file in changed {
-            if file.ends_with(".js") || file.ends_with(".mjs") || file.ends_with(".cjs") {
+            if is_node_syntax_source(file) {
                 match validated_changed_arg(workspace, file) {
                     Ok(Some(file)) => {
                         if node_available {
@@ -812,19 +827,28 @@ fn redact_spaced_assignments(text: &str) -> String {
         while value_end < bytes.len() && bytes[value_end] != b'\n' {
             value_end += 1;
         }
+        let mut scheme_needs_secret = matches!(
+            credential_token(text[value_start..value_end].trim()),
+            Some(CredentialToken::Scheme)
+        );
         while value_end < bytes.len() && bytes[value_end] == b'\n' {
             let next_line = value_end + 1;
             let mut content = next_line;
             while content < bytes.len() && matches!(bytes[content], b' ' | b'\t' | b'\r') {
                 content += 1;
             }
-            if content == next_line || content >= bytes.len() || bytes[content] == b'\n' {
+            let indented = content != next_line;
+            if (!indented && !scheme_needs_secret)
+                || content >= bytes.len()
+                || bytes[content] == b'\n'
+            {
                 break;
             }
             value_end = content;
             while value_end < bytes.len() && bytes[value_end] != b'\n' {
                 value_end += 1;
             }
+            scheme_needs_secret = false;
         }
         if value_end == value_start {
             search = separator + 1;
@@ -986,6 +1010,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn node_syntax_source_extensions_are_case_insensitive() {
+        for file in ["app.js", "APP.JS", "module.MjS", "legacy.CJS"] {
+            assert!(is_node_syntax_source(file), "not detected: {file}");
+        }
+        assert!(!is_node_syntax_source("component.jsx"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn quality_command_output_cap_fails_closed() {
@@ -1055,6 +1087,7 @@ mod tests {
             "Authorization: Bearer visible-credential\n",
             "Authorization: [Bearer BRACKET-LEAK]\n",
             "Authorization:\n  [Bearer MULTILINE-AUTH]\n",
+            "Authorization:\nBearer\nTHREE-LINE-AUTH\n",
             "Authorization:\r\n  [Basic CRLF-BASIC]\r\n",
             "Proxy-Authorization: (Bearer PROXY-AUTH)\n",
             "API_KEY :\n API-MULTILINE\n",
@@ -1079,6 +1112,7 @@ mod tests {
         for marker in [
             "BRACKET-LEAK",
             "MULTILINE-AUTH",
+            "THREE-LINE-AUTH",
             "CRLF-BASIC",
             "PROXY-AUTH",
             "API-MULTILINE",

@@ -9,6 +9,7 @@ use super::{
 
 const CODEX_RESPONSES: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_MAX_OUTPUT_BYTES_PER_TOKEN: usize = 4;
 
 enum CompatMode {
     ChatCompletions,
@@ -99,6 +100,7 @@ impl OpenAiCompatProvider {
     }
 
     pub async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        let codex = matches!(self.mode, CompatMode::CodexResponses);
         let body = match self.mode {
             CompatMode::CodexResponses => build_codex_body(req, false),
             CompatMode::ChatCompletions => build_body(req, false),
@@ -123,6 +125,9 @@ impl OpenAiCompatProvider {
             CompatMode::CodexResponses => parse_codex_response(&text)?,
             CompatMode::ChatCompletions => parse_completion(&text)?,
         };
+        if codex {
+            parsed = enforce_codex_output_limit(parsed, req.max_tokens);
+        }
         parsed.limit = hint;
         Ok(parsed)
     }
@@ -161,7 +166,7 @@ impl OpenAiCompatProvider {
         let mut cache_reported = false;
         let mut finish = None::<String>;
         let mut tool_acc: Vec<(String, String, String)> = Vec::new();
-    let mut stream_model = String::new();
+        let mut stream_model = String::new();
         // tool call 인덱스별로 마지막 진행 발행 시점의 누적 바이트 수.
         let mut args_marks: Vec<usize> = Vec::new();
         let mut reasoning_started = false;
@@ -328,7 +333,7 @@ impl OpenAiCompatProvider {
             .send()
             .await
             .context("Codex API 요청에 실패했습니다")?;
-        let mut stream_model = String::new();
+        let stream_model = String::new();
         let status = resp.status();
         let hint = limit_hint(resp.headers());
         if !status.is_success() {
@@ -370,7 +375,7 @@ impl OpenAiCompatProvider {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
-                apply_codex_event(
+                let output_limit_reached = apply_codex_event(
                     &v,
                     &mut full_text,
                     &mut tools,
@@ -380,7 +385,13 @@ impl OpenAiCompatProvider {
                     &mut cache_reported,
                     &mut finish,
                     Some(&mut on_event),
+                    req.max_tokens,
                 );
+                if output_limit_reached {
+                    tools.clear();
+                    finished = true;
+                    break;
+                }
                 if finish.is_some() {
                     finished = true;
                 }
@@ -397,16 +408,19 @@ impl OpenAiCompatProvider {
             );
         }
 
-        Ok(finish_stream(
-            full_text,
-            tools,
-            finish.as_deref(),
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            cache_reported,
-            hint,
-            stream_model,
+        Ok(enforce_codex_output_limit(
+            finish_stream(
+                full_text,
+                tools,
+                finish.as_deref(),
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                cache_reported,
+                hint,
+                stream_model,
+            ),
+            req.max_tokens,
         ))
     }
 }
@@ -436,6 +450,61 @@ fn parse_tool_args(args: &str) -> Option<Value> {
         return Some(json!({}));
     }
     serde_json::from_str(trimmed).ok()
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn codex_buffered_output_bytes(full_text: &str, tools: &[(String, String, String)]) -> usize {
+    tools
+        .iter()
+        .fold(full_text.len(), |total, (_, name, args)| {
+            total.saturating_add(name.len()).saturating_add(args.len())
+        })
+}
+
+fn codex_response_output_bytes(response: &ChatResponse) -> usize {
+    response.content.iter().fold(0usize, |total, block| {
+        let bytes = match block {
+            ContentBlock::Text { text } => text.len(),
+            ContentBlock::ToolUse { name, input, .. } => {
+                name.len().saturating_add(input.to_string().len())
+            }
+            ContentBlock::ToolResult { content, .. } => content.len(),
+        };
+        total.saturating_add(bytes)
+    })
+}
+
+fn codex_output_byte_limit(max_tokens: u32) -> usize {
+    (max_tokens as usize).saturating_mul(CODEX_MAX_OUTPUT_BYTES_PER_TOKEN)
+}
+
+fn enforce_codex_output_limit(mut response: ChatResponse, max_tokens: u32) -> ChatResponse {
+    let max_output_bytes = codex_output_byte_limit(max_tokens);
+    if max_tokens == 0
+        || (response.output_tokens <= max_tokens
+            && codex_response_output_bytes(&response) <= max_output_bytes)
+    {
+        return response;
+    }
+    let mut remaining = max_output_bytes;
+    response.content.retain_mut(|block| match block {
+        ContentBlock::Text { text } if remaining > 0 => {
+            let keep = utf8_prefix(text, remaining).len();
+            text.truncate(keep);
+            remaining = remaining.saturating_sub(keep);
+            !text.is_empty()
+        }
+        _ => false,
+    });
+    response.stop_reason = StopReason::MaxTokens;
+    response
 }
 
 #[allow(clippy::too_many_arguments)] // 스트림 종결 축이 인자별로 독립적이라 유지
@@ -819,18 +888,29 @@ fn apply_codex_event<F>(
     cache_reported: &mut bool,
     finish: &mut Option<String>,
     mut on_event: Option<&mut F>,
-) where
+    max_tokens: u32,
+) -> bool
+where
     F: FnMut(StreamEvent),
 {
+    let max_output_bytes = if max_tokens == 0 {
+        usize::MAX
+    } else {
+        codex_output_byte_limit(max_tokens)
+    };
+    let mut output_limit_reached = false;
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     if (kind.ends_with("output_text.delta") || kind == "response.output_text.delta")
         && let Some(delta) = v.get("delta").and_then(|x| x.as_str())
         && !delta.is_empty()
     {
-        full_text.push_str(delta);
+        let used = codex_buffered_output_bytes(full_text, tools);
+        let piece = utf8_prefix(delta, max_output_bytes.saturating_sub(used));
+        full_text.push_str(piece);
         if let Some(cb) = on_event.as_mut() {
-            cb(StreamEvent::Text(delta));
+            cb(StreamEvent::Text(piece));
         }
+        output_limit_reached = piece.len() != delta.len();
     }
     if (kind.ends_with("output_item.done") || kind == "response.output_item.done")
         && let Some(item) = v.get("item")
@@ -863,6 +943,12 @@ fn apply_codex_event<F>(
         cached_tokens,
         cache_reported,
     );
+    output_limit_reached |= codex_buffered_output_bytes(full_text, tools) > max_output_bytes;
+    output_limit_reached |= max_tokens > 0 && *output_tokens > max_tokens;
+    if output_limit_reached {
+        *finish = Some("max_tokens".into());
+    }
+    output_limit_reached
 }
 
 fn collect_codex_output(
@@ -965,6 +1051,65 @@ mod usage_tests {
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["model"], "gpt-5.6-sol");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn codex_client_limit_drops_over_budget_tools_and_truncates_utf8() {
+        let response = ChatResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "가나다".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "write_file".into(),
+                    input: json!({"path": "large.txt", "content": "overflow"}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 12,
+            cached_tokens: 0,
+            model: "gpt-5.6-sol".into(),
+            cache_reported: false,
+            limit: LimitHint::default(),
+        };
+        let guarded = enforce_codex_output_limit(response, 2);
+        assert_eq!(guarded.stop_reason, StopReason::MaxTokens);
+        assert_eq!(guarded.content.len(), 1);
+        assert!(matches!(
+            &guarded.content[0],
+            ContentBlock::Text { text } if text == "가나"
+        ));
+    }
+
+    #[test]
+    fn codex_stream_stops_before_emitting_past_the_client_limit() {
+        let event = json!({"type": "response.output_text.delta", "delta": "가나다"});
+        let mut full_text = String::new();
+        let mut tools = Vec::new();
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut cached_tokens = 0;
+        let mut cache_reported = false;
+        let mut finish = None;
+        fn ignore_stream_event(_: StreamEvent<'_>) {}
+        let mut callback = ignore_stream_event;
+        let limited = apply_codex_event(
+            &event,
+            &mut full_text,
+            &mut tools,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_tokens,
+            &mut cache_reported,
+            &mut finish,
+            Some(&mut callback),
+            2,
+        );
+        assert!(limited);
+        assert_eq!(full_text, "가나");
+        assert_eq!(finish.as_deref(), Some("max_tokens"));
     }
 
     #[test]
