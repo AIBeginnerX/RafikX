@@ -120,6 +120,7 @@ pub(super) async fn run_bounded_command(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    crate::process_tree::isolate(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("실행 실패: {error}"))?;
@@ -137,12 +138,12 @@ pub(super) async fn run_bounded_command(
     let status = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            let _ = child.kill().await;
+            crate::process_tree::terminate(&mut child).await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             return Err(format!("실행 대기 실패: {error}"));
         }
         Err(_) => {
-            let _ = child.kill().await;
+            crate::process_tree::terminate(&mut child).await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             return Err(format!("시간 초과 ({}초)", deadline.as_secs()));
         }
@@ -314,9 +315,12 @@ async fn run_step(
     }
 }
 
+fn missing_external_gate_is_nonblocking(language: Language, workspace: &Path) -> bool {
+    language == Language::JavaScript && !workspace.join("package.json").is_file()
+}
+
 /// 품질 게이트 전체 — S0 감지 → S3(포맷·린트·테스트) → S5(내장 스캔 + 의존성 감사).
-/// S3·S5 는 어떤 경우에도 생략되지 않는다: 도구가 없으면 "설치 권장" 기록 후
-/// 내장 스캐너가 최소 보장을 한다.
+/// S3·S5 는 어떤 경우에도 생략되지 않는다.
 pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityReport {
     let lang = profile::detect(workspace, changed);
     let profile = profile::profile_for(lang);
@@ -330,12 +334,17 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     ] {
         let (runnable, missing) = profile::runnable_commands_in(workspace, commands);
         for cmd in missing {
+            let nonblocking = missing_external_gate_is_nonblocking(lang, workspace);
             steps.push(GateStep {
                 stage,
                 command: cmd,
-                passed: true, // 없는 도구로 실패 처리하지 않는다 — 대신 기록
+                passed: nonblocking,
                 exit_code: None,
-                note: Some("도구 미설치 — 설치 시 게이트에 합류".into()),
+                note: Some(if nonblocking {
+                    "패키지 없는 JavaScript — node 구문·브라우저 게이트 적용".into()
+                } else {
+                    "필수 품질 도구 미설치".into()
+                }),
             });
         }
         for cmd in runnable {
@@ -406,12 +415,17 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     }
     // 의존성 감사 — 도구 있으면 실행.
     for (cmd, ok, summary) in security::run_dependency_audit(lang, workspace).await {
+        let nonblocking = missing_external_gate_is_nonblocking(lang, workspace);
         steps.push(GateStep {
             stage: "S5-audit",
             command: cmd.clone(),
-            passed: ok.unwrap_or(true), // 미설치는 실패로 치지 않고 기록
+            passed: ok.unwrap_or(nonblocking),
             exit_code: None,
-            note: Some(redact_local_output(&summary, workspace)),
+            note: Some(if ok.is_none() && !nonblocking {
+                "필수 보안 감사 도구 미설치".into()
+            } else {
+                redact_local_output(&summary, workspace)
+            }),
         });
     }
 
@@ -667,6 +681,9 @@ fn redact_spaced_assignments(text: &str) -> String {
             key_start -= 1;
         }
         let key = &text[key_start..key_end];
+        let authorization = key
+            .trim_matches(['\'', '"'])
+            .eq_ignore_ascii_case("authorization");
         let sensitive =
             looks_like_sensitive_key(key) || (bytes[separator] == b'=' && looks_like_env_key(key));
         if !sensitive {
@@ -683,7 +700,11 @@ fn redact_spaced_assignments(text: &str) -> String {
             continue;
         }
         let mut value_end = value_start;
-        if matches!(bytes[value_start], b'\'' | b'"') {
+        if authorization {
+            while value_end < bytes.len() && bytes[value_end] != b'\n' {
+                value_end += 1;
+            }
+        } else if matches!(bytes[value_start], b'\'' | b'"') {
             let quote = bytes[value_start];
             value_end += 1;
             while value_end < bytes.len() {
@@ -844,6 +865,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn only_package_free_javascript_can_skip_external_profile_tools() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-required-tool-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        assert!(missing_external_gate_is_nonblocking(
+            Language::JavaScript,
+            &root
+        ));
+        assert!(!missing_external_gate_is_nonblocking(Language::Go, &root));
+        std::fs::write(root.join("package.json"), "{}").expect("package manifest");
+        assert!(!missing_external_gate_is_nonblocking(
+            Language::JavaScript,
+            &root
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn quality_command_output_cap_fails_closed() {
@@ -886,7 +927,10 @@ mod tests {
             "S3-test",
             "timeout fixture".into(),
             "sh".into(),
-            vec!["-c".into(), "sleep 1; printf done > SURVIVED".into()],
+            vec![
+                "-c".into(),
+                "(sleep 1; printf done > SURVIVED) & wait".into(),
+            ],
             &root,
             std::time::Duration::from_millis(50),
         )
@@ -897,6 +941,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|note| note.contains("시간 초과"))
         );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert!(!root.join("SURVIVED").exists());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -904,7 +949,7 @@ mod tests {
     #[test]
     fn repair_output_redacts_paths_and_credentials() {
         let workspace = Path::new("/tmp/private-workspace");
-        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret API_KEY = \"hunter2\" {\"api_key\" : \"space secret\"} Cookie: session-value https://evil.test/x?value=query-secret postgres://user:password@host/db";
+        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential\nAuthorization: [Bearer BRACKET-LEAK]\nAWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret API_KEY = \"hunter2\" {\"api_key\" : \"space secret\"} Cookie: session-value https://evil.test/x?value=query-secret postgres://user:password@host/db";
         let redacted = redact_local_output(text, workspace);
         assert!(!redacted.contains("private-workspace"));
         assert!(!redacted.contains("abc123"));
@@ -918,6 +963,7 @@ mod tests {
         assert!(!redacted.contains("user:password"));
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("space secret"));
+        assert!(!redacted.contains("BRACKET-LEAK"));
         assert!(redacted.contains("postgres://[redacted]@host/db"));
     }
 }

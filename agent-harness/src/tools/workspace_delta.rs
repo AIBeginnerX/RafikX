@@ -324,9 +324,9 @@ impl WorkspaceSnapshot {
                 continue;
             };
             let path = entry.into_path();
-            let relative = path.strip_prefix(&root).map_err(|error| {
-                anyhow!("워크스페이스 상대 경로를 확인할 수 없습니다: {error}")
-            })?;
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|error| anyhow!("워크스페이스 상대 경로를 확인할 수 없습니다: {error}"))?;
             let under_excluded_directory = has_excluded_directory(relative);
             if file_type.is_symlink() {
                 let target = path.canonicalize().map_err(|error| {
@@ -355,9 +355,9 @@ impl WorkspaceSnapshot {
             if under_excluded_directory {
                 continue;
             }
-            let normalized = path.canonicalize().map_err(|error| {
-                anyhow!("워크스페이스 파일을 확인할 수 없습니다: {error}")
-            })?;
+            let normalized = path
+                .canonicalize()
+                .map_err(|error| anyhow!("워크스페이스 파일을 확인할 수 없습니다: {error}"))?;
             if !normalized.starts_with(&root) {
                 return Err(anyhow!(
                     "워크스페이스 파일이 경계를 벗어났습니다 ({})",
@@ -441,7 +441,11 @@ mod tests {
             .iter()
             .map(|change| change.path.as_path())
             .collect::<Vec<_>>();
-        let game = root.0.join("game.js").canonicalize().expect("canonical game");
+        let game = root
+            .0
+            .join("game.js")
+            .canonicalize()
+            .expect("canonical game");
         let env = root.0.join(".env").canonicalize().expect("canonical env");
         let cache = root
             .0
@@ -556,12 +560,39 @@ mod tests {
         let before_retarget = WorkspaceSnapshot::capture(&workspace.0).expect("retarget baseline");
         std::fs::remove_file(&link).expect("remove old symlink");
         std::os::unix::fs::symlink("two.txt", &link).expect("retarget internal symlink");
-        let retargeted = before_retarget.changed_baselines().expect("retargeted delta");
+        let retargeted = before_retarget
+            .changed_baselines()
+            .expect("retargeted delta");
         assert!(retargeted.iter().any(|change| change.path == tracked_link));
 
         let before_delete = WorkspaceSnapshot::capture(&workspace.0).expect("delete baseline");
         std::fs::remove_file(&link).expect("delete internal symlink");
         let deleted = before_delete.changed_baselines().expect("deleted delta");
         assert!(deleted.iter().any(|change| change.path == tracked_link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_context_keeps_the_symlink_path_as_evidence_identity() {
+        let workspace = TestDir::new("run-context-link-identity");
+        std::fs::write(workspace.0.join("target.txt"), "target").expect("target fixture");
+        let link = workspace.0.join("current.txt");
+        let tracked_link = workspace
+            .0
+            .canonicalize()
+            .expect("canonical workspace")
+            .join("current.txt");
+        let before = WorkspaceSnapshot::capture(&workspace.0).expect("baseline");
+        std::os::unix::fs::symlink("target.txt", &link).expect("create internal symlink");
+        let changes = before.changed_baselines().expect("created delta");
+        let run = crate::run::RunContext::isolated(
+            crate::run::RunId::new("link-identity"),
+            workspace.0.clone(),
+        );
+        run.record_committed_changes(changes);
+
+        assert_eq!(run.committed_paths(), vec![tracked_link]);
+        std::fs::remove_file(&link).expect("revert symlink creation");
+        assert!(run.committed_paths().is_empty());
     }
 }

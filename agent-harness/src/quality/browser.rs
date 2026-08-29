@@ -420,6 +420,19 @@ fn referenced_changed_sources(
     matched.into_iter().collect()
 }
 
+fn entry_references_source(root: &Path, entry: &Path, source: &Path) -> bool {
+    let Ok(metadata) = entry.metadata() else {
+        return false;
+    };
+    if metadata.len() > MAX_DISCOVERY_HTML_BYTES {
+        return false;
+    }
+    let Ok(html) = std::fs::read_to_string(entry) else {
+        return false;
+    };
+    !referenced_changed_sources(root, entry, &html, &[source.to_path_buf()]).is_empty()
+}
+
 pub(crate) fn discover_entries(
     workspace: &Path,
     changed: &[String],
@@ -462,6 +475,9 @@ pub(crate) fn discover_entries(
     }
 
     for source in &changed_sources {
+        if covered_sources.contains(source) {
+            continue;
+        }
         let joined = root.join(source);
         let Some(parent) = joined.parent() else {
             continue;
@@ -469,15 +485,16 @@ pub(crate) fn discover_entries(
         let Ok(mut directory) = parent.canonicalize() else {
             continue;
         };
-        while directory.starts_with(&root) {
+        'ancestor: while directory.starts_with(&root) {
             for candidate in [
                 directory.join("index.html"),
                 directory.join("public/index.html"),
                 directory.join("www/index.html"),
             ] {
-                if candidate.is_file() {
+                if candidate.is_file() && entry_references_source(&root, &candidate, source) {
                     insert_browser_entry(&mut entries, &root, &candidate)?;
                     covered_sources.insert(source.clone());
+                    break 'ancestor;
                 }
             }
             if directory == root || !directory.pop() {
@@ -501,7 +518,7 @@ pub(crate) fn discover_entries(
             project_root.join("dist/index.html"),
             project_root.join("build/index.html"),
         ] {
-            if candidate.is_file() {
+            if candidate.is_file() && entry_references_source(&root, &candidate, source) {
                 insert_browser_entry(&mut entries, &root, &candidate)?;
                 covered_sources.insert(source.clone());
                 break;
@@ -899,11 +916,12 @@ pub async fn smoke_test(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
+    crate::process_tree::isolate(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?;
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill().await;
+        crate::process_tree::terminate(&mut child).await;
         anyhow::bail!("브라우저 stderr를 열 수 없습니다");
     };
     let stderr_log = Arc::new(Mutex::new(String::new()));
@@ -964,16 +982,14 @@ pub async fn smoke_test(
         match child.try_wait()? {
             Some(status) => (status.success(), status.code()),
             None => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                crate::process_tree::terminate(&mut child).await;
                 (true, Some(0))
             }
         }
     } else if let Some(status) = early_status {
         (status.success(), status.code())
     } else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        crate::process_tree::terminate(&mut child).await;
         let _ = await_stderr_reader(&mut resources).await;
         anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
     };
@@ -1155,10 +1171,39 @@ mod tests {
             .expect("discover referenced entry");
         assert_eq!(
             entries,
-            vec![root
-                .join("demos/custom/launch/index.html")
-                .canonicalize()
-                .expect("entry")]
+            vec![
+                root.join("demos/custom/launch/index.html")
+                    .canonicalize()
+                    .expect("entry")
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unrelated_ancestor_entry_does_not_cover_a_nested_application() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-ancestor-entry-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("app/pages/launch")).expect("entry directory");
+        std::fs::write(root.join("index.html"), "<canvas></canvas>").expect("unrelated root entry");
+        std::fs::write(root.join("app/app.js"), "missingFunction();").expect("changed source");
+        std::fs::write(
+            root.join("app/pages/launch/index.html"),
+            "<script src=\"../../app.js\"></script>",
+        )
+        .expect("related nested entry");
+
+        let entries = discover_entries(&root, &["app/app.js".into()])
+            .expect("discover the related nested entry");
+        assert_eq!(
+            entries,
+            vec![
+                root.join("app/pages/launch/index.html")
+                    .canonicalize()
+                    .expect("entry")
+            ]
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1171,10 +1216,8 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("first")).expect("first directory");
         std::fs::create_dir_all(root.join("second")).expect("second directory");
-        std::fs::write(root.join("first/page.html"), "<canvas></canvas>")
-            .expect("first entry");
-        std::fs::write(root.join("second/page.html"), "<canvas></canvas>")
-            .expect("second entry");
+        std::fs::write(root.join("first/page.html"), "<canvas></canvas>").expect("first entry");
+        std::fs::write(root.join("second/page.html"), "<canvas></canvas>").expect("second entry");
 
         let entries = discover_entries(
             &root,
@@ -1183,7 +1226,14 @@ mod tests {
         .expect("discover entries");
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&root.join("first/page.html").canonicalize().expect("first")));
-        assert!(entries.contains(&root.join("second/page.html").canonicalize().expect("second")));
+        assert!(
+            entries.contains(
+                &root
+                    .join("second/page.html")
+                    .canonicalize()
+                    .expect("second")
+            )
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1288,15 +1338,10 @@ mod tests {
         let entry = workspace.join("index.html");
         std::fs::write(&entry, "<canvas></canvas>").expect("entry");
 
-        let error = stage_web_root_with_limits(
-            &workspace,
-            &entry,
-            &stage,
-            1,
-            Duration::from_secs(1),
-        )
-        .err()
-        .expect("entry limit must fail");
+        let error =
+            stage_web_root_with_limits(&workspace, &entry, &stage, 1, Duration::from_secs(1))
+                .err()
+                .expect("entry limit must fail");
         assert!(error.to_string().contains("항목 수"), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1338,22 +1383,27 @@ mod tests {
         if detect_browser().is_none() {
             return;
         }
-        let root =
-            std::env::temp_dir().join(format!("rafikx-browser-loopback-{}", crate::db::Db::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-loopback-{}",
+            crate::db::Db::new_id()
+        ));
         std::fs::create_dir_all(&root).expect("browser fixture");
         let trap = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback trap");
-        let trap_url = format!("http://{}/private", trap.local_addr().expect("trap address"));
-        let html = format!(
-            "<script>fetch('{trap_url}').catch(() => {{}});</script><canvas></canvas>"
+        let trap_url = format!(
+            "http://{}/private",
+            trap.local_addr().expect("trap address")
         );
+        let html =
+            format!("<script>fetch('{trap_url}').catch(() => {{}});</script><canvas></canvas>");
         let entry = root.join("index.html");
         std::fs::write(&entry, html).expect("browser fixture html");
 
         let result = smoke_test(&root, &entry).await.expect("browser smoke");
         assert!(result.is_some());
-        let reached = tokio::time::timeout(std::time::Duration::from_millis(300), trap.accept()).await;
+        let reached =
+            tokio::time::timeout(std::time::Duration::from_millis(300), trap.accept()).await;
         assert!(reached.is_err(), "page reached a different loopback port");
         let _ = std::fs::remove_dir_all(root);
     }

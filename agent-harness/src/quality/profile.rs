@@ -42,7 +42,7 @@ pub struct LanguageProfile {
     pub format_check: Vec<String>,
     pub lint: Vec<String>,
     pub test: Vec<String>,
-    /// 의존성 감사 명령 — 도구가 없으면 스킵 가능(가용성 검사는 실행기가 한다).
+    /// 의존성 감사 명령 — 가용성 검사는 실행기가 한다.
     pub audit: Vec<String>,
     /// idiom 금지 패턴 — 간단한 텍스트 스캔용 (언어별 최소 세트).
     pub forbidden_patterns: Vec<(String, String)>,
@@ -51,9 +51,7 @@ pub struct LanguageProfile {
 /// 워크스페이스·변경 파일에서 언어를 감지한다 (S0).
 pub fn detect(workspace: &std::path::Path, changed: &[String]) -> Language {
     let has = |marker: &str| workspace.join(marker).exists();
-    let ext_of = |p: &str| {
-        p.rsplit('.').next().unwrap_or("").to_ascii_lowercase()
-    };
+    let ext_of = |p: &str| p.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     // 변경 파일 확장자 우선 — 이번 작업의 언어가 무엇인지가 중요하다.
     let mut counts = std::collections::BTreeMap::new();
     for p in changed {
@@ -163,7 +161,7 @@ pub fn profile_for(lang: Language) -> LanguageProfile {
             vec!["sqlfluff lint .".into()],
             vec![],
             vec![],
-vec![(
+            vec![(
                 "+ \"".into(),
                 "문자열 연결 쿼리 — 파라미터화를 쓴다 (인젝션)".to_string(),
             )],
@@ -181,8 +179,6 @@ vec![(
 }
 
 /// S3 게이트 명령 생성 — 도구 가용성을 검사해 실행 가능한 명령만 남긴다.
-/// 도구가 없는 환경에서 게이트 전체가 무의미해지지 않게: 있는 것만 돌리고
-/// 없는 도구는 보고서에 "설치 권장"으로 남긴다.
 pub fn runnable_commands(commands: &[String]) -> (Vec<String>, Vec<String>) {
     runnable_commands_in(std::path::Path::new("."), commands)
 }

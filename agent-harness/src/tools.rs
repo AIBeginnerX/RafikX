@@ -993,6 +993,7 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .stdin(Stdio::null());
+    crate::process_tree::isolate(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -1041,7 +1042,7 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
 
     match wait {
         Err(_) => {
-            let _ = child.kill().await;
+            crate::process_tree::terminate(&mut child).await;
             Err(anyhow!("명령이 {timeout_secs}초를 넘겨 중단되었습니다"))
         }
         Ok(Err(e)) => Err(anyhow!("명령 실행 오류: {e}")),
@@ -1124,6 +1125,26 @@ mod tests {
         assert!(bash_blocked("python3 -m http.server 8000 >/dev/null &").is_none());
         assert!(bash_blocked("echo x > /dev/sda").is_some());
         assert!(bash_blocked("cat big > /dev/null; echo y > /dev/disk0").is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_descendants() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-bash-tree-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let result = run_bash(
+            "(sleep 2; printf survived > DESCENDANT_SURVIVED) & wait".into(),
+            root.clone(),
+            1,
+        )
+        .await;
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!root.join("DESCENDANT_SURVIVED").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

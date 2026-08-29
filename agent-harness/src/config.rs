@@ -562,7 +562,7 @@ pub fn builtin_profile(name: &str) -> Option<SubAgentConfig> {
                  작업을 마치면 [변경 요약] 머리표 아래에 바꾼 파일과 이유를 한 줄씩 남긴다 — 다음 역할은 이 요약만 받는다.",
         ),
         "reviewer" => (
-            &["read_file", "list_dir", "grep", "bash"],
+            &["read_file", "list_dir", "grep", "glob"],
             // 판정 불능 재질의(§15.1)까지 같은 미니 루프에서 소화하도록 여유를 둔다.
             8,
             false,

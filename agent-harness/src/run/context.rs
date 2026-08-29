@@ -155,23 +155,18 @@ impl RunContext {
         {
             return None;
         }
-        let normalized = match joined.canonicalize() {
-            Ok(path) => path,
-            Err(_) => {
-                let mut ancestor = joined.parent();
-                let mut resolved = None;
-                while let Some(path) = ancestor {
-                    if path.exists() {
-                        let canonical = path.canonicalize().ok()?;
-                        let suffix = joined.strip_prefix(path).ok()?;
-                        resolved = Some(canonical.join(suffix));
-                        break;
-                    }
-                    ancestor = path.parent();
-                }
-                resolved?
+        let mut ancestor = joined.parent();
+        let mut resolved = None;
+        while let Some(path) = ancestor {
+            if path.exists() {
+                let canonical = path.canonicalize().ok()?;
+                let suffix = joined.strip_prefix(path).ok()?;
+                resolved = Some(canonical.join(suffix));
+                break;
             }
-        };
+            ancestor = path.parent();
+        }
+        let normalized = resolved?;
         normalized.starts_with(&workspace).then_some(normalized)
     }
 

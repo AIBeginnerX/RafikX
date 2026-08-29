@@ -42,6 +42,7 @@ pub fn lane_tool_allowlist(profile: &str) -> Option<&'static [&'static str]> {
             "todo_read",
         ]),
         "researcher" => Some(&["web_search", "webfetch", "read_file"]),
+        "reviewer" => Some(&["read_file", "list_dir", "grep", "glob"]),
         _ => None,
     }
 }

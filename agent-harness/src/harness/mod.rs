@@ -517,7 +517,8 @@ mod tests {
 
         let reviewer = resolve_profile(&cfg, "reviewer").expect("reviewer 프리셋");
         assert_eq!(reviewer.max_iterations, REVIEW_GATE_MAX_ITER);
-        assert!(reviewer.tools.iter().any(|t| t == "bash"));
+        assert!(reviewer.tools.iter().any(|t| t == "glob"));
+        assert!(!reviewer.tools.iter().any(|t| t == "bash"));
         assert!(!reviewer.tools.iter().any(|t| t == "write_file"));
         assert!(reviewer.system_extra.contains("[판정]"));
         assert!(reviewer.system_extra.contains("[미충족 항목]"));

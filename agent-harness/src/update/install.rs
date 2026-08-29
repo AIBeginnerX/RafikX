@@ -1,4 +1,9 @@
-use std::process::Command;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+#[cfg(windows)]
+use std::process::Stdio;
 
 use super::{GIT_UPD_TOKEN_ENV, GIT_UPD_USER_ENV, GIT_URL};
 
@@ -34,76 +39,231 @@ impl<'a> ValidatedTag<'a> {
 
 pub(super) fn perform_install(raw_tag: &str) -> anyhow::Result<()> {
     let tag = ValidatedTag::parse(raw_tag)?;
-    let mut command = Command::new("sh");
-    command.args(install_args(tag));
+    let root = TempRoot::new()?;
+    let source = prepare_source(tag, root.path())?;
+
+    #[cfg(not(windows))]
+    {
+        let mut cargo = sanitized_command("cargo");
+        cargo
+            .args(["install", "--path"])
+            .arg(source.join("agent-harness"))
+            .args(["--locked", "--force"]);
+        run_status(&mut cargo, "cargo install")?;
+        println!();
+        println!("업그레이드 완료 — `rafikx` 를 다시 실행하세요.");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let install_root = root.path().join("install");
+        let mut cargo = sanitized_command("cargo");
+        cargo
+            .args(["install", "--root"])
+            .arg(&install_root)
+            .args(["--path"])
+            .arg(source.join("agent-harness"))
+            .args(["--locked", "--force"]);
+        run_status(&mut cargo, "cargo install")?;
+        let staged = install_root.join("bin/rafikx.exe");
+        if !staged.is_file() {
+            anyhow::bail!(
+                "업데이트 실행 파일을 찾을 수 없습니다: {}",
+                staged.display()
+            );
+        }
+        let current = std::env::current_exe()?;
+        spawn_windows_finalizer(std::process::id(), &staged, &current, root.path())?;
+        let _ = root.persist();
+        println!();
+        println!("업데이트 파일 준비 완료 — 현재 프로세스 종료 후 자동 교체됩니다.");
+        Ok(())
+    }
+}
+
+struct TempRoot {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl TempRoot {
+    fn new() -> anyhow::Result<Self> {
+        let path = std::env::temp_dir().join(format!("rafikx-update-{}", crate::db::Db::new_id()));
+        std::fs::create_dir(&path)?;
+        Ok(Self {
+            path,
+            cleanup: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(windows)]
+    fn persist(mut self) -> PathBuf {
+        self.cleanup = false;
+        self.path.clone()
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn sanitized_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for name in [
+        GIT_UPD_USER_ENV,
+        GIT_UPD_TOKEN_ENV,
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
     command
-        .env_remove(GIT_UPD_USER_ENV)
-        .env_remove(GIT_UPD_TOKEN_ENV)
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN");
-    if let (Some(owner), Some(token)) = (super::repo_owner(), super::owner_token()) {
-        // 비공개 저장소 fetch 도 활성 계정 대신 소유자 자격으로 수행한다.
-        command.env(GIT_UPD_USER_ENV, owner);
-        command.env(GIT_UPD_TOKEN_ENV, token);
-    }
-    let status = command.status()?;
+}
+
+fn run_status(command: &mut Command, action: &str) -> anyhow::Result<()> {
+    let status = command
+        .status()
+        .map_err(|error| anyhow::anyhow!("{action} 실행 실패: {error}"))?;
     if !status.success() {
-        anyhow::bail!("업그레이드 실패 (exit {})", status.code().unwrap_or(-1));
+        anyhow::bail!("{action} 실패 (exit {})", status.code().unwrap_or(-1));
     }
-    println!();
-    println!("업그레이드 완료 — `rafikx` 를 다시 실행하세요.");
     Ok(())
 }
 
-fn install_args<'a>(tag: ValidatedTag<'a>) -> [&'a str; 5] {
-    [
-        "-c",
-        install_script(),
-        "rafikx-updater",
-        tag.as_str(),
-        GIT_URL,
-    ]
+fn checked_output(command: &mut Command, action: &str) -> anyhow::Result<String> {
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = command
+        .output()
+        .map_err(|error| anyhow::anyhow!("{action} 실행 실패: {error}"))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
+        anyhow::bail!("{action} 실패: {}", detail.trim());
+    }
+    if stdout.len() > 4096 || stderr.len() > 4096 {
+        anyhow::bail!("{action} 출력이 상한을 초과했습니다");
+    }
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
-fn install_script() -> &'static str {
-    r#"
-set -eu
-TAG="$1"
-REPO="$2"
-TAG_REF="refs/tags/$TAG"
-TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/rafikx-update.XXXXXX")
-trap 'rm -rf "$TMP_ROOT"' EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-SRC="$TMP_ROOT/source"
-CRED_FLAGS=""
-if [ -n "${GIT_UPD_TOKEN:-}" ]; then
-  # 저장소 소유자 토큰만 쓰는 1회용 credential helper(기존 helper 는 차단).
-  # 토큰은 파일에 담지 않고 env 로만 흐른다. TMPDIR 경로에 공백이 없다는 전제.
-  cat >"$TMP_ROOT/cred.sh" <<'RAF_CRED'
-#!/bin/sh
-printf 'protocol=https\nhost=github.com\nusername=%s\npassword=%s\n\n' "$GIT_UPD_USER" "$GIT_UPD_TOKEN"
-RAF_CRED
-  chmod 700 "$TMP_ROOT/cred.sh"
-  CRED_FLAGS="-c credential.helper= -c credential.helper=!$TMP_ROOT/cred.sh"
-fi
-git init -q "$SRC"
-git -C "$SRC" remote add origin "$REPO"
-# shellcheck disable=SC2086 — CRED_FLAGS 의 의도적 word-splitting
-git -C "$SRC" $CRED_FLAGS fetch --depth 1 origin "$TAG_REF:$TAG_REF"
-unset GIT_UPD_USER GIT_UPD_TOKEN
-rm -f "$TMP_ROOT/cred.sh"
-CRED_FLAGS=""
-git -C "$SRC" checkout -q --detach "$TAG_REF"
-HEAD=$(git -C "$SRC" rev-parse --verify "HEAD^{commit}")
-TAG_HEAD=$(git -C "$SRC" rev-parse --verify "$TAG_REF^{commit}")
-if [ "$HEAD" != "$TAG_HEAD" ]; then
-  echo "릴리스 태그 검증 실패: $TAG" >&2
-  exit 1
-fi
-cargo install --path "$SRC/agent-harness" --locked --force
+fn tag_ref(tag: ValidatedTag<'_>) -> String {
+    format!("refs/tags/{}", tag.as_str())
+}
+
+fn prepare_source(tag: ValidatedTag<'_>, root: &Path) -> anyhow::Result<PathBuf> {
+    let source = root.join("source");
+    let reference = tag_ref(tag);
+
+    let mut init = sanitized_command("git");
+    init.args(["init", "-q"]).arg(&source);
+    run_status(&mut init, "git init")?;
+
+    let mut remote = sanitized_command("git");
+    remote
+        .arg("-C")
+        .arg(&source)
+        .args(["remote", "add", "origin", GIT_URL]);
+    run_status(&mut remote, "git remote add")?;
+
+    let mut fetch = sanitized_command("git");
+    fetch.arg("-C").arg(&source);
+    super::apply_git_credentials(&mut fetch);
+    fetch.args([
+        "fetch",
+        "--depth",
+        "1",
+        "origin",
+        &format!("{reference}:{reference}"),
+    ]);
+    run_status(&mut fetch, "git fetch")?;
+
+    let mut checkout = sanitized_command("git");
+    checkout
+        .arg("-C")
+        .arg(&source)
+        .args(["checkout", "-q", "--detach", &reference]);
+    run_status(&mut checkout, "git checkout")?;
+
+    let mut head = sanitized_command("git");
+    head.arg("-C")
+        .arg(&source)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"]);
+    let head = checked_output(&mut head, "git rev-parse HEAD")?;
+
+    let mut tag_head = sanitized_command("git");
+    tag_head.arg("-C").arg(&source).args([
+        "rev-parse",
+        "--verify",
+        &format!("{reference}^{{commit}}"),
+    ]);
+    let tag_head = checked_output(&mut tag_head, "git rev-parse tag")?;
+    if head != tag_head {
+        anyhow::bail!("릴리스 태그 검증 실패: {}", tag.as_str());
+    }
+    Ok(source)
+}
+
+#[cfg(any(windows, test))]
+fn windows_finalize_script() -> &'static str {
+    r#"$ErrorActionPreference = 'Stop'
+$parentId = [int]$env:RAFIKX_UPDATE_PARENT
+$source = $env:RAFIKX_UPDATE_SOURCE
+$destination = $env:RAFIKX_UPDATE_DESTINATION
+$root = $env:RAFIKX_UPDATE_ROOT
+Wait-Process -Id $parentId -ErrorAction SilentlyContinue
+$copied = $false
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    try {
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+        $copied = $true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 250
+    }
+}
+if (-not $copied) { throw 'RafikX 실행 파일 교체 실패' }
+Remove-Item -LiteralPath $root -Recurse -Force
 "#
+}
+
+#[cfg(windows)]
+fn spawn_windows_finalizer(
+    parent: u32,
+    source: &Path,
+    destination: &Path,
+    root: &Path,
+) -> anyhow::Result<()> {
+    let mut command = sanitized_command("powershell.exe");
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            windows_finalize_script(),
+        ])
+        .env("RAFIKX_UPDATE_PARENT", parent.to_string())
+        .env("RAFIKX_UPDATE_SOURCE", source)
+        .env("RAFIKX_UPDATE_DESTINATION", destination)
+        .env("RAFIKX_UPDATE_ROOT", root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -142,65 +302,46 @@ mod tests {
     }
 
     #[test]
-    fn targets_exact_ref_when_installing_discovered_tag() {
+    fn native_checkout_targets_the_exact_release_ref() {
         let tag = ValidatedTag::parse("v1.2.3").expect("valid release tag");
-        let args = install_args(tag);
-        let script = install_script();
-
-        assert_eq!(args, ["-c", script, "rafikx-updater", "v1.2.3", GIT_URL]);
-        assert!(script.contains("TAG=\"$1\""));
-        assert!(script.contains("REPO=\"$2\""));
-        assert!(script.contains("refs/tags/$TAG"));
-        assert!(script.contains("fetch --depth 1 origin \"$TAG_REF:$TAG_REF\""));
-        assert!(script.contains("checkout -q --detach \"$TAG_REF\""));
-        assert!(script.contains("rev-parse --verify \"$TAG_REF^{commit}\""));
-        assert!(script.contains("mktemp -d"));
-        assert!(script.contains("trap 'rm -rf"));
-        assert!(script.contains("cargo install --path"));
-        let mktemp = script
-            .find("mktemp -d")
-            .expect("temporary checkout creation");
-        let cleanup = script.find("trap 'rm -rf").expect("cleanup trap");
-        let git = script.find("git init").expect("git initialization");
-        let cargo = script.find("cargo install").expect("cargo installation");
-        assert!(mktemp < cleanup && cleanup < git && git < cargo);
-        assert!(!script.contains("master"));
-        assert!(!script.contains(".rafikx-src"));
+        assert_eq!(tag_ref(tag), "refs/tags/v1.2.3");
+        assert_eq!(
+            format!("{}^{{commit}}", tag_ref(tag)),
+            "refs/tags/v1.2.3^{commit}"
+        );
     }
 
     #[test]
-    fn credentials_exist_only_until_the_authenticated_fetch() {
-        let script = install_script();
-        // 토큰이 없으면 플래그 주입도 헬퍼 생성도 없다(기존 동작 유지).
-        assert!(script.contains("CRED_FLAGS=\"\""));
-        // 헬퍼 파일은 쓰기 시점 확장 금지(quoted heredoc) → env 참조만 담는다.
-        assert!(script.contains("<<'RAF_CRED'"));
-        assert_eq!(script.matches("\"$GIT_UPD_TOKEN\"").count(), 1);
-        let guard = script
-            .find("[ -n \"${GIT_UPD_TOKEN:-}\" ]")
-            .expect("token presence guard");
-        let helper_write = script
-            .find("cat >\"$TMP_ROOT/cred.sh\"")
-            .expect("one-shot helper creation");
-        let cred_flags = script
-            .find("CRED_FLAGS=\"-c credential.helper=")
-            .expect("helper swap flags");
-        let git_init = script.find("git init").expect("git initialization");
-        assert!(guard < helper_write && helper_write < cred_flags && cred_flags < git_init);
-        let fetch = script
-            .find("$CRED_FLAGS fetch --depth 1 origin")
-            .expect("fetch consumes injected flags");
-        let checkout = script
-            .find("checkout -q --detach \"$TAG_REF\"")
-            .expect("exact-ref checkout");
-        let unset = script
-            .find("unset GIT_UPD_USER GIT_UPD_TOKEN")
-            .expect("credential environment cleanup");
-        let helper_cleanup = script
-            .find("rm -f \"$TMP_ROOT/cred.sh\"")
-            .expect("credential helper cleanup");
-        let cargo = script.find("cargo install").expect("cargo installation");
-        assert!(fetch < unset && unset < helper_cleanup && helper_cleanup < checkout);
-        assert!(helper_cleanup < cargo);
+    fn every_non_fetch_command_starts_with_update_credentials_removed() {
+        let command = sanitized_command("git");
+        let removed = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value
+                    .is_none()
+                    .then_some(name.to_string_lossy().to_string())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            removed,
+            [
+                GIT_UPD_USER_ENV.to_string(),
+                GIT_UPD_TOKEN_ENV.to_string(),
+                "GH_TOKEN".to_string(),
+                "GITHUB_TOKEN".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn windows_finalizer_waits_for_exit_before_replacing_the_binary() {
+        let script = windows_finalize_script();
+        let wait = script.find("Wait-Process").expect("parent wait");
+        let copy = script.find("Copy-Item").expect("binary replacement");
+        let cleanup = script.find("Remove-Item").expect("temporary cleanup");
+        assert!(wait < copy && copy < cleanup);
+        assert!(!script.contains("GIT_UPD_TOKEN"));
     }
 }

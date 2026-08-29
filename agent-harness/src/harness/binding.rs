@@ -67,7 +67,12 @@ pub(crate) fn combo_chain_specs(cfg: &Config, combo_name: &str) -> Result<Vec<St
     Ok(specs.iter().take(COMBO_MAX_HOPS).cloned().collect())
 }
 
-fn bind_combo(cfg: &Config, class: TaskClass, profile_override: Option<&str>, combo_name: &str) -> Result<Binding> {
+fn bind_combo(
+    cfg: &Config,
+    class: TaskClass,
+    profile_override: Option<&str>,
+    combo_name: &str,
+) -> Result<Binding> {
     let specs = combo_chain_specs(cfg, combo_name)?;
     let profile_name = profile_override
         .map(|p| p.trim().to_string())
@@ -190,7 +195,12 @@ pub fn bind_profile(
     }
 
     let window = crate::packer::context_window_for(&provider_name, &model, Some(p));
-    let tools = with_memory_tools(&lane_filtered_tools(&profile_name, &sub.tools));
+    let lane_tools = lane_filtered_tools(&profile_name, &sub.tools);
+    let tools = if profile_name.eq_ignore_ascii_case("reviewer") {
+        lane_tools
+    } else {
+        with_memory_tools(&lane_tools)
+    };
     Ok(Binding {
         combo_chain: Vec::new(),
         class,
@@ -501,7 +511,11 @@ fn parse_manual_spec(spec: &str) -> (Option<String>, String) {
     (None, t.to_string())
 }
 
-pub(crate) fn resolve_spec(cfg: &Config, spec: &str, needs_tools: bool) -> Result<(String, String)> {
+pub(crate) fn resolve_spec(
+    cfg: &Config,
+    spec: &str,
+    needs_tools: bool,
+) -> Result<(String, String)> {
     let (p, m) = parse_manual_spec(spec);
     if let Some(p) = p {
         ensure_connected(cfg, &p)?;
@@ -1553,7 +1567,12 @@ mod lane_filter_tests {
     fn explorer_binding_excludes_mutation_tools() {
         let filtered = lane_filtered_tools(
             "explorer",
-            &["read_file".into(), "edit_file".into(), "bash".into(), "grep".into()],
+            &[
+                "read_file".into(),
+                "edit_file".into(),
+                "bash".into(),
+                "grep".into(),
+            ],
         );
         assert_eq!(filtered, vec!["read_file", "grep"]);
     }
@@ -1562,9 +1581,29 @@ mod lane_filter_tests {
     fn researcher_binding_keeps_only_web_and_read() {
         let filtered = lane_filtered_tools(
             "researcher",
-            &["web_search".into(), "write_file".into(), "read_file".into(), "bash".into()],
+            &[
+                "web_search".into(),
+                "write_file".into(),
+                "read_file".into(),
+                "bash".into(),
+            ],
         );
         assert_eq!(filtered, vec!["web_search", "read_file"]);
+    }
+
+    #[test]
+    fn reviewer_binding_excludes_every_mutating_or_executable_tool() {
+        let filtered = lane_filtered_tools(
+            "reviewer",
+            &[
+                "read_file".into(),
+                "write_file".into(),
+                "bash".into(),
+                "grep".into(),
+                "remember".into(),
+            ],
+        );
+        assert_eq!(filtered, vec!["read_file", "grep"]);
     }
 
     #[test]
@@ -1577,9 +1616,24 @@ mod lane_filter_tests {
     #[test]
     fn builtin_lane_presets_exist_with_read_only_tools() {
         let explorer = crate::config::builtin_profile("explorer").expect("explorer 프리셋");
-        assert!(explorer.tools.iter().all(|t| !["edit_file", "multi_edit", "write_file", "apply_patch", "bash"].contains(&t.as_str())));
+        assert!(explorer.tools.iter().all(|t| {
+            ![
+                "edit_file",
+                "multi_edit",
+                "write_file",
+                "apply_patch",
+                "bash",
+            ]
+            .contains(&t.as_str())
+        }));
         let researcher = crate::config::builtin_profile("researcher").expect("researcher 프리셋");
         assert!(researcher.tools.contains(&"web_search".to_string()));
+        let reviewer = crate::config::builtin_profile("reviewer").expect("reviewer 프리셋");
+        assert!(reviewer.tools.iter().all(|tool| {
+            crate::harness::lane_tool_allowlist("reviewer")
+                .expect("reviewer allowlist")
+                .contains(&tool.as_str())
+        }));
     }
 }
 
@@ -1661,8 +1715,14 @@ mod memory_tool_tests {
 
     #[test]
     fn memory_intent_is_not_simple() {
-        assert_ne!(crate::harness::classify_rules("이 프로젝트는 pytest 써. 기억해줘", false), crate::harness::TaskClass::Simple);
-        assert_ne!(crate::harness::classify_rules("이전에 뭐라고 했는지 기억나?", false), crate::harness::TaskClass::Simple);
+        assert_ne!(
+            crate::harness::classify_rules("이 프로젝트는 pytest 써. 기억해줘", false),
+            crate::harness::TaskClass::Simple
+        );
+        assert_ne!(
+            crate::harness::classify_rules("이전에 뭐라고 했는지 기억나?", false),
+            crate::harness::TaskClass::Simple
+        );
     }
 }
 

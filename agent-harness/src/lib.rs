@@ -28,6 +28,7 @@ pub mod obsidian;
 pub mod packer;
 pub mod palette;
 pub mod provider;
+mod process_tree;
 pub mod quality;
 pub mod ranks;
 pub mod rpc;
