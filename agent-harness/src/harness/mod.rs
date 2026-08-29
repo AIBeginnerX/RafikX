@@ -526,18 +526,14 @@ mod tests {
             gate_action(fail(), 1, false),
             GateAction::Report("[결함] 테스트 없음".into())
         );
-        // 판정 불능: 재질의는 실행당 1회, 그 뒤에도 불능이면 통과로 진행하되 구분해 남긴다.
+        // 판정 불능: 재질의는 실행당 1회, 그 뒤에도 불능이면 통과가 아니라 실패 보고다 (M2: G11).
         assert_eq!(
             gate_action(ReviewVerdict::Indeterminate, 0, false),
             GateAction::Requery
         );
         assert_eq!(
             gate_action(ReviewVerdict::Indeterminate, 0, true),
-            GateAction::AcceptUnknown
-        );
-        assert_eq!(
-            gate_action(ReviewVerdict::Indeterminate, 1, true),
-            GateAction::AcceptUnknown
+            GateAction::Report("판정 불능 — 검증자가 판정하지 못했다".into())
         );
         assert_eq!(
             verdict_headline("[결함] 테스트 없음\n둘째 줄"),

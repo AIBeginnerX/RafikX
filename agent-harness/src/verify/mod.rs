@@ -7,8 +7,10 @@
 //! 두 타입의 생성자가 이 모듈 내부에만 존재하기 때문이다(가시성으로 봉인).
 
 pub mod guard;
+pub mod plan;
 pub mod runner;
 pub mod task;
 
-pub use runner::run_task_verification;
+pub use plan::PlanDoc;
+pub use runner::{ratchet_check, run_task_verification};
 pub use task::{TaskDoc, TaskState};

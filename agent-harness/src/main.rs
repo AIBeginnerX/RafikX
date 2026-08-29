@@ -84,6 +84,11 @@ enum Commands {
         /// 태스크 문서 경로 (JSON)
         path: String,
     },
+    /// 계획 문서(JSON)의 AC 커버리지 매트릭스를 검사한다 — 매핑 누락은 확정 거부.
+    VerifyPlan {
+        /// 계획 문서 경로 (JSON)
+        path: String,
+    },
     /// MCP 서버 모드 (facts 메모리 remember/recall/forget/list 를 stdio MCP로 노출)
     McpServe,
     /// 새 릴리스 확인 후 업그레이드 진행 (에이전트 밖에서 단독 실행)
@@ -270,6 +275,7 @@ async fn main() -> ExitCode {
         Some(Commands::InitDeep) => cmd_init_deep(&cli),
         Some(Commands::Quota) => cmd_quota(&cli),
         Some(Commands::VerifyTask { path }) => cmd_verify_task(path).await,
+        Some(Commands::VerifyPlan { path }) => cmd_verify_plan(path),
         Some(Commands::McpServe) => rafikx::mcp_serve::stdio().await,
         Some(Commands::Update) => rafikx::update::run_update_flow(),
         Some(Commands::Lessons { action }) => cmd_lessons(&cli, action),
@@ -997,6 +1003,32 @@ async fn cmd_verify_task(path: &str) -> Result<()> {
         "state_before": task.state,
     });
     rafikx::verify::runner::append_ledger(&ledger, &event)?;
+    let mut outcome = outcome;
+    // 품질 래칫 — 통과 테스트 수가 과거 최고점에서 후퇴했으면 완료를 뺏는다 (G17).
+    if let rafikx::verify::task::TaskOutcome::Done(report) = &outcome {
+        let current = report
+            .results
+            .results
+            .iter()
+            .filter_map(|e| e.tests_passed)
+            .max()
+            .unwrap_or(0);
+        if current > 0 {
+            if let Some(violation) = rafikx::verify::ratchet_check(&ledger, current) {
+                println!("  ✗ {violation}");
+                outcome = rafikx::verify::task::TaskOutcome::Rework(violation);
+            } else {
+                rafikx::verify::runner::append_ledger(
+                    &ledger,
+                    &serde_json::json!({
+                        "event": "metric",
+                        "task_id": task.id,
+                        "tests_passed": current
+                    }),
+                )?;
+            }
+        }
+    }
     let state = *task.apply(outcome);
     if let TaskState::Done = state {
         let n = task.verification.len();
@@ -1016,6 +1048,28 @@ async fn cmd_verify_task(path: &str) -> Result<()> {
         TaskState::Done => Ok(()),
         _ => Err(anyhow::anyhow!("verification failed — 상태 {state:?}")),
     }
+}
+
+/// verify-plan — 계획 데이터의 AC 커버리지·태스크 검증 가능성을 검사한다 (M2).
+fn cmd_verify_plan(path: &str) -> Result<()> {
+    let plan = rafikx::verify::PlanDoc::load(std::path::Path::new(path))?;
+    print!("{}", plan.coverage_matrix());
+    let violations = plan.coverage_violations();
+    if violations.is_empty() {
+        println!(
+            "[verify-plan] 확정 가능 — AC {}개가 태스크 {}개에 모두 매핑됐습니다",
+            plan.acceptance.len(),
+            plan.task_docs().len()
+        );
+        return Ok(());
+    }
+    for v in &violations {
+        println!("  ✗ {v}");
+    }
+    Err(anyhow::anyhow!(
+        "계획 확정 거부 — 위반 {}건을 고친 뒤 다시 검사하세요",
+        violations.len()
+    ))
 }
 
 fn cmd_quota(cli: &Cli) -> Result<()> {

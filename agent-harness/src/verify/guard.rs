@@ -69,6 +69,23 @@ pub fn check_test_integrity(diff_text: &str) -> Vec<String> {
     violations
 }
 
+/// tests/acceptance/ 는 SPEC 동결 산출물 — Executor 의 어떤 변경도 승인 사유 없이는 금지.
+pub fn check_acceptance_immutable(diff_text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut flagged = std::collections::HashSet::new();
+    for line in diff_text.lines() {
+        let Some(path) = line.strip_prefix("+++ b/") else {
+            continue;
+        };
+        if path.contains("tests/acceptance/") && flagged.insert(path.to_string()) {
+            violations.push(format!(
+                "인수 테스트 불변: {path} 는 SPEC 동결 산출물 — 검증자 승인 없이 수정 금지"
+            ));
+        }
+    }
+    violations
+}
+
 fn is_test_path(path: &str) -> bool {
     path.contains("tests/")
         || path.contains("_test")

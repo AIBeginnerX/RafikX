@@ -37,6 +37,7 @@ async fn run_cmd(cmd: &str, timeout_secs: u64) -> Evidence {
             output_tail: format!("시간 초과 ({timeout_secs}초)"),
             diff_stat: None,
             guard: None,
+            tests_passed: None,
             recorded_at: now_secs(),
         },
         Ok(Err(e)) => Evidence {
@@ -48,6 +49,7 @@ async fn run_cmd(cmd: &str, timeout_secs: u64) -> Evidence {
             output_tail: format!("실행 실패: {e}"),
             diff_stat: None,
             guard: None,
+            tests_passed: None,
             recorded_at: now_secs(),
         },
         Ok(Ok(out)) => {
@@ -68,12 +70,57 @@ async fn run_cmd(cmd: &str, timeout_secs: u64) -> Evidence {
                 expect_exit: 0,
                 passed: exit_code == Some(0),
                 duration_ms,
-                output_tail: tail,
+                output_tail: tail.clone(),
                 diff_stat: None,
                 guard: None,
                 recorded_at: now_secs(),
+                tests_passed: parse_tests_passed(&tail),
             }
         }
+    }
+}
+
+/// cargo/go 스타일 출력에서 통과 테스트 수를 뽑는다 ("test result: ok. 12 passed…").
+pub(crate) fn parse_tests_passed(output: &str) -> Option<u32> {
+    for line in output.lines() {
+        let Some(idx) = line.find(" passed") else {
+            continue;
+        };
+        let before = &line[..idx];
+        let num: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(n) = num.parse::<u32>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// 품질 래칫 — LEDGER 원장의 과거 최고 통과 테스트 수와 비교해 후퇴를 잡는다 (G17).
+pub fn ratchet_check(ledger_path: &std::path::Path, current: u32) -> Option<String> {
+    let raw = std::fs::read_to_string(ledger_path).ok()?;
+    let mut best: Option<u32> = None;
+    for line in raw.lines() {
+        let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(n) = ev.get("tests_passed").and_then(|v| v.as_u64()) {
+            best = Some(best.map_or(n as u32, |b: u32| b.max(n as u32)));
+        }
+    }
+    let peak = best?;
+    if current < peak {
+        Some(format!(
+            "테스트 수 래칫 위반: 과거 최고 {peak}회에서 {current}회로 후퇴했다"
+        ))
+    } else {
+        None
     }
 }
 
@@ -134,8 +181,11 @@ pub async fn run_task_verification(
         .map(str::is_empty)
         .unwrap_or(true);
 
-    // 3) 테스트 무결성 가드.
-    let violations = guard::check_test_integrity(diff.diff_text.as_deref().unwrap_or(""));
+    // 3) 테스트 무결성 가드 + 인수 테스트 불변.
+    let mut violations = guard::check_test_integrity(diff.diff_text.as_deref().unwrap_or(""));
+    violations.extend(guard::check_acceptance_immutable(
+        diff.diff_text.as_deref().unwrap_or(""),
+    ));
 
     // 4) 판정 — 시스템 규칙만 적용한다.
     if !results.all_passed {
@@ -231,6 +281,35 @@ mod tests {
         let state = t.apply(outcome);
         assert_eq!(*state, TaskState::Rework, "diff 부재는 Rework");
         assert!(t.evidence.last().unwrap().output_tail.contains("diff 부재"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ratchet_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cargo_test_counts() {
+        let out = "running 5 tests\ntest a ... ok\ntest b ... ok\n\ntest result: ok. 12 passed; 0 failed; 0 ignored\n";
+        assert_eq!(parse_tests_passed(out), Some(12));
+        assert_eq!(parse_tests_passed("no test output"), None);
+    }
+
+    #[test]
+    fn ratchet_blocks_regression_but_allows_progress() {
+        let dir = std::env::temp_dir().join(format!("rk-ratchet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("LEDGER.jsonl");
+        std::fs::write(
+            &ledger,
+            "{\"event\":\"metric\",\"tests_passed\":20}\n{\"event\":\"other\"}\n",
+        )
+        .unwrap();
+        assert!(ratchet_check(&ledger, 19).is_some(), "후퇴 감지");
+        assert!(ratchet_check(&ledger, 20).is_none(), "동점은 통과");
+        assert!(ratchet_check(&ledger, 21).is_none(), "진행은 통과");
+        assert!(ratchet_check(&dir.join("none.jsonl"), 1).is_none(), "원장 없음 = 래칫 없음");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

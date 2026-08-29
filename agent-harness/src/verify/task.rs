@@ -68,6 +68,9 @@ pub struct Evidence {
     pub diff_stat: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<Vec<String>>,
+    /// 검증 출력에서 파싱한 통과 테스트 수 — 래칫(후퇴 감지)의 원천.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<u32>,
     pub recorded_at: i64,
 }
 
@@ -175,6 +178,7 @@ impl TaskDoc {
                     output_tail: reason.chars().take(500).collect(),
                     diff_stat: None,
                     guard: None,
+                    tests_passed: None,
                     recorded_at: now_secs(),
                 });
             }
@@ -189,6 +193,7 @@ impl TaskDoc {
                     output_tail: reason.chars().take(500).collect(),
                     diff_stat: None,
                     guard: None,
+                    tests_passed: None,
                     recorded_at: now_secs(),
                 });
             }
@@ -241,6 +246,7 @@ mod tests {
             output_tail: String::new(),
             diff_stat: Some("1 file changed".into()),
             guard: None,
+            tests_passed: Some(12),
             recorded_at: 0,
         }]);
         let report = VerifiedReport {

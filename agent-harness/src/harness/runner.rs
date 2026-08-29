@@ -243,6 +243,7 @@ pub(crate) const PLAN_CONTRACT_INSTRUCTION: &str = "\
     [완료 기준] 검증 가능한 체크리스트 3~10항목. 각 항목은 '무엇이 충족되어야 하는가'와 \
     '어떻게 확인하는가(명령·파일·관찰 대상)'를 함께 적는다.\n\
     [작업 분해] 실행 순서 3~9단계. 각 단계는 한 줄로 적고 결과물을 명시한다.\n\
+    [매핑] 완료 기준(AC) 항목마다 어떤 단계가 충족하는지 표시하라 — 매핑되지 않은 기준이 하나라도 있으면 계획은 불완전하다(MUST).
     [반박] 이 계획을 실패시킬 가장 유력한 위험 1개와 그것을 조기 확인할 최소 테스트 1개.
     [질문] 실행을 바꿀 수 있는 분기점이 남아 있을 때만 한두 개로 모은다. 사소한 모호함은     [해석]의 채택 해석으로 처리하고 묻지 않는다(확인 연극 금지). 분기점이 없으면 '없음'이라고만 적는다.";
 
@@ -1439,6 +1440,11 @@ async fn run_verify(
 ) -> Result<AgentOutcome> {
     let mut cmd = binding.verify_command.clone();
     if cmd.trim().is_empty() {
+        if outcome.changed_files.is_empty() {
+            // 변경이 없으면 검증할 것도 없다 — 질문·조사 턴이 회귀 게이트를 돌지 않는다.
+            crate::ui::live_line_in(&run_context, "검증 생략: 변경된 파일이 없습니다.");
+            return Ok(outcome);
+        }
         cmd = auto_verify_command(cfg, &outcome.changed_files);
     }
     if cmd.is_empty() {
@@ -1644,7 +1650,6 @@ pub(crate) enum GateAction {
     /// 판정 불능 — 리뷰어에게 결론만 한 줄 다시 묻는다 (실행당 1회).
     Requery,
     /// 재질의 후에도 판정 불능 — 통과로 진행하되 "판정 불능"으로 남긴다.
-    AcceptUnknown,
     /// 지적을 되먹여 본 작업을 1회 재개한다.
     Resume(String),
     /// 재개 후에도 미통과 — status 는 유지하고 error 에만 사유를 남긴다.
@@ -1657,7 +1662,10 @@ pub(crate) fn gate_action(verdict: ReviewVerdict, attempt: u8, requeried: bool) 
     match verdict {
         ReviewVerdict::Pass => GateAction::Accept,
         ReviewVerdict::Indeterminate if !requeried => GateAction::Requery,
-        ReviewVerdict::Indeterminate => GateAction::AcceptUnknown,
+        // 재질의 후에도 판정 불능이면 통과로 묻히지 않는다 — 실패로 보고한다 (M2: G11).
+        ReviewVerdict::Indeterminate => {
+            GateAction::Report("판정 불능 — 검증자가 판정하지 못했다".into())
+        }
         ReviewVerdict::Fail { summary } if attempt == 0 => GateAction::Resume(summary),
         ReviewVerdict::Fail { summary } => GateAction::Report(summary),
     }
@@ -1898,9 +1906,7 @@ async fn run_review_gate(
                 crate::ui::live_line_in(&run_context, "[검증자] 완료 기준 충족 — 통과");
                 return outcome;
             }
-            // 판정 불능은 통과와 구분해 기록한다: 가용성은 지키되 "안 돈 것"이 조용히
-            // 통과로 묻히지 않게 라이브 라인과 graph 에 남긴다 (설계 §15.1).
-            GateAction::AcceptUnknown | GateAction::Requery => {
+            GateAction::Requery => {
                 crate::graph::node_in(
                     &run_context,
                     "critic",
@@ -1908,17 +1914,21 @@ async fn run_review_gate(
                     "판정 줄 없음",
                     Some("verify"),
                 );
-                crate::ui::live_warn_in(&run_context, "[검증자] 판정 불능 — 통과로 간주");
+                crate::ui::live_warn_in(&run_context, "[검증자] 판정 불능 — 한 번만 되묻는다");
                 return outcome;
             }
+            // 미통과·판정 불능 모두 완료가 아니다 — 상태를 fail 로 바꿔 후속 게이트가
+            // "성공"으로 오인하지 않게 한다 (M2: G11, AcceptUnknown 폐지).
             GateAction::Report(summary) => {
                 let headline = verdict_headline(&summary);
                 crate::graph::node_in(&run_context, "critic", "fail", &headline, Some("verify"));
                 crate::ui::live_warn_in(
                     &run_context,
-                    &format!("[검증자] 2회 미통과 — 상태를 보고하고 종료합니다: {headline}"),
+                    &format!("[검증자] 미통과 — 검증자 판정을 결과로 남긴다: {headline}"),
                 );
+                outcome.status = "fail".into();
                 outcome.error = Some(format!("검증자 미통과: {headline}"));
+                outcome.verify_fail = Some(headline.clone());
                 return outcome;
             }
             GateAction::Resume(summary) => summary,
@@ -2493,6 +2503,10 @@ async fn run_graph_discipline(
 
 pub(crate) fn auto_verify_command(cfg: &Config, changed: &[String]) -> String {
     if cfg.workspace.join("Cargo.toml").exists() {
+        // 테스트 디렉터가 있으면 컴파일 게이트를 넘어 회귀 게이트로 — G5 해소.
+        if cfg.workspace.join("tests").is_dir() {
+            return "cargo test --quiet".into();
+        }
         return "cargo check".into();
     }
     let py_changed: Vec<&str> = changed
