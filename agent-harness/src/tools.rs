@@ -975,6 +975,19 @@ fn bash_blocked(cmd: &str) -> Option<&'static str> {
     None
 }
 
+fn truncate_bash_output(mut output: String) -> String {
+    if output.len() <= MAX_BASH_OUTPUT {
+        return output;
+    }
+    let mut boundary = MAX_BASH_OUTPUT;
+    while !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    output.push_str("\n... (출력이 20KB에서 잘렸습니다)");
+    output
+}
+
 async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Result<String> {
     #[cfg(windows)]
     let mut cmd = {
@@ -1057,10 +1070,7 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
                 }
                 combined.push_str(&String::from_utf8_lossy(&err_buf));
             }
-            if combined.len() > MAX_BASH_OUTPUT {
-                combined.truncate(MAX_BASH_OUTPUT);
-                combined.push_str("\n... (출력이 20KB에서 잘렸습니다)");
-            }
+            combined = truncate_bash_output(combined);
             if !status.success() {
                 let code = status
                     .code()
@@ -1083,6 +1093,17 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_output_truncation_keeps_a_utf8_boundary() {
+        let invalid = vec![0xff; MAX_BASH_OUTPUT / 3 + 1];
+        let lossy = String::from_utf8_lossy(&invalid).into_owned();
+        let truncated = truncate_bash_output(lossy);
+        let content = truncated.split("\n...").next().expect("bounded content");
+        assert!(content.len() <= MAX_BASH_OUTPUT);
+        assert_eq!(content.len() % '\u{fffd}'.len_utf8(), 0);
+        assert!(truncated.contains("20KB"));
+    }
     use serde_json::json;
 
     #[test]

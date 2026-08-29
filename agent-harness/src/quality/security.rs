@@ -129,6 +129,12 @@ pub fn scan(file: &str, text: &str) -> Vec<Finding> {
     findings
 }
 
+fn bounded_output_tail(raw: &[u8], max_chars: usize) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let count = text.chars().count();
+    text.chars().skip(count.saturating_sub(max_chars)).collect()
+}
+
 /// 의존성 감사 (S5) — 외부 도구가 있으면 실행, 없으면 스킵 보고.
 /// 반환: (실행한 명령, 통과 여부, 출력 요약)
 pub async fn run_dependency_audit(
@@ -167,16 +173,7 @@ pub async fn run_dependency_audit(
                 } else {
                     &output.stderr
                 };
-                (
-                    Some(output.status.success()),
-                    String::from_utf8_lossy(raw)
-                        .lines()
-                        .last()
-                        .unwrap_or("")
-                        .chars()
-                        .take(200)
-                        .collect(),
-                )
+                (Some(output.status.success()), bounded_output_tail(raw, 200))
             }
         };
         results.push((cmd, ok, summary));
@@ -190,6 +187,12 @@ pub async fn run_dependency_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_output_tail_keeps_short_multiline_context() {
+        let raw = b"Authorization:\n  [Bearer SYNTHETIC]\n";
+        assert_eq!(bounded_output_tail(raw, 200), String::from_utf8_lossy(raw));
+    }
 
     #[test]
     fn hardcoded_api_key_is_caught() {

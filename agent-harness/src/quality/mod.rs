@@ -315,8 +315,32 @@ async fn run_step(
     }
 }
 
-fn missing_external_gate_is_nonblocking(language: Language, workspace: &Path) -> bool {
-    language == Language::JavaScript && !workspace.join("package.json").is_file()
+fn package_free_javascript_fallback(
+    language: Language,
+    workspace: &Path,
+    changed: &[String],
+) -> bool {
+    if language != Language::JavaScript || workspace.join("package.json").is_file() {
+        return false;
+    }
+    let extensions = changed
+        .iter()
+        .filter_map(|file| Path::new(file).extension().and_then(|value| value.to_str()))
+        .map(|extension| extension.to_ascii_lowercase())
+        .filter(|extension| {
+            matches!(
+                extension.as_str(),
+                "cjs" | "css" | "htm" | "html" | "js" | "jsx" | "mjs" | "ts" | "tsx"
+            )
+        })
+        .collect::<Vec<_>>();
+    !extensions.is_empty()
+        && extensions.iter().all(|extension| {
+            matches!(
+                extension.as_str(),
+                "cjs" | "css" | "htm" | "html" | "js" | "mjs"
+            )
+        })
 }
 
 /// 품질 게이트 전체 — S0 감지 → S3(포맷·린트·테스트) → S5(내장 스캔 + 의존성 감사).
@@ -325,6 +349,7 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     let lang = profile::detect(workspace, changed);
     let profile = profile::profile_for(lang);
     let mut steps = Vec::new();
+    let package_free_javascript = package_free_javascript_fallback(lang, workspace, changed);
 
     // S3 — 포맷 체크 → 린트 → 테스트. 있는 도구만 실행, 없는 도구는 기록.
     for (stage, commands) in [
@@ -334,13 +359,12 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     ] {
         let (runnable, missing) = profile::runnable_commands_in(workspace, commands);
         for cmd in missing {
-            let nonblocking = missing_external_gate_is_nonblocking(lang, workspace);
             steps.push(GateStep {
                 stage,
                 command: cmd,
-                passed: nonblocking,
+                passed: package_free_javascript,
                 exit_code: None,
-                note: Some(if nonblocking {
+                note: Some(if package_free_javascript {
                     "패키지 없는 JavaScript — node 구문·브라우저 게이트 적용".into()
                 } else {
                     "필수 품질 도구 미설치".into()
@@ -357,11 +381,12 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
         lang,
         Language::JavaScript | Language::TypeScript | Language::Unknown
     ) {
-        if profile::tool_available("node") {
-            for file in changed {
-                if file.ends_with(".js") || file.ends_with(".mjs") || file.ends_with(".cjs") {
-                    match validated_changed_arg(workspace, file) {
-                        Ok(Some(file)) => {
+        let node_available = profile::tool_available("node");
+        for file in changed {
+            if file.ends_with(".js") || file.ends_with(".mjs") || file.ends_with(".cjs") {
+                match validated_changed_arg(workspace, file) {
+                    Ok(Some(file)) => {
+                        if node_available {
                             steps.push(
                                 run_argv_step(
                                     "S3-syntax",
@@ -372,16 +397,24 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
                                 )
                                 .await,
                             );
+                        } else {
+                            steps.push(GateStep {
+                                stage: "S3-syntax",
+                                command: format!("node --check {file:?}"),
+                                passed: false,
+                                exit_code: None,
+                                note: Some("필수 JavaScript 구문 검사기 node 미설치".into()),
+                            });
                         }
-                        Ok(None) => {}
-                        Err(error) => steps.push(GateStep {
-                            stage: "S3-syntax",
-                            command: format!("node --check {file:?}"),
-                            passed: false,
-                            exit_code: None,
-                            note: Some(error),
-                        }),
                     }
+                    Ok(None) => {}
+                    Err(error) => steps.push(GateStep {
+                        stage: "S3-syntax",
+                        command: format!("node --check {file:?}"),
+                        passed: false,
+                        exit_code: None,
+                        note: Some(error),
+                    }),
                 }
             }
         }
@@ -415,13 +448,12 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     }
     // 의존성 감사 — 도구 있으면 실행.
     for (cmd, ok, summary) in security::run_dependency_audit(lang, workspace).await {
-        let nonblocking = missing_external_gate_is_nonblocking(lang, workspace);
         steps.push(GateStep {
             stage: "S5-audit",
             command: cmd.clone(),
-            passed: ok.unwrap_or(nonblocking),
+            passed: ok.unwrap_or(package_free_javascript),
             exit_code: None,
-            note: Some(if ok.is_none() && !nonblocking {
+            note: Some(if ok.is_none() && !package_free_javascript {
                 "필수 보안 감사 도구 미설치".into()
             } else {
                 redact_local_output(&summary, workspace)
@@ -455,6 +487,28 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
             note: Some(redact_local_output(&format!("{error:#}"), workspace)),
         }),
         Ok(entries) => {
+            let browser_entry_required = changed.iter().any(|file| {
+                let path = workspace.join(file);
+                path.is_file()
+                    && matches!(
+                        Path::new(file)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "css" | "htm" | "html"
+                    )
+            });
+            if entries.is_empty() && browser_entry_required {
+                steps.push(GateStep {
+                    stage: "S4-smoke",
+                    command: "browser entry discovery".into(),
+                    passed: false,
+                    exit_code: None,
+                    note: Some("변경된 웹 자산을 실행할 HTML 엔트리를 찾지 못했습니다".into()),
+                });
+            }
             let display_root = workspace
                 .canonicalize()
                 .unwrap_or_else(|_| workspace.to_path_buf());
@@ -623,6 +677,62 @@ fn looks_like_sensitive_key(key: &str) -> bool {
     .any(|marker| key.contains(marker))
 }
 
+#[derive(Clone, Copy)]
+enum CredentialToken {
+    Scheme,
+    Secret,
+}
+
+fn strip_ansi_sequences(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            index += 1;
+            if bytes.get(index) == Some(&b'[') {
+                index += 1;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            } else if index < bytes.len() {
+                index += 1;
+            }
+            continue;
+        }
+        let Some(character) = value[index..].chars().next() else {
+            break;
+        };
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
+}
+
+fn credential_token(value: &str) -> Option<CredentialToken> {
+    let cleaned = strip_ansi_sequences(value);
+    let cleaned = cleaned.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+    let lower = cleaned.to_ascii_lowercase();
+    for scheme in ["basic", "bearer"] {
+        if lower == scheme {
+            return Some(CredentialToken::Scheme);
+        }
+        if let Some(rest) = lower.strip_prefix(scheme)
+            && rest
+                .chars()
+                .next()
+                .is_some_and(|character| !character.is_ascii_alphanumeric())
+        {
+            return Some(CredentialToken::Secret);
+        }
+    }
+    None
+}
+
 fn looks_like_env_key(key: &str) -> bool {
     let key =
         key.trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
@@ -681,9 +791,6 @@ fn redact_spaced_assignments(text: &str) -> String {
             key_start -= 1;
         }
         let key = &text[key_start..key_end];
-        let authorization = key
-            .trim_matches(['\'', '"'])
-            .eq_ignore_ascii_case("authorization");
         let sensitive =
             looks_like_sensitive_key(key) || (bytes[separator] == b'=' && looks_like_env_key(key));
         if !sensitive {
@@ -692,55 +799,31 @@ fn redact_spaced_assignments(text: &str) -> String {
         }
 
         let mut value_start = separator + 1;
-        while value_start < bytes.len() && matches!(bytes[value_start], b' ' | b'\t' | b'\r') {
+        while value_start < bytes.len()
+            && matches!(bytes[value_start], b' ' | b'\t' | b'\r' | b'\n')
+        {
             value_start += 1;
         }
-        if value_start >= bytes.len() || bytes[value_start] == b'\n' {
+        if value_start >= bytes.len() {
             search = separator + 1;
             continue;
         }
         let mut value_end = value_start;
-        if authorization {
+        while value_end < bytes.len() && bytes[value_end] != b'\n' {
+            value_end += 1;
+        }
+        while value_end < bytes.len() && bytes[value_end] == b'\n' {
+            let next_line = value_end + 1;
+            let mut content = next_line;
+            while content < bytes.len() && matches!(bytes[content], b' ' | b'\t' | b'\r') {
+                content += 1;
+            }
+            if content == next_line || content >= bytes.len() || bytes[content] == b'\n' {
+                break;
+            }
+            value_end = content;
             while value_end < bytes.len() && bytes[value_end] != b'\n' {
                 value_end += 1;
-            }
-        } else if matches!(bytes[value_start], b'\'' | b'"') {
-            let quote = bytes[value_start];
-            value_end += 1;
-            while value_end < bytes.len() {
-                if bytes[value_end] == b'\\' {
-                    value_end = (value_end + 2).min(bytes.len());
-                } else if bytes[value_end] == quote {
-                    value_end += 1;
-                    break;
-                } else {
-                    value_end += 1;
-                }
-            }
-        } else {
-            while value_end < bytes.len()
-                && !bytes[value_end].is_ascii_whitespace()
-                && !matches!(bytes[value_end], b',' | b';' | b'}' | b']')
-            {
-                value_end += 1;
-            }
-            let first = &text[value_start..value_end];
-            if first.eq_ignore_ascii_case("basic") || first.eq_ignore_ascii_case("bearer") {
-                let mut credential_start = value_end;
-                while credential_start < bytes.len()
-                    && matches!(bytes[credential_start], b' ' | b'\t' | b'\r')
-                {
-                    credential_start += 1;
-                }
-                if credential_start < bytes.len() && bytes[credential_start] != b'\n' {
-                    value_end = credential_start;
-                    while value_end < bytes.len()
-                        && !bytes[value_end].is_ascii_whitespace()
-                        && !matches!(bytes[value_end], b',' | b';' | b'}' | b']')
-                    {
-                        value_end += 1;
-                    }
-                }
             }
         }
         if value_end == value_start {
@@ -767,15 +850,21 @@ pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
     for token in normalized.split_whitespace() {
         let lower = token.to_ascii_lowercase();
         if redact_next {
-            if matches!(lower.as_str(), "basic" | "bearer") {
-                redacted.push(token.to_string());
-            } else {
-                redacted.push("[redacted]".to_string());
-                redact_next = false;
+            match credential_token(token) {
+                Some(CredentialToken::Scheme) => redacted.push(token.to_string()),
+                Some(CredentialToken::Secret) | None => {
+                    redacted.push("[redacted]".to_string());
+                    redact_next = false;
+                }
             }
-        } else if matches!(lower.as_str(), "authorization:" | "basic" | "bearer") {
-            redacted.push(token.to_string());
-            redact_next = true;
+        } else if let Some(kind) = credential_token(token) {
+            match kind {
+                CredentialToken::Scheme => {
+                    redacted.push(token.to_string());
+                    redact_next = true;
+                }
+                CredentialToken::Secret => redacted.push("[redacted]".to_string()),
+            }
         } else if let Some(url) = redact_url(token) {
             redacted.push(url);
         } else if let Some(at) = token.find(['=', ':'])
@@ -872,15 +961,27 @@ mod tests {
             crate::db::Db::new_id()
         ));
         std::fs::create_dir_all(&root).expect("workspace");
-        assert!(missing_external_gate_is_nonblocking(
+        let browser_files = vec!["index.html".into(), "style.css".into(), "game.js".into()];
+        assert!(package_free_javascript_fallback(
             Language::JavaScript,
-            &root
+            &root,
+            &browser_files,
         ));
-        assert!(!missing_external_gate_is_nonblocking(Language::Go, &root));
-        std::fs::write(root.join("package.json"), "{}").expect("package manifest");
-        assert!(!missing_external_gate_is_nonblocking(
+        assert!(!package_free_javascript_fallback(
             Language::JavaScript,
-            &root
+            &root,
+            &["component.jsx".into()],
+        ));
+        assert!(!package_free_javascript_fallback(
+            Language::Go,
+            &root,
+            &["main.go".into()],
+        ));
+        std::fs::write(root.join("package.json"), "{}").expect("package manifest");
+        assert!(!package_free_javascript_fallback(
+            Language::JavaScript,
+            &root,
+            &browser_files,
         ));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -949,21 +1050,46 @@ mod tests {
     #[test]
     fn repair_output_redacts_paths_and_credentials() {
         let workspace = Path::new("/tmp/private-workspace");
-        let text = "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret Authorization: Bearer visible-credential\nAuthorization: [Bearer BRACKET-LEAK]\nAWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret API_KEY = \"hunter2\" {\"api_key\" : \"space secret\"} Cookie: session-value https://evil.test/x?value=query-secret postgres://user:password@host/db";
+        let text = concat!(
+            "/tmp/private-workspace/src/main.rs token=abc123 sk-example-secret\n",
+            "Authorization: Bearer visible-credential\n",
+            "Authorization: [Bearer BRACKET-LEAK]\n",
+            "Authorization:\n  [Bearer MULTILINE-AUTH]\n",
+            "Authorization:\r\n  [Basic CRLF-BASIC]\r\n",
+            "Proxy-Authorization: (Bearer PROXY-AUTH)\n",
+            "API_KEY :\n API-MULTILINE\n",
+            "Cookie: first=COOKIE-FIRST; second=COOKIE-SECOND\n",
+            "[Bearer STANDALONE-DECORATED]\n",
+            "\x1b[31mBearer\x1b[0m ANSI-AUTH\n",
+            "AWS_SECRET_ACCESS_KEY=aws-value PRIVATE_VALUE=short-secret ",
+            "API_KEY = \"hunter2\" {\"api_key\" : \"space secret\"}\n",
+            "https://evil.test/x?value=query-secret postgres://user:password@host/db",
+        );
         let redacted = redact_local_output(text, workspace);
         assert!(!redacted.contains("private-workspace"));
         assert!(!redacted.contains("abc123"));
         assert!(!redacted.contains("sk-example"));
         assert!(!redacted.contains("visible-credential"));
         assert!(!redacted.contains("aws-value"));
-        assert!(!redacted.contains("json-value"));
-        assert!(!redacted.contains("session-value"));
         assert!(!redacted.contains("short-secret"));
         assert!(!redacted.contains("query-secret"));
         assert!(!redacted.contains("user:password"));
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("space secret"));
-        assert!(!redacted.contains("BRACKET-LEAK"));
+        for marker in [
+            "BRACKET-LEAK",
+            "MULTILINE-AUTH",
+            "CRLF-BASIC",
+            "PROXY-AUTH",
+            "API-MULTILINE",
+            "COOKIE-FIRST",
+            "COOKIE-SECOND",
+            "STANDALONE-DECORATED",
+            "ANSI-AUTH",
+        ] {
+            assert!(!redacted.contains(marker), "leaked marker: {marker}");
+        }
+        assert!(redacted.contains("[redacted]"));
         assert!(redacted.contains("postgres://[redacted]@host/db"));
     }
 }

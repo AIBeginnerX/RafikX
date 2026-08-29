@@ -27,6 +27,8 @@ const MAX_BROWSER_ENTRIES: usize = 8;
 const MAX_DISCOVERY_DURATION: Duration = Duration::from_secs(3);
 const MAX_DISCOVERY_HTML_BYTES: u64 = 256 * 1024;
 const MAX_DISCOVERY_TOTAL_HTML_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_REFERENCE_GRAPH_ENTRIES: usize = 512;
+const MAX_REFERENCE_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; sandbox allow-same-origin allow-scripts; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
 const PROBE_SCRIPT: &str = r#"(() => {
   const emit = (kind, value) => console.log('__RAFIKX_BROWSER_ERROR__' + kind + ': ' + String(value));
@@ -381,23 +383,14 @@ fn resolve_html_reference(root: &Path, entry: &Path, raw: &str) -> Option<PathBu
     Some(root.join(relative))
 }
 
-fn referenced_changed_sources(
-    root: &Path,
-    entry: &Path,
-    html: &str,
-    changed_sources: &[PathBuf],
-) -> Vec<PathBuf> {
-    let changed = changed_sources
-        .iter()
-        .map(|source| (root.join(source), source))
-        .collect::<Vec<_>>();
-    let bytes = html.as_bytes();
-    let mut matched = BTreeSet::new();
+fn quoted_local_references(root: &Path, source: &Path, text: &str) -> BTreeSet<PathBuf> {
+    let bytes = text.as_bytes();
+    let mut references = BTreeSet::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
         let Some(offset) = bytes[cursor..]
             .iter()
-            .position(|byte| matches!(*byte, b'\'' | b'"'))
+            .position(|byte| matches!(*byte, b'\'' | b'"' | b'`'))
         else {
             break;
         };
@@ -408,29 +401,80 @@ fn referenced_changed_sources(
             break;
         };
         let value_end = value_start + end_offset;
-        if let Some(resolved) = resolve_html_reference(root, entry, &html[value_start..value_end]) {
-            for (absolute, source) in &changed {
-                if resolved == *absolute {
-                    matched.insert((*source).clone());
-                }
-            }
+        if let Some(resolved) = resolve_html_reference(root, source, &text[value_start..value_end])
+        {
+            references.insert(resolved);
         }
         cursor = value_end + 1;
     }
-    matched.into_iter().collect()
+    references
 }
 
-fn entry_references_source(root: &Path, entry: &Path, source: &Path) -> bool {
-    let Ok(metadata) = entry.metadata() else {
-        return false;
-    };
-    if metadata.len() > MAX_DISCOVERY_HTML_BYTES {
-        return false;
+fn is_reference_graph_source(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "cjs" | "css" | "htm" | "html" | "js" | "jsx" | "mjs" | "ts" | "tsx"
+    )
+}
+
+fn entry_reaches_changed_sources(
+    root: &Path,
+    entry: &Path,
+    changed_sources: &[PathBuf],
+    started: Instant,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let targets = changed_sources
+        .iter()
+        .map(|source| (root.join(source), source))
+        .collect::<Vec<_>>();
+    let mut matched = BTreeSet::new();
+    let mut pending = vec![entry.to_path_buf()];
+    let mut visited = BTreeSet::new();
+    let mut inspected_bytes = 0u64;
+
+    while let Some(source) = pending.pop() {
+        if started.elapsed() > MAX_DISCOVERY_DURATION {
+            anyhow::bail!("브라우저 참조 그래프 탐색 시간 상한을 넘었습니다");
+        }
+        if !visited.insert(source.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_REFERENCE_GRAPH_ENTRIES {
+            anyhow::bail!("브라우저 참조 그래프 항목 수가 상한을 넘었습니다");
+        }
+        if !source.starts_with(root) {
+            anyhow::bail!("브라우저 참조 그래프가 워크스페이스 밖을 가리킵니다");
+        }
+        let metadata = match std::fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) | Err(_) => continue,
+        };
+        if metadata.len() > MAX_DISCOVERY_HTML_BYTES {
+            anyhow::bail!("브라우저 참조 그래프 파일이 상한을 넘었습니다");
+        }
+        inspected_bytes = inspected_bytes.saturating_add(metadata.len());
+        if inspected_bytes > MAX_REFERENCE_GRAPH_BYTES {
+            anyhow::bail!("브라우저 참조 그래프 합계가 상한을 넘었습니다");
+        }
+        let text = std::fs::read_to_string(&source).map_err(|error| {
+            anyhow::anyhow!("브라우저 참조 그래프 파일을 읽을 수 없습니다: {error}")
+        })?;
+        for reference in quoted_local_references(root, &source, &text) {
+            for (absolute, changed) in &targets {
+                if reference == *absolute {
+                    matched.insert((*changed).clone());
+                }
+            }
+            if reference.starts_with(root) && is_reference_graph_source(&reference) {
+                pending.push(reference);
+            }
+        }
     }
-    let Ok(html) = std::fs::read_to_string(entry) else {
-        return false;
-    };
-    !referenced_changed_sources(root, entry, &html, &[source.to_path_buf()]).is_empty()
+    Ok(matched.into_iter().collect())
 }
 
 pub(crate) fn discover_entries(
@@ -438,6 +482,7 @@ pub(crate) fn discover_entries(
     changed: &[String],
 ) -> anyhow::Result<Vec<PathBuf>> {
     let root = workspace.canonicalize()?;
+    let started = Instant::now();
     let mut entries = BTreeSet::new();
     let mut changed_sources = Vec::new();
     let mut covered_sources = BTreeSet::new();
@@ -491,7 +536,15 @@ pub(crate) fn discover_entries(
                 directory.join("public/index.html"),
                 directory.join("www/index.html"),
             ] {
-                if candidate.is_file() && entry_references_source(&root, &candidate, source) {
+                if candidate.is_file()
+                    && !entry_reaches_changed_sources(
+                        &root,
+                        &candidate,
+                        std::slice::from_ref(source),
+                        started,
+                    )?
+                    .is_empty()
+                {
                     insert_browser_entry(&mut entries, &root, &candidate)?;
                     covered_sources.insert(source.clone());
                     break 'ancestor;
@@ -518,7 +571,15 @@ pub(crate) fn discover_entries(
             project_root.join("dist/index.html"),
             project_root.join("build/index.html"),
         ] {
-            if candidate.is_file() && entry_references_source(&root, &candidate, source) {
+            if candidate.is_file()
+                && !entry_reaches_changed_sources(
+                    &root,
+                    &candidate,
+                    std::slice::from_ref(source),
+                    started,
+                )?
+                .is_empty()
+            {
                 insert_browser_entry(&mut entries, &root, &candidate)?;
                 covered_sources.insert(source.clone());
                 break;
@@ -532,7 +593,6 @@ pub(crate) fn discover_entries(
         return Ok(entries.into_iter().collect());
     }
 
-    let started = Instant::now();
     let filter_root = root.clone();
     let walker = ignore::WalkBuilder::new(&root)
         .hidden(false)
@@ -563,7 +623,15 @@ pub(crate) fn discover_entries(
         }
         let item = item.map_err(|error| anyhow::anyhow!("브라우저 엔트리 탐색 실패: {error}"))?;
         if item.file_type().is_some_and(|kind| kind.is_file())
-            && item.file_name() == std::ffi::OsStr::new("index.html")
+            && matches!(
+                item.path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "htm" | "html"
+            )
         {
             let metadata = item
                 .metadata()
@@ -573,13 +641,11 @@ pub(crate) fn discover_entries(
                     <= MAX_DISCOVERY_TOTAL_HTML_BYTES
             {
                 inspected_html_bytes = inspected_html_bytes.saturating_add(metadata.len());
-                if let Ok(html) = std::fs::read_to_string(item.path()) {
-                    let referenced =
-                        referenced_changed_sources(&root, item.path(), &html, &changed_sources);
-                    if !referenced.is_empty() {
-                        insert_browser_entry(&mut entries, &root, item.path())?;
-                        covered_sources.extend(referenced);
-                    }
+                let referenced =
+                    entry_reaches_changed_sources(&root, item.path(), &changed_sources, started)?;
+                if !referenced.is_empty() {
+                    insert_browser_entry(&mut entries, &root, item.path())?;
+                    covered_sources.extend(referenced);
                 }
             }
         }
@@ -1176,6 +1242,56 @@ mod tests {
                     .canonicalize()
                     .expect("entry")
             ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_non_index_html_entry_that_references_the_change() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-non-index-entry-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("scripts")).expect("source directory");
+        std::fs::write(root.join("scripts/runtime.js"), "missingFunction();")
+            .expect("source fixture");
+        std::fs::write(
+            root.join("launch.html"),
+            "<script src=\"./scripts/runtime.js\"></script>",
+        )
+        .expect("entry fixture");
+
+        let entries = discover_entries(&root, &["scripts/runtime.js".into()])
+            .expect("discover non-index entry");
+        assert_eq!(
+            entries,
+            vec![root.join("launch.html").canonicalize().expect("entry")]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_entry_through_local_module_imports() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-import-graph-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("js")).expect("source directory");
+        std::fs::write(
+            root.join("index.html"),
+            "<script type=\"module\" src=\"./js/app.js\"></script>",
+        )
+        .expect("entry fixture");
+        std::fs::write(root.join("js/app.js"), "import './events.js';").expect("root module");
+        std::fs::write(root.join("js/events.js"), "import './state.js';")
+            .expect("intermediate module");
+        std::fs::write(root.join("js/state.js"), "missingFunction();").expect("changed module");
+
+        let entries =
+            discover_entries(&root, &["js/state.js".into()]).expect("discover transitive entry");
+        assert_eq!(
+            entries,
+            vec![root.join("index.html").canonicalize().expect("entry")]
         );
         let _ = std::fs::remove_dir_all(root);
     }
