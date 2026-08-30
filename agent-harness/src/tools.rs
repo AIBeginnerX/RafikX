@@ -26,6 +26,7 @@ pub(crate) mod hashline;
 mod lsp_tools;
 pub mod mutation;
 mod task;
+mod text_stream;
 pub(crate) mod workspace_delta;
 
 use lsp_tools::{LspDefinition, LspDiagnostics, LspHover, LspReferences};
@@ -537,18 +538,7 @@ impl Tool for ReadFile {
                 len
             ));
         }
-        let text = fs::read_to_string(&resolved)
-            .map_err(|_| anyhow!("텍스트 파일이 아니거나 읽을 수 없습니다"))?;
-        let lines: Vec<&str> = text.lines().collect();
-        let start = offset.unwrap_or(1).max(1) as usize;
-        let start_idx = start.saturating_sub(1).min(lines.len());
-        let take = limit.map(|n| n as usize).unwrap_or(lines.len());
-        let slice = &lines[start_idx..lines.len().min(start_idx + take)];
-        let body = slice.join("\n");
-        if ctx.hashline {
-            return Ok(hashline::tag_lines(&body, start));
-        }
-        Ok(body)
+        text_stream::read_page(&resolved, offset, limit, ctx.hashline)
     }
 }
 
@@ -633,17 +623,25 @@ impl Tool for Grep {
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
             .clamp(0, 5) as usize;
-        let mut hits = Vec::new();
+        let mut hits = String::new();
+        let mut emitted = 0_usize;
+        let mut truncated = false;
         let walker = ignore::WalkBuilder::new(&root)
             .hidden(false)
             .git_ignore(true)
             .build();
         for entry in walker.flatten() {
-            if hits.len() >= MAX_GREP_LINES {
+            if truncated {
                 break;
             }
             let path = entry.path();
-            if !path.is_file() {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                continue;
+            }
+            if reject_vault(path, ctx.vault.as_deref()).is_err() {
                 continue;
             }
             if let Some(gr) = &glob_re {
@@ -652,61 +650,65 @@ impl Tool for Grep {
                     continue;
                 }
             }
-            let Ok(text) = fs::read_to_string(path) else {
-                continue;
-            };
             let rel = path.strip_prefix(&ctx.workspace).unwrap_or(path);
-            let lines: Vec<&str> = text.lines().collect();
-            let matched: Vec<usize> = lines
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| re.is_match(l))
-                .map(|(i, _)| i)
-                .collect();
-            if matched.is_empty() {
-                continue;
+            let remaining_bytes = text_stream::MAX_TEXT_OUTPUT_BYTES
+                .saturating_sub(hits.len())
+                .saturating_sub(usize::from(!hits.is_empty()))
+                .saturating_sub(text_stream::TRUNCATION_MARKER.len() + 1);
+            let result = match text_stream::grep_file(
+                path,
+                &rel.display().to_string(),
+                &re,
+                context,
+                MAX_GREP_LINES.saturating_sub(emitted),
+                remaining_bytes,
+            ) {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
+            let Some(result) = result else { continue };
+            if !append_grep_output(&mut hits, &result.output) {
+                truncated = true;
+                break;
             }
-            if context == 0 {
-                for i in matched
-                    .iter()
-                    .take(MAX_GREP_LINES.saturating_sub(hits.len()))
-                {
-                    hits.push(format!("{}:{}:{}", rel.display(), i + 1, lines[*i]));
-                }
-            } else {
-                // 겹치는 범위를 병합해 블록으로 출력 (-- 구분자로 블록 분리)
-                let mut ranges: Vec<(usize, usize)> = Vec::new();
-                for &i in &matched {
-                    match ranges.last_mut() {
-                        Some(r) if i <= r.1 + 1 => {
-                            r.1 = (i + context).min(lines.len().saturating_sub(1))
-                        }
-                        _ => ranges.push((
-                            i.saturating_sub(context),
-                            (i + context).min(lines.len().saturating_sub(1)),
-                        )),
-                    }
-                }
-                for (s, e) in ranges {
-                    if hits.len() >= MAX_GREP_LINES {
-                        break;
-                    }
-                    for (i, line) in lines.iter().enumerate().take(e + 1).skip(s) {
-                        let mark = if matched.contains(&i) { ":" } else { "-" };
-                        hits.push(format!("{}{}{}:{}", rel.display(), mark, i + 1, line));
-                    }
-                    hits.push("--".to_string());
-                }
-                if hits.last().map(|h| h == "--").unwrap_or(false) {
-                    hits.pop();
-                }
-            }
+            emitted = emitted.saturating_add(result.emitted);
+            truncated = result.truncated;
         }
+        Ok(finalize_grep(&hits, truncated))
+    }
+}
+
+fn append_grep_output(hits: &mut String, output: &str) -> bool {
+    if output.is_empty() {
+        return true;
+    }
+    let separator_len = usize::from(!hits.is_empty());
+    if hits
+        .len()
+        .saturating_add(separator_len)
+        .saturating_add(output.len())
+        > text_stream::MAX_TEXT_OUTPUT_BYTES
+    {
+        return false;
+    }
+    if separator_len == 1 {
+        hits.push('\n');
+    }
+    hits.push_str(output);
+    true
+}
+
+fn finalize_grep(hits: &str, truncated: bool) -> String {
+    if truncated {
         if hits.is_empty() {
-            Ok("(일치 없음)".to_string())
+            text_stream::TRUNCATION_MARKER.to_string()
         } else {
-            Ok(hits.join("\n"))
+            format!("{hits}\n{}", text_stream::TRUNCATION_MARKER)
         }
+    } else if hits.is_empty() {
+        "(일치 없음)".to_string()
+    } else {
+        hits.to_string()
     }
 }
 
@@ -1712,6 +1714,70 @@ mod hashline_tool_tests {
             fs::read_to_string(dir.join("a.txt")).unwrap(),
             "ONE\ntwo\nthree\n"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grep_reports_a_marker_when_the_first_rendered_match_is_oversized() {
+        let (dir, ctx) = setup("grep-oversized");
+        let mut body = b"needle".to_vec();
+        body.extend(std::iter::repeat_n(
+            b'x',
+            text_stream::MAX_TEXT_LINE_BYTES - body.len(),
+        ));
+        fs::write(dir.join("wide.txt"), body).unwrap();
+
+        assert_eq!(
+            Grep.run(json!({"pattern": "needle"}), &ctx).unwrap(),
+            text_stream::TRUNCATION_MARKER
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grep_marks_a_match_after_two_hundred_emitted_records() {
+        let (dir, ctx) = setup("grep-after-cap");
+        fs::write(dir.join("a.txt"), "needle\n".repeat(MAX_GREP_LINES)).unwrap();
+        fs::write(dir.join("b.txt"), "needle\n").unwrap();
+
+        let output = Grep.run(json!({"pattern": "needle"}), &ctx).unwrap();
+        let records = output
+            .lines()
+            .take_while(|line| *line != text_stream::TRUNCATION_MARKER)
+            .count();
+        assert!(output.ends_with(text_stream::TRUNCATION_MARKER));
+        assert_eq!(records, MAX_GREP_LINES);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn capped_empty_grep_probe_does_not_add_a_blank_marker_line() {
+        let mut hits = "a.txt:1:needle".to_string();
+        assert!(append_grep_output(&mut hits, ""));
+        assert_eq!(
+            finalize_grep(&hits, true),
+            format!("a.txt:1:needle\n{}", text_stream::TRUNCATION_MARKER)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_skips_external_file_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, ctx) = setup("grep-symlink");
+        let outside = std::env::temp_dir().join(format!(
+            "rafikx-grep-symlink-outside-{}",
+            std::process::id()
+        ));
+        fs::write(&outside, "needle\n").unwrap();
+        symlink(&outside, dir.join("outside.txt")).unwrap();
+
+        assert_eq!(
+            Grep.run(json!({"pattern": "needle"}), &ctx).unwrap(),
+            "(일치 없음)"
+        );
+        let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(dir);
     }
 }

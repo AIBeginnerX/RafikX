@@ -13,8 +13,7 @@ use crate::tools::ToolCtx;
 const B36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 /// old_str 모드 실패 시 붙이는 안내 — 앵커 모드로 유도.
-pub const ANCHOR_HINT: &str =
-    "힌트: read_file 출력의 N#HASH 태그를 anchors(start/end) 인자로 쓰면 내용 재생산 없이 정확히 편집할 수 있습니다.";
+pub const ANCHOR_HINT: &str = "힌트: read_file 출력의 N#HASH 태그를 anchors(start/end) 인자로 쓰면 내용 재생산 없이 정확히 편집할 수 있습니다.";
 
 /// 줄 내용의 단축 해시 — sha256 앞 2바이트를 base36 3글자로 (결정적).
 pub fn line_hash(line: &str) -> String {
@@ -29,6 +28,7 @@ pub fn line_hash(line: &str) -> String {
 }
 
 /// 읽기 결과를 `N#HASH|내용` 줄로 태그한다. start_line 은 1부터.
+#[cfg(test)]
 pub fn tag_lines(slice: &str, start_line: usize) -> String {
     slice
         .lines()
@@ -142,7 +142,12 @@ mod tests {
 
     #[test]
     fn verify_span_accepts_matching_anchors() {
-        let (s, e) = verify_span(BODY, &format!("1#{}", line_hash("fn main() {")), &format!("3#{}", line_hash("}"))).unwrap();
+        let (s, e) = verify_span(
+            BODY,
+            &format!("1#{}", line_hash("fn main() {")),
+            &format!("3#{}", line_hash("}")),
+        )
+        .unwrap();
         assert_eq!((s, e), (0, 2));
     }
 
@@ -160,14 +165,24 @@ mod tests {
 
     #[test]
     fn replace_span_swaps_range_and_keeps_trailing_newline() {
-        let (s, e) = verify_span(BODY, &format!("2#{}", line_hash("    println!(\"hi\");")), &format!("2#{}", line_hash("    println!(\"hi\");"))).unwrap();
+        let (s, e) = verify_span(
+            BODY,
+            &format!("2#{}", line_hash("    println!(\"hi\");")),
+            &format!("2#{}", line_hash("    println!(\"hi\");")),
+        )
+        .unwrap();
         let out = replace_span(BODY, s, e, "    println!(\"bye\");");
         assert_eq!(out, "fn main() {\n    println!(\"bye\");\n}\n");
     }
 
     #[test]
     fn replace_span_can_delete_range() {
-        let (s, e) = verify_span(BODY, &format!("2#{}", line_hash("    println!(\"hi\");")), &format!("2#{}", line_hash("    println!(\"hi\");"))).unwrap();
+        let (s, e) = verify_span(
+            BODY,
+            &format!("2#{}", line_hash("    println!(\"hi\");")),
+            &format!("2#{}", line_hash("    println!(\"hi\");")),
+        )
+        .unwrap();
         let out = replace_span(BODY, s, e, "");
         assert_eq!(out, "fn main() {\n}\n");
     }

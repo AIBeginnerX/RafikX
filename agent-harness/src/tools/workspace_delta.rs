@@ -315,10 +315,9 @@ impl WorkspaceSnapshot {
             .git_global(false)
             .git_ignore(false)
             .git_exclude(false)
-            .same_file_system(true)
-            .sort_by_file_path(|left, right| left.cmp(right));
+            .same_file_system(true);
         for entry in builder.build() {
-            budget.record_entry()?;
+            budget.check_deadline()?;
             let entry = entry.map_err(|error| anyhow!("워크스페이스 순회 실패: {error}"))?;
             let Some(file_type) = entry.file_type() else {
                 continue;
@@ -328,6 +327,14 @@ impl WorkspaceSnapshot {
                 .strip_prefix(&root)
                 .map_err(|error| anyhow!("워크스페이스 상대 경로를 확인할 수 없습니다: {error}"))?;
             let under_excluded_directory = has_excluded_directory(relative);
+            let excluded_directory =
+                file_type.is_dir() && relative.file_name().is_some_and(is_excluded_directory_name);
+            let excluded_symlink = file_type.is_symlink()
+                && (under_excluded_directory
+                    || relative.file_name().is_some_and(is_excluded_directory_name));
+            if excluded_directory {
+                continue;
+            }
             if file_type.is_symlink() {
                 let target = path.canonicalize().map_err(|error| {
                     anyhow!("워크스페이스 심볼릭 링크를 확인할 수 없습니다: {error}")
@@ -338,9 +345,10 @@ impl WorkspaceSnapshot {
                         path.display()
                     ));
                 }
-                if under_excluded_directory {
+                if excluded_symlink {
                     continue;
                 }
+                budget.record_entry()?;
                 let fingerprint = fingerprint_symlink(&path, &mut budget)?;
                 files.insert(path.clone(), fingerprint);
                 if target.is_file() && !files.contains_key(&target) {
@@ -355,6 +363,7 @@ impl WorkspaceSnapshot {
             if under_excluded_directory {
                 continue;
             }
+            budget.record_entry()?;
             let normalized = path
                 .canonicalize()
                 .map_err(|error| anyhow!("워크스페이스 파일을 확인할 수 없습니다: {error}"))?;
@@ -369,6 +378,7 @@ impl WorkspaceSnapshot {
                 files.insert(normalized, fingerprint);
             }
         }
+        budget.check_deadline()?;
         Ok(Self {
             root,
             files,
@@ -508,6 +518,34 @@ mod tests {
         assert!(error.to_string().contains("해시 양"));
     }
 
+    #[test]
+    fn excluded_regular_files_do_not_consume_tracked_budgets() {
+        let root = TestDir::new("excluded-entry-budget");
+        std::fs::write(root.0.join("tracked.txt"), "x").expect("tracked fixture");
+        let excluded = root.0.join("node_modules");
+        std::fs::create_dir_all(&excluded).expect("excluded directory");
+        for index in 0..8 {
+            std::fs::write(
+                excluded.join(format!("generated-{index}.js")),
+                "ignored content",
+            )
+            .expect("excluded fixture");
+        }
+
+        let snapshot = WorkspaceSnapshot::capture_with_limits(
+            &root.0,
+            SnapshotLimits {
+                max_entries: 1,
+                max_files: 1,
+                max_hash_bytes: 1,
+                ..SnapshotLimits::default()
+            },
+        )
+        .expect("excluded regular files must not consume tracked budgets");
+
+        assert_eq!(snapshot.files.len(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn external_symlink_fails_before_a_command_can_run() {
@@ -525,7 +563,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn external_symlink_under_excluded_directory_fails_closed() {
+    fn external_symlink_below_excluded_directory_fails_closed() {
         let workspace = TestDir::new("excluded-external-link-workspace");
         let outside = TestDir::new("excluded-external-link-target");
         std::fs::create_dir_all(workspace.0.join(".cache")).expect("excluded directory");
@@ -536,6 +574,125 @@ mod tests {
         let error = WorkspaceSnapshot::capture(&workspace.0)
             .err()
             .expect("excluded-directory external symlink must fail closed");
+        assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_symlink_after_excluded_regular_files_is_rejected() {
+        let workspace = TestDir::new("excluded-link-after-files-workspace");
+        let outside = TestDir::new("excluded-link-after-files-target");
+        let excluded = workspace.0.join(".cache");
+        std::fs::create_dir_all(&excluded).expect("excluded directory");
+        for index in 0..8 {
+            std::fs::write(excluded.join(format!("generated-{index}.txt")), "ignored")
+                .expect("excluded fixture");
+        }
+        std::os::unix::fs::symlink(&outside.0, excluded.join("zz-external"))
+            .expect("external symlink");
+
+        let error = WorkspaceSnapshot::capture_with_limits(
+            &workspace.0,
+            SnapshotLimits {
+                max_entries: 0,
+                ..SnapshotLimits::default()
+            },
+        )
+        .err()
+        .expect("external excluded symlink must be checked after regular files");
+        assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_excluded_external_symlink_fails_closed() {
+        let workspace = TestDir::new("nested-excluded-external-link-workspace");
+        let outside = TestDir::new("nested-excluded-external-link-target");
+        let nested = workspace.0.join("node_modules/dependency/.cache");
+        std::fs::create_dir_all(&nested).expect("nested excluded directory");
+        std::os::unix::fs::symlink(&outside.0, nested.join("escape"))
+            .expect("nested external symlink");
+
+        let error = WorkspaceSnapshot::capture(&workspace.0)
+            .err()
+            .expect("nested excluded external symlink must fail closed");
+        assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_oversized_file_and_internal_symlink_are_not_tracked() {
+        let workspace = TestDir::new("excluded-untracked-metadata");
+        let target = workspace.0.join("target.txt");
+        std::fs::write(&target, "x").expect("internal target");
+        let excluded = workspace.0.join(".venv/bin");
+        std::fs::create_dir_all(&excluded).expect("excluded directory");
+        let oversized = excluded.join("large-cache-file");
+        std::fs::File::create(&oversized)
+            .expect("oversized excluded file")
+            .set_len(2)
+            .expect("set excluded file length");
+        let link = excluded.join("python3");
+        std::os::unix::fs::symlink("../../target.txt", &link).expect("internal excluded link");
+
+        let snapshot = WorkspaceSnapshot::capture_with_limits(
+            &workspace.0,
+            SnapshotLimits {
+                max_entries: 1,
+                max_files: 1,
+                max_single_file_bytes: 1,
+                max_hash_bytes: 1,
+                ..SnapshotLimits::default()
+            },
+        )
+        .expect("excluded metadata must not consume tracked file budgets");
+
+        let tracked_target = target.canonicalize().expect("canonical target");
+        assert!(snapshot.files.contains_key(&tracked_target));
+        assert!(!snapshot.files.contains_key(&link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_excluded_symlink_fails_closed() {
+        let workspace = TestDir::new("broken-excluded-link-workspace");
+        let excluded = workspace.0.join(".cache");
+        std::fs::create_dir_all(&excluded).expect("excluded directory");
+        std::os::unix::fs::symlink("missing-target", excluded.join("broken"))
+            .expect("broken excluded symlink");
+
+        let error = WorkspaceSnapshot::capture(&workspace.0)
+            .err()
+            .expect("broken excluded symlink must fail closed");
+        assert!(error.to_string().contains("심볼릭 링크"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn looping_excluded_symlink_fails_closed() {
+        let workspace = TestDir::new("looping-excluded-link-workspace");
+        let excluded = workspace.0.join(".cache");
+        std::fs::create_dir_all(&excluded).expect("excluded directory");
+        std::os::unix::fs::symlink("loop", excluded.join("loop"))
+            .expect("looping excluded symlink");
+
+        let error = WorkspaceSnapshot::capture(&workspace.0)
+            .err()
+            .expect("looping excluded symlink must fail closed");
+        assert!(error.to_string().contains("심볼릭 링크"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_name_symlink_that_escapes_is_rejected() {
+        let workspace = TestDir::new("excluded-name-external-link-workspace");
+        let outside = TestDir::new("excluded-name-external-link-target");
+        std::os::unix::fs::symlink(&outside.0, workspace.0.join("node_modules"))
+            .expect("excluded-name external symlink");
+
+        let error = WorkspaceSnapshot::capture(&workspace.0)
+            .err()
+            .expect("excluded-name symlink must still be checked");
         assert!(error.to_string().contains("워크스페이스 밖"), "{error}");
     }
 
