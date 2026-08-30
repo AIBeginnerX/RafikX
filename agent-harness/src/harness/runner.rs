@@ -676,22 +676,27 @@ async fn run_pipeline_inner(
             stream: true,
         });
         crate::ui::live_line_in(&run_context, &format!("[계획 수립 중 · {}]", binding.model));
-        let mut plan_streamed = false;
-        let on_plan_event = |ev: StreamEvent| match ev {
-            StreamEvent::Text(piece) => {
-                plan_streamed = true;
-                crate::ui::live_chunk_in(&run_context, piece);
+        let on_plan_event = |ev: SemanticStreamEvent| match ev {
+            SemanticStreamEvent::ReasoningText(piece) => {
+                crate::ui::live_chunk_in(&run_context, piece)
             }
-            StreamEvent::ToolArgs { name, total_bytes } => {
+            SemanticStreamEvent::ContentCandidate(_) => {}
+            SemanticStreamEvent::ToolArgs { name, total_bytes } => {
                 crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
             }
         };
         let plan_call = if let Some(req) = req {
             if binding.combo_chain.is_empty() {
-                stream_with_fallback(cfg, &order, role, req, on_plan_event).await
+                stream_semantic_with_fallback(cfg, &order, role, req, on_plan_event).await
             } else {
-                stream_with_fallback_combo(cfg, &binding.combo_chain, role, req, on_plan_event)
-                    .await
+                stream_semantic_with_fallback_combo(
+                    cfg,
+                    &binding.combo_chain,
+                    role,
+                    req,
+                    on_plan_event,
+                )
+                .await
             }
         } else {
             Err(anyhow!(
@@ -701,19 +706,13 @@ async fn run_pipeline_inner(
         match plan_call {
             Ok((_n, resp)) => {
                 crate::graph::node_in(&run_context, "plan", "plan_first", "", Some("pre_step"));
-                if plan_streamed {
-                    // 이미 흘러나간 계획을 다시 찍지 않는다 — 줄바꿈으로만 끊는다.
-                    crate::ui::live_chunk_in(&run_context, "\n");
-                    crate::ui::live_line_in(&run_context, "[계획] 수립 완료");
-                } else {
-                    crate::ui::live_line_in(&run_context, "[계획]");
-                    for b in &resp.content {
-                        if let ContentBlock::Text { text } = b {
-                            crate::ui::live_assistant_in(
-                                &run_context,
-                                &format!("[모델 작업]\n{text}\n[/모델 작업]"),
-                            );
-                        }
+                crate::ui::live_line_in(&run_context, "[계획] 수립 완료");
+                for b in &resp.content {
+                    if let ContentBlock::Text { text } = b {
+                        crate::ui::live_assistant_in(
+                            &run_context,
+                            &format!("[모델 작업]\n{text}\n[/모델 작업]"),
+                        );
                     }
                 }
                 let plan = resp
@@ -828,9 +827,12 @@ async fn run_pipeline_inner(
             max_tokens: output_token_limit,
             stream: true,
         };
-        let on_main_event = |ev: StreamEvent| match ev {
-            StreamEvent::Text(piece) => crate::ui::live_chunk_in(&run_context, piece),
-            StreamEvent::ToolArgs { name, total_bytes } => {
+        let on_main_event = |ev: SemanticStreamEvent| match ev {
+            SemanticStreamEvent::ReasoningText(piece) => {
+                crate::ui::live_chunk_in(&run_context, piece)
+            }
+            SemanticStreamEvent::ContentCandidate(_) => {}
+            SemanticStreamEvent::ToolArgs { name, total_bytes } => {
                 crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
             }
         };
@@ -838,9 +840,15 @@ async fn run_pipeline_inner(
             Box<dyn std::future::Future<Output = Result<(String, ChatResponse)>> + Send + 'a>,
         >;
         let response: MainFuture<'_> = if binding.combo_chain.is_empty() {
-            Box::pin(stream_with_fallback(cfg, &order, role, req, on_main_event))
+            Box::pin(stream_semantic_with_fallback(
+                cfg,
+                &order,
+                role,
+                req,
+                on_main_event,
+            ))
         } else {
-            Box::pin(stream_with_fallback_combo(
+            Box::pin(stream_semantic_with_fallback_combo(
                 cfg,
                 &binding.combo_chain,
                 role,
@@ -865,7 +873,6 @@ async fn run_pipeline_inner(
             &format!("in={} out={}", resp.input_tokens, resp.output_tokens),
             Some("pre_step"),
         );
-        crate::ui::live_chunk_in(&run_context, "\n");
         crate::ui::live_status_in(
             &run_context,
             &format!(
@@ -903,7 +910,7 @@ async fn run_pipeline_inner(
         // coder 로 1회 승격해 다시 실행한다. (아래 본 경로의 승격과 같은 규칙 —
         // 이 조기 반환 경로는 그 검사에 도달하지 못해 v1.0 부터 누출이 그대로
         // 화면에 노출됐다: 2026-08-27 실측.)
-        if leaked_tool_call(&agent::assistant_text(&messages)) {
+        if !publish_no_tool_answer(&run_context, &resp) {
             crate::ui::live_line_in(
                 &run_context,
                 "도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.",
@@ -946,8 +953,6 @@ async fn run_pipeline_inner(
             });
             no_tool_outcome.messages = clean;
         }
-        let _ =
-            run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted);
         mark_missing_dev_change(binding.class, &mut no_tool_outcome);
         return Ok(no_tool_outcome);
     }
@@ -1542,6 +1547,37 @@ pub(crate) fn leaked_tool_call(text: &str) -> bool {
         return true;
     }
     text.contains("\"name\"") && text.contains("\"arguments\"")
+}
+
+fn publish_no_tool_answer(run: &RunContext, response: &ChatResponse) -> bool {
+    if response
+        .content
+        .iter()
+        .any(|block| !matches!(block, ContentBlock::Text { .. }))
+    {
+        return false;
+    }
+    let text = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if leaked_tool_call(&text) {
+        return false;
+    }
+    let _ = run.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted);
+    for block in &response.content {
+        if let ContentBlock::Text { text } = block
+            && !text.trim().is_empty()
+        {
+            crate::ui::live_assistant_in(run, text);
+        }
+    }
+    true
 }
 
 fn persist_goal_state(
@@ -3355,6 +3391,102 @@ fn shell_quote_arg(argument: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_tool_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            stop_reason: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+            model: "test-model".into(),
+            cache_reported: false,
+            limit: Default::default(),
+        }
+    }
+
+    #[test]
+    fn no_tools_candidate_is_not_published_when_it_contains_tool_syntax() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let run = RunContext::isolated(
+            crate::run::RunId::new("no-tools-leak"),
+            std::env::temp_dir(),
+        )
+        .with_live_sink(Some(Arc::new(move |event| {
+            sink_events.lock().expect("event lock").push(event);
+        })));
+        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+
+        assert!(!publish_no_tool_answer(
+            &run,
+            &no_tool_response(r#"<tool_call>{"name":"bash","arguments":{}}</tool_call>"#),
+        ));
+        assert!(emitted.lock().expect("event lock").is_empty());
+        assert_eq!(
+            run.lifecycle_state(),
+            Some(crate::lifecycle::LifecycleState::Running)
+        );
+    }
+
+    #[test]
+    fn no_tools_answer_enters_answering_before_the_first_sink_event() {
+        let observed = RunContext::isolated(
+            crate::run::RunId::new("no-tools-answer"),
+            std::env::temp_dir(),
+        );
+        observed
+            .transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        let lifecycle = observed.clone();
+        let states = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_states = Arc::clone(&states);
+        let run = observed.with_live_sink(Some(Arc::new(move |event| {
+            if matches!(event, crate::ui::Live::Assistant(_)) {
+                sink_states
+                    .lock()
+                    .expect("state lock")
+                    .push(lifecycle.lifecycle_state());
+            }
+        })));
+
+        assert!(publish_no_tool_answer(&run, &no_tool_response("완료")));
+        assert_eq!(
+            *states.lock().expect("state lock"),
+            vec![Some(crate::lifecycle::LifecycleState::Answering)]
+        );
+    }
+
+    #[test]
+    fn no_tools_structured_tool_use_never_enters_answering_or_reaches_the_sink() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let run = RunContext::isolated(
+            crate::run::RunId::new("no-tools-structured-tool"),
+            std::env::temp_dir(),
+        )
+        .with_live_sink(Some(Arc::new(move |event| {
+            sink_events.lock().expect("event lock").push(event);
+        })));
+        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        let response = ChatResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "true"}),
+            }],
+            ..no_tool_response("")
+        };
+
+        assert!(!publish_no_tool_answer(&run, &response));
+        assert!(emitted.lock().expect("event lock").is_empty());
+        assert_eq!(
+            run.lifecycle_state(),
+            Some(crate::lifecycle::LifecycleState::Running)
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prompt_exhaustion_fails_before_a_provider_call() {

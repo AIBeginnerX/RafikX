@@ -3,8 +3,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use super::{
-    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, StreamEvent,
-    limit_hint, map_stop_reason,
+    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, SemanticStreamEvent,
+    StopReason, StreamEvent, limit_hint, map_stop_reason,
 };
 
 const CODEX_RESPONSES: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -135,6 +135,18 @@ impl OpenAiCompatProvider {
     where
         F: FnMut(StreamEvent),
     {
+        self.chat_semantic_stream(req, |event| on_event(event.public()))
+            .await
+    }
+
+    pub(crate) async fn chat_semantic_stream<F>(
+        &self,
+        req: &ChatRequest,
+        mut on_event: F,
+    ) -> Result<ChatResponse>
+    where
+        F: FnMut(SemanticStreamEvent),
+    {
         if matches!(self.mode, CompatMode::CodexResponses) {
             return self.chat_codex_stream(req, on_event).await;
         }
@@ -184,7 +196,7 @@ impl OpenAiCompatProvider {
                 let data = data.trim();
                 if data == "[DONE]" {
                     if reasoning_started {
-                        on_event(StreamEvent::Text("\n[/모델 작업]\n"));
+                        on_event(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
                     }
                     return Ok(finish_stream(
                         full_text,
@@ -231,10 +243,10 @@ impl OpenAiCompatProvider {
                         && !piece.is_empty()
                     {
                         if reasoning_started {
-                            on_event(StreamEvent::Text("\n[/모델 작업]\n"));
+                            on_event(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
                             reasoning_started = false;
                         }
-                        on_event(StreamEvent::Text(piece));
+                        on_event(SemanticStreamEvent::ContentCandidate(piece));
                         full_text.push_str(piece);
                     }
                     if let Some(piece) = delta
@@ -244,10 +256,10 @@ impl OpenAiCompatProvider {
                         && !piece.is_empty()
                     {
                         if !reasoning_started {
-                            on_event(StreamEvent::Text("\n[모델 작업]\n"));
+                            on_event(SemanticStreamEvent::ReasoningText("\n[모델 작업]\n"));
                             reasoning_started = true;
                         }
-                        on_event(StreamEvent::Text(piece));
+                        on_event(SemanticStreamEvent::ReasoningText(piece));
                     }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                         for tc in tcs {
@@ -277,7 +289,7 @@ impl OpenAiCompatProvider {
                                     } else {
                                         tool_acc[idx].1.as_str()
                                     };
-                                    on_event(StreamEvent::ToolArgs {
+                                    on_event(SemanticStreamEvent::ToolArgs {
                                         name,
                                         total_bytes: total,
                                     });
@@ -300,7 +312,7 @@ impl OpenAiCompatProvider {
             );
         }
         if reasoning_started {
-            on_event(StreamEvent::Text("\n[/모델 작업]\n"));
+            on_event(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
         }
 
         Ok(finish_stream(
@@ -318,7 +330,7 @@ impl OpenAiCompatProvider {
 
     async fn chat_codex_stream<F>(&self, req: &ChatRequest, mut on_event: F) -> Result<ChatResponse>
     where
-        F: FnMut(StreamEvent),
+        F: FnMut(SemanticStreamEvent),
     {
         let body = build_codex_body(req, true);
         let builder = self.apply_auth(
@@ -348,6 +360,7 @@ impl OpenAiCompatProvider {
         let mut cache_reported = false;
         let mut finish = None::<String>;
         let mut finished = false;
+        let mut reasoning_started = false;
 
         while let Some(chunk) = stream.next().await {
             if finished {
@@ -366,6 +379,7 @@ impl OpenAiCompatProvider {
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    close_codex_reasoning(&mut reasoning_started, &mut on_event);
                     finished = true;
                     break;
                 }
@@ -381,6 +395,7 @@ impl OpenAiCompatProvider {
                     &mut cached_tokens,
                     &mut cache_reported,
                     &mut finish,
+                    &mut reasoning_started,
                     Some(&mut on_event),
                     req.max_tokens,
                 );
@@ -419,6 +434,16 @@ impl OpenAiCompatProvider {
             ),
             req.max_tokens,
         ))
+    }
+}
+
+fn close_codex_reasoning<F>(reasoning_started: &mut bool, on_event: &mut F)
+where
+    F: FnMut(SemanticStreamEvent),
+{
+    if *reasoning_started {
+        on_event(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
+        *reasoning_started = false;
     }
 }
 
@@ -847,29 +872,60 @@ fn apply_codex_event<F>(
     cached_tokens: &mut u32,
     cache_reported: &mut bool,
     finish: &mut Option<String>,
+    reasoning_started: &mut bool,
     mut on_event: Option<&mut F>,
     max_tokens: u32,
 ) -> bool
 where
-    F: FnMut(StreamEvent),
+    F: FnMut(SemanticStreamEvent),
 {
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    if kind.contains("reasoning")
+        && kind.ends_with(".delta")
+        && let Some(delta) = v.get("delta").and_then(|x| x.as_str())
+        && !delta.is_empty()
+        && let Some(cb) = on_event.as_mut()
+    {
+        if !*reasoning_started {
+            cb(SemanticStreamEvent::ReasoningText("\n[모델 작업]\n"));
+            *reasoning_started = true;
+        }
+        cb(SemanticStreamEvent::ReasoningText(delta));
+    }
     if (kind.ends_with("output_text.delta") || kind == "response.output_text.delta")
         && let Some(delta) = v.get("delta").and_then(|x| x.as_str())
         && !delta.is_empty()
     {
+        if *reasoning_started {
+            if let Some(cb) = on_event.as_mut() {
+                cb(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
+            }
+            *reasoning_started = false;
+        }
         full_text.push_str(delta);
         if let Some(cb) = on_event.as_mut() {
-            cb(StreamEvent::Text(delta));
+            cb(SemanticStreamEvent::ContentCandidate(delta));
         }
     }
     if (kind.ends_with("output_item.done") || kind == "response.output_item.done")
         && let Some(item) = v.get("item")
     {
+        if *reasoning_started {
+            if let Some(cb) = on_event.as_mut() {
+                cb(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
+            }
+            *reasoning_started = false;
+        }
         collect_codex_item(item, full_text, tools);
     }
     let completed = kind.ends_with("completed") || kind == "response.completed";
     if completed {
+        if *reasoning_started {
+            if let Some(cb) = on_event.as_mut() {
+                cb(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
+            }
+            *reasoning_started = false;
+        }
         *finish = Some("completed".into());
         if let Some(resp) = v.get("response") {
             take_stream_usage(
@@ -989,6 +1045,90 @@ fn take_stream_usage(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn codex_stream_labels_reasoning_and_content_candidates_separately() {
+        let mut full_text = String::new();
+        let mut tools = Vec::new();
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut cached_tokens = 0;
+        let mut cache_reported = false;
+        let mut finish = None;
+        let mut reasoning_started = false;
+        let mut kinds = Vec::new();
+        let mut callback = |event: SemanticStreamEvent<'_>| match event {
+            SemanticStreamEvent::ReasoningText(_) => kinds.push("reasoning"),
+            SemanticStreamEvent::ContentCandidate(_) => kinds.push("candidate"),
+            SemanticStreamEvent::ToolArgs { .. } => kinds.push("tool"),
+        };
+
+        apply_codex_event(
+            &json!({"type": "response.reasoning_summary_text.delta", "delta": "검토"}),
+            &mut full_text,
+            &mut tools,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_tokens,
+            &mut cache_reported,
+            &mut finish,
+            &mut reasoning_started,
+            Some(&mut callback),
+            1024,
+        );
+        apply_codex_event(
+            &json!({"type": "response.output_text.delta", "delta": "완료"}),
+            &mut full_text,
+            &mut tools,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_tokens,
+            &mut cache_reported,
+            &mut finish,
+            &mut reasoning_started,
+            Some(&mut callback),
+            1024,
+        );
+
+        assert_eq!(kinds, ["reasoning", "reasoning", "reasoning", "candidate"]);
+        assert_eq!(full_text, "완료");
+    }
+
+    #[test]
+    fn codex_done_closes_an_open_reasoning_marker() {
+        let mut full_text = String::new();
+        let mut tools = Vec::new();
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut cached_tokens = 0;
+        let mut cache_reported = false;
+        let mut finish = None;
+        let mut reasoning_started = false;
+        let mut events = Vec::new();
+        let mut callback = |event: SemanticStreamEvent<'_>| {
+            if let SemanticStreamEvent::ReasoningText(text) = event {
+                events.push(text.to_string());
+            }
+        };
+
+        apply_codex_event(
+            &json!({"type": "response.reasoning_summary_text.delta", "delta": "검토"}),
+            &mut full_text,
+            &mut tools,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_tokens,
+            &mut cache_reported,
+            &mut finish,
+            &mut reasoning_started,
+            Some(&mut callback),
+            1024,
+        );
+        close_codex_reasoning(&mut reasoning_started, &mut callback);
+
+        assert_eq!(events, ["\n[모델 작업]\n", "검토", "\n[/모델 작업]\n"]);
+        assert!(!reasoning_started);
+    }
 
     #[test]
     fn codex_backend_body_omits_unsupported_output_limit() {
@@ -1126,8 +1266,9 @@ mod usage_tests {
         let mut cached_tokens = 0;
         let mut cache_reported = false;
         let mut finish = None;
-        fn ignore_stream_event(_: StreamEvent<'_>) {}
+        fn ignore_stream_event(_: SemanticStreamEvent<'_>) {}
         let mut callback = ignore_stream_event;
+        let mut reasoning_started = false;
         let limited = apply_codex_event(
             &event,
             &mut full_text,
@@ -1137,6 +1278,7 @@ mod usage_tests {
             &mut cached_tokens,
             &mut cache_reported,
             &mut finish,
+            &mut reasoning_started,
             Some(&mut callback),
             2,
         );
@@ -1157,6 +1299,7 @@ mod usage_tests {
             &mut cached_tokens,
             &mut cache_reported,
             &mut finish,
+            &mut reasoning_started,
             Some(&mut callback),
             2,
         );

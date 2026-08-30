@@ -1265,7 +1265,24 @@ pub async fn stream_with_fallback<F>(
 where
     F: FnMut(StreamEvent),
 {
-    stream_with_fallback_inner(cfg, order, model_role, req, None, on_event).await
+    let mut on_event = on_event;
+    stream_with_fallback_inner(cfg, order, model_role, req, None, true, |event| {
+        on_event(event.public())
+    })
+    .await
+}
+
+pub(crate) async fn stream_semantic_with_fallback<F>(
+    cfg: &Config,
+    order: &[String],
+    model_role: &str,
+    req: ChatRequest,
+    on_event: F,
+) -> Result<(String, ChatResponse)>
+where
+    F: FnMut(SemanticStreamEvent),
+{
+    stream_with_fallback_inner(cfg, order, model_role, req, None, false, on_event).await
 }
 
 /// 콤보 체인 스트리밍 (F8) — 체인의 (provider, model) 쌍을 순서대로 시도한다.
@@ -1286,7 +1303,30 @@ where
             order.push(p.clone());
         }
     }
-    stream_with_fallback_inner(cfg, &order, model_role, req, Some(combo), on_event).await
+    let mut on_event = on_event;
+    stream_with_fallback_inner(cfg, &order, model_role, req, Some(combo), true, |event| {
+        on_event(event.public())
+    })
+    .await
+}
+
+pub(crate) async fn stream_semantic_with_fallback_combo<F>(
+    cfg: &Config,
+    combo: &[(String, String)],
+    model_role: &str,
+    req: ChatRequest,
+    on_event: F,
+) -> Result<(String, ChatResponse)>
+where
+    F: FnMut(SemanticStreamEvent),
+{
+    let mut order: Vec<String> = Vec::new();
+    for (provider, _) in combo {
+        if !order.contains(provider) {
+            order.push(provider.clone());
+        }
+    }
+    stream_with_fallback_inner(cfg, &order, model_role, req, Some(combo), false, on_event).await
 }
 
 async fn stream_with_fallback_inner<F>(
@@ -1295,10 +1335,11 @@ async fn stream_with_fallback_inner<F>(
     model_role: &str,
     mut req: ChatRequest,
     combo: Option<&[(String, String)]>,
+    candidates_visible: bool,
     mut on_event: F,
 ) -> Result<(String, ChatResponse)>
 where
-    F: FnMut(StreamEvent),
+    F: FnMut(SemanticStreamEvent),
 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let original_model = req.model.clone();
@@ -1345,12 +1386,18 @@ where
             // 화면에 이미 텍스트가 흘러나간 뒤의 재시도·폴백은 중복 출력을 만드므로 금지한다.
             let mut attempt = 0u32;
             loop {
-                let mut track = |ev: StreamEvent| {
+                let mut track = |ev: SemanticStreamEvent| {
                     // 진행 신호(ToolArgs)는 화면 출력이 아니므로 재시도 판정에서 제외된다.
-                    emitted.fetch_add(emitted_chars(&ev), Ordering::Relaxed);
+                    let chars = match ev {
+                        SemanticStreamEvent::ContentCandidate(text) if candidates_visible => {
+                            text.chars().count()
+                        }
+                        _ => ev.displayed_chars(),
+                    };
+                    emitted.fetch_add(chars, Ordering::Relaxed);
                     on_event(ev);
                 };
-                match client.chat_stream(&req, &mut track).await {
+                match client.chat_semantic_stream(&req, &mut track).await {
                     Ok(resp) => {
                         crate::usage::record_success(id, &resp);
                         warn_model_mismatch(&req.model, &resp);
@@ -1372,7 +1419,9 @@ where
                             if emitted.load(Ordering::Relaxed) > 0 {
                                 // 출력이 이미 나간 뒤의 절단 — 같은 연결로만 다시 시도하고,
                                 // 재출력이 중복으로 보이지 않게 경계 표시를 남긴다.
-                                on_event(StreamEvent::Text("\n[연결 끊김 — 같은 연결로 재시도]\n"));
+                                on_event(SemanticStreamEvent::ReasoningText(
+                                    "\n[연결 끊김 — 같은 연결로 재시도]\n",
+                                ));
                             }
                             tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt)))
                                 .await;

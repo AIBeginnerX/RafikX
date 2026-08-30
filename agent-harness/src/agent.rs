@@ -12,13 +12,14 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::lifecycle::{ApprovalDecision, LifecycleEventData, LifecycleState};
 use crate::provider::{
-    ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason, StreamEvent,
+    ChatRequest, ChatResponse, ContentBlock, Message, Role, SemanticStreamEvent, StopReason,
 };
 use crate::run::{RunContext, RunId};
 use crate::tools::{self, ToolCtx, ToolRegistry};
 
 pub const HARD_CAP: u32 = 50;
 pub const AGENT_MAX_ITER: u32 = 25;
+const LEAKED_TOOL_RETRY_CAP: u8 = 2;
 
 /// 한 응답의 도구 호출 목록 앞부분에서 병렬로 묶을 수 있는 연속 `task` 구간의 길이.
 /// 2 미만이면 0 — 호출부는 기존 순차 경로를 그대로 탄다.
@@ -222,6 +223,7 @@ pub async fn run_agent_with_context(
     let mut tool_errors: Vec<String> = Vec::new();
     let mut deny_reasons: Vec<String> = Vec::new();
     let mut truncation_retries = 0u8;
+    let mut leaked_tool_retries = 0u8;
     let max_iter = max_iterations.min(HARD_CAP);
     run_context.ensure_model_iteration_limit(max_iter);
 
@@ -349,22 +351,21 @@ pub async fn run_agent_with_context(
             }
             v
         };
-        let mut streamed = false;
         let (_used, resp) = {
-            let on_event = |ev: crate::provider::StreamEvent| match ev {
-                StreamEvent::Text(piece) => {
-                    streamed = true;
-                    crate::ui::live_chunk_in(&run_context, piece);
+            let on_event = |ev: SemanticStreamEvent| match ev {
+                SemanticStreamEvent::ReasoningText(piece) => {
+                    crate::ui::live_chunk_in(&run_context, piece)
                 }
+                SemanticStreamEvent::ContentCandidate(_) => {}
                 // 대형 tool call 인자를 쓰는 동안은 텍스트가 없다 — 진행만 갱신한다.
-                StreamEvent::ToolArgs { name, total_bytes } => {
+                SemanticStreamEvent::ToolArgs { name, total_bytes } => {
                     let label = crate::harness::tool_args_label(name, total_bytes);
                     crate::ui::live_status_in(&run_context, &label);
                     worker_activity(&run_context, &label);
                 }
             };
             let response = if combo_chain.is_empty() {
-                Box::pin(crate::harness::stream_with_fallback(
+                Box::pin(crate::harness::stream_semantic_with_fallback(
                     cfg, &order, "main", req, on_event,
                 ))
                     as std::pin::Pin<
@@ -376,7 +377,7 @@ pub async fn run_agent_with_context(
                         >,
                     >
             } else {
-                Box::pin(crate::harness::stream_with_fallback_combo(
+                Box::pin(crate::harness::stream_semantic_with_fallback_combo(
                     cfg,
                     &combo_chain,
                     "main",
@@ -451,10 +452,6 @@ pub async fn run_agent_with_context(
             ),
         );
 
-        if !streamed {
-            print_text_blocks(&run_context, &resp);
-        }
-
         let tool_uses: Vec<(String, String, serde_json::Value)> = resp
             .content
             .iter()
@@ -466,6 +463,36 @@ pub async fn run_agent_with_context(
             })
             .collect();
 
+        if tool_uses.is_empty() && crate::harness::leaked_tool_call(&response_text(&resp)) {
+            if leaked_tool_retries < LEAKED_TOOL_RETRY_CAP {
+                leaked_tool_retries += 1;
+                messages.push(Message::user_text(
+                    "[시스템] 도구 호출 문법을 텍스트로 출력하지 마라. 제공된 실제 도구를 구조화된 tool call 로 호출해 작업을 계속하라.",
+                ));
+                crate::ui::live_warn_in(
+                    &run_context,
+                    "텍스트 도구 호출을 차단했습니다 — 실제 도구 호출로 다시 시도합니다.",
+                );
+                continue;
+            }
+            return Ok(AgentOutcome {
+                status: "incomplete".into(),
+                iterations,
+                input_tokens,
+                output_tokens,
+                context_tokens,
+                cached_tokens,
+                cache_reported,
+                error: Some("모델이 실제 도구 대신 텍스트 도구 호출을 반복했습니다.".into()),
+                messages,
+                changed_files: committed_files(&run_context),
+                tool_errors,
+                deny_reasons,
+                verify_fail: None,
+                verify_recovered: None,
+            });
+        }
+
         // 출력 상한(max_tokens)에서 잘려 도구 호출까지 유실된 응답 — 종료하지 말고
         // 모델에게 잘렸다는 사실과 분할 전략을 알려준 뒤 같은 런에서 이어간다.
         if resp.stop_reason == StopReason::MaxTokens
@@ -473,6 +500,7 @@ pub async fn run_agent_with_context(
             && truncation_retries < 2
         {
             truncation_retries += 1;
+            print_work_text_blocks(&run_context, &resp);
             if !resp.content.is_empty() {
                 messages.push(Message {
                     role: Role::Assistant,
@@ -493,12 +521,9 @@ pub async fn run_agent_with_context(
         }
 
         if resp.stop_reason != StopReason::ToolUse && tool_uses.is_empty() {
-            messages.push(Message {
-                role: Role::Assistant,
-                content: resp.content.clone(),
-            });
+            let published = publish_final_answer(&run_context, &mut messages, &resp);
+            debug_assert!(published);
             let hit_token_limit = resp.stop_reason == StopReason::MaxTokens;
-            let _ = run_context.transition_lifecycle(LifecycleEventData::AnswerStarted);
             return Ok(AgentOutcome {
                 status: if hit_token_limit {
                     "incomplete".into()
@@ -522,6 +547,8 @@ pub async fn run_agent_with_context(
                 verify_recovered: None,
             });
         }
+
+        print_work_text_blocks(&run_context, &resp);
 
         if tool_uses.is_empty() {
             messages.push(Message {
@@ -962,6 +989,7 @@ pub async fn run_agent_with_context(
         });
         // 도구가 실제로 실행된 반복 — 진전이 있었으므로 절단 재시도 카운터를 되돌린다.
         truncation_retries = 0;
+        leaked_tool_retries = 0;
     }
 }
 
@@ -991,6 +1019,45 @@ fn print_text_blocks(run: &RunContext, resp: &ChatResponse) {
             && !text.trim().is_empty()
         {
             crate::ui::live_assistant_in(run, text);
+        }
+    }
+}
+
+fn response_text(response: &ChatResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn publish_final_answer(
+    run: &RunContext,
+    messages: &mut Vec<Message>,
+    response: &ChatResponse,
+) -> bool {
+    if crate::harness::leaked_tool_call(&response_text(response)) {
+        return false;
+    }
+    let _ = run.transition_lifecycle(LifecycleEventData::AnswerStarted);
+    print_text_blocks(run, response);
+    messages.push(Message {
+        role: Role::Assistant,
+        content: response.content.clone(),
+    });
+    true
+}
+
+fn print_work_text_blocks(run: &RunContext, resp: &ChatResponse) {
+    for block in &resp.content {
+        if let ContentBlock::Text { text } = block
+            && !text.trim().is_empty()
+        {
+            crate::ui::live_assistant_in(run, &format!("[모델 작업]\n{text}\n[/모델 작업]"));
         }
     }
 }
@@ -1229,6 +1296,43 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    fn final_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            stop_reason: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+            model: "test-model".into(),
+            cache_reported: false,
+            limit: Default::default(),
+        }
+    }
+
+    #[test]
+    fn polluted_tool_candidate_never_reaches_sink_messages_or_answering() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let run = RunContext::isolated(RunId::new("polluted-tool-candidate"), std::env::temp_dir())
+            .with_live_sink(Some(Arc::new(move |event| {
+                sink_events.lock().expect("event lock").push(event);
+            })));
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        let mut messages = vec![Message::user_text("게임을 만들어줘")];
+
+        assert!(!publish_final_answer(
+            &run,
+            &mut messages,
+            &final_response(r#"<tool_call>{"name":"write_file","arguments":{}}</tool_call>"#),
+        ));
+        assert!(emitted.lock().expect("event lock").is_empty());
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, Role::User));
+        assert!(assistant_text(&messages).is_empty());
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::Running));
+    }
 
     #[test]
     fn last_assistant_text_takes_only_the_final_turn() {

@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use super::{
-    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, StreamEvent,
-    limit_hint, map_stop_reason, rate_limit_error,
+    ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, SemanticStreamEvent,
+    StopReason, StreamEvent, limit_hint, map_stop_reason, rate_limit_error,
 };
 
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -243,6 +243,18 @@ impl AnthropicProvider {
     where
         F: FnMut(StreamEvent),
     {
+        self.chat_semantic_stream(req, |event| on_event(event.public()))
+            .await
+    }
+
+    pub(crate) async fn chat_semantic_stream<F>(
+        &self,
+        req: &ChatRequest,
+        mut on_event: F,
+    ) -> Result<ChatResponse>
+    where
+        F: FnMut(SemanticStreamEvent),
+    {
         let body = build_body(req);
         let resp = self
             .apply_auth(
@@ -311,10 +323,12 @@ impl AnthropicProvider {
                                     && !piece.is_empty()
                                 {
                                     if thinking_started {
-                                        on_event(StreamEvent::Text("\n[/모델 작업]\n"));
+                                        on_event(SemanticStreamEvent::ReasoningText(
+                                            "\n[/모델 작업]\n",
+                                        ));
                                         thinking_started = false;
                                     }
-                                    on_event(StreamEvent::Text(piece));
+                                    on_event(SemanticStreamEvent::ContentCandidate(piece));
                                     full_text.push_str(piece);
                                     content.text_delta(&v);
                                 }
@@ -325,16 +339,16 @@ impl AnthropicProvider {
                                 && !piece.is_empty()
                             {
                                 if !thinking_started {
-                                    on_event(StreamEvent::Text("\n[모델 작업]\n"));
+                                    on_event(SemanticStreamEvent::ReasoningText("\n[모델 작업]\n"));
                                     thinking_started = true;
                                 }
-                                on_event(StreamEvent::Text(piece));
+                                on_event(SemanticStreamEvent::ReasoningText(piece));
                             } else if v.pointer("/delta/type").and_then(|x| x.as_str())
                                 == Some("input_json_delta")
                                 && let Some((name, total_bytes)) = content.input_json_delta(&v)
                             {
                                 let name = if name.is_empty() { "tool" } else { &name };
-                                on_event(StreamEvent::ToolArgs { name, total_bytes });
+                                on_event(SemanticStreamEvent::ToolArgs { name, total_bytes });
                             }
                         }
                         Some("content_block_stop") => content.content_block_stop(&v),
@@ -350,7 +364,7 @@ impl AnthropicProvider {
                         }
                         Some("message_stop") => {
                             if thinking_started {
-                                on_event(StreamEvent::Text("\n[/모델 작업]\n"));
+                                on_event(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
                             }
                             if let Some(stopped_cache) = crate::provider::cached_tokens_entry(&v) {
                                 cached_tokens = stopped_cache;

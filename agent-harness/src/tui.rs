@@ -383,14 +383,34 @@ pub async fn run(
     let mut upd_open = true;
     let mut live_open = true;
     let mut ask_open = true;
+    let mut pending_done: Option<TurnDone> = None;
 
     loop {
         if app.quit {
             break;
         }
+        if let Some(done) = pending_done.take() {
+            if let Ok(live) = live_rx.try_recv() {
+                apply_live(&mut app, live);
+                pending_done = Some(done);
+                dirty = true;
+            } else {
+                finish_turn(&mut app, done, &local_ask, &done_tx);
+                dirty = true;
+                if app.quit_after {
+                    app.quit = true;
+                }
+            }
+        }
         if dirty {
             terminal.draw(|f| view::draw(f, &app))?;
             dirty = false;
+        }
+        if app.quit {
+            break;
+        }
+        if pending_done.is_some() {
+            continue;
         }
 
         tokio::select! {
@@ -460,11 +480,8 @@ pub async fn run(
             }
             done = done_rx.recv() => {
                 if let Some(done) = done {
-                    finish_turn(&mut app, done, &local_ask, &done_tx);
-                    dirty = true;
-                    if app.quit_after {
-                        app.quit = true;
-                    }
+                    pending_done = Some(done);
+                    continue;
                 }
             }
         }
@@ -1455,6 +1472,9 @@ fn apply_live(app: &mut App, ev: Live) {
     if app.final_summary && ignore_after_final_summary(&ev) {
         return;
     }
+    if matches!(&ev, Live::Chunk(_) | Live::Assistant(_)) {
+        project_active_lifecycle(&app.active_run, &app.lifecycle_state);
+    }
     app.follow = true;
     match ev {
         Live::Chunk(s) => {
@@ -1559,6 +1579,22 @@ fn apply_live(app: &mut App, ev: Live) {
             app.follow = true;
         }
         Live::Mode(s) => app.mode_line = s,
+    }
+}
+
+fn project_active_lifecycle(
+    active_run: &Arc<Mutex<Option<crate::run::RunContext>>>,
+    lifecycle_state: &Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
+) {
+    let projected = active_run.lock().ok().and_then(|active| {
+        active
+            .as_ref()
+            .and_then(crate::run::RunContext::lifecycle_state)
+    });
+    if let Some(projected) = projected
+        && let Ok(mut current) = lifecycle_state.lock()
+    {
+        *current = Some(projected);
     }
 }
 
@@ -2975,6 +3011,27 @@ mod upgrade_tests {
         assert!(ignore_after_final_summary(&Live::Status(
             "[tokens] total_in=1 total_out=1 context=1".into()
         )));
+    }
+
+    #[test]
+    fn final_live_output_projects_answering_before_render() {
+        let run = crate::run::RunContext::isolated(
+            crate::run::RunId::new("answer-frame"),
+            std::env::temp_dir(),
+        );
+        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted)
+            .expect("start answer");
+        let active = Arc::new(Mutex::new(Some(run)));
+        let projected = Arc::new(Mutex::new(Some(crate::lifecycle::LifecycleState::Running)));
+
+        project_active_lifecycle(&active, &projected);
+
+        assert_eq!(
+            *projected.lock().expect("lifecycle lock"),
+            Some(crate::lifecycle::LifecycleState::Answering)
+        );
     }
 
     #[test]

@@ -23,7 +23,8 @@
 - [x] 메시지 예산 0인 요청의 provider 호출 차단과 현재 사용자 작업 보존
 - [x] ULW 연속 루트 epoch 격리와 boot 이후 정적인 Ready 화면 고정
 - [x] Anthropic 스트리밍 tool_use·input_json_delta 복원
-- [ ] (진행) 내부 semantic stream으로 추론·후보 본문·최종 Answering 표시 순서 고정
+- [x] 내부 semantic stream으로 추론·후보 본문·최종 Answering 표시 순서 고정
+- [ ] (진행) 릴리스 문서·기본/최소 전체 테스트·브라우저 게임 E2E·실제 PTY 최종 갱신
 - [ ] (대기) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 

@@ -140,6 +140,29 @@ pub enum StreamEvent<'a> {
     ToolArgs { name: &'a str, total_bytes: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticStreamEvent<'a> {
+    ReasoningText(&'a str),
+    ContentCandidate(&'a str),
+    ToolArgs { name: &'a str, total_bytes: usize },
+}
+
+impl<'a> SemanticStreamEvent<'a> {
+    pub(crate) const fn public(self) -> StreamEvent<'a> {
+        match self {
+            Self::ReasoningText(text) | Self::ContentCandidate(text) => StreamEvent::Text(text),
+            Self::ToolArgs { name, total_bytes } => StreamEvent::ToolArgs { name, total_bytes },
+        }
+    }
+
+    pub(crate) fn displayed_chars(self) -> usize {
+        match self {
+            Self::ReasoningText(text) => text.chars().count(),
+            Self::ContentCandidate(_) | Self::ToolArgs { .. } => 0,
+        }
+    }
+}
+
 /// 이 이벤트가 화면으로 내보낸 문자 수. ToolArgs 는 진행 표시일 뿐 출력이 아니므로 0이다
 /// — 이 구분이 없으면 "이미 출력이 나갔다"는 판정이 오염돼 폴백이 막힌다.
 pub fn emitted_chars(event: &StreamEvent) -> usize {
@@ -169,6 +192,20 @@ impl DynProvider {
         match self {
             DynProvider::Anthropic(p) => p.chat_stream(req, on_event).await,
             DynProvider::OpenAi(p) => p.chat_stream(req, on_event).await,
+        }
+    }
+
+    pub(crate) async fn chat_semantic_stream<F>(
+        &self,
+        req: &ChatRequest,
+        on_event: F,
+    ) -> Result<ChatResponse>
+    where
+        F: FnMut(SemanticStreamEvent),
+    {
+        match self {
+            DynProvider::Anthropic(p) => p.chat_semantic_stream(req, on_event).await,
+            DynProvider::OpenAi(p) => p.chat_semantic_stream(req, on_event).await,
         }
     }
 }
@@ -250,6 +287,37 @@ mod tests {
                 name: "write_file",
                 total_bytes: 16384,
             }),
+            0
+        );
+    }
+
+    #[test]
+    fn semantic_text_kinds_preserve_the_public_stream_contract() {
+        assert_eq!(
+            SemanticStreamEvent::ReasoningText("생각").public(),
+            StreamEvent::Text("생각")
+        );
+        assert_eq!(
+            SemanticStreamEvent::ContentCandidate("답").public(),
+            StreamEvent::Text("답")
+        );
+        assert_eq!(
+            SemanticStreamEvent::ToolArgs {
+                name: "write_file",
+                total_bytes: 8192,
+            }
+            .public(),
+            StreamEvent::ToolArgs {
+                name: "write_file",
+                total_bytes: 8192,
+            }
+        );
+        assert_eq!(
+            SemanticStreamEvent::ReasoningText("생각").displayed_chars(),
+            2
+        );
+        assert_eq!(
+            SemanticStreamEvent::ContentCandidate("아직 후보").displayed_chars(),
             0
         );
     }

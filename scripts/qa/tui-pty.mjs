@@ -270,6 +270,8 @@ async function terminalSurface(
   }, { cols, rows });
   let raw = "";
   let closed = false;
+  const frames = [];
+  let writeQueue = Promise.resolve();
   const cliArgs = config ? ["--config", config, ...args] : args;
   childProcess = pty.spawn(binary, cliArgs, {
     cols,
@@ -284,9 +286,20 @@ async function terminalSurface(
   });
   childProcess.onData((data) => {
     raw += data;
-    if (!closed) page.evaluate((chunk) => window.term.write(chunk), data).catch(() => {});
+    if (!closed) {
+      writeQueue = writeQueue.then(() => page.evaluate((chunk) => new Promise((resolve) => {
+        window.term.write(chunk, () => {
+          const buffer = window.term.buffer.active;
+          resolve(Array.from(
+            { length: window.term.rows },
+            (_, row) => buffer.getLine(row)?.translateToString(true) || "",
+          ).join("\n"));
+        });
+      }), data)).then((frame) => { frames.push(frame); });
+    }
   });
   async function screenText() {
+    await writeQueue;
     return page.evaluate(() => {
       const buffer = window.term.buffer.active;
       return Array.from({ length: window.term.rows }, (_, row) => buffer.getLine(row)?.translateToString(true) || "").join("\n");
@@ -321,7 +334,16 @@ async function terminalSurface(
       surfaces.delete(surface);
     }
   }
-  surface = { close, page, process: childProcess, raw: () => raw, screenText, screenshot, waitFor };
+  surface = {
+    close,
+    page,
+    process: childProcess,
+    raw: () => raw,
+    frames: async () => { await writeQueue; return [...frames]; },
+    screenText,
+    screenshot,
+    waitFor,
+  };
   surfaces.add(surface);
   return surface;
   } catch (error) {
@@ -410,6 +432,15 @@ assert.match(await approval.screenText(), /Waiting approval/);
 await approval.screenshot("tui-approval-100x30.png");
 approval.process.write("y");
 await approval.waitFor("승인된 명령을 실행하고 결과를 검증했습니다", 8000);
+const firstAnswerFrame = (await approval.frames()).find((frame) =>
+  frame.includes("승인된 명령을 실행하고 결과를 검증했습니다"),
+);
+assert.ok(firstAnswerFrame, "final answer never reached an xterm frame");
+assert.match(firstAnswerFrame, /Answering/, "first final-answer frame was not Answering");
+await fs.writeFile(
+  path.join(stagingOutput, "tui-answering-first-frame.txt"),
+  `${firstAnswerFrame}\n`,
+);
 await approval.waitFor("Run summary · ✓ ok", 8000);
 await approval.waitFor("Succeeded", 8000);
 assert.match(await approval.screenText(), /Succeeded/);
