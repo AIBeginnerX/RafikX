@@ -116,10 +116,10 @@ impl OpenAiCompatProvider {
             .context("OpenAI 호환 API 요청에 실패했습니다")?;
         let status = resp.status();
         let hint = limit_hint(resp.headers());
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(api_error(status.as_u16(), &text, &hint, &self.mode));
+            return Err(api_error(status.as_u16(), "", &hint, &self.mode));
         }
+        let text = resp.text().await.unwrap_or_default();
         let mut parsed = match self.mode {
             CompatMode::CodexResponses => parse_codex_response(&text)?,
             CompatMode::ChatCompletions => parse_completion(&text)?,
@@ -152,8 +152,7 @@ impl OpenAiCompatProvider {
         let status = resp.status();
         let hint = limit_hint(resp.headers());
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(api_error(status.as_u16(), &text, &hint, &self.mode));
+            return Err(api_error(status.as_u16(), "", &hint, &self.mode));
         }
 
         let mut stream = resp.bytes_stream();
@@ -336,8 +335,7 @@ impl OpenAiCompatProvider {
         let status = resp.status();
         let hint = limit_hint(resp.headers());
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(api_error(status.as_u16(), &text, &hint, &self.mode));
+            return Err(api_error(status.as_u16(), "", &hint, &self.mode));
         }
 
         let mut stream = resp.bytes_stream();

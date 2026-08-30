@@ -231,10 +231,9 @@ fn header_u32(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u32> {
     header_u64(headers, name).map(saturating_token_count)
 }
 
-pub fn rate_limit_error(status: u16, body: &str, hint: &LimitHint) -> anyhow::Error {
-    let snippet: String = body.chars().take(200).collect();
+pub fn rate_limit_error(status: u16, _body: &str, hint: &LimitHint) -> anyhow::Error {
     let wait = hint.retry_after_secs.unwrap_or(45);
-    anyhow!("HTTP {status} rate_limited retry_after={wait} {snippet}")
+    anyhow!("HTTP {status} rate_limited retry_after={wait}")
 }
 
 #[cfg(test)]
@@ -253,5 +252,20 @@ mod tests {
             }),
             0
         );
+    }
+
+    #[test]
+    fn rate_limit_error_never_persists_provider_body() {
+        let body = "unlabelled upstream credential 7f8db8d8";
+        let error = rate_limit_error(
+            429,
+            body,
+            &LimitHint {
+                retry_after_secs: Some(7),
+                ..LimitHint::default()
+            },
+        );
+        assert_eq!(format!("{error}"), "HTTP 429 rate_limited retry_after=7");
+        assert!(!format!("{error:?}").contains(body));
     }
 }

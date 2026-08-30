@@ -77,10 +77,10 @@ impl AnthropicProvider {
 
         let status = resp.status();
         let hint = limit_hint(resp.headers());
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(api_error(status.as_u16(), &text, &hint));
+            return Err(api_error(status.as_u16(), "", &hint));
         }
+        let text = resp.text().await.unwrap_or_default();
         let mut parsed = parse_message_json(&text)?;
         parsed.limit = hint;
         Ok(parsed)
@@ -106,8 +106,7 @@ impl AnthropicProvider {
         let status = resp.status();
         let hint = limit_hint(resp.headers());
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(api_error(status.as_u16(), &text, &hint));
+            return Err(api_error(status.as_u16(), "", &hint));
         }
 
         let mut stream = resp.bytes_stream();
@@ -206,11 +205,7 @@ impl AnthropicProvider {
                             });
                         }
                         Some("error") => {
-                            let msg = v
-                                .pointer("/error/message")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("스트림 오류");
-                            return Err(anyhow!("Anthropic API 오류: {}", redact_secrets(msg)));
+                            return Err(anyhow!("Anthropic API 스트림 오류"));
                         }
                         _ => {}
                     }
@@ -392,30 +387,15 @@ fn take_stream_input_usage(
     }
 }
 
-fn api_error(status: u16, body: &str, hint: &LimitHint) -> anyhow::Error {
-    let safe = redact_secrets(body);
+fn api_error(status: u16, _body: &str, hint: &LimitHint) -> anyhow::Error {
     if status == 429 {
-        return rate_limit_error(status, &safe, hint);
+        return rate_limit_error(status, "", hint);
     }
-    let snippet: String = safe.chars().take(400).collect();
     if status == 401 {
         anyhow!("Anthropic API 인증 실패 (HTTP 401). API 키를 확인하세요.")
     } else {
-        anyhow!("Anthropic API 오류 HTTP {status}: {snippet}")
+        anyhow!("Anthropic API 오류 HTTP {status}")
     }
-}
-
-fn redact_secrets(s: &str) -> String {
-    let mut out = s.to_string();
-    let prefix = "sk-ant-";
-    while let Some(i) = out.find(prefix) {
-        let rest = &out[i + prefix.len()..];
-        let n = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(rest.len());
-        out.replace_range(i..i + prefix.len() + n, "[redacted]");
-    }
-    out
 }
 
 #[cfg(test)]
@@ -439,5 +419,31 @@ mod streaming_usage_tests {
         take_stream_input_usage(&event, &mut input, &mut cached, &mut reported);
         assert_eq!((input, cached), (200, 800));
         assert!(reported);
+    }
+
+    #[test]
+    fn api_error_discards_untrusted_body_before_persistent_logging() {
+        let echoed_credential = "unlabeled-anthropic-credential-7f8db8d8";
+        let body = format!("upstream detail: {echoed_credential}");
+
+        for status in [429, 500] {
+            let error = api_error(
+                status,
+                &body,
+                &LimitHint {
+                    retry_after_secs: Some(12),
+                    ..LimitHint::default()
+                },
+            );
+            for persistent_log_message in [
+                format!("{error}"),
+                format!("{error:#}"),
+                format!("{error:?}"),
+            ] {
+                assert!(persistent_log_message.contains(&format!("HTTP {status}")));
+                assert!(!persistent_log_message.contains(echoed_credential));
+                assert!(!persistent_log_message.contains("upstream detail"));
+            }
+        }
     }
 }

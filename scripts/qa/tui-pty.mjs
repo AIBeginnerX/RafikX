@@ -331,9 +331,21 @@ async function terminalSurface(
   }
 }
 
-function processEnv() {
-  return Object.fromEntries(Object.entries(globalThis.process.env).filter(([key, value]) => key !== "NO_COLOR" && value !== undefined));
+function processEnv(source = globalThis.process.env) {
+  const env = {
+    TERM: "xterm-256color",
+    COLORTERM: "truecolor",
+  };
+  for (const key of ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]) {
+    if (source[key] !== undefined) env[key] = source[key];
+  }
+  return env;
 }
+
+assert.deepEqual(
+  processEnv({ PATH: "/usr/bin:/bin", OPENAI_API_KEY: "must-not-pass", RAFIKX_HOME: "/wrong" }),
+  { TERM: "xterm-256color", COLORTERM: "truecolor", PATH: "/usr/bin:/bin" },
+);
 
 const start = await terminalSurface(120, 40);
 await start.waitFor("RAFIKX");
