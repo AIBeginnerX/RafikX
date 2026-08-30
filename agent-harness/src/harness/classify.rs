@@ -47,26 +47,123 @@ impl TaskClass {
 
 /// medium 키워드 — 규칙 분류와 확신도 판정이 같은 목록을 쓴다(단일 원천).
 const MEDIUM_KEYWORDS: &[&str] = &[
-    "요약", "정리", "번역", "초안", "검색", "찾아", "노트", "문서", "파일", "마크다운",
-    "폴터", "디렉토리", "워크스페이스",
+    "요약",
+    "정리",
+    "번역",
+    "초안",
+    "검색",
+    "찾아",
+    "노트",
+    "문서",
+    "파일",
+    "마크다운",
+    "폴터",
+    "디렉토리",
+    "워크스페이스",
     // 기억 의도 — remember/recall 도구가 필요하므로 도구 없는 quick 으로내면 안 된다 (T4 실측).
-    "기억해", "기억나", "기록해", "remember", "recall",
+    "기억해",
+    "기억나",
+    "기록해",
+    "remember",
+    "recall",
 ];
 
 /// 경로·파일 신호 — dev 키워드는 안 맞지만 도구 필요 가능성이 있는 짧은 입력.
 const TOOL_HINTS: &[&str] = &["~/", "./", "src/", "/tmp", ".txt", ".log", ".csv"];
 
 const ENGLISH_DEV_ACTIONS: &[&str] = &[
-    "add", "build", "code", "create", "delete", "develop", "edit", "fix", "generate",
-    "implement", "make", "modify", "program", "remove", "rename", "repair", "replace",
-    "update", "upgrade", "write",
+    "add",
+    "build",
+    "code",
+    "create",
+    "delete",
+    "develop",
+    "edit",
+    "fix",
+    "generate",
+    "implement",
+    "make",
+    "modify",
+    "program",
+    "remove",
+    "rename",
+    "repair",
+    "replace",
+    "update",
+    "upgrade",
+    "write",
 ];
 
 const ENGLISH_ARTIFACTS: &[&str] = &[
-    "api", "app", "application", "browser game", "button", "class", "cli", "code",
-    "component", "endpoint", "feature", "file", "function", "game", "method", "module",
-    "page", "script", "test", "tool", "web page", "website",
+    "api",
+    "app",
+    "application",
+    "browser game",
+    "button",
+    "class",
+    "cli",
+    "code",
+    "component",
+    "endpoint",
+    "feature",
+    "file",
+    "function",
+    "game",
+    "method",
+    "module",
+    "page",
+    "script",
+    "test",
+    "tool",
+    "web page",
+    "website",
 ];
+
+pub(crate) fn browser_game_intent(text: &str) -> bool {
+    let operative = strip_quoted(text);
+    let lower = operative.to_ascii_lowercase();
+    let dashboard_or_chart = ["dashboard", "chart", "대시보드", "차트"]
+        .iter()
+        .any(|signal| lower.contains(signal));
+    let game_signal = contains_english_term(&lower, "game")
+        || [
+            "snake",
+            "tetris",
+            "pong",
+            "breakout",
+            "pacman",
+            "platformer",
+            "super mario",
+            "게임",
+            "테트리스",
+            "핑퐁",
+            "벽돌깨기",
+            "플랫포머",
+            "슈퍼마리오",
+            "슈퍼 마리오",
+        ]
+        .iter()
+        .any(|signal| lower.contains(signal));
+    let browser_signal = contains_english_term(&lower, "js")
+        || contains_english_term(&lower, "css")
+        || [
+            "browser",
+            "canvas",
+            "html",
+            "html5",
+            "javascript",
+            "web",
+            ".css",
+            ".html",
+            ".js",
+            "브라우저",
+            "캔버스",
+            "웹",
+        ]
+        .iter()
+        .any(|signal| lower.contains(signal));
+    game_signal && browser_signal && !dashboard_or_chart
+}
 
 pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
     classify_rules_with_confidence(text, obsidian).0
@@ -159,11 +256,8 @@ pub async fn classify_gated(
             via: ClassSource::Rules,
         });
     }
-    let judged = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        classify_llm(cfg, text),
-    )
-    .await;
+    let judged =
+        tokio::time::timeout(std::time::Duration::from_secs(3), classify_llm(cfg, text)).await;
     match judged {
         Ok(Ok(c)) => Ok(ClassDecision {
             class: c,
@@ -188,7 +282,6 @@ pub async fn classify_gated(
     }
 }
 
-
 /// 인용 구간("…"·'…'·「…」·`…`) 제거 — 인용 속 동사는 지시가 아니라 인용이다 (G5).
 /// "이 요청을 검토해줘: '…만들어줘'" 같은 입력이 인용 속 생성 동사 때문에
 /// dev 로 오분류되는 것을 막는다. 인용 밖의 파일명·동사는 그대로 남는다.
@@ -204,7 +297,11 @@ pub(crate) fn strip_quoted(text: &str) -> String {
             }
             None => {
                 if matches!(c, '"' | '\'' | '「' | '『' | '`') {
-                    quote = Some(match c { '「' => '」', '『' => '』', other => other });
+                    quote = Some(match c {
+                        '「' => '」',
+                        '『' => '』',
+                        other => other,
+                    });
                 } else {
                     out.push(c);
                 }
@@ -218,12 +315,15 @@ fn looks_like_dev(text: &str) -> bool {
     if text.contains("```") {
         return true;
     }
+    if browser_game_intent(text) {
+        return true;
+    }
     let text = strip_quoted(text);
     let lower = text.to_ascii_lowercase();
     let exts = [
         ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".toml", ".json", ".go",
-        ".java", ".c", ".cpp", ".h", ".cs", ".rb", ".php", ".kt", ".swift", ".sh", ".ps1",
-        ".md", ".yml", ".yaml",
+        ".java", ".c", ".cpp", ".h", ".cs", ".rb", ".php", ".kt", ".swift", ".sh", ".ps1", ".md",
+        ".yml", ".yaml",
     ];
     if exts.iter().any(|e| lower.contains(e)) {
         return true;
@@ -440,11 +540,36 @@ mod intent_gate_tests {
 
     #[test]
     fn strong_signals_are_confident() {
-        assert_eq!(classify_rules_with_confidence("안녕", false), (TaskClass::Simple, true));
+        assert_eq!(
+            classify_rules_with_confidence("안녕", false),
+            (TaskClass::Simple, true)
+        );
         let (c, conf) = classify_rules_with_confidence("buggy.py 만들어서 고쳐줘", false);
         assert_eq!((c, conf), (TaskClass::Dev, true));
-        let (c, conf) = classify_rules_with_confidence("이 저장소 구조 분석해서 개선 전략 보고서 써줘", false);
+        let (c, conf) =
+            classify_rules_with_confidence("이 저장소 구조 분석해서 개선 전략 보고서 써줘", false);
         assert_eq!((c, conf), (TaskClass::Advanced, true));
+    }
+
+    #[test]
+    fn browser_game_intent_is_shared_and_does_not_match_dashboards_or_charts() {
+        for task in [
+            "create a Snake game in HTML",
+            "Build an HTML5 Pong game",
+            "make a Breakout game in JS",
+            "HTML 게임 만들어줘",
+            "캔버스 테트리스 구현",
+        ] {
+            assert!(browser_game_intent(task), "task: {task}");
+            assert_eq!(classify_rules(task, false), TaskClass::Dev, "task: {task}");
+        }
+        for task in [
+            "build an HTML dashboard for game scores",
+            "render a canvas chart for game analytics",
+            "게임 통계 웹 대시보드를 만들어줘",
+        ] {
+            assert!(!browser_game_intent(task), "task: {task}");
+        }
     }
 
     #[test]
@@ -480,7 +605,10 @@ mod intent_gate_tests {
     fn rules_wrapper_behavior_is_unchanged() {
         // with_confidence 도입 후에도 규칙 결과 자체는 기존과 동일해야 한다
         assert_eq!(classify_rules("안녕", false), TaskClass::Simple);
-        assert_eq!(classify_rules("AGENTS.md 업그레이드해줘", false), TaskClass::Dev);
+        assert_eq!(
+            classify_rules("AGENTS.md 업그레이드해줘", false),
+            TaskClass::Dev
+        );
         assert_eq!(classify_rules("내 노트 찾아줘", true), TaskClass::Medium);
     }
 
@@ -501,8 +629,19 @@ pub fn suggest_lane(text: &str) -> Option<&'static str> {
     if contains_any(
         text,
         &[
-            "수정해", "고쳐", "만들어", "생성해", "작성해", "적용해", "리팩터",
-            "구현해", "바꿔", "추가해", "삭제해", "커밋", "옮겨",
+            "수정해",
+            "고쳐",
+            "만들어",
+            "생성해",
+            "작성해",
+            "적용해",
+            "리팩터",
+            "구현해",
+            "바꿔",
+            "추가해",
+            "삭제해",
+            "커밋",
+            "옮겨",
         ],
     ) {
         return None;
@@ -511,8 +650,18 @@ pub fn suggest_lane(text: &str) -> Option<&'static str> {
     if contains_any(
         text,
         &[
-            "호출하는", "호출하는 곳", "어디서", "의존하는", "의존성", "참조하는",
-            "정의로", "레퍼런스", "어느 파일", "코드 구조", "구조를 보여", "구조 알려",
+            "호출하는",
+            "호출하는 곳",
+            "어디서",
+            "의존하는",
+            "의존성",
+            "참조하는",
+            "정의로",
+            "레퍼런스",
+            "어느 파일",
+            "코드 구조",
+            "구조를 보여",
+            "구조 알려",
         ],
     ) {
         return Some("explorer");
@@ -521,8 +670,16 @@ pub fn suggest_lane(text: &str) -> Option<&'static str> {
     if contains_any(
         text,
         &[
-            "최신", "공식 문서", "라이브러리", "비교해줘", "알아봐", "버전 뭐",
-            "출시", " changelog", "문서 찾아", "스펙 확인",
+            "최신",
+            "공식 문서",
+            "라이브러리",
+            "비교해줘",
+            "알아봐",
+            "버전 뭐",
+            "출시",
+            " changelog",
+            "문서 찾아",
+            "스펙 확인",
         ],
     ) {
         return Some("researcher");
@@ -536,18 +693,36 @@ mod lane_tests {
 
     #[test]
     fn code_exploration_routes_to_explorer() {
-        assert_eq!(suggest_lane("이 함수를 호출하는 곳을 다 찾아줘"), Some("explorer"));
-        assert_eq!(suggest_lane("Db::open 이 어디서 의존하는지 궁금해"), Some("explorer"));
+        assert_eq!(
+            suggest_lane("이 함수를 호출하는 곳을 다 찾아줘"),
+            Some("explorer")
+        );
+        assert_eq!(
+            suggest_lane("Db::open 이 어디서 의존하는지 궁금해"),
+            Some("explorer")
+        );
         assert_eq!(suggest_lane("이 구조체 정의로 이동해줘"), Some("explorer"));
         assert_eq!(suggest_lane("레퍼런스 검색해줘"), Some("explorer"));
     }
 
     #[test]
     fn external_research_routes_to_researcher() {
-        assert_eq!(suggest_lane("최신 ratatui 버전이 뭐야?"), Some("researcher"));
-        assert_eq!(suggest_lane("tokio 공식 문서에서 select! 사용법 찾아줘"), Some("researcher"));
-        assert_eq!(suggest_lane("이 라이브러리 두 개 비교해줘"), Some("researcher"));
-        assert_eq!(suggest_lane("rust 1.98 출시했는지 알아봐줘"), Some("researcher"));
+        assert_eq!(
+            suggest_lane("최신 ratatui 버전이 뭐야?"),
+            Some("researcher")
+        );
+        assert_eq!(
+            suggest_lane("tokio 공식 문서에서 select! 사용법 찾아줘"),
+            Some("researcher")
+        );
+        assert_eq!(
+            suggest_lane("이 라이브러리 두 개 비교해줘"),
+            Some("researcher")
+        );
+        assert_eq!(
+            suggest_lane("rust 1.98 출시했는지 알아봐줘"),
+            Some("researcher")
+        );
     }
 
     #[test]
@@ -566,7 +741,10 @@ mod lane_tests {
 
 #[test]
 fn t3_actual_input_routes_explorer() {
-    assert_eq!(crate::harness::suggest_lane("src 에서 helper 함수를 호출하는 곳을 다 찾아줘"), Some("explorer"));
+    assert_eq!(
+        crate::harness::suggest_lane("src 에서 helper 함수를 호출하는 곳을 다 찾아줘"),
+        Some("explorer")
+    );
 }
 
 #[cfg(test)]
@@ -575,7 +753,10 @@ mod quote_strip_tests {
 
     #[test]
     fn strips_double_single_backtick_korean_quotes() {
-        assert_eq!(strip_quoted("이 파일을 \"지금\" 고쳐줘"), "이 파일을  고쳐줘");
+        assert_eq!(
+            strip_quoted("이 파일을 \"지금\" 고쳐줘"),
+            "이 파일을  고쳐줘"
+        );
         assert_eq!(strip_quoted("'이 부분'을 수정해줘"), "을 수정해줘");
         assert_eq!(strip_quoted("「이 함수」를 만들어줘"), "를 만들어줘");
         assert_eq!(strip_quoted("`x` 라는 변수"), " 라는 변수");
@@ -585,20 +766,28 @@ mod quote_strip_tests {
     fn quoted_action_verbs_do_not_trigger_dev() {
         // G5 — 인용 속 생성 동사는 지시가 아니다
         let (c, _) = classify_rules_with_confidence(
-            "이 요청을 검토해줘: '내일까지 뭐든 빨리 만들어줘'", false);
+            "이 요청을 검토해줘: '내일까지 뭐든 빨리 만들어줘'",
+            false,
+        );
         assert_ne!(c, TaskClass::Dev);
     }
 
     #[test]
     fn real_edit_requests_still_dev() {
         // 인용 밖 동사는 그대로 유효
-        assert_eq!(classify_rules("notes.txt 의 \"beta\" 를 BETA2 로 바꿔줘", false), TaskClass::Dev);
+        assert_eq!(
+            classify_rules("notes.txt 의 \"beta\" 를 BETA2 로 바꿔줘", false),
+            TaskClass::Dev
+        );
         assert_eq!(classify_rules("'fix.py' 만들어줘", false), TaskClass::Dev);
         assert_eq!(classify_rules("이 파일을 고쳐줘", false), TaskClass::Dev);
     }
 
     #[test]
     fn quoted_sentence_as_content_is_not_dev() {
-        assert_ne!(classify_rules("'이 함수를 고쳐' 라고 쓰여 있는 문장을 번역해줘", false), TaskClass::Dev);
+        assert_ne!(
+            classify_rules("'이 함수를 고쳐' 라고 쓰여 있는 문장을 번역해줘", false),
+            TaskClass::Dev
+        );
     }
 }

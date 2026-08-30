@@ -87,12 +87,15 @@ pub fn scan(file: &str, text: &str) -> Vec<Finding> {
         || lower_path.ends_with(".md");
 
     let lines = text.lines().collect::<Vec<_>>();
-    let scan_lines = if lower_path.ends_with(".rs") {
-        super::production_scan_limit(&lines)
+    let production = if lower_path.ends_with(".rs") {
+        super::production_line_mask(&lines)
     } else {
-        lines.len()
+        vec![true; lines.len()]
     };
-    for (line_no, line) in lines.into_iter().take(scan_lines).enumerate() {
+    for (line_no, line) in lines.into_iter().enumerate() {
+        if !production[line_no] {
+            continue;
+        }
         let no = line_no + 1;
         // 1) 시크릿 하드코딩
         if !is_testish {
@@ -240,6 +243,28 @@ mod tests {
     fn env_lookup_is_not_flagged() {
         let code = "let key = std::env::var(\"API_KEY\").unwrap_or_default();";
         assert!(scan("src/main.rs", code).iter().all(|f| f.kind != "secret"));
+    }
+
+    #[test]
+    fn production_secrets_after_test_modules_are_scanned() {
+        let code = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    let api_key = \"dummy-test-value\";\n",
+            "}\n",
+            "#[cfg(not(test))]\n",
+            "mod production {\n",
+            "    let api_key = \"sk-prod-1234567890abcdef\";\n",
+            "}\n",
+            "let api_key = \"sk-live-1234567890abcdef\";\n",
+        );
+        let findings = scan("src/config.rs", code);
+        let secret_lines = findings
+            .iter()
+            .filter(|finding| finding.kind == "secret")
+            .map(|finding| finding.line)
+            .collect::<Vec<_>>();
+        assert_eq!(secret_lines, [7, 9]);
     }
 
     #[test]

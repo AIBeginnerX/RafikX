@@ -38,7 +38,7 @@ impl Language {
 pub struct LanguageProfile {
     pub language: Language,
     /// S3 게이트 명령 — 순서대로 실행, 하나라도 실패하면 게이트 실패.
-    /// `{files}` 자리표시자는 변경 파일 목록으로 치환된다.
+    /// `{files}`는 전체 변경 파일, `{rust_files}`는 Rust 변경 파일로 치환된다.
     pub format_check: Vec<String>,
     pub lint: Vec<String>,
     pub test: Vec<String>,
@@ -94,8 +94,8 @@ pub fn detect(workspace: &std::path::Path, changed: &[String]) -> Language {
 pub fn profile_for(lang: Language) -> LanguageProfile {
     let (format_check, lint, test, audit, forbidden): ProfileCommands = match lang {
         Language::Rust => (
-            vec!["rustfmt --edition 2024 --check --config skip_children=true {files}".into()],
-            vec!["cargo clippy --quiet --message-format=short --no-deps".into()],
+            vec!["rustfmt --edition 2024 --check --config skip_children=true {rust_files}".into()],
+            vec!["cargo clippy --quiet --color never --message-format=short --no-deps".into()],
             vec!["cargo test --quiet".into()],
             vec!["cargo audit".into()],
             vec![
@@ -285,7 +285,12 @@ mod tests {
         assert!(
             p.format_check
                 .iter()
-                .any(|command| command.contains("{files}"))
+                .any(|command| command.contains("{rust_files}"))
+        );
+        assert!(
+            p.lint
+                .iter()
+                .any(|command| command.contains("--color never"))
         );
         assert!(p.test.iter().any(|c| c.contains("cargo test")));
         assert!(!p.forbidden_patterns.is_empty());

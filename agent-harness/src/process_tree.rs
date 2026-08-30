@@ -698,7 +698,7 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
     }
     #[cfg(unix)]
     {
-        for _ in 0..3 {
+        for _ in 0..20 {
             let mut remaining = scoped_pids(scope).await;
             match inherited_scope_pids(scope).await {
                 Ok(pids) => remaining.extend(pids),
@@ -715,7 +715,7 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
                 "/usr/bin/kill"
             };
             let _ = signal_pids(program, "-KILL", &remaining).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let mut remaining = scoped_pids(scope).await;
         match inherited_scope_pids(scope).await {
@@ -726,8 +726,8 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
         remaining.dedup();
         if !remaining.is_empty() {
             cleanup_errors.push(format!(
-                "프로세스 scope 정리 후에도 {}개 자식이 남았습니다",
-                remaining.len()
+                "프로세스 scope 정리 후에도 {}개 자식이 남았습니다: {remaining:?}",
+                remaining.len(),
             ));
         }
     }

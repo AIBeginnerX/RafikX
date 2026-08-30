@@ -220,9 +220,17 @@ fn command_argv(
     let mut had_files_placeholder = false;
     let mut file_args = 0usize;
     for word in words {
-        if word == "{files}" {
+        if matches!(word, "{files}" | "{rust_files}") {
             had_files_placeholder = true;
             for file in changed {
+                if word == "{rust_files}"
+                    && !Path::new(file)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+                {
+                    continue;
+                }
                 if let Some(file) = validated_changed_arg(workspace, file)? {
                     args.push(file);
                     file_args += 1;
@@ -313,7 +321,9 @@ async fn run_step(
     workspace: &Path,
     changed: &[String],
 ) -> GateStep {
-    let display = cmd.replace("{files}", "<changed files>");
+    let display = cmd
+        .replace("{files}", "<changed files>")
+        .replace("{rust_files}", "<changed Rust files>");
     if stage == "S3-lint" && cmd.starts_with("cargo clippy ") {
         return run_rust_clippy_step(display, cmd, workspace, changed).await;
     }
@@ -350,6 +360,7 @@ fn normalized_changed_files(
 fn clippy_warning_summary(output: &str, changed: &BTreeSet<String>) -> (usize, Vec<String>) {
     let mut baseline = 0usize;
     let mut blocking = Vec::new();
+    let output = strip_ansi_sequences(output);
     for line in output.lines() {
         let Some((location, message)) = line.split_once(": warning: ") else {
             continue;
@@ -475,6 +486,14 @@ fn package_free_javascript_fallback(
         })
 }
 
+fn browser_game_contract_target(html: &str, required: bool, entry_count: usize) -> bool {
+    required
+        && (entry_count == 1
+            || browser::entry_requires_game_contract(html)
+            || browser::entry_has_canvas(html)
+            || browser::entry_looks_like_browser_game(html))
+}
+
 fn has_adjacent_safety_justification(lines: &[&str], line: usize) -> bool {
     lines[..line]
         .iter()
@@ -506,17 +525,176 @@ fn code_contains_pattern(line: &str, pattern: &str) -> bool {
     false
 }
 
-fn production_scan_limit(lines: &[&str]) -> usize {
-    for (index, line) in lines.iter().enumerate() {
-        let cfg_test = line.trim_start().starts_with("#[cfg") && line.contains("test");
-        let next_is_module = lines
-            .get(index + 1)
-            .is_some_and(|next| next.trim_start().starts_with("mod "));
-        if cfg_test && next_is_module {
-            return index;
+#[derive(Default)]
+struct RustScanState {
+    block_comment_depth: usize,
+    string: bool,
+    raw_hashes: Option<usize>,
+}
+
+fn rust_char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start + 1;
+    if bytes.get(cursor) == Some(&b'\\') {
+        cursor += 1;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+            } else if bytes[cursor] == b'\'' {
+                return Some(cursor + 1);
+            } else {
+                cursor += 1;
+            }
+        }
+        return None;
+    }
+    let width = std::str::from_utf8(bytes.get(cursor..)?)
+        .ok()?
+        .chars()
+        .next()?
+        .len_utf8();
+    cursor += width;
+    (bytes.get(cursor) == Some(&b'\'')).then_some(cursor + 1)
+}
+
+fn rust_brace_counts(line: &str, state: &mut RustScanState) -> (i32, i32) {
+    let bytes = line.as_bytes();
+    let mut cursor = 0usize;
+    let mut opens = 0i32;
+    let mut closes = 0i32;
+    while cursor < bytes.len() {
+        if let Some(hashes) = state.raw_hashes {
+            if bytes[cursor] == b'"'
+                && bytes
+                    .get(cursor + 1..cursor + 1 + hashes)
+                    .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+            {
+                state.raw_hashes = None;
+                cursor += hashes + 1;
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        if state.string {
+            match bytes[cursor] {
+                b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                b'"' => {
+                    state.string = false;
+                    cursor += 1;
+                }
+                _ => cursor += 1,
+            }
+            continue;
+        }
+        if state.block_comment_depth > 0 {
+            if bytes[cursor..].starts_with(b"/*") {
+                state.block_comment_depth += 1;
+                cursor += 2;
+            } else if bytes[cursor..].starts_with(b"*/") {
+                state.block_comment_depth -= 1;
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"//") {
+            break;
+        }
+        if bytes[cursor..].starts_with(b"/*") {
+            state.block_comment_depth = 1;
+            cursor += 2;
+            continue;
+        }
+        if bytes[cursor] == b'r' {
+            let mut quote = cursor + 1;
+            while bytes.get(quote) == Some(&b'#') {
+                quote += 1;
+            }
+            if bytes.get(quote) == Some(&b'"') {
+                state.raw_hashes = Some(quote - cursor - 1);
+                cursor = quote + 1;
+                continue;
+            }
+        }
+        match bytes[cursor] {
+            b'"' => {
+                state.string = true;
+                cursor += 1;
+            }
+            b'\'' => {
+                cursor = rust_char_literal_end(bytes, cursor).unwrap_or(cursor + 1);
+            }
+            b'{' => {
+                opens += 1;
+                cursor += 1;
+            }
+            b'}' => {
+                closes += 1;
+                cursor += 1;
+            }
+            _ => cursor += 1,
         }
     }
-    lines.len()
+    (opens, closes)
+}
+
+pub(super) fn production_line_mask(lines: &[&str]) -> Vec<bool> {
+    let mut lexer = RustScanState::default();
+    let braces = lines
+        .iter()
+        .map(|line| rust_brace_counts(line, &mut lexer))
+        .collect::<Vec<_>>();
+    let mut mask = vec![true; lines.len()];
+    let mut pending_cfg = None;
+    let mut active = false;
+    let mut opened = false;
+    let mut depth = 0i32;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if active {
+            mask[index] = false;
+            let (opens, closes) = braces[index];
+            opened |= opens > 0;
+            depth += opens - closes;
+            if (opened && depth <= 0) || (!opened && trimmed.ends_with(';')) {
+                active = false;
+            }
+            continue;
+        }
+        let compact = trimmed
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>();
+        let cfg_test = compact.starts_with("#[cfg(test)]");
+        if cfg_test {
+            pending_cfg = Some(index);
+            let inline_module = trimmed
+                .split_once(']')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with("mod "));
+            if !inline_module {
+                continue;
+            }
+        } else if let Some(start) = pending_cfg {
+            if trimmed.is_empty() || trimmed.starts_with("#[") {
+                continue;
+            }
+            if !trimmed.starts_with("mod ") {
+                pending_cfg = None;
+                continue;
+            }
+            mask[start..=index].fill(false);
+        } else {
+            continue;
+        }
+        let start = pending_cfg.take().unwrap_or(index);
+        mask[start..=index].fill(false);
+        let (opens, closes) = braces[index];
+        opened = opens > 0;
+        depth = opens - closes;
+        active = (!opened || depth > 0) && !trimmed.ends_with(';');
+    }
+    mask
 }
 
 /// 품질 게이트 전체 — S0 감지 → S3(포맷·린트·테스트) → S5(내장 스캔 + 의존성 감사).
@@ -625,8 +803,11 @@ async fn run_quality_gate_with_contract(
         let path = workspace.join(file);
         if let Ok(text) = std::fs::read_to_string(&path) {
             let lines = text.lines().collect::<Vec<_>>();
-            let production_lines = production_scan_limit(&lines);
-            for (line_no, line) in lines.iter().take(production_lines).enumerate() {
+            let production = production_line_mask(&lines);
+            for (line_no, line) in lines.iter().enumerate() {
+                if !production[line_no] {
+                    continue;
+                }
                 for (pattern, why) in &profile.forbidden_patterns {
                     if pattern == "unsafe "
                         && code_contains_pattern(line, pattern)
@@ -712,15 +893,12 @@ async fn run_quality_gate_with_contract(
             let display_root = workspace
                 .canonicalize()
                 .unwrap_or_else(|_| workspace.to_path_buf());
-            let force_single_entry = browser_game_required && entries.len() == 1;
+            let entry_count = entries.len();
             let mut game_contract_targeted = !browser_game_required;
             for entry in entries {
-                let entry_is_game = std::fs::read_to_string(&entry).is_ok_and(|html| {
-                    browser::entry_requires_game_contract(&html)
-                        || browser::entry_looks_like_browser_game(&html)
-                });
+                let html = std::fs::read_to_string(&entry).unwrap_or_default();
                 let require_game_contract =
-                    browser_game_required && (force_single_entry || entry_is_game);
+                    browser_game_contract_target(&html, browser_game_required, entry_count);
                 game_contract_targeted |= require_game_contract;
                 let display_entry = entry
                     .strip_prefix(&display_root)
@@ -1092,53 +1270,92 @@ fn redact_spaced_assignments(text: &str) -> String {
     output
 }
 
-pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
+fn normalize_redaction_input(text: &str, workspace: &Path) -> String {
     let cleaned = strip_ansi_sequences(text);
     let mut normalized = cleaned.replace(&workspace.display().to_string(), "<workspace>");
     if let Some(home) = std::env::var_os("HOME") {
         normalized = normalized.replace(&Path::new(&home).display().to_string(), "<home>");
     }
-    normalized = redact_spaced_assignments(&normalized);
-    let mut redacted = Vec::new();
+    redact_spaced_assignments(&normalized)
+}
+
+fn redact_output_token(token: &str, redact_next: &mut bool) -> String {
+    let lower = token.to_ascii_lowercase();
+    if *redact_next {
+        return match credential_token(token) {
+            Some(CredentialToken::Scheme) => token.to_string(),
+            Some(CredentialToken::Secret) | None => {
+                *redact_next = false;
+                "[redacted]".to_string()
+            }
+        };
+    }
+    if let Some(kind) = credential_token(token) {
+        return match kind {
+            CredentialToken::Scheme => {
+                *redact_next = true;
+                token.to_string()
+            }
+            CredentialToken::Secret => "[redacted]".to_string(),
+        };
+    }
+    if let Some(url) = redact_url(token) {
+        return url;
+    }
+    if let Some(at) = token.find(['=', ':'])
+        && (looks_like_sensitive_key(&token[..at])
+            || (token.as_bytes()[at] == b'=' && looks_like_env_key(&token[..at])))
+    {
+        *redact_next = at + 1 == token.len();
+        return format!("{}[redacted]", &token[..=at]);
+    }
+    if lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("xoxb-")
+        || looks_like_high_entropy_secret(token)
+    {
+        return "[redacted]".to_string();
+    }
+    token.to_string()
+}
+
+pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
+    let normalized = normalize_redaction_input(text, workspace);
     let mut redact_next = false;
-    for token in normalized.split_whitespace() {
-        let lower = token.to_ascii_lowercase();
-        if redact_next {
-            match credential_token(token) {
-                Some(CredentialToken::Scheme) => redacted.push(token.to_string()),
-                Some(CredentialToken::Secret) | None => {
-                    redacted.push("[redacted]".to_string());
-                    redact_next = false;
-                }
+    normalized
+        .split_whitespace()
+        .map(|token| redact_output_token(token, &mut redact_next))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) fn redact_tool_output(text: &str, workspace: &Path) -> String {
+    let normalized = normalize_redaction_input(text, workspace);
+    let mut output = String::with_capacity(normalized.len());
+    let mut redact_next = false;
+    let mut token_start = None;
+    for (index, character) in normalized.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                output.push_str(&redact_output_token(
+                    &normalized[start..index],
+                    &mut redact_next,
+                ));
             }
-        } else if let Some(kind) = credential_token(token) {
-            match kind {
-                CredentialToken::Scheme => {
-                    redacted.push(token.to_string());
-                    redact_next = true;
-                }
-                CredentialToken::Secret => redacted.push("[redacted]".to_string()),
-            }
-        } else if let Some(url) = redact_url(token) {
-            redacted.push(url);
-        } else if let Some(at) = token.find(['=', ':'])
-            && (looks_like_sensitive_key(&token[..at])
-                || (token.as_bytes()[at] == b'=' && looks_like_env_key(&token[..at])))
-        {
-            redacted.push(format!("{}[redacted]", &token[..=at]));
-            redact_next = at + 1 == token.len();
-        } else if lower.starts_with("sk-")
-            || lower.starts_with("ghp_")
-            || lower.starts_with("github_pat_")
-            || lower.starts_with("xoxb-")
-            || looks_like_high_entropy_secret(token)
-        {
-            redacted.push("[redacted]".to_string());
-        } else {
-            redacted.push(token.to_string());
+            output.push(character);
+        } else if token_start.is_none() {
+            token_start = Some(index);
         }
     }
-    redacted.join(" ")
+    if let Some(start) = token_start {
+        output.push_str(&redact_output_token(&normalized[start..], &mut redact_next));
+    }
+    let mut bounded = output.chars().take(40_000).collect::<String>();
+    if output.chars().count() > 40_000 {
+        bounded.push_str("\n…[truncated]");
+    }
+    bounded
 }
 
 pub(crate) fn redact_bounded_error(text: &str, workspace: &Path) -> String {
@@ -1401,6 +1618,22 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_redaction_preserves_layout_and_bounds_content() {
+        let workspace = Path::new("/tmp/private-workspace");
+        let output = concat!(
+            "first line\n",
+            "  TOKEN=TOOL-SECRET\n",
+            "/tmp/private-workspace/src/main.rs\n",
+        );
+        let redacted = redact_tool_output(output, workspace);
+        assert_eq!(redacted.lines().count(), 3);
+        assert!(redacted.contains("  TOKEN=[redacted]"));
+        assert!(redacted.contains("<workspace>/src/main.rs"));
+        assert!(!redacted.contains("TOOL-SECRET"));
+        assert!(!redacted.contains("private-workspace"));
+    }
+
+    #[test]
     fn unsafe_idiom_requires_an_adjacent_safety_justification() {
         let justified = ["// SAFETY: checked ABI", "unsafe { call(); }"];
         let unproved = ["// ordinary note", "unsafe { call(); }"];
@@ -1411,19 +1644,60 @@ mod tests {
             "unsafe "
         ));
         assert!(!code_contains_pattern("let rule = \"unsafe \";", "unsafe "));
+        let lines = [
+            "fn before() {}",
+            "#[cfg(test)]",
+            "mod tests {",
+            "const FIXTURE: &str = r#\"}\"#;",
+            "}",
+            "unsafe { after_tests(); }",
+        ];
         assert_eq!(
-            production_scan_limit(&["fn live() {}", "#[cfg(test)]", "mod tests {}"]),
-            1
+            production_line_mask(&lines),
+            [true, false, false, false, false, true]
         );
     }
 
     #[test]
     fn clippy_warnings_are_attributed_to_changed_files() {
-        let output =
-            "src/old.rs:10:2: warning: old warning\nsrc/new.rs:20:4: warning: new warning\n";
+        let output = concat!(
+            "src/old.rs:10:2: warning: old warning\n",
+            "src/new.rs:20:4: \x1b[33mwarning\x1b[0m: new warning\n",
+        );
         let changed = BTreeSet::from(["src/new.rs".to_string()]);
         let (baseline, blocking) = clippy_warning_summary(output, &changed);
         assert_eq!(baseline, 1);
         assert_eq!(blocking, ["new warning"]);
+    }
+
+    #[test]
+    fn rust_file_placeholder_excludes_non_rust_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-rust-files-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("workspace");
+        std::fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").expect("Rust fixture");
+        std::fs::write(root.join("README.md"), "# fixture\n").expect("Markdown fixture");
+        let (_, args) = command_argv(
+            "rustfmt --check {rust_files}",
+            &root,
+            &["src/lib.rs".into(), "README.md".into()],
+        )
+        .expect("command")
+        .expect("Rust file");
+        assert_eq!(args, ["--check", "src/lib.rs"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_game_task_targets_every_canvas_entry_in_multi_entry_workspaces() {
+        let decoy = r#"<canvas id="game"></canvas><script src="game.js"></script>"#;
+        let actual = r#"<canvas id="board"></canvas><script src="snake-engine.js"></script>"#;
+        let dashboard = r#"<main id="dashboard"></main><script src="charts.js"></script>"#;
+        assert!(browser_game_contract_target(decoy, true, 3));
+        assert!(browser_game_contract_target(actual, true, 3));
+        assert!(!browser_game_contract_target(dashboard, true, 3));
+        assert!(!browser_game_contract_target(actual, false, 3));
     }
 }

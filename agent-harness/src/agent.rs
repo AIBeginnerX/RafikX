@@ -634,6 +634,7 @@ pub async fn run_agent_with_context(
                 for ((id, name, input), out) in batch.into_iter().zip(outs) {
                     match out {
                         Ok(text) => {
+                            let text = crate::quality::redact_tool_output(&text, &ctx.workspace);
                             if name == tools::TaskTool::NAME {
                                 run_context.clear_unresolved_child_task(
                                     &tools::TaskTool::invocation_key(&input),
@@ -660,10 +661,14 @@ pub async fn run_agent_with_context(
                             );
                         }
                         Err(e) => {
+                            let safe = crate::quality::redact_bounded_error(
+                                &format!("{e:#}"),
+                                &ctx.workspace,
+                            );
                             if name == tools::TaskTool::NAME {
                                 run_context.mark_unresolved_child_task(
                                     tools::TaskTool::invocation_key(&input),
-                                    e.to_string(),
+                                    safe.clone(),
                                 );
                             }
                             crate::graph::node_in(
@@ -673,12 +678,12 @@ pub async fn run_agent_with_context(
                                 "error",
                                 Some("tool_pre"),
                             );
-                            applog::error(&format!("tool {name}: {e}"));
-                            crate::ui::live_line_in(&run_context, &format!("도구 오류: {e}"));
-                            tool_errors.push(format!("{name}: {e}"));
+                            applog::error(&format!("tool {name}: {safe}"));
+                            crate::ui::live_line_in(&run_context, &format!("도구 오류: {safe}"));
+                            tool_errors.push(format!("{name}: {safe}"));
                             results.push(ContentBlock::ToolResult {
                                 tool_use_id: id,
-                                content: e.to_string(),
+                                content: safe,
                                 is_error: true,
                             });
                             let _ = run_context.transition_lifecycle(
@@ -756,18 +761,20 @@ pub async fn run_agent_with_context(
             if tool.needs_approval(&input) && !allow_all {
                 match tools::approval_preview(tool.name(), &input, &ctx) {
                     Ok(preview) => {
-                        crate::ui::live_line_in(&run_context, &preview);
+                        let safe_preview =
+                            crate::quality::redact_tool_output(&preview, &ctx.workspace);
+                        crate::ui::live_line_in(&run_context, &safe_preview);
                         let approval_id = format!("approval-{}", Db::new_id());
                         let _ = run_context.transition_lifecycle(
                             LifecycleEventData::ApprovalRequested {
                                 approval_id: approval_id.clone(),
-                                preview: preview.clone(),
+                                preview: safe_preview.clone(),
                             },
                         );
                         let Some(choice) = decide_approval_or_cancel(
                             &remote,
                             &local_ask,
-                            preview.clone(),
+                            safe_preview,
                             &run_context,
                         )
                         .await?
@@ -836,10 +843,12 @@ pub async fn run_agent_with_context(
                                 } else {
                                     format!("사용자가 도구 실행을 거부했습니다. 사유: {reason}")
                                 };
+                                let msg =
+                                    crate::quality::redact_bounded_error(&msg, &ctx.workspace);
                                 deny_reasons.push(if reason.is_empty() {
                                     "거부".into()
                                 } else {
-                                    reason
+                                    crate::quality::redact_bounded_error(&reason, &ctx.workspace)
                                 });
                                 results.push(ContentBlock::ToolResult {
                                     tool_use_id: id,
@@ -857,12 +866,14 @@ pub async fn run_agent_with_context(
                         }
                     }
                     Err(e) => {
+                        let safe =
+                            crate::quality::redact_bounded_error(&format!("{e:#}"), &ctx.workspace);
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id,
-                            content: e.to_string(),
+                            content: safe.clone(),
                             is_error: true,
                         });
-                        tool_errors.push(e.to_string());
+                        tool_errors.push(safe);
                         let _ =
                             run_context.transition_lifecycle(LifecycleEventData::ToolFinished {
                                 name: name.clone(),
@@ -877,6 +888,7 @@ pub async fn run_agent_with_context(
 
             match tool.run(input.clone(), &ctx) {
                 Ok(out) => {
+                    let out = crate::quality::redact_tool_output(&out, &ctx.workspace);
                     if name == tools::TaskTool::NAME {
                         run_context
                             .clear_unresolved_child_task(&tools::TaskTool::invocation_key(&input));
@@ -897,10 +909,12 @@ pub async fn run_agent_with_context(
                     });
                 }
                 Err(e) => {
+                    let safe =
+                        crate::quality::redact_bounded_error(&format!("{e:#}"), &ctx.workspace);
                     if name == tools::TaskTool::NAME {
                         run_context.mark_unresolved_child_task(
                             tools::TaskTool::invocation_key(&input),
-                            e.to_string(),
+                            safe.clone(),
                         );
                     }
                     crate::graph::node_in(
@@ -910,12 +924,12 @@ pub async fn run_agent_with_context(
                         "error",
                         Some("tool_pre"),
                     );
-                    applog::error(&format!("tool {name}: {e}"));
-                    crate::ui::live_line_in(&run_context, &format!("도구 오류: {e}"));
-                    tool_errors.push(format!("{name}: {e}"));
+                    applog::error(&format!("tool {name}: {safe}"));
+                    crate::ui::live_line_in(&run_context, &format!("도구 오류: {safe}"));
+                    tool_errors.push(format!("{name}: {safe}"));
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id,
-                        content: e.to_string(),
+                        content: safe,
                         is_error: true,
                     });
                     let _ = run_context.transition_lifecycle(LifecycleEventData::ToolFinished {

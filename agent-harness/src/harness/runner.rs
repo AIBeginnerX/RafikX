@@ -268,27 +268,6 @@ const BROWSER_GAME_CONTRACT_RULE: &str = "\n\n[브라우저 게임 검증 계약
     restarts()는 KeyR 재시작마다 1 증가한 수를 반환한다. document의 Space는 ready→playing, \
     KeyP는 playing↔paused, KeyR은 lost→ready를 실제 UI와 같은 상태 머신으로 처리한다.\n";
 
-fn task_requires_browser_game_contract(task: &str) -> bool {
-    let lower = task.to_ascii_lowercase();
-    [
-        "browser game",
-        "web game",
-        "canvas game",
-        "super mario",
-        "mario game",
-        "platformer",
-        "브라우저 게임",
-        "웹 게임",
-        "캔버스 게임",
-        "슈퍼마리오",
-        "슈퍼 마리오",
-        "마리오 게임",
-        "플랫포머",
-    ]
-    .iter()
-    .any(|signal| lower.contains(signal))
-}
-
 const PLAN_BRIEF_INSTRUCTION: &str = "작업 계획을 3~7개 항목으로만 출력하라.";
 
 /// PlanDepth::Contract — 산출물을 3부로 강제한다 (dev/advanced 클래스에서만 활성).
@@ -514,7 +493,7 @@ async fn run_pipeline_inner(
     }
     let memory_block = format!("{lessons_block}{facts_block}{rules_block}");
     let mut system = system_prompt(cfg, &binding.system_extra, &memory_block);
-    if task_requires_browser_game_contract(task) {
+    if browser_game_intent(task) {
         system.push_str(BROWSER_GAME_CONTRACT_RULE);
     }
     crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
@@ -1747,7 +1726,7 @@ async fn run_quality_repair(
         let report = crate::quality::run_quality_gate_for_task(
             &cfg.workspace,
             &gate_files,
-            task_requires_browser_game_contract(task),
+            browser_game_intent(task),
         )
         .await;
         let rendered = crate::quality::render_report(&report);
@@ -3327,15 +3306,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_game_contract_is_derived_from_the_task() {
+    fn browser_game_contract_is_derived_from_the_shared_intent() {
         for task in [
             "create a Super Mario browser game",
             "웹 게임을 만들어줘",
             "Canvas game 구현",
         ] {
-            assert!(task_requires_browser_game_contract(task), "task: {task}");
+            assert!(browser_game_intent(task), "task: {task}");
         }
-        assert!(!task_requires_browser_game_contract(
+        assert!(!browser_game_intent(
             "add a settings button to the dashboard"
         ));
     }

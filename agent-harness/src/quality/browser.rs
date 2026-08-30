@@ -110,17 +110,36 @@ pub(crate) fn entry_requires_game_contract(html: &str) -> bool {
         || lower.contains(&format!("name='{GAME_CONTRACT_META}'"))
 }
 
+pub(crate) fn entry_has_canvas(html: &str) -> bool {
+    html.to_ascii_lowercase().contains("<canvas")
+}
+
 pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
-    lower.contains("<canvas")
+    entry_has_canvas(&lower)
         && [
             "id=\"game\"",
             "id='game'",
+            "id=\"board\"",
+            "id='board'",
             "game.js",
             "mario",
             "platformer",
+            "snake",
+            "tetris",
+            "pong",
+            "breakout",
+            "pacman",
+            "score",
+            "lives",
+            "restart",
+            "game over",
+            "level",
             "게임",
             "마리오",
+            "점수",
+            "목숨",
+            "재시작",
         ]
         .iter()
         .any(|signal| lower.contains(signal))
@@ -335,6 +354,7 @@ fn is_web_asset(path: &Path) -> bool {
             | "jpeg"
             | "jpg"
             | "js"
+            | "json"
             | "m4a"
             | "mjs"
             | "mp3"
@@ -373,8 +393,23 @@ fn has_sensitive_component(path: &Path) -> bool {
             .and_then(|value| value.to_str())
             .unwrap_or(&name);
         let normalized_stem = stem.replace('-', "_");
+        let extension = Path::new(&*name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let sensitive_web_code = matches!(
+            extension,
+            "cjs" | "js" | "json" | "mjs" | "toml" | "txt" | "yaml" | "yml"
+        ) && (normalized_stem == "auth"
+            || normalized_stem.starts_with("auth_")
+            || normalized_stem.contains("api_key")
+            || normalized_stem.contains("password")
+            || normalized_stem.contains("passwd")
+            || normalized_stem.contains("private_key")
+            || normalized_stem.contains("token"));
         normalized_stem.contains("credential")
             || normalized_stem.contains("secret")
+            || sensitive_web_code
             || matches!(
                 normalized_stem.as_str(),
                 "id_ed25519" | "id_rsa" | "private_key"
@@ -520,13 +555,19 @@ fn reference_literal_context(tokens: &[ReferenceToken], css: bool) -> bool {
     let called = matches!(tokens.last(), Some(ReferenceToken::Punctuation(b'(')))
         .then(|| last_identifier(1))
         .flatten();
+    let assigned = matches!(
+        tokens.last(),
+        Some(ReferenceToken::Punctuation(b'=' | b':'))
+    )
+    .then(|| last_identifier(1))
+    .flatten();
     if css {
         called == Some("url")
     } else {
         matches!(
             called,
-            Some("import" | "require" | "url" | "worker" | "sharedworker")
-        )
+            Some("audio" | "fetch" | "import" | "require" | "url" | "worker" | "sharedworker")
+        ) || matches!(assigned, Some("href" | "src"))
     }
 }
 
@@ -1133,59 +1174,94 @@ fn stage_web_root_with_limits(
     let mut staged_bytes = 0u64;
     let mut entries = 0usize;
     let started = Instant::now();
-    let filter_root = source_root.clone();
-    let walker = ignore::WalkBuilder::new(&source_root)
-        .hidden(false)
-        .ignore(false)
-        .git_global(false)
-        .git_ignore(false)
-        .git_exclude(false)
-        .filter_entry(move |item| {
-            if item.depth() == 0 {
-                return true;
-            }
-            let relative = item
-                .path()
-                .strip_prefix(&filter_root)
-                .unwrap_or(item.path());
-            !has_hidden_component(relative)
-                && !has_sensitive_component(relative)
-                && !is_discovery_excluded_name(item.file_name())
-        })
-        .build();
-    for item in walker {
+    let mut pending = vec![entry.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(source) = pending.pop() {
         if started.elapsed() > max_duration {
             anyhow::bail!("브라우저 자산 스테이징 시간 상한을 넘었습니다");
+        }
+        if !visited.insert(source.clone()) {
+            continue;
+        }
+        let relative = source
+            .strip_prefix(&source_root)
+            .map_err(|_| anyhow::anyhow!("브라우저 자산이 프로젝트 밖을 가리킵니다"))?;
+        if has_hidden_component(relative) || has_sensitive_component(relative) {
+            anyhow::bail!(
+                "민감한 브라우저 자산 참조를 차단했습니다: {}",
+                relative.display()
+            );
+        }
+        if relative
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if is_discovery_excluded_name(name)))
+        {
+            anyhow::bail!("제외된 브라우저 자산 참조를 차단했습니다: {}", relative.display());
+        }
+        let resolved = source.canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "브라우저 자산 참조를 확인할 수 없습니다({}): {error}",
+                relative.display()
+            )
+        })?;
+        if !resolved.starts_with(&source_root) || !resolved.is_file() {
+            anyhow::bail!(
+                "브라우저 자산이 프로젝트 밖을 가리킵니다: {}",
+                relative.display()
+            );
+        }
+        if !is_web_asset(&source) {
+            anyhow::bail!(
+                "허용되지 않은 브라우저 자산 형식입니다: {}",
+                relative.display()
+            );
         }
         entries = entries.saturating_add(1);
         if entries > max_entries {
             anyhow::bail!("브라우저 자산 항목 수가 상한을 넘었습니다");
         }
-        let item = item.map_err(|error| anyhow::anyhow!("브라우저 자산 순회 실패: {error}"))?;
-        if !item.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let source = item.into_path();
-        if !is_web_asset(&source) {
-            continue;
-        }
-        let metadata = source.metadata()?;
+        let metadata = resolved.metadata()?;
         if metadata.len() > MAX_STAGED_FILE_BYTES {
             anyhow::bail!(
                 "브라우저 자산이 파일 상한을 넘었습니다: {}",
-                source.display()
+                relative.display()
             );
         }
         staged_bytes = staged_bytes.saturating_add(metadata.len());
         if staged_bytes > MAX_STAGED_TOTAL_BYTES {
             anyhow::bail!("브라우저 자산 합계가 상한을 넘었습니다");
         }
-        let relative = source.strip_prefix(&source_root)?;
         let destination = stage.join(relative);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(&source, destination)?;
+        std::fs::copy(&resolved, destination)?;
+        if is_reference_graph_source(&source) {
+            let text = std::fs::read_to_string(&resolved).map_err(|error| {
+                anyhow::anyhow!(
+                    "브라우저 자산 참조 그래프를 읽을 수 없습니다({}): {error}",
+                    relative.display()
+                )
+            })?;
+            for reference in local_references(&source_root, &source, &text) {
+                let reference_relative = reference.strip_prefix(&source_root).map_err(|_| {
+                    anyhow::anyhow!("브라우저 자산 참조가 프로젝트 밖을 가리킵니다")
+                })?;
+                if has_hidden_component(reference_relative)
+                    || has_sensitive_component(reference_relative)
+                {
+                    anyhow::bail!(
+                        "민감한 브라우저 자산 참조를 차단했습니다: {}",
+                        reference_relative.display()
+                    );
+                }
+                if std::fs::symlink_metadata(&reference).is_ok_and(|metadata| {
+                    metadata.file_type().is_file() || metadata.file_type().is_symlink()
+                }) {
+                    pending.push(reference);
+                }
+            }
+        }
         if started.elapsed() > max_duration {
             anyhow::bail!("브라우저 자산 스테이징 시간 상한을 넘었습니다");
         }
@@ -1611,6 +1687,12 @@ mod tests {
         assert!(entry_looks_like_browser_game(
             r#"<canvas id="game"></canvas><script src="game.js"></script>"#
         ));
+        assert!(entry_looks_like_browser_game(
+            r#"<canvas id="board"></canvas><script src="snake.js"></script>"#
+        ));
+        assert!(entry_looks_like_browser_game(
+            r#"<canvas id="board"></canvas><script src="tetris-engine.js"></script>"#
+        ));
         assert!(!entry_looks_like_browser_game(
             r#"<canvas id="chart"></canvas><script src="chart.js"></script>"#
         ));
@@ -1931,19 +2013,34 @@ mod tests {
         std::fs::create_dir_all(workspace.join("assets")).expect("asset fixture");
         std::fs::write(
             workspace.join("index.html"),
-            "<script src=\"app.js\"></script>",
+            concat!(
+                "<link rel=\"stylesheet\" href=\"tokens.css\">",
+                "<script src=\"app.js\"></script>",
+            ),
         )
         .expect("entry fixture");
-        std::fs::write(workspace.join("app.js"), "console.log('ok')").expect("script fixture");
+        std::fs::write(
+            workspace.join("app.js"),
+            concat!(
+                "fetch('assets/level.json');",
+                "const sprite = new Image();",
+                "sprite.src = 'assets/pixel.png';",
+            ),
+        )
+        .expect("script fixture");
         std::fs::write(workspace.join("tokens.css"), ":root { --ink: #111; }")
             .expect("design tokens fixture");
         std::fs::write(workspace.join("assets/pixel.png"), b"png").expect("image fixture");
+        std::fs::write(workspace.join("assets/level.json"), "{}\n").expect("level fixture");
         std::fs::write(workspace.join(".env"), "PRIVATE_VALUE=short-secret").expect("env fixture");
         std::fs::write(workspace.join(".git/config"), "credential=secret").expect("git fixture");
         std::fs::write(workspace.join("notes.txt"), "short-secret").expect("text fixture");
         std::fs::write(workspace.join("secret.js"), "short-secret").expect("secret fixture");
         std::fs::write(workspace.join("aws-secrets.js"), "short-secret")
             .expect("prefixed secret fixture");
+        std::fs::write(workspace.join("token.js"), "short-secret").expect("token fixture");
+        std::fs::write(workspace.join("passwords.js"), "short-secret").expect("password fixture");
+        std::fs::write(workspace.join("auth.js"), "short-secret").expect("auth fixture");
 
         let staged_entry = stage_web_root(&workspace, &workspace.join("index.html"), &stage)
             .expect("stage web root");
@@ -1951,11 +2048,39 @@ mod tests {
         assert!(stage.join("app.js").is_file());
         assert!(stage.join("tokens.css").is_file());
         assert!(stage.join("assets/pixel.png").is_file());
+        assert!(stage.join("assets/level.json").is_file());
         assert!(!stage.join(".env").exists());
         assert!(!stage.join(".git/config").exists());
         assert!(!stage.join("notes.txt").exists());
         assert!(!stage.join("secret.js").exists());
         assert!(!stage.join("aws-secrets.js").exists());
+        assert!(!stage.join("token.js").exists());
+        assert!(!stage.join("passwords.js").exists());
+        assert!(!stage.join("auth.js").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_sensitive_web_asset_reference_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-sensitive-reference-{}",
+            crate::db::Db::new_id()
+        ));
+        let stage = root.join("stage");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join("index.html"),
+            "<script src=\"token.js\"></script>",
+        )
+        .expect("entry fixture");
+        std::fs::write(workspace.join("token.js"), "window.value = 'private';")
+            .expect("sensitive fixture");
+
+        let error = stage_web_root(&workspace, &workspace.join("index.html"), &stage)
+            .expect_err("sensitive reference must fail");
+        assert!(error.to_string().contains("민감한"), "{error}");
+        assert!(!stage.join("token.js").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2020,7 +2145,8 @@ mod tests {
         let stage = root.join("stage");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let entry = workspace.join("index.html");
-        std::fs::write(&entry, "<canvas></canvas>").expect("entry");
+        std::fs::write(&entry, "<script src=\"app.js\"></script>").expect("entry");
+        std::fs::write(workspace.join("app.js"), "console.log('ok')").expect("script");
 
         let error =
             stage_web_root_with_limits(&workspace, &entry, &stage, 1, Duration::from_secs(1))

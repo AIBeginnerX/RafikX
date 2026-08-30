@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use rafikx::config::{Config, ProviderConfig};
 use rafikx::harness::{Binding, TaskClass, classify_rules, run_pipeline_with_context};
+use rafikx::provider::ContentBlock;
 use rafikx::quality::detect_duplicate_blocks;
 use rafikx::quality::run_quality_gate;
 use rafikx::run::{RunContext, RunId};
@@ -298,6 +299,54 @@ async fn start_scripted_game_model()
     (format!("http://{address}/v1"), requests, server)
 }
 
+async fn start_scripted_tool_redaction_model()
+-> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("redaction listener");
+    let address = listener.local_addr().expect("redaction address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.expect("redaction accept");
+            let request = read_http_body(&mut stream)
+                .await
+                .expect("redaction request");
+            captured
+                .lock()
+                .expect("redaction request log")
+                .push(request);
+            let body = if index == 0 {
+                scripted_tool_response(vec![
+                    (
+                        "bash-failure",
+                        "bash",
+                        json!({"command":"printf 'Authorization:\nBearer\n%s%s\n' 'FAIL-' 'SECRET' >&2; exit 7"}),
+                    ),
+                    (
+                        "bash-success",
+                        "bash",
+                        json!({"command":"printf 'TO\\033[31mKEN\\033[0m=%s%s\n' 'SUCCESS-' 'SECRET'; pwd"}),
+                    ),
+                ])
+            } else {
+                scripted_text_response("도구 결과를 확인했습니다.")
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("redaction response");
+        }
+    });
+    (format!("http://{address}/v1"), requests, server)
+}
+
 async fn start_scripted_budget_model()
 -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -535,6 +584,66 @@ async fn bash_nonzero_exit_is_an_error_result() {
     let message = error.to_string();
     assert!(message.contains("failure"), "missing stderr: {message}");
     assert!(message.contains('7'), "missing exit code: {message}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_outputs_are_redacted_before_live_transcript_and_returned_errors() {
+    let workspace = TestWorkspace::new("tool-output-redaction");
+    let (base_url, requests, server) = start_scripted_tool_redaction_model().await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let binding = scripted_binding(TaskClass::Simple, &["bash"], 3, false, 8_000);
+    let live = Arc::new(Mutex::new(Vec::new()));
+    let live_capture = Arc::clone(&live);
+    let sink = Arc::new(move |event| live_capture.lock().expect("live events").push(event));
+    let run = RunContext::for_config(RunId::new("tool-output-redaction"), Arc::new(cfg.clone()))
+        .with_live_sink(Some(sink));
+    let outcome = run_pipeline_with_context(
+        &cfg,
+        &binding,
+        "run both diagnostic commands and report the result",
+        true,
+        None,
+        None,
+        None,
+        None,
+        run,
+    )
+    .await
+    .expect("redaction pipeline");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("redaction server timeout")
+        .expect("redaction server task");
+
+    let tool_results = outcome
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let live_evidence =
+        serde_json::to_string(&*live.lock().expect("live evidence")).expect("live json");
+    let sanitized_sinks = format!(
+        "{}\n{}\n{}",
+        tool_results,
+        outcome.tool_errors.join("\n"),
+        live_evidence,
+    );
+    let evidence = format!(
+        "{}\n{}\n{}",
+        serde_json::to_string(&outcome.messages).expect("messages"),
+        sanitized_sinks,
+        requests.lock().expect("request evidence").join("\n"),
+    );
+    for secret in ["FAIL-SECRET", "SUCCESS-SECRET"] {
+        assert!(!evidence.contains(secret), "leaked {secret}: {evidence}");
+    }
+    assert!(evidence.contains("[redacted]"), "{evidence}");
+    assert!(!sanitized_sinks.contains(&workspace.path().display().to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -968,7 +1077,7 @@ async fn browser_game_agent_repair_e2e() {
     let outcome = run_pipeline_with_context(
         &cfg,
         &binding,
-        "create a Super Mario browser game and verify every state",
+        "Build an HTML5 Snake game and verify every state",
         true,
         None,
         None,
