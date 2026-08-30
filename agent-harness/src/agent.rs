@@ -294,8 +294,17 @@ pub async fn run_agent_with_context(
         );
         worker_activity(&run_context, &format!("반복 {iterations}/{max_iter}"));
         let specs = registry.specs();
-        let output_token_limit =
-            crate::packer::effective_output_limit(context_window, cfg.file.general.max_tokens);
+        let output_token_limit = crate::packer::request_output_limit(
+            &system,
+            &specs,
+            context_window,
+            cfg.file.general.max_tokens,
+        );
+        if output_token_limit == 0 {
+            return Err(anyhow::anyhow!(
+                "고정 프롬프트가 컨텍스트 창을 모두 사용했습니다."
+            ));
+        }
         messages = crate::packer::pack_messages(
             &messages,
             &system,
@@ -316,7 +325,7 @@ pub async fn run_agent_with_context(
             model: model.to_string(),
             system: system.clone(),
             messages: messages.clone(),
-            tools: registry.specs(),
+            tools: specs,
             max_tokens: output_token_limit,
             stream: true,
         };
@@ -998,6 +1007,51 @@ fn read_deny_reason() -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+pub(crate) fn is_complete_tool_pair(tool_use: &Message, tool_result: &Message) -> bool {
+    if tool_use.role != Role::Assistant || tool_result.role != Role::User {
+        return false;
+    }
+
+    let use_ids: Vec<&str> = tool_use
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect();
+    let result_ids: Vec<&str> = tool_result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+        })
+        .collect();
+
+    !use_ids.is_empty()
+        && use_ids.len() == result_ids.len()
+        && use_ids.iter().all(|id| !id.trim().is_empty())
+        && result_ids.iter().all(|id| !id.trim().is_empty())
+        && use_ids
+            .iter()
+            .enumerate()
+            .all(|(index, id)| !use_ids[..index].contains(id))
+        && result_ids
+            .iter()
+            .enumerate()
+            .all(|(index, id)| !result_ids[..index].contains(id))
+        && use_ids.iter().all(|id| result_ids.contains(id))
+        && !tool_use
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        && !tool_result
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+}
+
 pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     let mut keep: Vec<Message> = Vec::new();
     let mut i = 0;
@@ -1010,30 +1064,26 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             .content
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
-        if messages[i].role == Role::Assistant && has_use {
-            if i + 1 < messages.len()
-                && messages[i + 1].role == Role::User
-                && messages[i + 1]
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-            {
+        if has_use || has_result {
+            if i + 1 < messages.len() && is_complete_tool_pair(&messages[i], &messages[i + 1]) {
                 keep.push(messages[i].clone());
                 keep.push(messages[i + 1].clone());
                 i += 2;
             } else {
+                let text: Vec<ContentBlock> = messages[i]
+                    .content
+                    .iter()
+                    .filter(|block| matches!(block, ContentBlock::Text { .. }))
+                    .cloned()
+                    .collect();
+                if !text.is_empty() {
+                    keep.push(Message {
+                        role: messages[i].role,
+                        content: text,
+                    });
+                }
                 i += 1;
             }
-            continue;
-        }
-        if messages[i].role == Role::User
-            && has_result
-            && !messages[i]
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text { .. }))
-        {
-            i += 1;
             continue;
         }
         keep.push(messages[i].clone());
@@ -1256,6 +1306,126 @@ mod tests {
         ];
         sanitize_tool_pairs(&mut msgs);
         assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn drops_tool_pair_with_mismatched_ids() {
+        let mut msgs = vec![
+            Message::user_text("hi"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-a".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "a.rs"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call-b".into(),
+                        content: "wrong result".into(),
+                        is_error: false,
+                    },
+                    ContentBlock::Text {
+                        text: "keep this user text".into(),
+                    },
+                ],
+            },
+        ];
+
+        sanitize_tool_pairs(&mut msgs);
+
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0].content[0], ContentBlock::Text { .. }));
+        assert!(
+            matches!(msgs[1].content[0], ContentBlock::Text { ref text } if text == "keep this user text")
+        );
+        assert_eq!(msgs[1].content.len(), 1);
+    }
+
+    #[test]
+    fn drops_multi_tool_pair_with_a_missing_result() {
+        let mut msgs = vec![
+            Message::user_text("hi"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "call-a".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "a.rs"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call-b".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "b.rs"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-a".into(),
+                    content: "partial result".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        sanitize_tool_pairs(&mut msgs);
+
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn drops_empty_and_duplicate_tool_ids_but_preserves_text() {
+        for (case, use_ids, result_ids) in [
+            ("empty", vec![""], vec![""]),
+            ("whitespace", vec!["  "], vec!["  "]),
+            ("duplicate", vec!["same", "same"], vec!["same", "same"]),
+        ] {
+            let mut use_content = vec![ContentBlock::Text {
+                text: format!("assistant text {case}"),
+            }];
+            use_content.extend(use_ids.into_iter().map(|id| ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read_file".into(),
+                input: json!({"path": "a.rs"}),
+            }));
+            let mut result_content = vec![ContentBlock::Text {
+                text: format!("user text {case}"),
+            }];
+            result_content.extend(result_ids.into_iter().map(|tool_use_id| {
+                ContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.into(),
+                    content: "result".into(),
+                    is_error: false,
+                }
+            }));
+            let mut messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    content: use_content,
+                },
+                Message {
+                    role: Role::User,
+                    content: result_content,
+                },
+            ];
+
+            sanitize_tool_pairs(&mut messages);
+
+            assert_eq!(messages.len(), 2, "case={case}");
+            assert!(messages.iter().all(|message| message.content.len() == 1));
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| matches!(message.content[0], ContentBlock::Text { .. }))
+            );
+        }
     }
 
     #[test]

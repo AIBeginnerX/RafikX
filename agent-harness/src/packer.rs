@@ -14,7 +14,7 @@ pub fn effective_output_limit(context_window: u32, requested: u32) -> u32 {
     if requested == 0 {
         0
     } else {
-        requested.min(context_window.max(256) / 2)
+        requested.min(context_window / 2)
     }
 }
 
@@ -48,6 +48,17 @@ fn tools_tokens(tools: &[ToolSpec]) -> usize {
         .sum()
 }
 
+pub(crate) fn request_output_limit(
+    system: &str,
+    tools: &[ToolSpec],
+    context_window: u32,
+    requested: u32,
+) -> u32 {
+    let fixed_input = estimate_tokens(system).saturating_add(tools_tokens(tools));
+    let available = (context_window as usize).saturating_sub(fixed_input);
+    effective_output_limit(context_window, requested).min(available as u32)
+}
+
 fn is_tool_use(m: &Message) -> bool {
     m.role == Role::Assistant
         && m.content
@@ -66,7 +77,7 @@ fn drop_oldest_unit(msgs: &mut Vec<Message>) -> bool {
     if msgs.len() <= 1 {
         return false;
     }
-    if is_tool_use(&msgs[0]) && is_tool_result(&msgs[1]) {
+    if agent::is_complete_tool_pair(&msgs[0], &msgs[1]) {
         if msgs.len() == 2 {
             return false;
         }
@@ -254,13 +265,12 @@ fn drop_tool_pair_for_budget(msgs: &mut Vec<Message>, budget: usize) -> bool {
     let pair_index = msgs
         .windows(2)
         .position(|pair| {
-            is_tool_use(&pair[0])
-                && is_tool_result(&pair[1])
+            agent::is_complete_tool_pair(&pair[0], &pair[1])
                 && message_tokens(&pair[0]).saturating_add(message_tokens(&pair[1])) > budget
         })
         .or_else(|| {
             msgs.windows(2)
-                .position(|pair| is_tool_use(&pair[0]) && is_tool_result(&pair[1]))
+                .position(|pair| agent::is_complete_tool_pair(&pair[0], &pair[1]))
         });
     let Some(pair_index) = pair_index else {
         return false;
@@ -283,15 +293,16 @@ pub fn pack_messages(
     let mut msgs = messages.to_vec();
     agent::sanitize_tool_pairs(&mut msgs);
 
-    let window = (context_window as usize).max(256);
-    let output_reserve = effective_output_limit(context_window, reserve_output) as usize;
+    let window = context_window as usize;
+    let output_reserve =
+        request_output_limit(system, tools, context_window, reserve_output) as usize;
     let reserved = estimate_tokens(system) + tools_tokens(tools) + output_reserve;
-    let mut budget = window.saturating_sub(reserved).max(256);
-    let char_cap = (max_context_chars as usize).max(4096);
+    let mut budget = window.saturating_sub(reserved);
+    let char_cap = max_context_chars as usize;
     // 문자 한도와 토큰 한도 중 더 작은 쪽 (토큰≈문자/4)
     let char_as_tokens = char_cap / 4;
     if char_as_tokens < budget {
-        budget = char_as_tokens.max(256);
+        budget = char_as_tokens;
     }
 
     let total = |m: &[Message]| m.iter().map(message_tokens).sum::<usize>();
@@ -337,6 +348,11 @@ pub fn pack_messages(
         break;
     }
     agent::sanitize_tool_pairs(&mut msgs);
+    while total(&msgs) > budget && !msgs.is_empty() {
+        if !drop_oldest_unit(&mut msgs) {
+            msgs.clear();
+        }
+    }
     msgs
 }
 
@@ -528,6 +544,57 @@ mod tests {
     }
 
     #[test]
+    fn packer_never_exceeds_a_256_token_window_after_reservations() {
+        let messages = vec![Message::user_text("x".repeat(800))];
+        let system = "system";
+        let reserve_output = 128;
+
+        let packed = pack_messages(&messages, system, &[], 256, reserve_output, 200_000);
+
+        let request_tokens = estimate_tokens(system)
+            + tools_tokens(&[])
+            + effective_output_limit(256, reserve_output) as usize
+            + packed.iter().map(message_tokens).sum::<usize>();
+        assert!(
+            request_tokens <= 256,
+            "request_tokens={request_tokens} window=256"
+        );
+    }
+
+    #[test]
+    fn fixed_system_prompt_without_output_capacity_is_rejected() {
+        let system = "s".repeat(1_024);
+        assert_eq!(estimate_tokens(&system), 256);
+        assert_eq!(request_output_limit(&system, &[], 256, 128), 0);
+
+        let packed = pack_messages(
+            &[Message::user_text("must not be sent")],
+            &system,
+            &[],
+            256,
+            128,
+            200_000,
+        );
+        assert!(packed.is_empty());
+    }
+
+    #[test]
+    fn packer_does_not_inflate_a_tiny_positive_window() {
+        let messages = vec![Message::user_text("x".repeat(160))];
+        let reserve_output = 64;
+
+        let packed = pack_messages(&messages, "", &[], 64, reserve_output, 200_000);
+
+        let output_tokens = effective_output_limit(64, reserve_output) as usize;
+        let request_tokens = output_tokens + packed.iter().map(message_tokens).sum::<usize>();
+        assert_eq!(output_tokens, 32);
+        assert!(
+            request_tokens <= 64,
+            "request_tokens={request_tokens} window=64"
+        );
+    }
+
+    #[test]
     fn packer_keeps_tool_pairs() {
         let msgs = pair();
         let packed = pack_messages(&msgs, "s", &[], 200, 32, 200_000);
@@ -691,11 +758,18 @@ mod tests {
         let msgs = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "oversized-input".into(),
-                    name: "read_file".into(),
-                    input: json!({"payload": "x".repeat(4_096)}),
-                }],
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "oversized-input".into(),
+                        name: "read_file".into(),
+                        input: json!({"payload": "x".repeat(4_096)}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "oversized-input-2".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "second.rs"}),
+                    },
+                ],
             },
             Message {
                 role: Role::User,
@@ -706,7 +780,7 @@ mod tests {
                         is_error: false,
                     },
                     ContentBlock::ToolResult {
-                        tool_use_id: "oversized-input".into(),
+                        tool_use_id: "oversized-input-2".into(),
                         content: "second result".repeat(128),
                         is_error: true,
                     },

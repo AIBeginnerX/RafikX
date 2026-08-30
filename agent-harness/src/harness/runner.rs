@@ -647,19 +647,34 @@ async fn run_pipeline_inner(
         } else {
             1024
         };
-        let req = ChatRequest {
+        let plan_system = if graph_mode {
+            plan_system_prompt_with(&system, PLAN_GRAPH_INSTRUCTION, &sh_plan_instruction)
+        } else {
+            plan_system_prompt(&system, plan_depth, &sh_plan_instruction)
+        };
+        let plan_messages = vec![Message::user_text(task)];
+        let plan_output_limit = crate::packer::request_output_limit(
+            &plan_system,
+            &[],
+            binding.context_window,
+            plan_budget,
+        );
+        let req = (plan_output_limit > 0).then(|| ChatRequest {
             model: binding.model.clone(),
-            system: if graph_mode {
-                plan_system_prompt_with(&system, PLAN_GRAPH_INSTRUCTION, &sh_plan_instruction)
-            } else {
-                plan_system_prompt(&system, plan_depth, &sh_plan_instruction)
-            },
-            messages: vec![Message::user_text(task)],
+            system: plan_system.clone(),
+            messages: crate::packer::pack_messages(
+                &plan_messages,
+                &plan_system,
+                &[],
+                binding.context_window,
+                plan_output_limit,
+                cfg.file.general.max_context_chars,
+            ),
             tools: vec![],
-            max_tokens: plan_budget,
+            max_tokens: plan_output_limit,
             // 계획은 수십 초가 걸린다 — 비스트리밍이면 그 구간이 통째로 침묵한다.
             stream: true,
-        };
+        });
         crate::ui::live_line_in(&run_context, &format!("[계획 수립 중 · {}]", binding.model));
         let mut plan_streamed = false;
         let on_plan_event = |ev: StreamEvent| match ev {
@@ -671,10 +686,17 @@ async fn run_pipeline_inner(
                 crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
             }
         };
-        let plan_call = if binding.combo_chain.is_empty() {
-            stream_with_fallback(cfg, &order, role, req, on_plan_event).await
+        let plan_call = if let Some(req) = req {
+            if binding.combo_chain.is_empty() {
+                stream_with_fallback(cfg, &order, role, req, on_plan_event).await
+            } else {
+                stream_with_fallback_combo(cfg, &binding.combo_chain, role, req, on_plan_event)
+                    .await
+            }
         } else {
-            stream_with_fallback_combo(cfg, &binding.combo_chain, role, req, on_plan_event).await
+            Err(anyhow!(
+                "고정 계획 프롬프트가 컨텍스트 창을 모두 사용했습니다."
+            ))
         };
         match plan_call {
             Ok((_n, resp)) => {
@@ -778,10 +800,15 @@ async fn run_pipeline_inner(
             return Ok(shared_iteration_limit_outcome(&run_context));
         }
         let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
-        let output_token_limit = crate::packer::effective_output_limit(
+        let output_token_limit = crate::packer::request_output_limit(
+            &system,
+            &[],
             binding.context_window,
             cfg.file.general.max_tokens,
         );
+        if output_token_limit == 0 {
+            return Err(anyhow!("고정 프롬프트가 컨텍스트 창을 모두 사용했습니다."));
+        }
         messages = crate::packer::pack_messages(
             &messages,
             &system,
@@ -3325,6 +3352,50 @@ fn shell_quote_arg(argument: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prompt_exhaustion_fails_before_a_provider_call() {
+        let dir = std::env::temp_dir().join(format!(
+            "rafikx-fixed-prompt-budget-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("workspace");
+        let mut cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).expect("config");
+        cfg.workspace = dir.clone();
+        cfg.file.memory.enabled = false;
+        let binding = Binding {
+            combo_chain: Vec::new(),
+            class: TaskClass::Simple,
+            profile_name: "quick".into(),
+            provider_name: "openai".into(),
+            model: "test-model".into(),
+            kind: "openai_compat".into(),
+            tools: Vec::new(),
+            max_iterations: 1,
+            plan_first: false,
+            verify: false,
+            verify_command: String::new(),
+            system_extra: String::new(),
+            context_window: 256,
+            verify_model: None,
+        };
+        let run = RunContext::isolated(crate::run::RunId::new("fixed-prompt-budget"), dir.clone());
+
+        let result =
+            run_pipeline_with_context(&cfg, &binding, "hello", false, None, None, None, None, run)
+                .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("request must fail before resolving or calling a provider"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("고정 프롬프트가 컨텍스트 창을 모두 사용했습니다")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn language_policy_keeps_work_in_english_and_briefing_in_korean() {
