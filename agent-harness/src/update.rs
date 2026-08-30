@@ -1,5 +1,7 @@
 //! GitHub 릴리스 확인 — 새 버전이 있으면 업그레이드 안내와 핵심 변경사항을 보여준다.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
@@ -38,6 +40,22 @@ impl<'a> ValidatedTag<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValidatedCommit<'a>(&'a str);
+
+impl<'a> ValidatedCommit<'a> {
+    fn parse(raw: &'a str) -> anyhow::Result<Self> {
+        if raw.len() != 40 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("릴리스 커밋은 정확한 40자리 Git OID여야 합니다");
+        }
+        Ok(Self(raw))
+    }
+
+    fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Release {
     pub tag: String,
@@ -54,6 +72,25 @@ struct GhRelease {
     #[serde(default)]
     body: Option<String>,
     html_url: String,
+}
+
+#[derive(Debug)]
+struct ResolvedRelease {
+    release: Release,
+    commit: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedTag {
+    tag: String,
+    commit: String,
+    key: SemverKey,
+}
+
+#[derive(Default)]
+struct TagRefs {
+    direct: Option<String>,
+    peeled: Option<String>,
 }
 
 /// REPO_API 에서 저장소 소유자(계정명)를 추출한다.
@@ -111,25 +148,25 @@ pub(super) const GIT_UPD_TOKEN_ENV: &str = "GIT_UPD_TOKEN";
 /// 비공개 저장소 대응: 소유자 계정 토큰으로 gh CLI releases/latest 를 시도하고,
 /// 없으면 같은 토큰을 넣어 `git ls-remote --tags` 에서 최신 semver 태그를 고른다.
 pub fn latest_release() -> Result<Release> {
+    latest_resolved_release().map(|resolved| resolved.release)
+}
+
+fn latest_resolved_release() -> Result<ResolvedRelease> {
     use std::process::Command;
+    let token = owner_token();
     let mut api_cmd = Command::new("gh");
     api_cmd.args(["api", REPO_API]);
-    if let Some(token) = owner_token() {
+    if let Some(token) = token.as_ref() {
         // 활성 계정과 무관하게 소유자 자격으로 조회한다.
         api_cmd.env("GH_TOKEN", token);
     }
-    if let Ok(out) = api_cmd.output()
-        && out.status.success()
-        && let Ok(gh) = serde_json::from_slice::<GhRelease>(&out.stdout)
-    {
-        return Ok(Release {
-            tag: gh.tag_name,
-            name: gh.name.unwrap_or_default(),
-            notes: gh.body.unwrap_or_default(),
-            url: gh.html_url,
-        });
-    }
-    let out = tag_lookup_command(owner_token())
+    let api_release = api_cmd.output().ok().and_then(|out| {
+        out.status
+            .success()
+            .then(|| serde_json::from_slice::<GhRelease>(&out.stdout).ok())
+            .flatten()
+    });
+    let out = tag_lookup_command(token)
         .output()
         .map_err(|e| anyhow!("git ls-remote 실패: {e}"))?;
     if !out.status.success() {
@@ -139,24 +176,86 @@ pub fn latest_release() -> Result<Release> {
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let Some(tag) = latest_stable_tag_from_refs(&text) else {
-        return Err(anyhow!("태그가 없습니다"));
+    resolve_release_from_sources(api_release, &text)
+}
+
+fn resolve_release_from_sources(
+    api_release: Option<GhRelease>,
+    refs: &str,
+) -> Result<ResolvedRelease> {
+    let tags = resolved_stable_tags_from_refs(refs)?;
+    if let Some(api) = api_release
+        && ValidatedTag::parse(&api.tag_name).is_ok()
+        && let Some(resolved) = tags.iter().find(|tag| tag.tag == api.tag_name)
+    {
+        return Ok(ResolvedRelease {
+            release: Release {
+                tag: resolved.tag.clone(),
+                name: api.name.unwrap_or_default(),
+                notes: api.body.unwrap_or_default(),
+                url: api.html_url,
+            },
+            commit: resolved.commit.clone(),
+        });
+    }
+    let Some(resolved) = tags
+        .into_iter()
+        .max_by(|left, right| left.key.cmp(&right.key))
+    else {
+        return Err(anyhow!("설치 가능한 안정 태그가 없습니다"));
     };
-    Ok(Release {
-        tag,
-        name: String::new(),
-        notes:
-            "공개 릴리스 노트가 없습니다. 전체 변경사항은 https://github.com/AIBeginnerX/RafikX/blob/master/README.md".into(),
-        url: "https://github.com/AIBeginnerX/RafikX/releases".into(),
+    Ok(ResolvedRelease {
+        release: Release {
+            tag: resolved.tag,
+            name: String::new(),
+            notes:
+                "공개 릴리스 노트가 없습니다. 전체 변경사항은 https://github.com/AIBeginnerX/RafikX/blob/master/README.md".into(),
+            url: "https://github.com/AIBeginnerX/RafikX/releases".into(),
+        },
+        commit: resolved.commit,
     })
 }
 
-fn latest_stable_tag_from_refs(text: &str) -> Option<String> {
-    text.lines()
-        .filter_map(|l| l.rsplit('/').next())
-        .filter_map(|t| t.parse::<SemverKey>().ok().map(|k| (t.to_string(), k)))
-        .max_by(|a, b| a.1.cmp(&b.1))
-        .map(|(tag, _)| tag)
+fn resolved_stable_tags_from_refs(text: &str) -> Result<Vec<ResolvedTag>> {
+    let mut refs = BTreeMap::<String, TagRefs>::new();
+    for line in text.lines() {
+        let Some((raw_commit, raw_ref)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(suffix) = raw_ref.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        let (raw_tag, peeled) = suffix
+            .strip_suffix("^{}")
+            .map_or((suffix, false), |tag| (tag, true));
+        let Ok(tag) = ValidatedTag::parse(raw_tag) else {
+            continue;
+        };
+        let commit = ValidatedCommit::parse(raw_commit)?
+            .as_str()
+            .to_ascii_lowercase();
+        let slot = if peeled {
+            &mut refs.entry(tag.as_str().to_string()).or_default().peeled
+        } else {
+            &mut refs.entry(tag.as_str().to_string()).or_default().direct
+        };
+        if slot.as_ref().is_some_and(|existing| existing != &commit) {
+            anyhow::bail!(
+                "같은 릴리스 ref가 서로 다른 커밋을 가리킵니다: {}",
+                tag.as_str()
+            );
+        }
+        *slot = Some(commit);
+    }
+
+    refs.into_iter()
+        .filter_map(|(tag, refs)| {
+            let direct = refs.direct?;
+            let commit = refs.peeled.unwrap_or(direct);
+            let key = tag.parse::<SemverKey>().ok()?;
+            Some(Ok(ResolvedTag { tag, commit, key }))
+        })
+        .collect()
 }
 
 /// vX.Y.Z 태그 정렬용 키.
@@ -179,28 +278,17 @@ impl std::str::FromStr for SemverKey {
 
 /// v 접두사를 제거하고 숫자 3구간(major.minor.patch)으로 비교한다. 최신이 더 크면 true.
 pub fn is_newer(latest_tag: &str, current: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.trim()
-            .trim_start_matches(|c: char| !c.is_ascii_digit())
-            .split('.')
-            .map(|p| {
-                p.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-            })
-            .filter_map(|p| p.parse::<u64>().ok())
-            .collect()
+    let Ok(latest) = latest_tag.parse::<SemverKey>() else {
+        return false;
     };
-    let l = parse(latest_tag);
-    let c = parse(current);
-    for i in 0..3 {
-        let lv = l.get(i).copied().unwrap_or(0);
-        let cv = c.get(i).copied().unwrap_or(0);
-        if lv != cv {
-            return lv > cv;
-        }
-    }
-    false
+    let current = if current.starts_with('v') {
+        current.to_string()
+    } else {
+        format!("v{current}")
+    };
+    current
+        .parse::<SemverKey>()
+        .is_ok_and(|current| latest > current)
 }
 
 /// 릴리스 노트에서 핵심 줄만 뽑는다. 마크다운 헤더/빈 줄을 걷어내고 최대 max_lines 줄.
@@ -273,7 +361,8 @@ pub fn upgrade_notice(release: &Release, current: &str) -> Option<String> {
 pub fn run_update_flow() -> anyhow::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("현재 버전 v{current} — GitHub 확인 중…");
-    let rel = latest_release()?;
+    let resolved = latest_resolved_release()?;
+    let rel = &resolved.release;
     if !is_newer(&rel.tag, current) {
         println!(
             "최신 버전을 사용 중입니다 (설치 v{current} · 공개 최신 {}).",
@@ -296,7 +385,7 @@ pub fn run_update_flow() -> anyhow::Result<()> {
         println!("취소했습니다. 나중에 `rafikx update` 로 다시 진행하세요.");
         return Ok(());
     }
-    install::perform_install(&rel.tag)
+    install::perform_install(&rel.tag, &resolved.commit)
 }
 
 #[cfg(test)]
@@ -362,25 +451,95 @@ mod tests {
     }
 
     #[test]
-    fn tag_fallback_ignores_annotated_peeled_and_non_stable_refs() {
+    fn tag_fallback_resolves_exact_stable_refs_to_commits() {
         let refs = concat!(
-            "111 refs/tags/v1.1.8\n",
-            "222 refs/tags/v1.1.8^{}\n",
-            "333 refs/tags/v1.1.9\n",
-            "444 refs/tags/v1.1.9^{}\n",
-            "555 refs/tags/v9.0.0-rc.1\n",
-            "666 refs/tags/release-10.0.0\n",
+            "1111111111111111111111111111111111111111\trefs/tags/v1.1.8\n",
+            "2222222222222222222222222222222222222222\trefs/tags/v1.1.8^{}\n",
+            "3333333333333333333333333333333333333333\trefs/tags/v1.1.9\n",
+            "4444444444444444444444444444444444444444\trefs/tags/v1.1.9^{}\n",
+            "5555555555555555555555555555555555555555\trefs/tags/v9.0.0-rc.1\n",
+            "6666666666666666666666666666666666666666\trefs/tags/release-10.0.0\n",
+            "7777777777777777777777777777777777777777\trefs/tags/release/v99.0.0\n",
         );
-        assert_eq!(latest_stable_tag_from_refs(refs), Some("v1.1.9".into()));
+        let tags = resolved_stable_tags_from_refs(refs).expect("valid refs");
+        assert_eq!(
+            tags,
+            vec![
+                ResolvedTag {
+                    tag: "v1.1.8".into(),
+                    commit: "2222222222222222222222222222222222222222".into(),
+                    key: "v1.1.8".parse().expect("semver"),
+                },
+                ResolvedTag {
+                    tag: "v1.1.9".into(),
+                    commit: "4444444444444444444444444444444444444444".into(),
+                    key: "v1.1.9".parse().expect("semver"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn release_api_tag_is_validated_and_pinned_before_advertising() {
+        let refs = concat!(
+            "1111111111111111111111111111111111111111\trefs/tags/v1.1.8\n",
+            "2222222222222222222222222222222222222222\trefs/tags/v1.1.9\n",
+        );
+        let exact = resolve_release_from_sources(
+            Some(GhRelease {
+                tag_name: "v1.1.9".into(),
+                name: Some("exact".into()),
+                body: Some("notes".into()),
+                html_url: "https://example.invalid/release".into(),
+            }),
+            refs,
+        )
+        .expect("exact API tag");
+        assert_eq!(exact.release.tag, "v1.1.9");
+        assert_eq!(exact.release.name, "exact");
+        assert_eq!(exact.commit, "2222222222222222222222222222222222222222");
+
+        let fallback = resolve_release_from_sources(
+            Some(GhRelease {
+                tag_name: "release/v99.0.0".into(),
+                name: Some("must not be shown".into()),
+                body: None,
+                html_url: "https://example.invalid/malformed".into(),
+            }),
+            refs,
+        )
+        .expect("fallback stable tag");
+        assert_eq!(fallback.release.tag, "v1.1.9");
+        assert!(fallback.release.name.is_empty());
+    }
+
+    #[test]
+    fn tag_ref_parser_fails_closed_on_conflicts_and_peeled_only_refs() {
+        let conflict = concat!(
+            "1111111111111111111111111111111111111111\trefs/tags/v1.2.3\n",
+            "2222222222222222222222222222222222222222\trefs/tags/v1.2.3\n",
+        );
+        assert!(resolved_stable_tags_from_refs(conflict).is_err());
+
+        let peeled_only = "3333333333333333333333333333333333333333\trefs/tags/v1.2.3^{}\n";
+        assert!(
+            resolved_stable_tags_from_refs(peeled_only)
+                .expect("well-formed refs")
+                .is_empty()
+        );
+
+        let malformed = "not-a-git-oid\trefs/tags/v1.2.3\n";
+        assert!(resolved_stable_tags_from_refs(malformed).is_err());
     }
 
     #[test]
     fn semver_compare() {
         assert!(is_newer("v0.4.0", "0.3.4"));
-        assert!(is_newer("0.3.10", "0.3.9"));
+        assert!(is_newer("v0.3.10", "0.3.9"));
         assert!(!is_newer("v0.3.4", "0.3.4"));
-        assert!(!is_newer("0.3.3", "0.3.4"));
-        assert!(is_newer("1.0.0-rc1", "0.9.9")); // 접두사 무시, 앞 구간 비교
+        assert!(!is_newer("v0.3.3", "0.3.4"));
+        assert!(!is_newer("1.0.0-rc1", "0.9.9"));
+        assert!(!is_newer("release/v9.0.0", "0.9.9"));
     }
 
     #[test]

@@ -31,8 +31,12 @@ jobs:
         run: cargo test --manifest-path agent-harness/Cargo.toml --locked
       - name: test (core, no telegram)
         run: cargo test --manifest-path agent-harness/Cargo.toml --locked --no-default-features
-      - name: check help
-        run: cargo run --manifest-path agent-harness/Cargo.toml --locked -- --version
+      - name: check CLI version and help surfaces
+        run: |
+          cargo run --manifest-path agent-harness/Cargo.toml --locked -- --version
+          cargo run --manifest-path agent-harness/Cargo.toml --locked -- --help
+          cargo run --manifest-path agent-harness/Cargo.toml --locked -- update --help
+          cargo run --manifest-path agent-harness/Cargo.toml --locked -- quality-gate --help
       - name: check desktop (Windows)
         if: runner.os == 'Windows'
         run: cargo check --manifest-path desktop/src-tauri/Cargo.toml

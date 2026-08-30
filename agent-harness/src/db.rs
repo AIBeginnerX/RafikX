@@ -377,7 +377,7 @@ impl Db {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        format!("{millis}-{seq}")
+        format!("{millis}-{}-{seq}", std::process::id())
     }
 
     pub fn start_run(
@@ -1461,6 +1461,16 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_ids_include_the_process_boundary() {
+        let first = Db::new_id();
+        let second = Db::new_id();
+        let fields = first.split('-').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[1], std::process::id().to_string());
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn fts_query_quotes_and_escapes() {

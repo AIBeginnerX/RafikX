@@ -10,6 +10,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(unix)]
+use std::sync::Mutex;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -23,6 +25,8 @@ use tokio::process::{Child, Command};
 #[cfg(unix)]
 static PROCESS_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(unix)]
+static PROCESS_SCOPE_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(unix)]
 const PROCESS_SCOPE_ENV: &str = "RAFIKX_PROCESS_SCOPE";
 #[cfg(unix)]
 const MAX_SCOPE_SCAN_BYTES: usize = 64 * 1024 * 1024;
@@ -32,9 +36,11 @@ pub(crate) struct ProcessScope {
     #[cfg(unix)]
     marker: String,
     #[cfg(unix)]
-    _marker_file: File,
-    #[cfg(unix)]
     marker_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    marker_device: u64,
+    #[cfg(target_os = "linux")]
+    marker_inode: u64,
     #[cfg(windows)]
     job: WindowsJob,
     #[cfg(test)]
@@ -70,6 +76,9 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
+        let _spawn_guard = PROCESS_SCOPE_SPAWN_LOCK
+            .lock()
+            .map_err(|_| std::io::Error::other("process scope spawn lock poisoned"))?;
         let id = PROCESS_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
         let marker = format!(
             "{}-{id:020}-{}",
@@ -77,6 +86,8 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
             crate::db::Db::new_id()
         );
         let (marker_file, marker_path) = create_scope_file(&marker)?;
+        #[cfg(target_os = "linux")]
+        let marker_metadata = marker_file.metadata()?;
         let marker_fd = marker_file.as_raw_fd();
         command.as_std_mut().process_group(0);
         command.env(PROCESS_SCOPE_ENV, &marker);
@@ -90,17 +101,26 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
                 Ok(())
             });
         }
-        let scope = ProcessScope {
-            marker,
-            _marker_file: marker_file,
-            marker_path,
-            #[cfg(test)]
-            force_discovery_failure: false,
-        };
         match command.spawn() {
-            Ok(child) => Ok((child, scope)),
+            Ok(child) => {
+                drop(marker_file);
+                Ok((
+                    child,
+                    ProcessScope {
+                        marker,
+                        marker_path,
+                        #[cfg(target_os = "linux")]
+                        marker_device: marker_metadata.dev(),
+                        #[cfg(target_os = "linux")]
+                        marker_inode: marker_metadata.ino(),
+                        #[cfg(test)]
+                        force_discovery_failure: false,
+                    },
+                ))
+            }
             Err(error) => {
-                let _ = std::fs::remove_file(&scope.marker_path);
+                drop(marker_file);
+                let _ = std::fs::remove_file(&marker_path);
                 Err(error)
             }
         }
@@ -484,12 +504,8 @@ async fn scoped_pids(scope: &ProcessScope) -> Vec<u32> {
 
 #[cfg(target_os = "linux")]
 fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
-    let metadata = scope
-        ._marker_file
-        .metadata()
-        .map_err(|error| format!("프로세스 scope 파일 metadata 실패: {error}"))?;
-    let device = metadata.dev();
-    let inode = metadata.ino();
+    let device = scope.marker_device;
+    let inode = scope.marker_inode;
     let entries =
         std::fs::read_dir("/proc").map_err(|error| format!("/proc 조회 실패: {error}"))?;
     let mut matches = std::collections::BTreeSet::new();
@@ -833,6 +849,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_closes_the_scope_marker_after_spawn() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn scoped child");
+
+        #[cfg(target_os = "linux")]
+        {
+            let inherited = std::fs::read_dir("/proc/self/fd")
+                .expect("parent descriptors")
+                .flatten()
+                .filter_map(|entry| entry.path().metadata().ok())
+                .any(|metadata| {
+                    metadata.dev() == scope.marker_device && metadata.ino() == scope.marker_inode
+                });
+            assert!(!inherited, "parent retained the process scope descriptor");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let Some(program) = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+                .into_iter()
+                .find(|path| std::path::Path::new(path).is_file())
+            else {
+                terminate(&mut child, &scope)
+                    .await
+                    .expect("terminate child");
+                return;
+            };
+            let status = std::process::Command::new(program)
+                .args(["-a", "-p", &std::process::id().to_string(), "--"])
+                .arg(&scope.marker_path)
+                .status()
+                .expect("inspect parent descriptors");
+            assert!(
+                !status.success(),
+                "parent retained the process scope descriptor"
+            );
+        }
+
+        terminate(&mut child, &scope)
+            .await
+            .expect("terminate child");
+    }
+
+    #[tokio::test]
     async fn terminate_kills_descendants() {
         let root =
             std::env::temp_dir().join(format!("rafikx-process-tree-{}", crate::db::Db::new_id()));
@@ -864,22 +924,49 @@ mod tests {
             crate::db::Db::new_id()
         ));
         std::fs::create_dir_all(&root).expect("test directory");
-        let marker = root.join("escaped");
+        let ready = root.join("ready");
         let mut command = Command::new("sh");
         command.args([
             "-c",
-            "\"$1\" -c 'import os,sys,time\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n time.sleep(1)\n open(sys.argv[1], \"w\").write(\"escaped\")\nelse:\n time.sleep(5)' \"$2\"",
+            "\"$1\" -c 'import os,sys,time\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n open(sys.argv[1], \"w\").write(str(os.getpid()))\n time.sleep(60)\nelse:\n time.sleep(60)' \"$2\"",
             "rafikx-process-session",
             python,
-            marker.to_str().expect("marker path"),
+            ready.to_str().expect("ready path"),
         ]);
         let (mut child, scope) = spawn_scoped(&mut command).expect("spawn detached process");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&ready)
+                    && let Ok(pid) = pid.parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached daemon ready");
         terminate(&mut child, &scope)
             .await
             .expect("terminate detached tree");
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert!(!marker.exists());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let output = std::process::Command::new("ps")
+                    .args(["-p", &daemon_pid.to_string(), "-o", "stat="])
+                    .output()
+                    .expect("inspect detached daemon");
+                let state = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success()
+                    || state.trim().is_empty()
+                    || state.trim().starts_with('Z')
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached daemon terminated");
         let _ = std::fs::remove_dir_all(root);
     }
 

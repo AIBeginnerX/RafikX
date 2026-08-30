@@ -5,12 +5,13 @@ use std::process::{Command, Output};
 #[cfg(windows)]
 use std::process::Stdio;
 
-use super::{GIT_UPD_TOKEN_ENV, GIT_UPD_USER_ENV, GIT_URL, ValidatedTag};
+use super::{GIT_UPD_TOKEN_ENV, GIT_UPD_USER_ENV, GIT_URL, ValidatedCommit, ValidatedTag};
 
-pub(super) fn perform_install(raw_tag: &str) -> anyhow::Result<()> {
+pub(super) fn perform_install(raw_tag: &str, raw_commit: &str) -> anyhow::Result<()> {
     let tag = ValidatedTag::parse(raw_tag)?;
+    let commit = ValidatedCommit::parse(raw_commit)?;
     let root = TempRoot::new()?;
-    let source = prepare_source(tag, root.path())?;
+    let source = prepare_source(tag, commit, root.path())?;
 
     #[cfg(not(windows))]
     {
@@ -131,7 +132,21 @@ fn tag_ref(tag: ValidatedTag<'_>) -> String {
     format!("refs/tags/{}", tag.as_str())
 }
 
-fn prepare_source(tag: ValidatedTag<'_>, root: &Path) -> anyhow::Result<PathBuf> {
+fn prepare_source(
+    tag: ValidatedTag<'_>,
+    commit: ValidatedCommit<'_>,
+    root: &Path,
+) -> anyhow::Result<PathBuf> {
+    prepare_source_from(tag, commit, root, Path::new(GIT_URL), true)
+}
+
+fn prepare_source_from(
+    tag: ValidatedTag<'_>,
+    commit: ValidatedCommit<'_>,
+    root: &Path,
+    remote_url: &Path,
+    authenticated: bool,
+) -> anyhow::Result<PathBuf> {
     let source = root.join("source");
     let reference = tag_ref(tag);
 
@@ -143,12 +158,15 @@ fn prepare_source(tag: ValidatedTag<'_>, root: &Path) -> anyhow::Result<PathBuf>
     remote
         .arg("-C")
         .arg(&source)
-        .args(["remote", "add", "origin", GIT_URL]);
+        .args(["remote", "add", "origin"])
+        .arg(remote_url);
     run_status(&mut remote, "git remote add")?;
 
     let mut fetch = sanitized_command("git");
     fetch.arg("-C").arg(&source);
-    super::apply_git_credentials(&mut fetch);
+    if authenticated {
+        super::apply_git_credentials(&mut fetch);
+    }
     fetch.args([
         "fetch",
         "--depth",
@@ -158,19 +176,6 @@ fn prepare_source(tag: ValidatedTag<'_>, root: &Path) -> anyhow::Result<PathBuf>
     ]);
     run_status(&mut fetch, "git fetch")?;
 
-    let mut checkout = sanitized_command("git");
-    checkout
-        .arg("-C")
-        .arg(&source)
-        .args(["checkout", "-q", "--detach", &reference]);
-    run_status(&mut checkout, "git checkout")?;
-
-    let mut head = sanitized_command("git");
-    head.arg("-C")
-        .arg(&source)
-        .args(["rev-parse", "--verify", "HEAD^{commit}"]);
-    let head = checked_output(&mut head, "git rev-parse HEAD")?;
-
     let mut tag_head = sanitized_command("git");
     tag_head.arg("-C").arg(&source).args([
         "rev-parse",
@@ -178,8 +183,24 @@ fn prepare_source(tag: ValidatedTag<'_>, root: &Path) -> anyhow::Result<PathBuf>
         &format!("{reference}^{{commit}}"),
     ]);
     let tag_head = checked_output(&mut tag_head, "git rev-parse tag")?;
-    if head != tag_head {
-        anyhow::bail!("릴리스 태그 검증 실패: {}", tag.as_str());
+    if !tag_head.eq_ignore_ascii_case(commit.as_str()) {
+        anyhow::bail!("릴리스 태그가 확인 이후 이동했습니다: {}", tag.as_str());
+    }
+
+    let mut checkout = sanitized_command("git");
+    checkout
+        .arg("-C")
+        .arg(&source)
+        .args(["checkout", "-q", "--detach", commit.as_str()]);
+    run_status(&mut checkout, "git checkout")?;
+
+    let mut head = sanitized_command("git");
+    head.arg("-C")
+        .arg(&source)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"]);
+    let head = checked_output(&mut head, "git rev-parse HEAD")?;
+    if !head.eq_ignore_ascii_case(commit.as_str()) {
+        anyhow::bail!("릴리스 커밋 checkout 검증 실패: {}", tag.as_str());
     }
     Ok(source)
 }
@@ -271,18 +292,121 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_checkout_targets_the_exact_release_ref() {
-        let tag = ValidatedTag::parse("v1.2.3").expect("valid release tag");
-        assert_eq!(tag_ref(tag), "refs/tags/v1.2.3");
-        assert_eq!(
-            format!("{}^{{commit}}", tag_ref(tag)),
-            "refs/tags/v1.2.3^{commit}"
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn tagged_remote(annotated: bool) -> (PathBuf, PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-update-tag-fixture-{}",
+            crate::db::Db::new_id()
+        ));
+        let work = root.join("work");
+        let remote = root.join("remote.git");
+        std::fs::create_dir_all(&root).expect("fixture root");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .arg(&work)
+            .status()
+            .expect("git init work");
+        assert!(init.success());
+        git(&work, &["config", "user.name", "RafikX Test"]);
+        git(&work, &["config", "user.email", "rafikx@example.invalid"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        git(&work, &["config", "tag.gpgsign", "false"]);
+        std::fs::write(work.join("fixture.txt"), "first\n").expect("fixture file");
+        git(&work, &["add", "fixture.txt"]);
+        git(&work, &["commit", "-q", "-m", "first"]);
+        if annotated {
+            git(&work, &["tag", "-a", "v1.2.3", "-m", "release"]);
+        } else {
+            git(&work, &["tag", "v1.2.3"]);
+        }
+        let commit = git(&work, &["rev-parse", "HEAD^{commit}"]);
+        let init = Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&remote)
+            .status()
+            .expect("git init remote");
+        assert!(init.success());
+        git(
+            &work,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                "origin",
+                "HEAD:refs/heads/master",
+                "refs/tags/v1.2.3",
+            ],
+        );
+        (root, work, commit)
     }
 
     #[test]
-    fn every_non_fetch_command_starts_with_update_credentials_removed() {
+    fn native_checkout_accepts_lightweight_and_annotated_pinned_tags() {
+        for annotated in [false, true] {
+            let (root, _, commit) = tagged_remote(annotated);
+            let checkout = root.join("checkout");
+            let tag = ValidatedTag::parse("v1.2.3").expect("valid tag");
+            let commit = ValidatedCommit::parse(&commit).expect("valid commit");
+            let source =
+                prepare_source_from(tag, commit, &checkout, &root.join("remote.git"), false)
+                    .expect("pinned tag checkout");
+            assert_eq!(
+                git(&source, &["rev-parse", "HEAD^{commit}"]),
+                commit.as_str()
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn native_checkout_rejects_a_tag_moved_after_discovery() {
+        let (root, work, discovered) = tagged_remote(false);
+        std::fs::write(work.join("fixture.txt"), "second\n").expect("updated fixture");
+        git(&work, &["add", "fixture.txt"]);
+        git(&work, &["commit", "-q", "-m", "second"]);
+        git(&work, &["tag", "-f", "v1.2.3"]);
+        git(
+            &work,
+            &["push", "-q", "--force", "origin", "refs/tags/v1.2.3"],
+        );
+
+        let error = prepare_source_from(
+            ValidatedTag::parse("v1.2.3").expect("valid tag"),
+            ValidatedCommit::parse(&discovered).expect("discovered commit"),
+            &root.join("checkout"),
+            &root.join("remote.git"),
+            false,
+        )
+        .expect_err("moved tag must fail before checkout");
+        assert!(error.to_string().contains("이동했습니다"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sanitized_commands_remove_update_credentials() {
         let command = sanitized_command("git");
         let removed = command
             .get_envs()

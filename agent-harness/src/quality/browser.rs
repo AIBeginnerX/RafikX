@@ -69,149 +69,413 @@ const PROBE_SCRIPT: &str = r#"(() => {
     }
     return String(result >>> 0);
   };
-  // Track rendered 2D primitives by frame; fillText/strokeText are intentionally not wrapped.
+  const MAX_CANVAS_OPERATIONS = 2048;
+  const MAX_CANVAS_FRAME_BYTES = 64 * 1024;
+  const MAX_CANVAS_OPERATION_BYTES = 512;
+  const MAX_CANVAS_SAMPLES = 16;
+  const MAX_CANVAS_DIMENSION = 8192;
+  const MAX_CANVAS_PIXELS = 16 * 1024 * 1024;
+  const MAX_PATH_COMMANDS = 512;
   const canvasTrackers = new WeakMap();
-  const canvasArgument = value => {
-    if (typeof value === 'number') {
-      return Number.isFinite(value) ? String(Math.round(value * 1000) / 1000) : String(value);
+  const canvasKinds = new WeakMap();
+  const pathTrackers = new WeakMap();
+  const bitmapTrackers = new WeakMap();
+  const probeCanvases = new WeakSet();
+  const wrappedMethod = Symbol('rafikxCanvasWrapped');
+  const nativePath2D = globalThis.Path2D;
+  const native2DPrototype = globalThis.CanvasRenderingContext2D?.prototype;
+  const nativeClearRect = native2DPrototype?.clearRect;
+  const nativeFillRect = native2DPrototype?.fillRect;
+  const nativeDrawImage = native2DPrototype?.drawImage;
+  const nativeGetImageData = native2DPrototype?.getImageData;
+  const normalizedNumber = value => Number.isFinite(Number(value))
+    ? String(Math.round(Number(value) * 1000) / 1000)
+    : String(value);
+  const mix = (seed, value) => {
+    let result = seed >>> 0;
+    for (let index = 0; index < value.length; index += 1) {
+      result ^= value.charCodeAt(index);
+      result = Math.imul(result, 16777619);
     }
-    if (value instanceof HTMLImageElement) return `image:${value.currentSrc || value.src}`;
-    if (value instanceof HTMLCanvasElement) return `canvas:${value.width}x${value.height}`;
-    if (typeof ImageBitmap !== 'undefined' && value instanceof ImageBitmap) {
-      return `bitmap:${value.width}x${value.height}`;
+    return result >>> 0;
+  };
+  const newPathTracker = () => ({
+    digest: 2166136261, commands: 0, bytes: 0, drawable: false, hasPoint: false, trusted: true,
+  });
+  const clonePathTracker = source => ({ ...source });
+  const pathCommand = (tracker, method, args) => {
+    if (!tracker.trusted) return;
+    const values = args.map(value => typeof value === 'number'
+      ? normalizedNumber(value)
+      : `${Object.prototype.toString.call(value)}:${hash(String(value))}`);
+    const operation = [method, ...values].join('|');
+    tracker.commands += 1;
+    tracker.bytes += operation.length;
+    if (tracker.commands > MAX_PATH_COMMANDS || operation.length > MAX_CANVAS_OPERATION_BYTES
+        || tracker.bytes > MAX_CANVAS_FRAME_BYTES) {
+      tracker.trusted = false;
+      return;
     }
-    if (typeof ImageData !== 'undefined' && value instanceof ImageData) {
-      let sampled = '';
-      const stride = Math.max(1, Math.floor(value.data.length / 4096));
-      for (let index = 0; index < value.data.length; index += stride) {
-        sampled += String.fromCharCode(value.data[index]);
+    tracker.digest = mix(tracker.digest, operation);
+    if (method === 'moveTo') tracker.hasPoint = true;
+    else if (method === 'lineTo' || method === 'bezierCurveTo'
+        || method === 'quadraticCurveTo' || method === 'arcTo') {
+      tracker.drawable ||= tracker.hasPoint;
+      tracker.hasPoint = true;
+    } else if (method === 'arc' && Number(args[2]) > 0) {
+      tracker.drawable = true;
+      tracker.hasPoint = true;
+    } else if (method === 'ellipse' && Number(args[2]) > 0 && Number(args[3]) > 0) {
+      tracker.drawable = true;
+      tracker.hasPoint = true;
+    } else if ((method === 'rect' || method === 'roundRect')
+        && Number(args[2]) !== 0 && Number(args[3]) !== 0) {
+      tracker.drawable = true;
+      tracker.hasPoint = true;
+    }
+  };
+  if (typeof nativePath2D === 'function') {
+    const TrackedPath2D = function(...args) {
+      const target = new.target === TrackedPath2D ? nativePath2D : new.target;
+      const instance = Reflect.construct(nativePath2D, args, target);
+      let tracker = newPathTracker();
+      if (args[0] instanceof nativePath2D && pathTrackers.has(args[0])) {
+        tracker = clonePathTracker(pathTrackers.get(args[0]));
+      } else if (typeof args[0] === 'string') {
+        const source = args[0];
+        pathCommand(tracker, 'svg', [`${source.length}:${hash(source)}`]);
+        tracker.drawable = source.length <= 50_000 && /[LlHhVvCcSsQqTtAa]/.test(source);
+        tracker.trusted &&= source.length <= 50_000;
       }
-      return `image-data:${value.width}x${value.height}:${hash(sampled)}`;
+      pathTrackers.set(instance, tracker);
+      return instance;
+    };
+    Object.setPrototypeOf(TrackedPath2D, nativePath2D);
+    TrackedPath2D.prototype = nativePath2D.prototype;
+    globalThis.Path2D = TrackedPath2D;
+    for (const method of [
+      'addPath', 'closePath', 'moveTo', 'lineTo', 'bezierCurveTo',
+      'quadraticCurveTo', 'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
+    ]) {
+      const original = nativePath2D.prototype[method];
+      if (typeof original !== 'function') continue;
+      nativePath2D.prototype[method] = function(...args) {
+        const result = Reflect.apply(original, this, args);
+        const tracker = pathTrackers.get(this) || newPathTracker();
+        if (method === 'addPath' && args[0] instanceof nativePath2D) {
+          const source = pathTrackers.get(args[0]);
+          if (!source?.trusted) tracker.trusted = false;
+          else {
+            pathCommand(tracker, 'addPath', [source.digest, source.commands, args[1] || '']);
+            tracker.drawable ||= source.drawable;
+          }
+        } else {
+          pathCommand(tracker, method, args);
+        }
+        pathTrackers.set(this, tracker);
+        return result;
+      };
     }
-    return String(value);
+  }
+  const resetCanvasFrame = tracker => {
+    tracker.frameOperations.clear();
+    tracker.frameCalls = 0;
+    tracker.frameBytes = 0;
   };
   const canvasTracker = context => {
     let tracker = canvasTrackers.get(context.canvas);
     if (!tracker) {
       tracker = {
-        operations: [], pathOperations: [], observed: new Set(), baseline: '', observing: false, skipCurrent: false,
+        canvas: context.canvas,
+        context,
+        currentPath: newPathTracker(),
+        frameOperations: new Set(),
+        frameCalls: 0,
+        frameBytes: 0,
+        hasEligibleContent: false,
+        lastContentDigest: '',
+        observing: false,
+        samples: [],
+        trusted: true,
       };
       canvasTrackers.set(context.canvas, tracker);
     }
     return tracker;
   };
-  const canvasFrameFingerprint = tracker => hash(
-    [...new Set(tracker.operations)].sort().join('\n')
-  );
-  const finishCanvasFrame = tracker => {
-    const fingerprint = canvasFrameFingerprint(tracker);
-    if (tracker.observing) {
-      if (tracker.skipCurrent) tracker.skipCurrent = false;
-      else {
-        tracker.observed.add(fingerprint);
-        if (tracker.observed.size > 512) {
-          tracker.observed.delete(tracker.observed.values().next().value);
+  const canvasFrameDigest = tracker => hash([...tracker.frameOperations].sort().join('\n'));
+  const recordFrameOperation = (tracker, operation) => {
+    if (!tracker.trusted) return;
+    tracker.frameCalls += 1;
+    tracker.frameBytes += operation.length;
+    if (tracker.frameCalls > MAX_CANVAS_OPERATIONS
+        || operation.length > MAX_CANVAS_OPERATION_BYTES
+        || tracker.frameBytes > MAX_CANVAS_FRAME_BYTES) {
+      if (tracker.observing) tracker.trusted = false;
+      else resetCanvasFrame(tracker);
+      return;
+    }
+    tracker.frameOperations.add(hash(operation));
+    tracker.hasEligibleContent = true;
+  };
+  const imageDataEvidence = value => {
+    if (typeof ImageData === 'undefined' || !(value instanceof ImageData)) return null;
+    let digest = 2166136261;
+    let visible = false;
+    const pixels = value.data.length / 4;
+    const stride = Math.max(1, Math.floor(pixels / 4096));
+    for (let pixel = 0; pixel < pixels; pixel += stride) {
+      const index = pixel * 4;
+      const alpha = value.data[index + 3];
+      digest = mix(digest, String(alpha));
+      if (alpha !== 0) {
+        visible = true;
+        digest = mix(digest, `${value.data[index]}:${value.data[index + 1]}:${value.data[index + 2]}`);
+      }
+    }
+    return { visible, value: `image-data:${value.width}x${value.height}:${digest}` };
+  };
+  const trackedCanvasEvidence = source => {
+    const tracker = canvasTrackers.get(source);
+    if (!tracker?.trusted || !tracker.hasEligibleContent) return null;
+    if (tracker.frameOperations.size > 0) {
+      tracker.lastContentDigest = canvasFrameDigest(tracker);
+      if (!tracker.observing) resetCanvasFrame(tracker);
+    }
+    if (!tracker.lastContentDigest) return null;
+    return `canvas:${source.width}x${source.height}:${tracker.lastContentDigest}`;
+  };
+  const canvasArgument = value => {
+    if (typeof value === 'number') return normalizedNumber(value);
+    if (typeof value === 'string') return `string:${value.length}:${hash(value)}`;
+    if (typeof HTMLImageElement !== 'undefined' && value instanceof HTMLImageElement) {
+      const source = String(value.currentSrc || value.src || '');
+      return `image:${value.naturalWidth}x${value.naturalHeight}:${source.length}:${hash(source)}`;
+    }
+    if ((typeof HTMLCanvasElement !== 'undefined' && value instanceof HTMLCanvasElement)
+        || (typeof OffscreenCanvas !== 'undefined' && value instanceof OffscreenCanvas)) {
+      return trackedCanvasEvidence(value);
+    }
+    if (typeof ImageBitmap !== 'undefined' && value instanceof ImageBitmap) {
+      const tracked = bitmapTrackers.get(value);
+      return tracked?.trusted && tracked.eligible
+        ? `bitmap:${value.width}x${value.height}:${tracked.digest}`
+        : null;
+    }
+    const imageData = imageDataEvidence(value);
+    if (imageData) return imageData.visible ? imageData.value : null;
+    const rendered = String(value);
+    return `${Object.prototype.toString.call(value)}:${rendered.length}:${hash(rendered)}`;
+  };
+  let colorProbeContext;
+  const paintMayBeVisible = style => {
+    if (typeof style !== 'string') return false;
+    try {
+      if (!colorProbeContext) {
+        const canvas = document.createElement('canvas');
+        probeCanvases.add(canvas);
+        canvas.width = 1;
+        canvas.height = 1;
+        colorProbeContext = canvas.getContext('2d', { willReadFrequently: true });
+      }
+      Reflect.apply(nativeClearRect, colorProbeContext, [0, 0, 1, 1]);
+      colorProbeContext.globalAlpha = 1;
+      colorProbeContext.globalCompositeOperation = 'source-over';
+      colorProbeContext.fillStyle = style;
+      Reflect.apply(nativeFillRect, colorProbeContext, [0, 0, 1, 1]);
+      return Reflect.apply(nativeGetImageData, colorProbeContext, [0, 0, 1, 1]).data[3] !== 0;
+    } catch (_) {
+      return false;
+    }
+  };
+  const transformEvidence = context => {
+    const value = typeof context.getTransform === 'function' ? context.getTransform() : null;
+    return value
+      ? [value.a, value.b, value.c, value.d, value.e, value.f].map(normalizedNumber).join(':')
+      : '';
+  };
+  const pathEvidence = (tracker, method, args) => {
+    const candidate = typeof nativePath2D === 'function' && args[0] instanceof nativePath2D
+      ? pathTrackers.get(args[0])
+      : tracker.currentPath;
+    if (!candidate?.trusted || !candidate.drawable) return null;
+    return `path:${candidate.digest}:${candidate.commands}:${method}`;
+  };
+  const recordCanvasOperation = (context, method, args) => {
+    if (probeCanvases.has(context.canvas)) return;
+    const tracker = canvasTracker(context);
+    if (method === 'beginPath') {
+      tracker.currentPath = newPathTracker();
+      return;
+    }
+    if (method === 'clearRect') {
+      if (Number(args[0]) <= 0 && Number(args[1]) <= 0
+          && Number(args[2]) >= context.canvas.width
+          && Number(args[3]) >= context.canvas.height) {
+        resetCanvasFrame(tracker);
+        tracker.hasEligibleContent = false;
+        tracker.lastContentDigest = '';
+      }
+      return;
+    }
+    if ([
+      'closePath', 'moveTo', 'lineTo', 'bezierCurveTo', 'quadraticCurveTo',
+      'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
+    ].includes(method)) {
+      pathCommand(tracker.currentPath, method, args);
+      return;
+    }
+    let evidenceArgs = args.map(canvasArgument);
+    if (method === 'putImageData') {
+      const imageData = imageDataEvidence(args[0]);
+      if (!imageData?.visible) return;
+      evidenceArgs[0] = imageData.value;
+    } else {
+      if (Number(context.globalAlpha) <= 0) return;
+      if (method === 'fillRect' || method === 'strokeRect') {
+        if (Number(args[2]) === 0 || Number(args[3]) === 0) return;
+      }
+      if (method === 'fill' || method === 'stroke') {
+        const path = pathEvidence(tracker, method, args);
+        if (!path) return;
+        const pathArgument = typeof nativePath2D === 'function' && args[0] instanceof nativePath2D;
+        evidenceArgs = [path, ...(pathArgument ? args.slice(1) : args).map(canvasArgument)];
+      }
+      const paint = method === 'stroke' || method === 'strokeRect'
+        ? context.strokeStyle
+        : context.fillStyle;
+      if ((method === 'fill' || method === 'fillRect'
+          || method === 'stroke' || method === 'strokeRect')
+          && !paintMayBeVisible(paint)) return;
+      if (method === 'drawImage') {
+        if (evidenceArgs[0] === null) return;
+        const width = args.length >= 9 ? Number(args[7])
+          : args.length >= 5 ? Number(args[3]) : Number(args[0]?.width);
+        const height = args.length >= 9 ? Number(args[8])
+          : args.length >= 5 ? Number(args[4]) : Number(args[0]?.height);
+        if (width === 0 || height === 0) return;
+      }
+    }
+    if (evidenceArgs.some(value => value === null)) return;
+    const operation = [
+      method,
+      ...evidenceArgs,
+      `fill:${hash(String(context.fillStyle))}`,
+      `stroke:${hash(String(context.strokeStyle))}`,
+      `alpha:${normalizedNumber(context.globalAlpha)}`,
+      `composite:${context.globalCompositeOperation}`,
+      `line:${normalizedNumber(context.lineWidth)}:${context.lineCap}:${context.lineJoin}`,
+      `dash:${typeof context.getLineDash === 'function' ? context.getLineDash().map(normalizedNumber).join(',') : ''}`,
+      `transform:${transformEvidence(context)}`,
+    ].join('|');
+    recordFrameOperation(tracker, operation);
+  };
+  const contextTypes = [globalThis.CanvasRenderingContext2D, globalThis.OffscreenCanvasRenderingContext2D]
+    .filter((value, index, values) => typeof value === 'function' && values.indexOf(value) === index);
+  const drawingMethods = [
+    'clearRect', 'fillRect', 'strokeRect', 'drawImage', 'putImageData',
+    'beginPath', 'closePath', 'moveTo', 'lineTo', 'bezierCurveTo',
+    'quadraticCurveTo', 'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
+    'fill', 'stroke',
+  ];
+  for (const Context of contextTypes) {
+    for (const method of drawingMethods) {
+      const original = Context.prototype[method];
+      if (typeof original !== 'function' || original[wrappedMethod]) continue;
+      const wrapped = function(...args) {
+        const result = Reflect.apply(original, this, args);
+        try { recordCanvasOperation(this, method, args); }
+        catch (_) { canvasTracker(this).trusted = false; }
+        return result;
+      };
+      wrapped[wrappedMethod] = true;
+      Context.prototype[method] = wrapped;
+    }
+  }
+  const wrapGetContext = Canvas => {
+    if (typeof Canvas !== 'function') return;
+    const original = Canvas.prototype.getContext;
+    if (typeof original !== 'function' || original[wrappedMethod]) return;
+    const wrapped = function(kind, ...args) {
+      const context = Reflect.apply(original, this, [kind, ...args]);
+      if (!probeCanvases.has(this) && context) {
+        canvasKinds.set(this, String(kind).toLowerCase());
+        if (String(kind).toLowerCase() === '2d') canvasTracker(context);
+      }
+      return context;
+    };
+    wrapped[wrappedMethod] = true;
+    Canvas.prototype.getContext = wrapped;
+  };
+  wrapGetContext(globalThis.HTMLCanvasElement);
+  wrapGetContext(globalThis.OffscreenCanvas);
+  if (typeof globalThis.createImageBitmap === 'function') {
+    const original = globalThis.createImageBitmap;
+    globalThis.createImageBitmap = async function(source, ...args) {
+      const bitmap = await Reflect.apply(original, this, [source, ...args]);
+      const digest = ((typeof HTMLCanvasElement !== 'undefined' && source instanceof HTMLCanvasElement)
+          || (typeof OffscreenCanvas !== 'undefined' && source instanceof OffscreenCanvas))
+        ? trackedCanvasEvidence(source)
+        : null;
+      if (digest) bitmapTrackers.set(bitmap, { trusted: true, eligible: true, digest });
+      return bitmap;
+    };
+  }
+  const canvasVisualFingerprint = tracker => {
+    const canvas = tracker.canvas;
+    if (!(canvas.width > 0 && canvas.height > 0)
+        || canvas.width > MAX_CANVAS_DIMENSION || canvas.height > MAX_CANVAS_DIMENSION
+        || canvas.width * canvas.height > MAX_CANVAS_PIXELS) return null;
+    try {
+      if (!tracker.scratch) {
+        tracker.scratch = document.createElement('canvas');
+        probeCanvases.add(tracker.scratch);
+        tracker.scratchContext = tracker.scratch.getContext('2d', { willReadFrequently: true });
+      }
+      const scale = Math.min(1, 128 / canvas.width, 128 / canvas.height);
+      const width = Math.max(1, Math.round(canvas.width * scale));
+      const height = Math.max(1, Math.round(canvas.height * scale));
+      tracker.scratch.width = width;
+      tracker.scratch.height = height;
+      Reflect.apply(nativeDrawImage, tracker.scratchContext, [canvas, 0, 0, width, height]);
+      const data = Reflect.apply(nativeGetImageData, tracker.scratchContext, [0, 0, width, height]).data;
+      let digest = 2166136261;
+      for (let index = 0; index < data.length; index += 4) {
+        const alpha = data[index + 3];
+        digest = mix(digest, String(alpha));
+        if (alpha !== 0) digest = mix(digest, `${data[index]}:${data[index + 1]}:${data[index + 2]}`);
+      }
+      return String(digest);
+    } catch (_) {
+      return null;
+    }
+  };
+  const sampleCanvasFrame = tracker => {
+    if (!tracker.trusted || tracker.frameOperations.size === 0) {
+      resetCanvasFrame(tracker);
+      return;
+    }
+    const semantic = canvasFrameDigest(tracker);
+    const visual = canvasVisualFingerprint(tracker);
+    resetCanvasFrame(tracker);
+    if (visual === null) {
+      tracker.trusted = false;
+      return;
+    }
+    tracker.samples.push({ semantic, visual });
+    if (tracker.samples.length > MAX_CANVAS_SAMPLES) tracker.samples.shift();
+  };
+  const canvasGameplayFingerprint = canvas => {
+    const tracker = canvasTrackers.get(canvas);
+    if (!tracker?.observing || !tracker.trusted) return 'canvas2d:pending';
+    for (let left = 0; left < tracker.samples.length; left += 1) {
+      for (let right = left + 1; right < tracker.samples.length; right += 1) {
+        if (tracker.samples[left].semantic !== tracker.samples[right].semantic
+            && tracker.samples[left].visual !== tracker.samples[right].visual) {
+          return `canvas2d-motion:${hash(tracker.samples.map(sample => `${sample.semantic}:${sample.visual}`).join('\n'))}`;
         }
       }
     }
-    return fingerprint;
-  };
-  const canvasPathMethods = new Set([
-    'closePath', 'moveTo', 'lineTo', 'bezierCurveTo', 'quadraticCurveTo',
-    'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
-  ]);
-  const recordCanvasOperation = (context, method, args) => {
-    const tracker = canvasTracker(context);
-    if (method === 'clearRect') {
-      if (Number(args[0]) <= 0
-          && Number(args[1]) <= 0
-          && Number(args[2]) >= context.canvas.width
-          && Number(args[3]) >= context.canvas.height) {
-        finishCanvasFrame(tracker);
-        tracker.operations = [];
-        tracker.pathOperations = [];
-      }
-      return;
-    }
-    const transform = typeof context.getTransform === 'function' ? context.getTransform() : null;
-    const matrix = transform
-      ? `matrix:${transform.a}:${transform.b}:${transform.c}:${transform.d}:${transform.e}:${transform.f}`
-      : '';
-    if (method === 'beginPath') {
-      tracker.pathOperations = [];
-      return;
-    }
-    if (canvasPathMethods.has(method)) {
-      tracker.pathOperations.push([method, ...args.map(canvasArgument), matrix].join('|'));
-      if (tracker.pathOperations.length > 4096) {
-        tracker.pathOperations.splice(0, tracker.pathOperations.length - 4096);
-      }
-      return;
-    }
-    if (method !== 'putImageData' && Number(context.globalAlpha) <= 0) return;
-    const fillMethod = method === 'fill' || method === 'fillRect';
-    const strokeMethod = method === 'stroke' || method === 'strokeRect';
-    const paint = strokeMethod ? String(context.strokeStyle) : String(context.fillStyle);
-    if ((fillMethod || strokeMethod)
-        && ['transparent', 'rgba(0, 0, 0, 0)', 'rgba(0,0,0,0)'].includes(paint)) {
-      return;
-    }
-    if ((method === 'fill' || method === 'stroke')
-        && tracker.pathOperations.length === 0
-        && !(typeof Path2D !== 'undefined' && args[0] instanceof Path2D)) {
-      return;
-    }
-    const path = method === 'fill' || method === 'stroke'
-      ? `path:${hash(tracker.pathOperations.join('\n'))}`
-      : '';
-    tracker.operations.push([
-      method,
-      ...args.map(canvasArgument),
-      path,
-      `fill:${String(context.fillStyle)}`,
-      `stroke:${String(context.strokeStyle)}`,
-      `alpha:${context.globalAlpha}`,
-      `composite:${context.globalCompositeOperation}`,
-      `line:${context.lineWidth}:${context.lineCap}:${context.lineJoin}`,
-      `dash:${typeof context.getLineDash === 'function' ? context.getLineDash().join(',') : ''}`,
-      `shadow:${context.shadowColor}:${context.shadowBlur}:${context.shadowOffsetX}:${context.shadowOffsetY}`,
-      `filter:${context.filter || 'none'}`,
-      matrix,
-    ].join('|'));
-    if (tracker.operations.length > 4096) {
-      tracker.operations.splice(0, tracker.operations.length - 4096);
-    }
-  };
-  if (typeof CanvasRenderingContext2D !== 'undefined') {
-    const drawingMethods = [
-      'clearRect', 'fillRect', 'strokeRect', 'drawImage', 'putImageData',
-      'beginPath', 'closePath', 'moveTo', 'lineTo', 'bezierCurveTo',
-      'quadraticCurveTo', 'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
-      'fill', 'stroke',
-    ];
-    for (const method of drawingMethods) {
-      const original = CanvasRenderingContext2D.prototype[method];
-      if (typeof original !== 'function') continue;
-      CanvasRenderingContext2D.prototype[method] = function(...args) {
-        recordCanvasOperation(this, method, args);
-        return original.apply(this, args);
-      };
-    }
-  }
-  const canvasGameplayFingerprint = canvas => {
-    const tracker = canvasTrackers.get(canvas);
-    if (!tracker) {
-      try { return `canvas:${hash(canvas.toDataURL())}`; }
-      catch (error) { return `canvas-error:${String(error)}`; }
-    }
-    const current = canvasFrameFingerprint(tracker);
-    if (!tracker.observing) return `canvas2d:${current}`;
-    const variants = new Set(tracker.observed);
-    variants.add(current);
-    if (![...variants].some(fingerprint => fingerprint !== tracker.baseline)) {
-      return `canvas2d:${tracker.baseline}`;
-    }
-    return `canvas2d-motion:${hash([...variants].sort().join('\n'))}`;
+    return 'canvas2d:pending';
   };
   const beginGameplayObservation = surface => {
     const canvases = [];
@@ -219,13 +483,24 @@ const PROBE_SCRIPT: &str = r#"(() => {
       if (primary instanceof HTMLCanvasElement) canvases.push(primary);
       for (const canvas of primary.querySelectorAll?.('canvas') || []) canvases.push(canvas);
     }
-    for (const canvas of [...new Set(canvases)]) {
+    const unique = [...new Set(canvases)];
+    if (unique.length > 8) return;
+    for (const canvas of unique) {
       const tracker = canvasTrackers.get(canvas);
-      if (!tracker) continue;
-      tracker.baseline = canvasFrameFingerprint(tracker);
-      tracker.observed.clear();
+      if (!tracker || canvasKinds.get(canvas) !== '2d') continue;
       tracker.observing = true;
-      tracker.skipCurrent = true;
+      tracker.samples = [];
+      tracker.trusted = true;
+      resetCanvasFrame(tracker);
+      const started = performance.now();
+      let remaining = MAX_CANVAS_SAMPLES;
+      const observe = () => {
+        if (!tracker.observing || remaining <= 0 || performance.now() - started > 300) return;
+        sampleCanvasFrame(tracker);
+        remaining -= 1;
+        requestAnimationFrame(observe);
+      };
+      requestAnimationFrame(observe);
     }
   };
   const visiblyRendered = element => {
@@ -1985,6 +2260,64 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
 mod tests {
     use super::*;
 
+    async fn canvas_contract_fixture(
+        label: &str,
+        drawing: &str,
+    ) -> anyhow::Result<Option<Vec<String>>> {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-canvas-{label}-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let entry = root.join("index.html");
+        let html = [
+            r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"></head><body><canvas id="game" width="320" height="180"></canvas><script>
+const canvas = document.querySelector('#game');
+const context = canvas.getContext('2d');
+const game = { mode: 'ready', restarts: 0, tick: 0 };
+"#,
+            drawing,
+            r#"
+const drawState = () => {
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.globalAlpha = 1;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  if (game.mode === 'playing') drawPlaying(game.tick);
+  else {
+    context.fillStyle = game.mode === 'ready' ? '#14532d' : game.mode === 'paused' ? '#854d0e' : '#7f1d1d';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  }
+};
+document.addEventListener('keydown', event => {
+  if (event.code === 'Space' && game.mode === 'ready') game.mode = 'playing';
+  else if (event.code === 'KeyP' && game.mode === 'playing') game.mode = 'paused';
+  else if (event.code === 'KeyP' && game.mode === 'paused') game.mode = 'playing';
+  else if (event.code === 'KeyR' && game.mode === 'lost') {
+    game.mode = 'ready'; game.restarts += 1; game.tick = 0;
+  }
+  drawState();
+});
+const animate = () => {
+  if (game.mode === 'playing') { game.tick += 1; drawPlaying(game.tick); }
+  requestAnimationFrame(animate);
+};
+window.__rafikxGameTest = {
+  state: () => game.mode,
+  restarts: () => game.restarts,
+  forceLoss: () => { game.mode = 'lost'; drawState(); },
+  surface: () => canvas
+};
+drawState();
+requestAnimationFrame(animate);
+</script></body></html>"#,
+        ]
+        .concat();
+        std::fs::write(&entry, html)?;
+        let result = smoke_test_in_workspace_with_contract(&root, &entry, true).await;
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
     #[test]
     fn parses_uncaught_reference_error() {
         let stderr = "[38240:20464795:0829/143631.043658:INFO:CONSOLE:230] \"Uncaught ReferenceError: camTarget is not defined\", source: file:///tmp/game.js (230)";
@@ -2701,6 +3034,211 @@ render();
             .expect_err("canvas text-only state must fail");
         assert!(
             error.to_string().contains("playing gameplay progress"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn clear_transparent_and_incomplete_canvas_work_cannot_prove_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let error = canvas_contract_fixture(
+            "invisible",
+            r#"
+const transparent = context.createImageData(1, 1);
+const drawPlaying = tick => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#1e293b';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.globalAlpha = 0;
+  context.fillStyle = '#ffffff';
+  context.fillRect(tick % 200, 20, 20, 20);
+  context.globalAlpha = 1;
+  transparent.data[0] = tick % 255;
+  context.putImageData(transparent, tick % 200, 10);
+  const transparentGradient = context.createLinearGradient(0, 0, canvas.width, 0);
+  transparentGradient.addColorStop(0, 'rgba(255, 0, 0, 0)');
+  transparentGradient.addColorStop(1, 'rgba(0, 0, 255, 0)');
+  context.fillStyle = transparentGradient;
+  context.fillRect(tick % 200, 30, 20, 20);
+  context.beginPath();
+  context.moveTo(tick % 200, 40);
+  context.fill();
+  context.fillText(`PLAYING ${tick}`, 20, 90);
+};
+"#,
+        )
+        .await
+        .expect_err("invisible Canvas changes must fail");
+        assert!(
+            error.to_string().contains("playing gameplay progress"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_path2d_is_canvas_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let errors = canvas_contract_fixture(
+            "path2d",
+            r#"
+const drawPlaying = tick => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  const path = new Path2D();
+  path.rect(20 + (tick % 120), 70, 32, 32);
+  context.fillStyle = '#22c55e';
+  context.fill(path);
+};
+"#,
+        )
+        .await
+        .expect("moving Path2D contract")
+        .expect("installed browser");
+        assert!(errors.is_empty(), "browser errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    async fn fixed_offscreen_blit_tracks_non_text_geometry_but_not_text() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let errors = canvas_contract_fixture(
+            "offscreen-geometry",
+            r#"
+const source = document.createElement('canvas');
+source.width = canvas.width;
+source.height = canvas.height;
+const sourceContext = source.getContext('2d');
+const drawPlaying = tick => {
+  sourceContext.clearRect(0, 0, source.width, source.height);
+  sourceContext.fillStyle = '#38bdf8';
+  sourceContext.fillRect(20 + (tick % 120), 70, 32, 32);
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(source, 0, 0);
+};
+"#,
+        )
+        .await
+        .expect("offscreen geometry contract")
+        .expect("installed browser");
+        assert!(errors.is_empty(), "browser errors: {errors:?}");
+
+        let error = canvas_contract_fixture(
+            "offscreen-text",
+            r#"
+const source = document.createElement('canvas');
+source.width = canvas.width;
+source.height = canvas.height;
+const sourceContext = source.getContext('2d');
+const drawPlaying = tick => {
+  sourceContext.clearRect(0, 0, source.width, source.height);
+  sourceContext.fillText(`PLAYING ${tick}`, 20, 90);
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(source, 0, 0);
+};
+"#,
+        )
+        .await
+        .expect_err("offscreen text-only changes must fail");
+        assert!(
+            error.to_string().contains("playing gameplay progress"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_image_bitmap_cannot_prove_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let error = canvas_contract_fixture(
+            "untracked-image-bitmap",
+            r#"
+const source = new OffscreenCanvas(canvas.width, canvas.height);
+const sourceContext = source.getContext('webgl');
+if (!sourceContext) throw new Error('trackerless ImageBitmap source unavailable');
+const drawPlaying = tick => {
+  sourceContext.clearColor((tick % 10) / 10, 0.2, 0.4, 1);
+  sourceContext.clear(sourceContext.COLOR_BUFFER_BIT);
+  const bitmap = source.transferToImageBitmap();
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0);
+  bitmap.close();
+};
+"#,
+        )
+        .await
+        .expect_err("untracked ImageBitmap changes must fail closed");
+        assert!(
+            error.to_string().contains("playing gameplay progress")
+                || error
+                    .to_string()
+                    .contains("trackerless ImageBitmap source unavailable"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trackerless_canvas_pixels_cannot_prove_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-canvas-webgl-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(
+            root.join("index.html"),
+            r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"></head><body><main id="game" role="application" style="width:320px;height:180px;background:#14532d"><canvas width="320" height="180"></canvas></main><script>
+const root = document.querySelector('#game');
+const canvas = root.querySelector('canvas');
+const gl = canvas.getContext('webgl');
+const bitmap = gl ? null : canvas.getContext('bitmaprenderer');
+const source = gl || !bitmap ? null : new OffscreenCanvas(canvas.width, canvas.height);
+const sourceContext = source?.getContext('2d');
+const game = { mode: 'ready', restarts: 0, tick: 0 };
+const paintState = () => { root.style.background = game.mode === 'ready' ? '#14532d' : game.mode === 'playing' ? '#1e3a8a' : game.mode === 'paused' ? '#854d0e' : '#7f1d1d'; };
+const paint = value => {
+  if (gl) { gl.clearColor(value, 0.2, 0.4, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+  else if (bitmap) {
+    sourceContext.fillStyle = `rgb(${Math.round(value * 255)}, 51, 102)`;
+    sourceContext.fillRect(0, 0, source.width, source.height);
+    bitmap.transferFromImageBitmap(source.transferToImageBitmap());
+  } else throw new Error('trackerless Canvas context unavailable');
+};
+document.addEventListener('keydown', event => {
+  if (event.code === 'Space' && game.mode === 'ready') game.mode = 'playing';
+  else if (event.code === 'KeyP' && game.mode === 'playing') game.mode = 'paused';
+  else if (event.code === 'KeyP' && game.mode === 'paused') game.mode = 'playing';
+  else if (event.code === 'KeyR' && game.mode === 'lost') { game.mode = 'ready'; game.restarts += 1; }
+  paintState();
+  paint(game.mode === 'ready' ? 0.1 : game.mode === 'playing' ? 0.3 : game.mode === 'paused' ? 0.5 : 0.7);
+});
+setInterval(() => { if (game.mode === 'playing') { game.tick += 1; paint((game.tick % 10) / 10); } }, 20);
+window.__rafikxGameTest = {
+  state: () => game.mode,
+  restarts: () => game.restarts,
+  forceLoss: () => { game.mode = 'lost'; paintState(); paint(0.7); },
+  surface: () => root
+};
+paintState();
+paint(0.1);
+</script></body></html>"#,
+        )
+        .expect("WebGL fixture");
+        let error = smoke_test_in_workspace_with_contract(&root, &root.join("index.html"), true)
+            .await
+            .expect_err("trackerless Canvas must fail closed");
+        assert!(
+            error.to_string().contains("playing gameplay progress")
+                || error
+                    .to_string()
+                    .contains("trackerless Canvas context unavailable"),
             "{error}"
         );
         let _ = std::fs::remove_dir_all(root);
