@@ -313,6 +313,11 @@ pub async fn run_agent_with_context(
             output_token_limit,
             cfg.file.general.max_context_chars,
         );
+        if messages.is_empty() {
+            return Err(anyhow::anyhow!(
+                "현재 작업을 담을 메시지 예산이 없습니다."
+            ));
+        }
         crate::graph::node_in(
             &run_context,
             "pre_step",

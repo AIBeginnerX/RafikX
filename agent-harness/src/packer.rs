@@ -55,7 +55,9 @@ pub(crate) fn request_output_limit(
     requested: u32,
 ) -> u32 {
     let fixed_input = estimate_tokens(system).saturating_add(tools_tokens(tools));
-    let available = (context_window as usize).saturating_sub(fixed_input);
+    let available = (context_window as usize)
+        .saturating_sub(fixed_input)
+        .saturating_sub(1);
     effective_output_limit(context_window, requested).min(available as u32)
 }
 
@@ -574,6 +576,26 @@ mod tests {
             256,
             128,
             200_000,
+        );
+        assert!(packed.is_empty());
+    }
+
+    #[test]
+    fn output_limit_reserves_capacity_for_the_current_message() {
+        let system = "s".repeat(1_020);
+        assert_eq!(estimate_tokens(&system), 255);
+        assert_eq!(request_output_limit(&system, &[], 256, 128), 0);
+    }
+
+    #[test]
+    fn sub_token_character_cap_cannot_preserve_the_current_message() {
+        let packed = pack_messages(
+            &[Message::user_text("current task")],
+            "",
+            &[],
+            256,
+            128,
+            3,
         );
         assert!(packed.is_empty());
     }

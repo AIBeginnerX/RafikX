@@ -1,3 +1,3 @@
-완료: Anthropic·OpenAI 호환 오류 응답은 상태 확인 뒤 임의 body를 읽거나 저장하지 않으며, Anthropic 스트림 오류도 원문을 폐기하고 PTY 자식 환경은 터미널·locale·PATH allowlist만 전달한다.
-검증: provider 관련 16개 테스트, Node 문법 검사와 실제 9-state PTY/xterm 실행이 통과했고 실행별 home·config·staging 정리도 유지됐다. TypeScript LSP는 workspace 설치 부재와 사용자 설치 보류 때문에 실행하지 않았다.
-다음: 출력 여유가 양수여도 메시지 예산이 0이면 현재 사용자 작업을 지운 채 provider를 호출하지 않도록 패커와 세 호출 경계를 고정한다. 데스크탑은 계속 제외한다.
+완료: 요청 출력 한도는 현재 메시지용 최소 토큰을 먼저 남기며, 문자 상한이나 고정 입력 때문에 패킹 결과가 비면 agent·계획·no-tools 세 경계가 현재 사용자 작업 없는 provider 호출을 거부한다.
+검증: 패커 15개와 고정 프롬프트·0-message provider 미호출 회귀 2개가 통과했고 Rust 컴파일 경고는 기존 기준선 4개뿐이다.
+다음: ULW 연속 루트 실행마다 lifecycle epoch를 분리하고, boot 완료 뒤 Ready 화면을 정지시키며 실제 답변 표시 전에 Answering 전이를 발행한다. 데스크탑은 계속 제외한다.

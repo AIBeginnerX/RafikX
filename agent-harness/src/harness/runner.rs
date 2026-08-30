@@ -652,24 +652,24 @@ async fn run_pipeline_inner(
         } else {
             plan_system_prompt(&system, plan_depth, &sh_plan_instruction)
         };
-        let plan_messages = vec![Message::user_text(task)];
         let plan_output_limit = crate::packer::request_output_limit(
             &plan_system,
             &[],
             binding.context_window,
             plan_budget,
         );
-        let req = (plan_output_limit > 0).then(|| ChatRequest {
+        let plan_messages = crate::packer::pack_messages(
+            &[Message::user_text(task)],
+            &plan_system,
+            &[],
+            binding.context_window,
+            plan_output_limit,
+            cfg.file.general.max_context_chars,
+        );
+        let req = (plan_output_limit > 0 && !plan_messages.is_empty()).then(|| ChatRequest {
             model: binding.model.clone(),
             system: plan_system.clone(),
-            messages: crate::packer::pack_messages(
-                &plan_messages,
-                &plan_system,
-                &[],
-                binding.context_window,
-                plan_output_limit,
-                cfg.file.general.max_context_chars,
-            ),
+            messages: plan_messages,
             tools: vec![],
             max_tokens: plan_output_limit,
             // 계획은 수십 초가 걸린다 — 비스트리밍이면 그 구간이 통째로 침묵한다.
@@ -695,7 +695,7 @@ async fn run_pipeline_inner(
             }
         } else {
             Err(anyhow!(
-                "고정 계획 프롬프트가 컨텍스트 창을 모두 사용했습니다."
+                "계획 프롬프트와 현재 작업을 컨텍스트 창에 함께 담을 수 없습니다."
             ))
         };
         match plan_call {
@@ -817,6 +817,9 @@ async fn run_pipeline_inner(
             output_token_limit,
             cfg.file.general.max_context_chars,
         );
+        if messages.is_empty() {
+            return Err(anyhow!("현재 작업을 담을 메시지 예산이 없습니다."));
+        }
         let req = ChatRequest {
             model: binding.model.clone(),
             system,
@@ -3393,6 +3396,60 @@ mod tests {
             error
                 .to_string()
                 .contains("고정 프롬프트가 컨텍스트 창을 모두 사용했습니다")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_message_budget_fails_before_a_provider_call() {
+        let dir = std::env::temp_dir().join(format!(
+            "rafikx-zero-message-budget-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("workspace");
+        let mut cfg = crate::config::Config::load(Some(&dir.join("config.toml"))).expect("config");
+        cfg.workspace = dir.clone();
+        cfg.file.memory.enabled = false;
+        cfg.file.general.max_context_chars = 3;
+        let binding = Binding {
+            combo_chain: Vec::new(),
+            class: TaskClass::Simple,
+            profile_name: "quick".into(),
+            provider_name: "openai".into(),
+            model: "test-model".into(),
+            kind: "openai_compat".into(),
+            tools: Vec::new(),
+            max_iterations: 1,
+            plan_first: false,
+            verify: false,
+            verify_command: String::new(),
+            system_extra: String::new(),
+            context_window: 400_000,
+            verify_model: None,
+        };
+        let run = RunContext::isolated(crate::run::RunId::new("zero-message-budget"), dir.clone());
+
+        let result = run_pipeline_with_context(
+            &cfg,
+            &binding,
+            "must remain in the request",
+            false,
+            None,
+            None,
+            None,
+            None,
+            run,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("request must fail before resolving or calling a provider"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("현재 작업을 담을 메시지 예산이 없습니다")
         );
         let _ = std::fs::remove_dir_all(dir);
     }
