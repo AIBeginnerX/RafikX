@@ -25,7 +25,10 @@
 - [x] Anthropic 스트리밍 tool_use·input_json_delta 복원
 - [x] 내부 semantic stream으로 추론·후보 본문·최종 Answering 표시 순서 고정
 - [x] 릴리스 문서·기본/최소 전체 테스트·브라우저 게임 E2E·실제 PTY 최종 갱신
-- [ ] (진행) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
+- [x] 네이티브 게임의 대시보드·차트·리포트 요청 오분류 수정과 Rust 1.96 문서 통일
+- [ ] (진행) 프로세스 정리·공급자 스트림·병렬 lifecycle·검증 후 최종 답변 차단점 수정
+- [ ] (대기) 기본·최소 전체 테스트, 브라우저 게임 복구 E2E, 실제 PTY 재검증
+- [ ] (대기) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 
 ## 터미널 릴리스 이후

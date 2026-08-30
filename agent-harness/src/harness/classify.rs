@@ -122,9 +122,22 @@ const ENGLISH_ARTIFACTS: &[&str] = &[
 pub(crate) fn browser_game_intent(text: &str) -> bool {
     let operative = strip_quoted(text);
     let lower = operative.to_ascii_lowercase();
-    let reporting_surface = ["dashboard", "chart", "대시보드", "차트"]
-        .iter()
-        .any(|signal| lower.contains(signal));
+    let reporting_surface = [
+        "dashboard",
+        "chart",
+        "analytics",
+        "admin",
+        "report",
+        "reporting",
+        "대시보드",
+        "차트",
+        "분석",
+        "관리자",
+        "리포트",
+        "보고서",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal));
     let playable_detail = [
         "snake",
         "tetris",
@@ -166,18 +179,6 @@ pub(crate) fn browser_game_intent(text: &str) -> bool {
     ]
     .iter()
     .any(|signal| lower.contains(signal));
-    let reporting_only = reporting_surface
-        && !playable_detail
-        && [
-            "dashboard for game",
-            "chart for game",
-            "game analytics",
-            "game scores",
-            "게임 통계",
-            "게임 점수",
-        ]
-        .iter()
-        .any(|signal| lower.contains(signal));
     let named_browser_game = [
         "snake",
         "tetris",
@@ -240,6 +241,19 @@ pub(crate) fn browser_game_intent(text: &str) -> bool {
     ]
     .iter()
     .any(|signal| lower.contains(signal));
+    let reporting_only = reporting_surface
+        && !playable_detail
+        && (native_game_target
+            || [
+                "dashboard for game",
+                "chart for game",
+                "game analytics",
+                "game scores",
+                "게임 통계",
+                "게임 점수",
+            ]
+            .iter()
+            .any(|signal| lower.contains(signal)));
     game_signal
         && (browser_signal || (named_browser_game && !native_game_target))
         && !reporting_only
@@ -657,6 +671,32 @@ mod intent_gate_tests {
             "Build a Snake game in Rust",
         ] {
             assert!(!browser_game_intent(task), "task: {task}");
+        }
+    }
+
+    #[test]
+    fn native_game_context_does_not_turn_reporting_work_into_a_browser_game() {
+        for task in [
+            "Build a web dashboard for my Rust game",
+            "Add an HTML chart to a Unity game",
+            "Build an analytics report for my Rust game",
+            "Create an admin panel for my Unity game",
+        ] {
+            assert!(!browser_game_intent(task), "task: {task}");
+            assert_eq!(classify_rules(task, false), TaskClass::Dev, "task: {task}");
+        }
+
+        let task = "Build a browser game for my Rust game";
+        assert!(browser_game_intent(task), "task: {task}");
+        assert_eq!(classify_rules(task, false), TaskClass::Dev, "task: {task}");
+
+        for task in [
+            "Build a Rust WASM browser game",
+            "Build a browser game and dashboard for my Rust game",
+            "슈퍼마리오 게임을 만들어줘",
+        ] {
+            assert!(browser_game_intent(task), "task: {task}");
+            assert_eq!(classify_rules(task, false), TaskClass::Dev, "task: {task}");
         }
     }
 

@@ -4,7 +4,7 @@
 
 ## 개발
 
-필요: [Rust](https://rustup.rs) stable (에디션 2024, rustc 1.85+), Git.
+필요: [Rust](https://rustup.rs) stable (에디션 2024, rustc 1.96+), Git.
 
 ```bash
 git clone https://github.com/AIBeginnerX/RafikX.git
