@@ -103,34 +103,59 @@ const PROBE_SCRIPT: &str = r#"(() => {
     if (visiblePrimaries.length === 0) throw new Error('visible gameplay surface is missing');
     return { root, primaries: visiblePrimaries };
   };
-  const renderedFingerprint = root => {
+  const renderedFingerprint = (root, includeText) => {
     const elements = [root, ...root.querySelectorAll('*')].slice(0, 512);
-    const parts = [`innerText:${String(root.innerText || '').trim()}`];
+    const parts = [];
+    if (includeText) parts.push(`innerText:${String(root.innerText || '').trim()}`);
     for (const element of elements) {
       if (!visiblyRendered(element)) continue;
       const style = getComputedStyle(element);
       const rect = element.getBoundingClientRect();
-      const directText = Array.from(element.childNodes)
-        .filter(node => node.nodeType === Node.TEXT_NODE)
-        .map(node => String(node.textContent || '').trim())
-        .filter(Boolean)
-        .join(' ');
       const before = getComputedStyle(element, '::before').content;
       const after = getComputedStyle(element, '::after').content;
-      parts.push([
+      const isCanvas = element instanceof HTMLCanvasElement;
+      const isImage = element instanceof HTMLImageElement;
+      const isSvgShape = typeof SVGGraphicsElement !== 'undefined'
+        && element instanceof SVGGraphicsElement
+        && !['svg', 'text', 'tspan'].includes(element.localName);
+      const containsText = String(element.textContent || '').trim().length > 0
+        || !['none', 'normal', '""'].includes(before)
+        || !['none', 'normal', '""'].includes(after);
+      const borderWidth = ['borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth']
+        .reduce((total, property) => total + (Number.parseFloat(style[property]) || 0), 0);
+      const paintedBox = !['transparent', 'rgba(0, 0, 0, 0)'].includes(style.backgroundColor)
+        || style.backgroundImage !== 'none'
+        || borderWidth > 0
+        || style.boxShadow !== 'none'
+        || (Number.parseFloat(style.outlineWidth) || 0) > 0;
+      if (!includeText && !(isCanvas || isImage || isSvgShape || (!containsText && paintedBox))) {
+        continue;
+      }
+      const visual = [
         element.tagName,
         Math.round(rect.x * 10), Math.round(rect.y * 10),
         Math.round(rect.width * 10), Math.round(rect.height * 10),
         style.display, style.visibility, style.opacity, style.color,
         style.backgroundColor, style.backgroundImage, style.borderColor,
         style.transform, style.fill, style.stroke, style.font,
-        before, after, directText,
-      ].join('|'));
-      if (element instanceof HTMLCanvasElement) {
+      ];
+      if (includeText) {
+        visual.push(
+          before,
+          after,
+          Array.from(element.childNodes)
+            .filter(node => node.nodeType === Node.TEXT_NODE)
+            .map(node => String(node.textContent || '').trim())
+            .filter(Boolean)
+            .join(' '),
+        );
+      }
+      parts.push(visual.join('|'));
+      if (isCanvas) {
         try { parts.push(`canvas:${hash(element.toDataURL())}`); } catch (error) { parts.push(`canvas-error:${String(error)}`); }
-      } else if (element instanceof HTMLImageElement) {
+      } else if (isImage) {
         parts.push(`image:${element.currentSrc || element.src}`);
-      } else if (typeof SVGGraphicsElement !== 'undefined' && element instanceof SVGGraphicsElement) {
+      } else if (isSvgShape) {
         try {
           const box = element.getBBox();
           parts.push(`svg:${box.x}:${box.y}:${box.width}:${box.height}`);
@@ -139,9 +164,9 @@ const PROBE_SCRIPT: &str = r#"(() => {
     }
     return hash(parts.join('\n'));
   };
-  const surfaceFingerprint = surface => renderedFingerprint(surface.root);
+  const surfaceFingerprint = surface => renderedFingerprint(surface.root, true);
   const gameplayFingerprint = surface => hash(
-    surface.primaries.map(element => renderedFingerprint(element)).join('\n')
+    surface.primaries.map(element => renderedFingerprint(element, false)).join('\n')
   );
   const expectSurfaceChange = (before, after, transition) => {
     if (before === after) throw new Error(`game surface did not change for ${transition}`);
@@ -2370,7 +2395,7 @@ window.__rafikxGameTest = {
     }
 
     #[tokio::test]
-    async fn status_only_state_machine_cannot_validate_gameplay_progress() {
+    async fn status_counter_only_state_machine_cannot_validate_gameplay_progress() {
         if detect_browser().is_none() {
             return;
         }
@@ -2381,14 +2406,21 @@ window.__rafikxGameTest = {
         std::fs::create_dir_all(&root).expect("workspace");
         std::fs::write(
             root.join("index.html"),
-            r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"></head><body><main><canvas id="game" width="320" height="180"></canvas><p id="status">READY</p></main><script>
-const fake = { state: 'ready', restarts: 0 };
-const render = () => { document.querySelector('#status').textContent = fake.state.toUpperCase(); };
+            r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"></head><body><main id="game" role="application" style="width:320px;height:180px;background:#eee"><p id="status">READY</p></main><script>
+const fake = { state: 'ready', restarts: 0, counter: 0 };
+const render = () => {
+  document.querySelector('#status').textContent = `${fake.state.toUpperCase()} ${fake.counter}`;
+};
+setInterval(() => {
+  if (fake.state === 'playing') { fake.counter += 1; render(); }
+}, 20);
 document.addEventListener('keydown', event => {
   if (event.code === 'Space' && fake.state === 'ready') fake.state = 'playing';
   else if (event.code === 'KeyP' && fake.state === 'playing') fake.state = 'paused';
   else if (event.code === 'KeyP' && fake.state === 'paused') fake.state = 'playing';
-  else if (event.code === 'KeyR' && fake.state === 'lost') { fake.state = 'ready'; fake.restarts += 1; }
+  else if (event.code === 'KeyR' && fake.state === 'lost') {
+    fake.state = 'ready'; fake.restarts += 1; fake.counter = 0;
+  }
   render();
 });
 window.__rafikxGameTest = {

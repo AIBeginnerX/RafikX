@@ -735,7 +735,9 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
                 Err(_) => cleanup_errors.push("루트 프로세스 종료 확인 시간 초과".into()),
             }
         }
-        for _ in 0..4 {
+        let mut settled_rounds = 0;
+        let mut verdict_scope = Vec::new();
+        for _ in 0..8 {
             let mut remaining = scoped_pids(scope).await;
             match inherited_scope_pids(scope).await {
                 Ok(pids) => remaining.extend(pids),
@@ -743,41 +745,19 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
             }
             remaining.sort_unstable();
             remaining.dedup();
-            if remaining.iter().all(|pid| delivered.contains(pid)) {
-                break;
-            }
+            let discovered = remaining.iter().any(|pid| !delivered.contains(pid));
             deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
+            verdict_scope = remaining;
+            if discovered {
+                settled_rounds = 0;
+            } else {
+                settled_rounds += 1;
+                if settled_rounds == 2 {
+                    break;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let mut remaining = scoped_pids(scope).await;
-        match inherited_scope_pids(scope).await {
-            Ok(pids) => remaining.extend(pids),
-            Err(error) => cleanup_errors.push(error),
-        }
-        remaining.sort_unstable();
-        remaining.dedup();
-        deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
-        let mut currently_scoped = scoped_pids(scope).await;
-        match inherited_scope_pids(scope).await {
-            Ok(pids) => currently_scoped.extend(pids),
-            Err(error) => cleanup_errors.push(error),
-        }
-        currently_scoped.sort_unstable();
-        currently_scoped.dedup();
-        deliver_sigkill(
-            program,
-            &currently_scoped,
-            &mut delivered,
-            &mut kill_failures,
-        )
-        .await;
-        let mut verdict_scope = scoped_pids(scope).await;
-        match inherited_scope_pids(scope).await {
-            Ok(pids) => verdict_scope.extend(pids),
-            Err(error) => cleanup_errors.push(error),
-        }
-        verdict_scope.sort_unstable();
-        verdict_scope.dedup();
         cleanup_errors.extend(unresolved_kill_failures(
             &delivered,
             &kill_failures,

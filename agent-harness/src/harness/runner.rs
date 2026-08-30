@@ -283,7 +283,8 @@ const BROWSER_GAME_CONTRACT_RULE: &str = "\n\n[브라우저 게임 검증 계약
     그려지는 보이는 게임 루트 Element 또는 그 선택자를 반환하며, 루트 안에는 실제 게임을 그리는 \
     canvas·svg·role=application·#game/#arena/#board/#screen 중 하나가 있어야 한다. document의 Space는 \
     ready→playing, KeyP는 playing↔paused, KeyR은 lost→ready를 실제 UI와 같은 상태 머신으로 처리한다. \
-    playing 동안 게임 루프 또는 ArrowRight/KeyD 조작으로 주 게임 표면의 픽셀·도형·위치가 실제로 진행되어야 한다.\n";
+    playing 동안 게임 루프 또는 ArrowRight/KeyD 조작으로 주 게임 표면의 픽셀·도형·위치가 실제로 진행되어야 하며, \
+    상태·점수·카운터 텍스트만 바뀌는 구현은 실패한다.\n";
 
 const PLAN_BRIEF_INSTRUCTION: &str = "작업 계획을 3~7개 항목으로만 출력하라.";
 

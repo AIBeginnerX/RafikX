@@ -282,32 +282,31 @@ mod tests {
 
     #[test]
     fn git_credentials_go_through_env_not_argv() {
+        let token = "synthetic-credential";
         let mut cmd = std::process::Command::new("git");
-        apply_git_credentials(&mut cmd);
+        apply_git_credentials_with(&mut cmd, Some(token.into()));
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        match owner_token() {
-            // 토큰이 있으면: -c 플래그로 기존 helper 를 끄고 교체하되,
-            // 토큰 자체는 argv 에 절대 노출되지 않고 env 이름으로만 참조된다.
-            Some(token) => {
-                assert!(
-                    args.windows(2)
-                        .any(|w| w[0] == "-c" && w[1] == "credential.helper=")
-                );
-                let helper = args
-                    .iter()
-                    .find(|a| a.starts_with("credential.helper=!f()"))
-                    .expect("inline credential helper present");
-                assert!(!args.iter().any(|a| a.contains(token.as_str())));
-                assert!(helper.contains("$GIT_UPD_USER") && helper.contains("$GIT_UPD_TOKEN"));
-            }
-            // 토큰을 못 얻으면 기존 동작(ambient helper) 유지.
-            None => {
-                assert!(args.iter().all(|a| !a.starts_with("credential.helper")));
-            }
-        }
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "credential.helper=")
+        );
+        let helper = args
+            .iter()
+            .find(|a| a.starts_with("credential.helper=!f()"))
+            .expect("inline credential helper present");
+        assert!(!args.iter().any(|a| a.contains(token)));
+        assert!(helper.contains("$GIT_UPD_USER") && helper.contains("$GIT_UPD_TOKEN"));
+
+        let mut ambient = std::process::Command::new("git");
+        apply_git_credentials_with(&mut ambient, None);
+        assert!(
+            ambient
+                .get_args()
+                .all(|argument| !argument.to_string_lossy().starts_with("credential.helper"))
+        );
     }
 
     #[test]

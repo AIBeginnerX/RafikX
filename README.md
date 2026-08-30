@@ -79,7 +79,7 @@ GitHub 인증이 필요하면 `gh auth login` 또는 자격증명 관리자에 P
 | | |
 | --- | --- |
 | OS | Windows 10+, macOS 12+, Linux |
-| Rust | 1.88+ (에디션 2024·let-chains). 한 줄 설치가 처리 |
+| Rust | 1.96+ (에디션 2024·기본 Telegram 의존성 포함). 한 줄 설치가 처리 |
 | Git | 한 줄 설치에 필요 |
 | 선택 | AI 계정(로그인 또는 키), 텔레그램 봇, [Ollama](https://ollama.com) |
 

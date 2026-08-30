@@ -1,3 +1,3 @@
-완료: v1.1.9 CLI 후보 — 실제 게임 surface·입력 후 진행을 검증하고 공유 자산의 비게임 페이지는 분리했으며, 슈퍼마리오·Flappy Bird 의도 분류와 중첩 셸 삭제 차단, URL 경로 시크릿·raw 문자열 unsafe·혼합 TypeScript/TSX/JSX 검증, Rust 1.88 MSRV를 구현. 전체 535개·최소 기능 478개 테스트와 명시적 Node·Chrome 게임 복구 E2E, 실제 CLI 게임·혼합 언어 실패→복구 QA 통과.
+완료: v1.1.9 CLI 후보 — 실제 게임 surface·입력 후 시각 진행을 검증하고 상태 텍스트·카운터 위장을 제외했으며, 공유 자산의 비게임 페이지 분리, 슈퍼마리오·Flappy Bird 의도 분류, 중첩 셸 삭제 차단, URL 경로 시크릿·raw 문자열 unsafe·혼합 TypeScript/TSX/JSX 검증, 기본 Telegram 그래프를 포함한 Rust 1.96 MSRV를 구현. 전체 535개·최소 기능 478개 테스트와 명시적 Node·Chrome 게임 복구 E2E, 실제 CLI 게임·혼합 언어 실패→복구 QA 통과.
 다음: 새 정확 커밋 SHA를 5개 독립 gpt-5.6-sol CLI 검증에 통과시킨 뒤 3개 OS와 MSRV CI를 확인하고 master·v1.1.9 CLI 배포 및 설치된 터미널의 `rafikx update`를 검증한다. Tauri 데스크탑과 디지털 애니메이션 시작 화면은 별도 후속 Phase로 보류한다.
 이슈: 환경 의존 LSP 실동작 3개와 릴리스용 브라우저 게임 E2E 1개는 기본 실행에서 ignore이며 후자는 엄격 리뷰·최종 재검증까지 명시 실행해 통과. Unix 추적은 악성 후손을 격리하는 보안 샌드박스가 아니며, 기존 경고·전역 rustfmt 부채 외 신규 오류 없음.
