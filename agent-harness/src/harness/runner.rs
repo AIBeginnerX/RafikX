@@ -245,6 +245,7 @@ pub async fn run_pipeline_with_context(
     )
     .await;
     sanitize_pipeline_result(&mut result, &cfg.workspace);
+    finalize_pipeline_delivery(&run_context, &mut result);
     if run_context.parent_run_id().is_none()
         && let Ok(outcome) = &mut result
     {
@@ -707,14 +708,6 @@ async fn run_pipeline_inner(
             Ok((_n, resp)) => {
                 crate::graph::node_in(&run_context, "plan", "plan_first", "", Some("pre_step"));
                 crate::ui::live_line_in(&run_context, "[계획] 수립 완료");
-                for b in &resp.content {
-                    if let ContentBlock::Text { text } = b {
-                        crate::ui::live_assistant_in(
-                            &run_context,
-                            &format!("[모델 작업]\n{text}\n[/모델 작업]"),
-                        );
-                    }
-                }
                 let plan = resp
                     .content
                     .iter()
@@ -910,7 +903,20 @@ async fn run_pipeline_inner(
         // coder 로 1회 승격해 다시 실행한다. (아래 본 경로의 승격과 같은 규칙 —
         // 이 조기 반환 경로는 그 검사에 도달하지 못해 v1.0 부터 누출이 그대로
         // 화면에 노출됐다: 2026-08-27 실측.)
-        if !publish_no_tool_answer(&run_context, &resp) {
+        if !no_tool_answer_is_deliverable(&resp) {
+            let has_text = resp.content.iter().any(
+                |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
+            );
+            let contains_non_text = resp
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::Text { .. }));
+            if !has_text && !contains_non_text {
+                no_tool_outcome.status = "incomplete".into();
+                no_tool_outcome.error =
+                    Some("모델이 전달 가능한 최종 답변을 반환하지 않았습니다.".into());
+                return Ok(no_tool_outcome);
+            }
             crate::ui::live_line_in(
                 &run_context,
                 "도구가 필요한 작업으로 판단 — coder 로 승격해 다시 실행합니다.",
@@ -1054,7 +1060,7 @@ async fn run_pipeline_inner(
             remaining_iteration_budget(turn_iteration_limit, total_iterations, effective_max_iter);
         let registry = ToolRegistry::with_names(&binding.tools);
         let resume_for_failure = next_resume.clone().unwrap_or_default();
-        let run = agent::run_agent_with_context(
+        let run = agent::run_agent_with_context_deferred(
             AgentRun {
                 cfg,
                 provider_name: &binding.provider_name,
@@ -1549,7 +1555,7 @@ pub(crate) fn leaked_tool_call(text: &str) -> bool {
     text.contains("\"name\"") && text.contains("\"arguments\"")
 }
 
-fn publish_no_tool_answer(run: &RunContext, response: &ChatResponse) -> bool {
+fn no_tool_answer_is_deliverable(response: &ChatResponse) -> bool {
     if response
         .content
         .iter()
@@ -1566,18 +1572,47 @@ fn publish_no_tool_answer(run: &RunContext, response: &ChatResponse) -> bool {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if leaked_tool_call(&text) {
+    !text.trim().is_empty() && !leaked_tool_call(&text)
+}
+
+fn publish_verified_answer(run: &RunContext, outcome: &AgentOutcome) -> bool {
+    let text = agent::deliverable_assistant_text(&outcome.messages);
+    if text.trim().is_empty() || leaked_tool_call(&text) {
         return false;
     }
-    let _ = run.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted);
-    for block in &response.content {
-        if let ContentBlock::Text { text } = block
-            && !text.trim().is_empty()
-        {
-            crate::ui::live_assistant_in(run, text);
-        }
+    if run
+        .transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted)
+        .is_err()
+    {
+        return false;
     }
+    crate::ui::live_assistant_in(run, &text);
     true
+}
+
+fn finalize_pipeline_delivery(run: &RunContext, result: &mut Result<AgentOutcome>) {
+    if run.is_cancelled() {
+        match result {
+            Ok(outcome) => mark_outcome_cancelled(outcome),
+            Err(_) => *result = Ok(cancelled_outcome()),
+        }
+        return;
+    }
+    let Ok(outcome) = result else {
+        return;
+    };
+    if run.parent_run_id().is_some() {
+        return;
+    }
+    if outcome.status == "ok" && !publish_verified_answer(run, outcome) {
+        outcome.status = "incomplete".into();
+        outcome.error = Some("검증을 통과한 최종 답변이 비어 있습니다.".into());
+    }
+}
+
+fn mark_outcome_cancelled(outcome: &mut AgentOutcome) {
+    outcome.status = "cancelled".into();
+    outcome.error = Some("실행이 취소되었습니다.".into());
 }
 
 fn persist_goal_state(
@@ -1801,6 +1836,10 @@ async fn run_quality_repair(
             browser_game_intent(task),
         )
         .await;
+        if run_context.is_cancelled() {
+            mark_outcome_cancelled(&mut outcome);
+            return Ok(outcome);
+        }
         let rendered = crate::quality::render_report_in_workspace(&report, &cfg.workspace);
         for line in rendered.lines().take(24) {
             crate::ui::live_line_in(run_context, line);
@@ -1842,7 +1881,7 @@ async fn run_quality_repair(
         messages.push(Message::user_text(format!(
             "품질 게이트가 실패했습니다. 아래 구조화·정제된 실행 증거를 바탕으로 실제 파일을 수정하세요.\n{evidence}"
         )));
-        let mut next = agent::run_agent_with_context(
+        let mut next = agent::run_agent_with_context_deferred(
             AgentRun {
                 cfg,
                 provider_name: &binding.provider_name,
@@ -1957,7 +1996,12 @@ async fn run_verify(
                 return Ok(outcome);
             }
         }
-        match tool.run(serde_json::json!({"command": cmd}), &ctx) {
+        let command_result = tool.run(serde_json::json!({"command": cmd}), &ctx);
+        if run_context.is_cancelled() {
+            mark_outcome_cancelled(&mut outcome);
+            return Ok(outcome);
+        }
+        match command_result {
             Ok(out) if !out.contains("[exit") => {
                 // 성공 시 원문 대신 요약 한 줄 — 실패했을 때만 상세가 필요하다.
                 let lines = out.trim().lines().count();
@@ -2024,7 +2068,7 @@ async fn run_verify(
                 msgs.push(Message::user_text(format!(
                     "검증 명령이 실패했습니다. 아래 정제된 오류를 고치세요.\n{safe_err}"
                 )));
-                let mut next = agent::run_agent_with_context(
+                let mut next = agent::run_agent_with_context_deferred(
                     AgentRun {
                         cfg,
                         provider_name: &binding.provider_name,
@@ -2310,7 +2354,7 @@ async fn run_review_once(
     // 신선한 컨텍스트: 본 작업의 대화·lessons 를 물려받지 않는다.
     let mut system = system_prompt(cfg, &reviewer.system_extra, "");
     system.push_str(engine_block);
-    agent::run_agent_with_context(
+    agent::run_agent_with_context_deferred(
         AgentRun {
             cfg,
             provider_name: &reviewer.provider_name,
@@ -2675,7 +2719,7 @@ async fn run_review_gate(
             outcome.verify_fail = Some(headline);
             return outcome;
         }
-        let resumed = agent::run_agent_with_context(
+        let resumed = agent::run_agent_with_context_deferred(
             AgentRun {
                 cfg,
                 provider_name: &binding.provider_name,
@@ -3047,6 +3091,7 @@ enum GraphBoundaryVerdict {
     Passed,
     Failed(String),
     Denied,
+    Cancelled,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3059,6 +3104,9 @@ async fn graph_node_boundary_check(
     local_ask: &Option<agent::LocalAsk>,
     run_context: &RunContext,
 ) -> GraphBoundaryVerdict {
+    if run_context.is_cancelled() {
+        return GraphBoundaryVerdict::Cancelled;
+    }
     let cmd = auto_verify_command(cfg, changed);
     let web_changed = changed
         .iter()
@@ -3111,7 +3159,11 @@ async fn graph_node_boundary_check(
         }
         let public_cmd = crate::quality::redact_bounded_error(&cmd, &cfg.workspace);
         crate::spinner::set_label_in(run_context, &format!("노드 경계 검증: {public_cmd}"));
-        match tool.run(input, &ctx) {
+        let command_result = tool.run(input, &ctx);
+        if run_context.is_cancelled() {
+            return GraphBoundaryVerdict::Cancelled;
+        }
+        match command_result {
             Ok(out) if !out.contains("[exit") => {
                 crate::ui::live_line_in(run_context, &format!("[노드 검증] {public_cmd} — 통과"));
             }
@@ -3138,6 +3190,9 @@ async fn graph_node_boundary_check(
             browser_game_intent(task),
         )
         .await;
+        if run_context.is_cancelled() {
+            return GraphBoundaryVerdict::Cancelled;
+        }
         if !report.passed {
             return GraphBoundaryVerdict::Failed(format!(
                 "노드 웹 경계 검증 실패:\n{}",
@@ -3243,7 +3298,7 @@ async fn run_graph_discipline(
                 ));
                 return Ok(agg);
             }
-            let outcome = agent::run_agent_with_context(
+            let outcome = agent::run_agent_with_context_deferred(
                 AgentRun {
                     cfg,
                     provider_name: &binding.provider_name,
@@ -3299,6 +3354,7 @@ async fn run_graph_discipline(
                         agg.error = Some(format!("그래프 중단: 노드 {id} 검증 승인 거부"));
                         return Ok(agg);
                     }
+                    GraphBoundaryVerdict::Cancelled => return Ok(cancelled_outcome()),
                 }
             }
             if ok {
@@ -3407,31 +3463,13 @@ mod tests {
 
     #[test]
     fn no_tools_candidate_is_not_published_when_it_contains_tool_syntax() {
-        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink_events = Arc::clone(&emitted);
-        let run = RunContext::isolated(
-            crate::run::RunId::new("no-tools-leak"),
-            std::env::temp_dir(),
-        )
-        .with_live_sink(Some(Arc::new(move |event| {
-            sink_events.lock().expect("event lock").push(event);
-        })));
-        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
-            .expect("start run");
-
-        assert!(!publish_no_tool_answer(
-            &run,
-            &no_tool_response(r#"<tool_call>{"name":"bash","arguments":{}}</tool_call>"#),
-        ));
-        assert!(emitted.lock().expect("event lock").is_empty());
-        assert_eq!(
-            run.lifecycle_state(),
-            Some(crate::lifecycle::LifecycleState::Running)
-        );
+        assert!(!no_tool_answer_is_deliverable(&no_tool_response(
+            r#"<tool_call>{"name":"bash","arguments":{}}</tool_call>"#,
+        )));
     }
 
     #[test]
-    fn no_tools_answer_enters_answering_before_the_first_sink_event() {
+    fn verified_answer_enters_answering_before_exactly_one_sink_event() {
         let observed = RunContext::isolated(
             crate::run::RunId::new("no-tools-answer"),
             std::env::temp_dir(),
@@ -3451,26 +3489,26 @@ mod tests {
             }
         })));
 
-        assert!(publish_no_tool_answer(&run, &no_tool_response("완료")));
+        let mut result = Ok(AgentOutcome {
+            messages: vec![Message {
+                role: crate::provider::Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "완료".into(),
+                }],
+            }],
+            ..AgentOutcome::default()
+        });
+        finalize_pipeline_delivery(&run, &mut result);
+
         assert_eq!(
             *states.lock().expect("state lock"),
             vec![Some(crate::lifecycle::LifecycleState::Answering)]
         );
+        assert_eq!(result.expect("outcome").status, "ok");
     }
 
     #[test]
     fn no_tools_structured_tool_use_never_enters_answering_or_reaches_the_sink() {
-        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink_events = Arc::clone(&emitted);
-        let run = RunContext::isolated(
-            crate::run::RunId::new("no-tools-structured-tool"),
-            std::env::temp_dir(),
-        )
-        .with_live_sink(Some(Arc::new(move |event| {
-            sink_events.lock().expect("event lock").push(event);
-        })));
-        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
-            .expect("start run");
         let response = ChatResponse {
             content: vec![ContentBlock::ToolUse {
                 id: "call-1".into(),
@@ -3480,10 +3518,93 @@ mod tests {
             ..no_tool_response("")
         };
 
-        assert!(!publish_no_tool_answer(&run, &response));
-        assert!(emitted.lock().expect("event lock").is_empty());
+        assert!(!no_tool_answer_is_deliverable(&response));
+    }
+
+    #[test]
+    fn cancellation_after_verification_overrides_success_without_publishing() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let run = RunContext::isolated(
+            crate::run::RunId::new("cancel-after-verification"),
+            std::env::temp_dir(),
+        )
+        .with_live_sink(Some(Arc::new(move |event| {
+            sink_events.lock().expect("event lock").push(event);
+        })));
+        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        run.cancel("test cancellation");
+        let mut result = Ok(AgentOutcome {
+            messages: vec![Message {
+                role: crate::provider::Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "검증 전 후보".into(),
+                }],
+            }],
+            ..AgentOutcome::default()
+        });
+
+        finalize_pipeline_delivery(&run, &mut result);
+
+        let outcome = result.expect("outcome");
+        assert_eq!(outcome.status, "cancelled");
+        assert!(
+            emitted
+                .lock()
+                .expect("event lock")
+                .iter()
+                .all(|event| !matches!(event, crate::ui::Live::Assistant(_)))
+        );
+
+        let mut error_result: Result<AgentOutcome> = Err(anyhow!("late verification error"));
+        finalize_pipeline_delivery(&run, &mut error_result);
         assert_eq!(
-            run.lifecycle_state(),
+            error_result.expect("cancelled outcome").status,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn successful_child_answer_is_kept_internal() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let root = RunContext::isolated(
+            crate::run::RunId::new("root-with-child"),
+            std::env::temp_dir(),
+        )
+        .with_live_sink(Some(Arc::new(move |event| {
+            sink_events.lock().expect("event lock").push(event);
+        })));
+        let child = root.child(
+            crate::run::RunId::new("internal-child"),
+            crate::run::AgentId::new("worker"),
+        );
+        child
+            .transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
+            .expect("start child");
+        let mut result = Ok(AgentOutcome {
+            messages: vec![Message {
+                role: crate::provider::Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "자식 후보".into(),
+                }],
+            }],
+            ..AgentOutcome::default()
+        });
+
+        finalize_pipeline_delivery(&child, &mut result);
+
+        assert_eq!(result.expect("outcome").status, "ok");
+        assert!(
+            emitted
+                .lock()
+                .expect("event lock")
+                .iter()
+                .all(|event| !matches!(event, crate::ui::Live::Assistant(_)))
+        );
+        assert_eq!(
+            child.lifecycle_state(),
             Some(crate::lifecycle::LifecycleState::Running)
         );
     }

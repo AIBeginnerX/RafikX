@@ -9,13 +9,21 @@ use crate::run::{FinishResult, RunEventKind, TerminalState};
 impl RunContext {
     pub fn cancel(&self, reason: impl Into<String>) -> bool {
         let reason = reason.into();
-        let cancelled = self.control.cancel(reason.clone());
-        if cancelled {
-            let _ = self
+        if self.control.is_cancelled() {
+            return false;
+        }
+        if self.lifecycle.state().is_some()
+            && self
                 .lifecycle
                 .transition(LifecycleEventData::CancelRequested {
                     reason: reason.clone(),
-                });
+                })
+                .is_err()
+        {
+            return false;
+        }
+        let cancelled = self.control.cancel(reason.clone());
+        if cancelled {
             self.emit(RunEventKind::Cancel, json!({"reason": reason}));
         }
         cancelled
@@ -87,5 +95,40 @@ impl RunContext {
 
     pub fn terminal_state(&self) -> Option<TerminalState> {
         self.control.terminal_state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::RunId;
+
+    #[test]
+    fn answer_commit_rejects_late_cancellation_before_the_token_changes() {
+        let run = RunContext::isolated(RunId::new("answer-commit"), std::env::temp_dir());
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        run.transition_lifecycle(LifecycleEventData::AnswerStarted)
+            .expect("commit answer");
+
+        assert!(!run.cancel("too late"));
+        assert!(!run.is_cancelled());
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::Answering));
+    }
+
+    #[test]
+    fn cancellation_commit_prevents_answer_publication() {
+        let run = RunContext::isolated(RunId::new("cancel-commit"), std::env::temp_dir());
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+
+        assert!(run.cancel("before answer"));
+        assert!(run.is_cancelled());
+        assert_eq!(
+            run.lifecycle_state(),
+            Some(LifecycleState::CancelRequested)
+        );
+        run.transition_lifecycle(LifecycleEventData::AnswerStarted)
+            .expect_err("cancelled run cannot publish an answer");
     }
 }

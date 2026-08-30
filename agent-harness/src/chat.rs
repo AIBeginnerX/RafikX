@@ -57,46 +57,11 @@ impl CompletionSummary {
     }
 }
 
-fn final_assistant_answer(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == Role::Assistant)
-        .map(|message| {
-            message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .map(|answer| strip_thinking_blocks(&answer))
-        .find(|answer| !answer.trim().is_empty())
-        .unwrap_or_default()
-}
-
-fn strip_thinking_blocks(text: &str) -> String {
-    const TAGS: [(&str, &str); 3] = [
-        ("<think>", "</think>"),
-        ("<thinking>", "</thinking>"),
-        ("[모델 작업]", "[/모델 작업]"),
-    ];
-    let mut current = text.to_string();
-    for (open, close) in TAGS {
-        while let Some(start) = current.find(open) {
-            let after_open = start + open.len();
-            let Some(relative_end) = current[after_open..].find(close) else {
-                current.truncate(start);
-                break;
-            };
-            let end = after_open + relative_end + close.len();
-            current.replace_range(start..end, "");
-        }
+fn final_assistant_answer(outcome: &agent::AgentOutcome) -> String {
+    if outcome.status != "ok" {
+        return String::new();
     }
-    current.trim().to_string()
+    agent::deliverable_assistant_text(&outcome.messages)
 }
 
 #[derive(Clone)]
@@ -1909,7 +1874,7 @@ pub async fn run_turn_observed(
     .await
     {
         Ok(outcome) => {
-            let answer = final_assistant_answer(&outcome.messages);
+            let answer = final_assistant_answer(&outcome);
             let summary = CompletionSummary::from_outcome(
                 &outcome,
                 &crate::tools_more::current_todos_in(&run_context),
@@ -2161,21 +2126,43 @@ mod tests {
         let messages = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: format!("<think>내부 추론</think>\n{answer}"),
-                }],
-            },
-            Message {
-                role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "tool-1".into(),
                     name: "read".into(),
                     input: serde_json::json!({}),
                 }],
             },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: format!("<think>내부 추론</think>\n{answer}"),
+                }],
+            },
         ];
 
-        assert_eq!(final_assistant_answer(&messages), answer);
+        assert_eq!(
+            final_assistant_answer(&agent::AgentOutcome {
+                messages,
+                ..Default::default()
+            }),
+            answer
+        );
+    }
+
+    #[test]
+    fn failed_turn_does_not_reexpose_a_provisional_answer() {
+        let outcome = agent::AgentOutcome {
+            status: "fail".into(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "검증 전에만 유효했던 후보".into(),
+                }],
+            }],
+            ..Default::default()
+        };
+
+        assert!(final_assistant_answer(&outcome).is_empty());
     }
 
     #[test]

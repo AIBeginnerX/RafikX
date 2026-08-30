@@ -152,6 +152,27 @@ pub async fn run_agent_with_context(
     run: AgentRun<'_>,
     run_context: RunContext,
 ) -> Result<AgentOutcome> {
+    run_agent_with_delivery(run, run_context, AnswerDelivery::Immediate).await
+}
+
+pub(crate) async fn run_agent_with_context_deferred(
+    run: AgentRun<'_>,
+    run_context: RunContext,
+) -> Result<AgentOutcome> {
+    run_agent_with_delivery(run, run_context, AnswerDelivery::Deferred).await
+}
+
+#[derive(Clone, Copy)]
+enum AnswerDelivery {
+    Immediate,
+    Deferred,
+}
+
+async fn run_agent_with_delivery(
+    run: AgentRun<'_>,
+    run_context: RunContext,
+    answer_delivery: AnswerDelivery,
+) -> Result<AgentOutcome> {
     let AgentRun {
         cfg,
         provider_name,
@@ -316,9 +337,7 @@ pub async fn run_agent_with_context(
             cfg.file.general.max_context_chars,
         );
         if messages.is_empty() {
-            return Err(anyhow::anyhow!(
-                "현재 작업을 담을 메시지 예산이 없습니다."
-            ));
+            return Err(anyhow::anyhow!("현재 작업을 담을 메시지 예산이 없습니다."));
         }
         crate::graph::node_in(
             &run_context,
@@ -500,7 +519,9 @@ pub async fn run_agent_with_context(
             && truncation_retries < 2
         {
             truncation_retries += 1;
-            print_work_text_blocks(&run_context, &resp);
+            if matches!(answer_delivery, AnswerDelivery::Immediate) {
+                print_work_text_blocks(&run_context, &resp);
+            }
             if !resp.content.is_empty() {
                 messages.push(Message {
                     role: Role::Assistant,
@@ -521,8 +542,24 @@ pub async fn run_agent_with_context(
         }
 
         if resp.stop_reason != StopReason::ToolUse && tool_uses.is_empty() {
-            let published = publish_final_answer(&run_context, &mut messages, &resp);
-            debug_assert!(published);
+            if !record_final_answer(&run_context, &mut messages, &resp, answer_delivery) {
+                return Ok(AgentOutcome {
+                    status: "incomplete".into(),
+                    iterations,
+                    input_tokens,
+                    output_tokens,
+                    context_tokens,
+                    cached_tokens,
+                    cache_reported,
+                    error: Some("모델이 전달 가능한 최종 답변을 반환하지 않았습니다.".into()),
+                    messages,
+                    changed_files: committed_files(&run_context),
+                    tool_errors,
+                    deny_reasons,
+                    verify_fail: None,
+                    verify_recovered: None,
+                });
+            }
             let hit_token_limit = resp.stop_reason == StopReason::MaxTokens;
             return Ok(AgentOutcome {
                 status: if hit_token_limit {
@@ -548,7 +585,9 @@ pub async fn run_agent_with_context(
             });
         }
 
-        print_work_text_blocks(&run_context, &resp);
+        if matches!(answer_delivery, AnswerDelivery::Immediate) {
+            print_work_text_blocks(&run_context, &resp);
+        }
 
         if tool_uses.is_empty() {
             messages.push(Message {
@@ -929,7 +968,26 @@ pub async fn run_agent_with_context(
                 crate::ui::live_warn_in(&run_context, &format!("[자동승인] {name}"));
             }
 
-            match tool.run(input.clone(), &ctx) {
+            let tool_result = tool.run(input.clone(), &ctx);
+            if run_context.is_cancelled() {
+                return Ok(AgentOutcome {
+                    status: "cancelled".into(),
+                    iterations,
+                    input_tokens,
+                    output_tokens,
+                    context_tokens,
+                    cached_tokens,
+                    cache_reported,
+                    error: Some("실행이 취소되었습니다.".into()),
+                    messages,
+                    changed_files: committed_files(&run_context),
+                    tool_errors,
+                    deny_reasons,
+                    verify_fail: None,
+                    verify_recovered: None,
+                });
+            }
+            match tool_result {
                 Ok(out) => {
                     let out = crate::quality::redact_tool_output(&out, &ctx.workspace);
                     if name == tools::TaskTool::NAME {
@@ -1035,16 +1093,20 @@ fn response_text(response: &ChatResponse) -> String {
         .join("\n")
 }
 
-fn publish_final_answer(
+fn record_final_answer(
     run: &RunContext,
     messages: &mut Vec<Message>,
     response: &ChatResponse,
+    delivery: AnswerDelivery,
 ) -> bool {
-    if crate::harness::leaked_tool_call(&response_text(response)) {
+    let text = response_text(response);
+    if text.trim().is_empty() || crate::harness::leaked_tool_call(&text) {
         return false;
     }
-    let _ = run.transition_lifecycle(LifecycleEventData::AnswerStarted);
-    print_text_blocks(run, response);
+    if matches!(delivery, AnswerDelivery::Immediate) {
+        let _ = run.transition_lifecycle(LifecycleEventData::AnswerStarted);
+        print_text_blocks(run, response);
+    }
     messages.push(Message {
         role: Role::Assistant,
         content: response.content.clone(),
@@ -1264,6 +1326,42 @@ pub fn last_assistant_text(messages: &[Message]) -> String {
         .join("\n")
 }
 
+pub(crate) fn deliverable_assistant_text(messages: &[Message]) -> String {
+    const INTERNAL_BLOCKS: [(&str, &str); 3] = [
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+        ("[모델 작업]", "[/모델 작업]"),
+    ];
+    let Some(message) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+    else {
+        return String::new();
+    };
+    let mut text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (open, close) in INTERNAL_BLOCKS {
+        while let Some(start) = text.find(open) {
+            let after_open = start + open.len();
+            let Some(relative_end) = text[after_open..].find(close) else {
+                text.truncate(start);
+                break;
+            };
+            let end = after_open + relative_end + close.len();
+            text.replace_range(start..end, "");
+        }
+    }
+    text.trim().to_string()
+}
+
 pub fn record_finish(db: &Db, run_id: &str, outcome: &AgentOutcome) -> Result<()> {
     db.finish_run(
         run_id,
@@ -1322,15 +1420,40 @@ mod tests {
             .expect("start run");
         let mut messages = vec![Message::user_text("게임을 만들어줘")];
 
-        assert!(!publish_final_answer(
+        assert!(!record_final_answer(
             &run,
             &mut messages,
             &final_response(r#"<tool_call>{"name":"write_file","arguments":{}}</tool_call>"#),
+            AnswerDelivery::Immediate,
         ));
         assert!(emitted.lock().expect("event lock").is_empty());
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0].role, Role::User));
         assert!(assistant_text(&messages).is_empty());
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::Running));
+    }
+
+    #[test]
+    fn deferred_final_answer_is_recorded_without_entering_answering_or_reaching_sink() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let run = RunContext::isolated(RunId::new("deferred-answer"), std::env::temp_dir())
+            .with_live_sink(Some(Arc::new(move |event| {
+                sink_events.lock().expect("event lock").push(event);
+            })));
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        let mut messages = vec![Message::user_text("작업")];
+
+        assert!(record_final_answer(
+            &run,
+            &mut messages,
+            &final_response("검증 전 후보"),
+            AnswerDelivery::Deferred,
+        ));
+
+        assert!(emitted.lock().expect("event lock").is_empty());
+        assert_eq!(last_assistant_text(&messages), "검증 전 후보");
         assert_eq!(run.lifecycle_state(), Some(LifecycleState::Running));
     }
 
@@ -1372,6 +1495,28 @@ mod tests {
         assert!(assistant_text(&msgs).contains("내리겠다"));
         assert_eq!(last_assistant_text(&[]), "");
         assert_eq!(last_assistant_text(&[Message::user_text("x")]), "");
+    }
+
+    #[test]
+    fn deliverable_answer_never_falls_back_to_an_older_provisional_turn() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "검증 전 후보".into(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "true"}),
+                }],
+            },
+        ];
+
+        assert!(deliverable_assistant_text(&messages).is_empty());
     }
 
     #[test]

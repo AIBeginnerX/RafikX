@@ -826,12 +826,7 @@ fn handle_key(
             if app.help {
                 app.help = false;
             } else if app.busy {
-                app.cancel_requested.store(true, Ordering::Release);
-                if let Ok(active) = app.active_run.lock()
-                    && let Some(run) = active.as_ref()
-                {
-                    run.cancel("TUI Esc");
-                }
+                request_turn_cancel(&app.cancel_requested, &app.active_run);
                 // 취소했으면 조회 완료 후 피커를 띄우지 않는다.
                 app.model_pick_after = None;
                 app.status = "취소 요청 중…".into();
@@ -1055,12 +1050,7 @@ fn make_turn_observer(
     lifecycle_epoch: Arc<AtomicU64>,
 ) -> chat::RunObserver {
     Arc::new(move |run: crate::run::RunContext| {
-        if cancel_requested.load(Ordering::Acquire) {
-            run.cancel("TUI Esc");
-        }
-        if let Ok(mut active) = active_run.lock() {
-            *active = Some(run.clone());
-        }
+        install_active_run(&cancel_requested, &active_run, &run);
         let mut events = run.subscribe_lifecycle();
         let state = Arc::clone(&lifecycle_state);
         let state_epoch = Arc::clone(&lifecycle_epoch);
@@ -1102,6 +1092,31 @@ fn make_turn_observer(
             }
         });
     })
+}
+
+fn request_turn_cancel(
+    cancel_requested: &AtomicBool,
+    active_run: &Mutex<Option<crate::run::RunContext>>,
+) {
+    cancel_requested.store(true, Ordering::Release);
+    if let Ok(active) = active_run.lock()
+        && let Some(run) = active.as_ref()
+    {
+        run.cancel("TUI Esc");
+    }
+}
+
+fn install_active_run(
+    cancel_requested: &AtomicBool,
+    active_run: &Mutex<Option<crate::run::RunContext>>,
+    run: &crate::run::RunContext,
+) {
+    if let Ok(mut active) = active_run.lock() {
+        *active = Some(run.clone());
+        if cancel_requested.load(Ordering::Acquire) {
+            run.cancel("TUI Esc");
+        }
+    }
 }
 
 fn start_turn(
@@ -1250,6 +1265,10 @@ fn finish_turn(
     app.binding = binding_label(&app.session);
     match done.result {
         Ok(info) => {
+            app.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+            if let Ok(mut lifecycle) = app.lifecycle_state.lock() {
+                *lifecycle = info.lifecycle_state;
+            }
             let secs = info.elapsed_ms as f64 / 1000.0;
             app.status = format!("{}  {}  ·  {:.1}s", info.status, info.label, secs);
             let fmt_k = |n: u32| -> String {
@@ -1472,8 +1491,17 @@ fn apply_live(app: &mut App, ev: Live) {
     if app.final_summary && ignore_after_final_summary(&ev) {
         return;
     }
-    if matches!(&ev, Live::Chunk(_) | Live::Assistant(_)) {
-        project_active_lifecycle(&app.active_run, &app.lifecycle_state);
+    match &ev {
+        Live::Chunk(_) => project_active_lifecycle(&app.active_run, &app.lifecycle_state),
+        Live::Assistant(_) => {
+            project_final_answer_lifecycle(&app.lifecycle_state, &app.lifecycle_epoch)
+        }
+        Live::System(_)
+        | Live::Warn(_)
+        | Live::Status(_)
+        | Live::Todo(_)
+        | Live::Agent(_)
+        | Live::Mode(_) => {}
     }
     app.follow = true;
     match ev {
@@ -1595,6 +1623,16 @@ fn project_active_lifecycle(
         && let Ok(mut current) = lifecycle_state.lock()
     {
         *current = Some(projected);
+    }
+}
+
+fn project_final_answer_lifecycle(
+    lifecycle_state: &Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
+    lifecycle_epoch: &Arc<AtomicU64>,
+) {
+    lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut current) = lifecycle_state.lock() {
+        *current = Some(crate::lifecycle::LifecycleState::Answering);
     }
 }
 
@@ -2866,6 +2904,50 @@ mod upgrade_tests {
     }
 
     #[tokio::test]
+    async fn observer_handoff_honors_escape_requested_before_active_run_registration() {
+        use crate::run::{RunContext, RunId};
+
+        let cancel_requested = Arc::new(AtomicBool::new(true));
+        let active_run = Arc::new(Mutex::new(None));
+        let observer = make_turn_observer(
+            Arc::clone(&cancel_requested),
+            Arc::clone(&active_run),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let run = RunContext::isolated(RunId::new("escape-before-handoff"), std::env::temp_dir());
+
+        observer(run.clone());
+
+        assert!(
+            run.is_cancelled(),
+            "pre-handoff Esc must cancel the installed run"
+        );
+        assert_eq!(
+            active_run
+                .lock()
+                .expect("active run lock")
+                .as_ref()
+                .map(|active| active.run_id().to_string()),
+            Some("escape-before-handoff".into())
+        );
+    }
+
+    #[test]
+    fn escape_after_active_run_registration_cancels_the_installed_run() {
+        use crate::run::{RunContext, RunId};
+
+        let cancel_requested = AtomicBool::new(false);
+        let active_run = Mutex::new(None);
+        let run = RunContext::isolated(RunId::new("handoff-before-escape"), std::env::temp_dir());
+        install_active_run(&cancel_requested, &active_run, &run);
+
+        request_turn_cancel(&cancel_requested, &active_run);
+
+        assert!(run.is_cancelled(), "Esc must cancel an already installed run");
+    }
+
+    #[tokio::test]
     async fn background_activity_rejects_a_late_terminal_event_from_the_previous_run() {
         use crate::lifecycle::LifecycleEventData;
         use crate::run::{RunContext, RunId, TerminalState};
@@ -3014,24 +3096,19 @@ mod upgrade_tests {
     }
 
     #[test]
-    fn final_live_output_projects_answering_before_render() {
-        let run = crate::run::RunContext::isolated(
-            crate::run::RunId::new("answer-frame"),
-            std::env::temp_dir(),
-        );
-        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
-            .expect("start run");
-        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::AnswerStarted)
-            .expect("start answer");
-        let active = Arc::new(Mutex::new(Some(run)));
-        let projected = Arc::new(Mutex::new(Some(crate::lifecycle::LifecycleState::Running)));
+    fn final_live_output_projects_answering_even_if_finish_already_raced_ahead() {
+        let projected = Arc::new(Mutex::new(Some(
+            crate::lifecycle::LifecycleState::Succeeded,
+        )));
+        let epoch = Arc::new(AtomicU64::new(7));
 
-        project_active_lifecycle(&active, &projected);
+        project_final_answer_lifecycle(&projected, &epoch);
 
         assert_eq!(
             *projected.lock().expect("lifecycle lock"),
             Some(crate::lifecycle::LifecycleState::Answering)
         );
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
     }
 
     #[test]

@@ -424,7 +424,11 @@ async fn ask_pipeline(bot: &Bot, msg: &Message, app: &Arc<App>, prompt: &str) ->
             }
             graph::node_in(&run_context, "persist", &outcome.status, "", Some("bind"));
             lessons::maybe_spawn(cfg, prompt, &outcome);
-            let mut text = agent::assistant_text(&outcome.messages);
+            let mut text = if outcome.status == "ok" {
+                agent::deliverable_assistant_text(&outcome.messages)
+            } else {
+                String::new()
+            };
             if text.trim().is_empty() {
                 text = format!("상태: {}", outcome.status);
             }
