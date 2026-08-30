@@ -10,7 +10,7 @@ pub mod review;
 pub mod rubric;
 pub mod security;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 use std::process::ExitStatus;
 
@@ -314,6 +314,9 @@ async fn run_step(
     changed: &[String],
 ) -> GateStep {
     let display = cmd.replace("{files}", "<changed files>");
+    if stage == "S3-lint" && cmd.starts_with("cargo clippy ") {
+        return run_rust_clippy_step(display, cmd, workspace, changed).await;
+    }
     match command_argv(cmd, workspace, changed) {
         Ok(Some((program, args))) => run_argv_step(stage, display, program, args, workspace).await,
         Ok(None) => GateStep {
@@ -330,6 +333,117 @@ async fn run_step(
             exit_code: None,
             note: Some(error),
         },
+    }
+}
+
+fn normalized_changed_files(
+    workspace: &Path,
+    changed: &[String],
+) -> Result<BTreeSet<String>, String> {
+    changed
+        .iter()
+        .filter_map(|file| validated_changed_arg(workspace, file).transpose())
+        .map(|file| file.map(|path| path.replace('\\', "/")))
+        .collect()
+}
+
+fn clippy_warning_summary(output: &str, changed: &BTreeSet<String>) -> (usize, Vec<String>) {
+    let mut baseline = 0usize;
+    let mut blocking = Vec::new();
+    for line in output.lines() {
+        let Some((location, message)) = line.split_once(": warning: ") else {
+            continue;
+        };
+        let file = location
+            .rsplit_once(':')
+            .map(|(location, _)| location)
+            .and_then(|location| location.rsplit_once(':').map(|(file, _)| file))
+            .unwrap_or(location)
+            .replace('\\', "/");
+        if changed.is_empty() || changed.contains(&file) {
+            blocking.push(message.to_string());
+        } else {
+            baseline += 1;
+        }
+    }
+    blocking.sort();
+    blocking.dedup();
+    (baseline, blocking)
+}
+
+async fn run_rust_clippy_step(
+    display: String,
+    cmd: &str,
+    workspace: &Path,
+    changed: &[String],
+) -> GateStep {
+    let changed = match normalized_changed_files(workspace, changed) {
+        Ok(changed) => changed,
+        Err(error) => {
+            return GateStep {
+                stage: "S3-lint",
+                command: display,
+                passed: false,
+                exit_code: None,
+                note: Some(error),
+            };
+        }
+    };
+    let Some((program, args)) = command_argv(cmd, workspace, &[]).ok().flatten() else {
+        return GateStep {
+            stage: "S3-lint",
+            command: display,
+            passed: false,
+            exit_code: None,
+            note: Some("clippy 명령을 구성하지 못했습니다".into()),
+        };
+    };
+    match run_bounded_command(
+        &program,
+        &args,
+        workspace,
+        std::time::Duration::from_secs(600),
+    )
+    .await
+    {
+        Err(error) => GateStep {
+            stage: "S3-lint",
+            command: display,
+            passed: false,
+            exit_code: None,
+            note: Some(redact_local_output(&error, workspace)),
+        },
+        Ok(output) => {
+            let code = output.status.code();
+            let detail = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let (baseline, blocking) = clippy_warning_summary(&detail, &changed);
+            let passed = output.status.success() && !output.overflow && blocking.is_empty();
+            let note = if output.overflow {
+                Some("clippy 출력이 수집 상한을 초과했습니다".into())
+            } else if !blocking.is_empty() {
+                Some(blocking.into_iter().take(10).collect::<Vec<_>>().join("\n"))
+            } else if !output.status.success() {
+                Some(redact_local_output(
+                    &detail.chars().take(1500).collect::<String>(),
+                    workspace,
+                ))
+            } else if baseline > 0 {
+                Some(format!("변경 밖 기존 clippy 경고 {baseline}건 격리"))
+            } else {
+                None
+            };
+            GateStep {
+                stage: "S3-lint",
+                command: display,
+                passed,
+                exit_code: code,
+                note,
+            }
+        }
     }
 }
 
@@ -361,9 +475,69 @@ fn package_free_javascript_fallback(
         })
 }
 
+fn has_adjacent_safety_justification(lines: &[&str], line: usize) -> bool {
+    lines[..line]
+        .iter()
+        .rev()
+        .take_while(|candidate| candidate.trim_start().starts_with("//"))
+        .take(4)
+        .any(|candidate| candidate.contains("SAFETY:"))
+}
+
+fn code_contains_pattern(line: &str, pattern: &str) -> bool {
+    let code = line.split("//").next().unwrap_or_default();
+    let mut search = 0usize;
+    while let Some(found) = code[search..].find(pattern) {
+        let at = search + found;
+        let quoted = code[..at]
+            .char_indices()
+            .filter(|(index, character)| {
+                *character == '"'
+                    && (*index == 0 || code.as_bytes().get(index - 1).copied() != Some(b'\\'))
+            })
+            .count()
+            % 2
+            == 1;
+        if !quoted {
+            return true;
+        }
+        search = at + pattern.len();
+    }
+    false
+}
+
+fn production_scan_limit(lines: &[&str]) -> usize {
+    for (index, line) in lines.iter().enumerate() {
+        let cfg_test = line.trim_start().starts_with("#[cfg") && line.contains("test");
+        let next_is_module = lines
+            .get(index + 1)
+            .is_some_and(|next| next.trim_start().starts_with("mod "));
+        if cfg_test && next_is_module {
+            return index;
+        }
+    }
+    lines.len()
+}
+
 /// 품질 게이트 전체 — S0 감지 → S3(포맷·린트·테스트) → S5(내장 스캔 + 의존성 감사).
 /// S3·S5 는 어떤 경우에도 생략되지 않는다.
 pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityReport {
+    run_quality_gate_with_contract(workspace, changed, false).await
+}
+
+pub(crate) async fn run_quality_gate_for_task(
+    workspace: &Path,
+    changed: &[String],
+    browser_game_required: bool,
+) -> QualityReport {
+    run_quality_gate_with_contract(workspace, changed, browser_game_required).await
+}
+
+async fn run_quality_gate_with_contract(
+    workspace: &Path,
+    changed: &[String],
+    browser_game_required: bool,
+) -> QualityReport {
     let lang = profile::detect(workspace, changed);
     let profile = profile::profile_for(lang);
     let mut steps = Vec::new();
@@ -450,9 +624,17 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
     for file in changed {
         let path = workspace.join(file);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            for (line_no, line) in text.lines().enumerate() {
+            let lines = text.lines().collect::<Vec<_>>();
+            let production_lines = production_scan_limit(&lines);
+            for (line_no, line) in lines.iter().take(production_lines).enumerate() {
                 for (pattern, why) in &profile.forbidden_patterns {
-                    if line.contains(pattern.as_str()) {
+                    if pattern == "unsafe "
+                        && code_contains_pattern(line, pattern)
+                        && has_adjacent_safety_justification(&lines, line_no)
+                    {
+                        continue;
+                    }
+                    if code_contains_pattern(line, pattern) {
                         findings.push(security::Finding {
                             kind: "idiom",
                             file: file.to_string(),
@@ -530,14 +712,29 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
             let display_root = workspace
                 .canonicalize()
                 .unwrap_or_else(|_| workspace.to_path_buf());
+            let force_single_entry = browser_game_required && entries.len() == 1;
+            let mut game_contract_targeted = !browser_game_required;
             for entry in entries {
+                let entry_is_game = std::fs::read_to_string(&entry).is_ok_and(|html| {
+                    browser::entry_requires_game_contract(&html)
+                        || browser::entry_looks_like_browser_game(&html)
+                });
+                let require_game_contract =
+                    browser_game_required && (force_single_entry || entry_is_game);
+                game_contract_targeted |= require_game_contract;
                 let display_entry = entry
                     .strip_prefix(&display_root)
                     .unwrap_or(&entry)
                     .display()
                     .to_string();
                 let command = format!("browser smoke (headless): {display_entry}");
-                match browser::smoke_test_in_workspace(workspace, &entry).await {
+                match browser::smoke_test_in_workspace_with_contract(
+                    workspace,
+                    &entry,
+                    require_game_contract,
+                )
+                .await
+                {
                     Ok(Some(errors)) if !errors.is_empty() => {
                         let count = errors.len();
                         for error in errors {
@@ -581,6 +778,15 @@ pub async fn run_quality_gate(workspace: &Path, changed: &[String]) -> QualityRe
                         note: Some(redact_local_output(&format!("{error:#}"), workspace)),
                     }),
                 }
+            }
+            if !game_contract_targeted {
+                steps.push(GateStep {
+                    stage: "S4-smoke",
+                    command: "browser game contract targeting".into(),
+                    passed: false,
+                    exit_code: None,
+                    note: Some("브라우저 게임 작업의 실행 엔트리를 식별하지 못했습니다".into()),
+                });
             }
         }
     }
@@ -935,6 +1141,15 @@ pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
     redacted.join(" ")
 }
 
+pub(crate) fn redact_bounded_error(text: &str, workspace: &Path) -> String {
+    let redacted = redact_local_output(text, workspace);
+    let mut bounded = redacted.chars().take(1000).collect::<String>();
+    if redacted.chars().count() > 1000 {
+        bounded.push_str(" …[truncated]");
+    }
+    bounded
+}
+
 pub(crate) fn repair_evidence(report: &QualityReport, workspace: &Path) -> String {
     let mut evidence = String::new();
     for step in report.steps.iter().filter(|step| !step.passed) {
@@ -1183,5 +1398,32 @@ mod tests {
         }
         assert!(redacted.contains("[redacted]"));
         assert!(redacted.contains("postgres://[redacted]@host/db"));
+    }
+
+    #[test]
+    fn unsafe_idiom_requires_an_adjacent_safety_justification() {
+        let justified = ["// SAFETY: checked ABI", "unsafe { call(); }"];
+        let unproved = ["// ordinary note", "unsafe { call(); }"];
+        assert!(has_adjacent_safety_justification(&justified, 1));
+        assert!(!has_adjacent_safety_justification(&unproved, 1));
+        assert!(code_contains_pattern(
+            "let value = unsafe { call() };",
+            "unsafe "
+        ));
+        assert!(!code_contains_pattern("let rule = \"unsafe \";", "unsafe "));
+        assert_eq!(
+            production_scan_limit(&["fn live() {}", "#[cfg(test)]", "mod tests {}"]),
+            1
+        );
+    }
+
+    #[test]
+    fn clippy_warnings_are_attributed_to_changed_files() {
+        let output =
+            "src/old.rs:10:2: warning: old warning\nsrc/new.rs:20:4: warning: new warning\n";
+        let changed = BTreeSet::from(["src/new.rs".to_string()]);
+        let (baseline, blocking) = clippy_warning_summary(output, &changed);
+        assert_eq!(baseline, 1);
+        assert_eq!(blocking, ["new warning"]);
     }
 }

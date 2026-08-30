@@ -766,7 +766,12 @@ impl Tool for EditFile {
             let end = anchors.get("end").and_then(|v| v.as_str()).unwrap_or("");
             match hashline::verify_span(&body, start, end) {
                 Ok((s, e)) => {
-                    let old_span = body.lines().skip(s).take(e - s + 1).collect::<Vec<_>>().join("\n");
+                    let old_span = body
+                        .lines()
+                        .skip(s)
+                        .take(e - s + 1)
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     let updated = hashline::replace_span(&body, s, e, new_str);
                     let mut plan = mutation::MutationPlan::new(&ctx.workspace)?;
                     plan.replace(
@@ -1160,9 +1165,10 @@ mod tests {
         assert!(err.to_string().contains("SPEC 동결 산출물"), "{err}");
         // 읽기는 자유 — 검증자가 내용을 확인할 수 있어야 한다.
         let read = registry.get("read_file").unwrap();
-        assert!(read
-            .run(json!({"path": "tests/acceptance/a.rs"}), &ctx)
-            .is_ok());
+        assert!(
+            read.run(json!({"path": "tests/acceptance/a.rs"}), &ctx)
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1279,7 +1285,8 @@ mod hashline_tool_tests {
     use serde_json::json;
 
     fn setup(tag: &str) -> (PathBuf, ToolCtx) {
-        let dir = std::env::temp_dir().join(format!("rafikx-hashline-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rafikx-hashline-{tag}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         (dir.clone(), ToolCtx::new(dir))
     }
@@ -1290,7 +1297,14 @@ mod hashline_tool_tests {
         fs::write(dir.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
 
         let tagged = ReadFile.run(json!({"path": "a.txt"}), &ctx).unwrap();
-        let anchor1 = tagged.lines().nth(1).unwrap().split('|').next().unwrap().to_string();
+        let anchor1 = tagged
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split('|')
+            .next()
+            .unwrap()
+            .to_string();
         assert!(anchor1.contains('#'));
 
         EditFile
@@ -1299,7 +1313,10 @@ mod hashline_tool_tests {
                 &ctx,
             )
             .unwrap();
-        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "alpha\nBETA\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1314,7 +1331,10 @@ mod hashline_tool_tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("파일이 바뀌었습니다"));
-        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "alpha\nbeta\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "alpha\nbeta\n"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1323,7 +1343,10 @@ mod hashline_tool_tests {
         let (dir, ctx) = setup("oldstr-hint");
         fs::write(dir.join("a.txt"), "dup\ndup\n").unwrap();
         let err = EditFile
-            .run(json!({"path": "a.txt", "old_str": "dup", "new_str": "X"}), &ctx)
+            .run(
+                json!({"path": "a.txt", "old_str": "dup", "new_str": "X"}),
+                &ctx,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("anchors"));
         let _ = fs::remove_dir_all(dir);
@@ -1344,14 +1367,24 @@ mod hashline_tool_tests {
         let (dir, ctx) = setup("multi-anchor");
         fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         let tagged = ReadFile.run(json!({"path": "a.txt"}), &ctx).unwrap();
-        let a1 = tagged.lines().next().unwrap().split('|').next().unwrap().to_string();
+        let a1 = tagged
+            .lines()
+            .next()
+            .unwrap()
+            .split('|')
+            .next()
+            .unwrap()
+            .to_string();
         MultiEdit
             .run(
                 json!({"path": "a.txt", "edits": [{"anchors": {"start": a1, "end": a1}, "new_str": "ONE"}]}),
                 &ctx,
             )
             .unwrap();
-        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "ONE\ntwo\nthree\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "ONE\ntwo\nthree\n"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

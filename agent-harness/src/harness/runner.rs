@@ -166,6 +166,22 @@ pub async fn run_pipeline(
     .await
 }
 
+fn sanitize_pipeline_result(result: &mut Result<AgentOutcome>, workspace: &std::path::Path) {
+    match result {
+        Ok(outcome) => {
+            if let Some(error) = outcome.error.as_deref() {
+                outcome.error = Some(crate::quality::redact_bounded_error(error, workspace));
+            }
+        }
+        Err(error) => {
+            *error = anyhow::anyhow!(crate::quality::redact_bounded_error(
+                &format!("{error:#}"),
+                workspace,
+            ));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // 공개 파이프라인 API: 호출부 호환을 위해 시그니처 유지
 pub async fn run_pipeline_with_context(
     cfg: &Config,
@@ -214,6 +230,7 @@ pub async fn run_pipeline_with_context(
         run_context.clone(),
     )
     .await;
+    sanitize_pipeline_result(&mut result, &cfg.workspace);
     if run_context.parent_run_id().is_none()
         && let Ok(outcome) = &mut result
     {
@@ -240,7 +257,8 @@ pub async fn run_pipeline_with_context(
 }
 
 /// 계획 호출은 메인 system 을 그대로 이어받고 이 머리말만 덧붙인다.
-pub(crate) const PLAN_MODE_HEADER: &str = "\n\n[계획 모드] 지금은 계획만 세운다. 도구는 쓰지 마라.\n";
+pub(crate) const PLAN_MODE_HEADER: &str =
+    "\n\n[계획 모드] 지금은 계획만 세운다. 도구는 쓰지 마라.\n";
 
 const BROWSER_GAME_CONTRACT_RULE: &str = "\n\n[브라우저 게임 검증 계약]\n\
     브라우저 게임을 만들거나 수정할 때는 HTML <head>에 \
@@ -249,6 +267,27 @@ const BROWSER_GAME_CONTRACT_RULE: &str = "\n\n[브라우저 게임 검증 계약
     state()는 ready·playing·paused·lost 중 현재 상태를 반환하고, forceLoss()는 lost로 전환하며, \
     restarts()는 KeyR 재시작마다 1 증가한 수를 반환한다. document의 Space는 ready→playing, \
     KeyP는 playing↔paused, KeyR은 lost→ready를 실제 UI와 같은 상태 머신으로 처리한다.\n";
+
+fn task_requires_browser_game_contract(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "browser game",
+        "web game",
+        "canvas game",
+        "super mario",
+        "mario game",
+        "platformer",
+        "브라우저 게임",
+        "웹 게임",
+        "캔버스 게임",
+        "슈퍼마리오",
+        "슈퍼 마리오",
+        "마리오 게임",
+        "플랫포머",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal))
+}
 
 const PLAN_BRIEF_INSTRUCTION: &str = "작업 계획을 3~7개 항목으로만 출력하라.";
 
@@ -289,7 +328,11 @@ pub(crate) const PLAN_GRAPH_INSTRUCTION: &str = "\
 /// 계획에도 반영되어야 하므로 절대 통째로 교체하지 않는다.
 /// `plan_extra` 는 Self-Harness 의 계획 전용 면(plan_instruction) — 메타 레이어가
 /// 켜졌을 때만 채워지고, decorate_system 이 아니라 여기서만 붙는다.
-pub(crate) fn plan_system_prompt(system: &str, depth: crate::engine::PlanDepth, plan_extra: &str) -> String {
+pub(crate) fn plan_system_prompt(
+    system: &str,
+    depth: crate::engine::PlanDepth,
+    plan_extra: &str,
+) -> String {
     plan_system_prompt_with(
         system,
         if depth == crate::engine::PlanDepth::Contract {
@@ -471,7 +514,7 @@ async fn run_pipeline_inner(
     }
     let memory_block = format!("{lessons_block}{facts_block}{rules_block}");
     let mut system = system_prompt(cfg, &binding.system_extra, &memory_block);
-    if matches!(binding.class, TaskClass::Dev | TaskClass::Advanced) {
+    if task_requires_browser_game_contract(task) {
         system.push_str(BROWSER_GAME_CONTRACT_RULE);
     }
     crate::context::record_system_sources(&run_context, cfg, &system, &lessons_block);
@@ -766,7 +809,13 @@ async fn run_pipeline_inner(
         let response: MainFuture<'_> = if binding.combo_chain.is_empty() {
             Box::pin(stream_with_fallback(cfg, &order, role, req, on_main_event))
         } else {
-            Box::pin(stream_with_fallback_combo(cfg, &binding.combo_chain, role, req, on_main_event))
+            Box::pin(stream_with_fallback_combo(
+                cfg,
+                &binding.combo_chain,
+                role,
+                req,
+                on_main_event,
+            ))
         };
         tokio::pin!(response);
         let (_name, resp) = tokio::select! {
@@ -850,9 +899,8 @@ async fn run_pipeline_inner(
                     return Ok(merge_agent_outcomes(no_tool_outcome, next));
                 }
                 Ok(_) => {
-                    no_tool_outcome.error = Some(
-                        "도구 호출이 필요하지만 coder 프로파일에 도구가 없습니다.".into(),
-                    );
+                    no_tool_outcome.error =
+                        Some("도구 호출이 필요하지만 coder 프로파일에 도구가 없습니다.".into());
                 }
                 Err(error) => {
                     no_tool_outcome.error = Some(format!("coder 승격 실패: {error}"));
@@ -966,11 +1014,8 @@ async fn run_pipeline_inner(
     }
 
     let mut outcome = loop {
-        let cycle_max_iterations = remaining_iteration_budget(
-            turn_iteration_limit,
-            total_iterations,
-            effective_max_iter,
-        );
+        let cycle_max_iterations =
+            remaining_iteration_budget(turn_iteration_limit, total_iterations, effective_max_iter);
         let registry = ToolRegistry::with_names(&binding.tools);
         let resume_for_failure = next_resume.clone().unwrap_or_default();
         let run = agent::run_agent_with_context(
@@ -1063,8 +1108,8 @@ async fn run_pipeline_inner(
 
         let seeded_missing = staged && progress.total == 0 && continuations == 0;
         let continuation_eligible = matches!(current.status.as_str(), "ok" | "limit");
-        let has_iteration_budget = run_context.model_iterations_used()
-            < run_context.model_iteration_limit();
+        let has_iteration_budget =
+            run_context.model_iterations_used() < run_context.model_iteration_limit();
         let should_continue = continuation_eligible
             && has_iteration_budget
             && (seeded_missing
@@ -1193,12 +1238,7 @@ async fn run_pipeline_inner(
             persist_goal_state(
                 &run_context,
                 task,
-                goal_persist_status(
-                    &current.status,
-                    progress.completed,
-                    progress.total,
-                    false,
-                ),
+                goal_persist_status(&current.status, progress.completed, progress.total, false),
                 progress.completed,
                 progress.total,
                 continuations,
@@ -1290,18 +1330,12 @@ async fn run_pipeline_inner(
         }
     };
     if staged {
-        let progress = crate::tools_more::todo_progress(
-            &crate::tools_more::current_todos_in(&run_context),
-        );
+        let progress =
+            crate::tools_more::todo_progress(&crate::tools_more::current_todos_in(&run_context));
         persist_goal_state(
             &run_context,
             task,
-            goal_persist_status(
-                &outcome.status,
-                progress.completed,
-                progress.total,
-                true,
-            ),
+            goal_persist_status(&outcome.status, progress.completed, progress.total, true),
             progress.completed,
             progress.total,
             continuations,
@@ -1546,7 +1580,8 @@ fn refresh_change_evidence(class: TaskClass, run: &RunContext, outcome: &mut Age
         .collect();
     if !run.change_tracking_complete() {
         outcome.status = "incomplete".into();
-        outcome.error = Some("워크스페이스 변경 추적 상한을 초과해 완료를 증명할 수 없습니다.".into());
+        outcome.error =
+            Some("워크스페이스 변경 추적 상한을 초과해 완료를 증명할 수 없습니다.".into());
         return;
     }
     mark_missing_dev_change(class, outcome);
@@ -1559,13 +1594,11 @@ fn refresh_change_evidence(class: TaskClass, run: &RunContext, outcome: &mut Age
 }
 
 pub(crate) fn turn_iteration_budget(per_cycle: u32) -> u32 {
-    per_cycle.saturating_mul(2).min(agent::HARD_CAP).max(1)
+    per_cycle.saturating_mul(2).clamp(1, agent::HARD_CAP)
 }
 
 pub(crate) fn promoted_dev_max_iterations(requested: u32) -> u32 {
-    requested
-        .min(agent::HARD_CAP.saturating_sub(1) / 2)
-        .max(1)
+    requested.min(agent::HARD_CAP.saturating_sub(1) / 2).max(1)
 }
 
 pub(crate) fn remaining_iteration_budget(limit: u32, used: u32, per_cycle: u32) -> u32 {
@@ -1587,10 +1620,7 @@ pub(crate) fn mark_verification_failure(outcome: &mut AgentOutcome, failure: Str
     outcome.verify_fail = Some(failure);
 }
 
-pub(crate) fn merge_agent_outcomes(
-    previous: AgentOutcome,
-    mut next: AgentOutcome,
-) -> AgentOutcome {
+pub(crate) fn merge_agent_outcomes(previous: AgentOutcome, mut next: AgentOutcome) -> AgentOutcome {
     next.iterations = previous.iterations.saturating_add(next.iterations);
     next.input_tokens = previous.input_tokens.saturating_add(next.input_tokens);
     next.output_tokens = previous.output_tokens.saturating_add(next.output_tokens);
@@ -1714,7 +1744,12 @@ async fn run_quality_repair(
         } else {
             outcome.changed_files.clone()
         };
-        let report = crate::quality::run_quality_gate(&cfg.workspace, &gate_files).await;
+        let report = crate::quality::run_quality_gate_for_task(
+            &cfg.workspace,
+            &gate_files,
+            task_requires_browser_game_contract(task),
+        )
+        .await;
         let rendered = crate::quality::render_report(&report);
         for line in rendered.lines().take(24) {
             crate::ui::live_line_in(run_context, line);
@@ -1857,10 +1892,7 @@ async fn run_verify(
             }
             BashApproval::Blocked(e) => {
                 let failure = format!("검증 명령이 안전 정책에 차단되었습니다: {e}");
-                crate::ui::live_line_in(
-                    &run_context,
-                    &failure,
-                );
+                crate::ui::live_line_in(&run_context, &failure);
                 mark_verification_failure(&mut outcome, failure);
                 return Ok(outcome);
             }
@@ -2307,10 +2339,7 @@ async fn run_review_gate(
                 &run_context,
                 &format!("검증자 게이트 실패(바인딩): {detail}"),
             );
-            mark_verification_failure(
-                &mut outcome,
-                format!("검증자 바인딩 실패: {detail}"),
-            );
+            mark_verification_failure(&mut outcome, format!("검증자 바인딩 실패: {detail}"));
             return outcome;
         }
     };
@@ -2343,7 +2372,9 @@ async fn run_review_gate(
             false,
         );
         let prompt = match persona {
-            Some(p) => crate::quality::review::reviewer_prompt(p, task, &outcome.changed_files, dod),
+            Some(p) => {
+                crate::quality::review::reviewer_prompt(p, task, &outcome.changed_files, dod)
+            }
             None => review_prompt(task, dod, rebuttal, &outcome.changed_files),
         };
         // 안쪽 루프는 "판정 불능 → 결론만 재질의" 1회를 흡수한다.
@@ -2365,10 +2396,8 @@ async fn run_review_gate(
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     run_context.mark_change_tracking_incomplete();
-                    let detail = crate::quality::redact_local_output(
-                        &error.to_string(),
-                        &cfg.workspace,
-                    );
+                    let detail =
+                        crate::quality::redact_local_output(&error.to_string(), &cfg.workspace);
                     mark_verification_failure(
                         &mut outcome,
                         format!("검증자 실행 전 변경 추적 실패: {detail}"),
@@ -2400,10 +2429,8 @@ async fn run_review_gate(
                 }
                 Err(error) => {
                     run_context.mark_change_tracking_incomplete();
-                    let detail = crate::quality::redact_local_output(
-                        &error.to_string(),
-                        &cfg.workspace,
-                    );
+                    let detail =
+                        crate::quality::redact_local_output(&error.to_string(), &cfg.workspace);
                     mark_verification_failure(
                         &mut outcome,
                         format!("검증자 실행 후 변경 추적 실패: {detail}"),
@@ -2420,17 +2447,8 @@ async fn run_review_gate(
                         &run_context,
                         &format!("검증자 게이트 실행 실패: {detail}"),
                     );
-                    crate::graph::node_in(
-                        &run_context,
-                        "critic",
-                        "error",
-                        &detail,
-                        Some("verify"),
-                    );
-                    mark_verification_failure(
-                        &mut outcome,
-                        format!("검증자 실행 실패: {detail}"),
-                    );
+                    crate::graph::node_in(&run_context, "critic", "error", &detail, Some("verify"));
+                    mark_verification_failure(&mut outcome, format!("검증자 실행 실패: {detail}"));
                     return outcome;
                 }
             };
@@ -2581,10 +2599,8 @@ async fn run_review_gate(
                     Ok(outcome) => outcome,
                     Err(error) => {
                         outcome = verification_fallback;
-                        let detail = crate::quality::redact_local_output(
-                            &error.to_string(),
-                            &cfg.workspace,
-                        );
+                        let detail =
+                            crate::quality::redact_local_output(&error.to_string(), &cfg.workspace);
                         mark_verification_failure(
                             &mut outcome,
                             format!("검증자 수정 후 기계 검증 실패: {detail}"),
@@ -3206,10 +3222,8 @@ mod tests {
 
     #[test]
     fn reviewer_workspace_mutation_is_recorded() {
-        let dir = std::env::temp_dir().join(format!(
-            "rafikx-reviewer-delta-{}",
-            crate::db::Db::new_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rafikx-reviewer-delta-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&dir).expect("workspace");
         let source = dir.join("game.js");
         std::fs::write(&source, "before").expect("source");
@@ -3266,5 +3280,63 @@ mod tests {
         assert_eq!(reduced.specs().len(), 1);
         assert!(reduced.get("read_file").is_some());
         assert!(reduced.get("list_dir").is_none());
+    }
+
+    #[test]
+    fn pipeline_errors_are_redacted_before_lifecycle_publication_and_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-pipeline-error-redaction-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        let mut cfg = crate::config::Config::load(Some(&root.join("config.toml"))).expect("config");
+        cfg.workspace = root.join("workspace");
+        cfg.data_dir = root.join("data");
+        std::fs::create_dir_all(&cfg.workspace).expect("workspace");
+        std::fs::create_dir_all(&cfg.data_dir).expect("data directory");
+        let run = RunContext::for_config(
+            crate::run::RunId::new("pipeline-error-redaction"),
+            std::sync::Arc::new(cfg.clone()),
+        );
+        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted {
+            model: Some("fixture".into()),
+        })
+        .expect("run start");
+        let mut receiver = run.subscribe_lifecycle();
+        let secret = "Authorization: Bearer PIPELINE-SECRET TOKEN=SECOND-SECRET";
+        let mut result: Result<AgentOutcome> = Err(anyhow::anyhow!(secret));
+        sanitize_pipeline_result(&mut result, &cfg.workspace);
+        let safe = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("pipeline error was replaced with success"),
+        };
+        assert!(!safe.contains("PIPELINE-SECRET"));
+        assert!(!safe.contains("SECOND-SECRET"));
+        run.finish_with_error(TerminalState::Failed, Some(safe));
+
+        let live = receiver.try_recv().expect("live finish event");
+        let history = serde_json::to_string(&run.lifecycle_events()).expect("history json");
+        let stored = serde_json::to_string(&run.stored_lifecycle_events()).expect("stored json");
+        let live = serde_json::to_string(&live).expect("live json");
+        for evidence in [history, stored, live] {
+            assert!(!evidence.contains("PIPELINE-SECRET"));
+            assert!(!evidence.contains("SECOND-SECRET"));
+            assert!(evidence.contains("[redacted]"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_game_contract_is_derived_from_the_task() {
+        for task in [
+            "create a Super Mario browser game",
+            "웹 게임을 만들어줘",
+            "Canvas game 구현",
+        ] {
+            assert!(task_requires_browser_game_contract(task), "task: {task}");
+        }
+        assert!(!task_requires_browser_game_contract(
+            "add a settings button to the dashboard"
+        ));
     }
 }

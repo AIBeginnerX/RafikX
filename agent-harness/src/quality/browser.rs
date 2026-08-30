@@ -61,12 +61,25 @@ const PROBE_SCRIPT: &str = r#"(() => {
       throw new Error('window.__rafikxGameTest contract is missing');
     }
     expectState(api, 'ready');
+    const initialRestarts = Number(api.restarts());
+    press('KeyR');
+    await frame();
+    expectState(api, 'ready');
+    if (Number(api.restarts()) !== initialRestarts) throw new Error('KeyR restarted from ready');
     press('Space');
     await frame();
     expectState(api, 'playing');
+    press('KeyR');
+    await frame();
+    expectState(api, 'playing');
+    if (Number(api.restarts()) !== initialRestarts) throw new Error('KeyR restarted from playing');
     press('KeyP');
     await frame();
     expectState(api, 'paused');
+    press('KeyR');
+    await frame();
+    expectState(api, 'paused');
+    if (Number(api.restarts()) !== initialRestarts) throw new Error('KeyR restarted from paused');
     press('KeyP');
     await frame();
     expectState(api, 'playing');
@@ -91,10 +104,26 @@ const PROBE_SCRIPT: &str = r#"(() => {
   }, 0), { once: true });
 })();"#;
 
-fn entry_requires_game_contract(html: &str) -> bool {
+pub(crate) fn entry_requires_game_contract(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
     lower.contains(&format!("name=\"{GAME_CONTRACT_META}\""))
         || lower.contains(&format!("name='{GAME_CONTRACT_META}'"))
+}
+
+pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    lower.contains("<canvas")
+        && [
+            "id=\"game\"",
+            "id='game'",
+            "game.js",
+            "mario",
+            "platformer",
+            "게임",
+            "마리오",
+        ]
+        .iter()
+        .any(|signal| lower.contains(signal))
 }
 
 /// 콘솔 로그(stderr)에서 런타임 오류를 추출한다 — 순수 함수(테스트 가능).
@@ -206,7 +235,11 @@ fn evaluate_browser_output(
         anyhow::bail!("브라우저 준비 프로브가 실행되지 않았습니다");
     }
     if game_contract_required && !stderr.contains(GAME_SEQUENCE_MARKER) {
-        anyhow::bail!("브라우저 게임 상태 전이 프로브가 완료되지 않았습니다");
+        let detail = errors
+            .first()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        anyhow::bail!("브라우저 게임 상태 전이 프로브가 완료되지 않았습니다{detail}");
     }
     Ok(errors)
 }
@@ -1282,10 +1315,10 @@ async fn serve_request(
     let resolved = match requested.canonicalize() {
         Ok(path) if path.starts_with(&root) && path.is_file() => path,
         _ => {
-            if let Ok(mut errors) = errors.lock() {
-                if errors.len() < MAX_BROWSER_ERRORS {
-                    errors.push(format!("HTTP 404: /{decoded}"));
-                }
+            if let Ok(mut errors) = errors.lock()
+                && errors.len() < MAX_BROWSER_ERRORS
+            {
+                errors.push(format!("HTTP 404: /{decoded}"));
             }
             return write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await;
         }
@@ -1351,11 +1384,26 @@ pub(crate) async fn smoke_test_in_workspace(
     workspace: &std::path::Path,
     entry_html: &std::path::Path,
 ) -> anyhow::Result<Option<Vec<String>>> {
+    smoke_test_in_workspace_with_contract(workspace, entry_html, false).await
+}
+
+pub(crate) async fn smoke_test_in_workspace_with_contract(
+    workspace: &std::path::Path,
+    entry_html: &std::path::Path,
+    task_requires_game_contract: bool,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let html = std::fs::read_to_string(entry_html)?;
+    let has_contract = entry_requires_game_contract(&html);
+    let game_contract_required =
+        task_requires_game_contract || has_contract || entry_looks_like_browser_game(&html);
+    if game_contract_required && !has_contract {
+        anyhow::bail!(
+            "브라우저 게임 계약 meta가 없습니다: <meta name=\"{GAME_CONTRACT_META}\" content=\"v1\">"
+        );
+    }
     let Some(browser) = detect_browser() else {
         return Ok(None);
     };
-    let game_contract_required =
-        entry_requires_game_contract(&std::fs::read_to_string(entry_html)?);
     let run_dir =
         std::env::temp_dir().join(format!("rafikx-browser-smoke-{}", crate::db::Db::new_id()));
     std::fs::create_dir_all(&run_dir)?;
@@ -1432,10 +1480,10 @@ pub(crate) async fn smoke_test_in_workspace(
             }
             let keep = READY_MARKER.len().saturating_sub(1).min(scan.len());
             marker_tail = scan[scan.len() - keep..].to_vec();
-            if let Ok(mut log) = reader_log.lock() {
-                if append_bounded_stderr(&mut log, &String::from_utf8_lossy(&buffer[..read])) {
-                    reader_overflow.store(true, Ordering::Relaxed);
-                }
+            if let Ok(mut log) = reader_log.lock()
+                && append_bounded_stderr(&mut log, &String::from_utf8_lossy(&buffer[..read]))
+            {
+                reader_overflow.store(true, Ordering::Relaxed);
             }
         }
     });
@@ -1560,6 +1608,12 @@ mod tests {
             r#"<meta name="rafikx-browser-game-contract" content="v1">"#
         ));
         assert!(!entry_requires_game_contract("<title>ordinary app</title>"));
+        assert!(entry_looks_like_browser_game(
+            r#"<canvas id="game"></canvas><script src="game.js"></script>"#
+        ));
+        assert!(!entry_looks_like_browser_game(
+            r#"<canvas id="chart"></canvas><script src="chart.js"></script>"#
+        ));
     }
 
     #[tokio::test]
@@ -1842,8 +1896,7 @@ mod tests {
         std::fs::write(root.join("index.html"), "<script src=\"app.js\"></script>")
             .expect("entry fixture");
         std::fs::write(root.join("app.js"), "console.log('ok')").expect("covered source");
-        std::fs::write(root.join("orphan.js"), "missingFunction();")
-            .expect("uncovered source");
+        std::fs::write(root.join("orphan.js"), "missingFunction();").expect("uncovered source");
 
         let error = discover_entries(&root, &["app.js".into(), "orphan.js".into()])
             .expect_err("uncovered source must fail closed");
@@ -1859,8 +1912,7 @@ mod tests {
             crate::db::Db::new_id()
         ));
         std::fs::create_dir_all(&root).expect("workspace");
-        std::fs::write(root.join("script.js"), "console.log('ok')")
-            .expect("standalone source");
+        std::fs::write(root.join("script.js"), "console.log('ok')").expect("standalone source");
 
         let entries = discover_entries(&root, &["script.js".into()])
             .expect("standalone JavaScript needs no browser entry");

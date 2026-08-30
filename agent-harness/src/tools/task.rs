@@ -210,6 +210,10 @@ impl TaskTool {
         let outcome = match propagate_child_result(&parent, &child, result) {
             Ok(outcome) => outcome,
             Err(error) => {
+                let error = anyhow!(crate::quality::redact_bounded_error(
+                    &format!("{error:#}"),
+                    &cfg.workspace,
+                ));
                 finish_parent(&parent, &child, 0, 0);
                 if !team_tag.is_empty() {
                     crate::ui::live_line_in(&child, &format!("{team_tag}[task] 실패 · {error}"));
@@ -450,15 +454,23 @@ mod category_tests {
         cfg.file
             .categories
             .insert("quick".into(), "minimax:MiniMax-M2".into());
-        cfg.file.categories.insert("deep".into(), "claude:opus".into());
+        cfg.file
+            .categories
+            .insert("deep".into(), "claude:opus".into());
         cfg
     }
 
     #[test]
     fn category_maps_to_configured_model() {
         let cfg = cfg_with_categories("maps");
-        assert_eq!(resolve_category_model(&cfg, Some("quick")), Some("minimax:MiniMax-M2"));
-        assert_eq!(resolve_category_model(&cfg, Some("deep")), Some("claude:opus"));
+        assert_eq!(
+            resolve_category_model(&cfg, Some("quick")),
+            Some("minimax:MiniMax-M2")
+        );
+        assert_eq!(
+            resolve_category_model(&cfg, Some("deep")),
+            Some("claude:opus")
+        );
     }
 
     #[test]

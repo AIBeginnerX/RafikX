@@ -348,11 +348,33 @@ pub async fn run_agent_with_context(
                 }
             };
             let response = if combo_chain.is_empty() {
-                Box::pin(crate::harness::stream_with_fallback(cfg, &order, "main", req, on_event))
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, crate::provider::ChatResponse)>> + Send + '_>>
+                Box::pin(crate::harness::stream_with_fallback(
+                    cfg, &order, "main", req, on_event,
+                ))
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<(String, crate::provider::ChatResponse)>,
+                                > + Send
+                                + '_,
+                        >,
+                    >
             } else {
-                Box::pin(crate::harness::stream_with_fallback_combo(cfg, &combo_chain, "main", req, on_event))
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, crate::provider::ChatResponse)>> + Send + '_>>
+                Box::pin(crate::harness::stream_with_fallback_combo(
+                    cfg,
+                    &combo_chain,
+                    "main",
+                    req,
+                    on_event,
+                ))
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<(String, crate::provider::ChatResponse)>,
+                                > + Send
+                                + '_,
+                        >,
+                    >
             };
             tokio::pin!(response);
             tokio::select! {
@@ -1247,7 +1269,6 @@ mod tests {
         assert!(!effective_yes(false, &None));
     }
 }
-
 
 #[cfg(test)]
 mod approval_eof_tests {

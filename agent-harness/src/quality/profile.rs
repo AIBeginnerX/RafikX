@@ -48,6 +48,14 @@ pub struct LanguageProfile {
     pub forbidden_patterns: Vec<(String, String)>,
 }
 
+type ProfileCommands = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String)>,
+);
+
 /// 워크스페이스·변경 파일에서 언어를 감지한다 (S0).
 pub fn detect(workspace: &std::path::Path, changed: &[String]) -> Language {
     let has = |marker: &str| workspace.join(marker).exists();
@@ -84,16 +92,10 @@ pub fn detect(workspace: &std::path::Path, changed: &[String]) -> Language {
 
 /// 언어별 표준 프로파일 — 최엄격 설정의 데이터화 (지시서 §3 표).
 pub fn profile_for(lang: Language) -> LanguageProfile {
-    let (format_check, lint, test, audit, forbidden): (
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        Vec<(String, String)>,
-    ) = match lang {
+    let (format_check, lint, test, audit, forbidden): ProfileCommands = match lang {
         Language::Rust => (
-            vec!["cargo fmt --check".into()],
-            vec!["cargo clippy -- -D warnings".into()],
+            vec!["rustfmt --edition 2024 --check --config skip_children=true {files}".into()],
+            vec!["cargo clippy --quiet --message-format=short --no-deps".into()],
             vec!["cargo test --quiet".into()],
             vec!["cargo audit".into()],
             vec![
@@ -275,7 +277,16 @@ mod tests {
     #[test]
     fn rust_profile_is_strict_and_has_forbidden_idioms() {
         let p = profile_for(Language::Rust);
-        assert!(p.lint.iter().any(|c| c.contains("-D warnings")));
+        assert!(
+            p.lint
+                .iter()
+                .any(|command| command.contains("message-format=short"))
+        );
+        assert!(
+            p.format_check
+                .iter()
+                .any(|command| command.contains("{files}"))
+        );
         assert!(p.test.iter().any(|c| c.contains("cargo test")));
         assert!(!p.forbidden_patterns.is_empty());
     }

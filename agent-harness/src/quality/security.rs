@@ -37,7 +37,10 @@ fn looks_like_assigned_secret(line: &str, keyword: &str) -> bool {
         .or_else(|| after_trim.strip_prefix('='))
         .map(str::trim_start)
         .unwrap_or(after_trim);
-    let Some(rest) = after_trim.strip_prefix('"').or_else(|| after_trim.strip_prefix('\'')) else {
+    let Some(rest) = after_trim
+        .strip_prefix('"')
+        .or_else(|| after_trim.strip_prefix('\''))
+    else {
         return false;
     };
     let value: String = rest.chars().take(60).collect();
@@ -52,6 +55,27 @@ fn looks_like_assigned_secret(line: &str, keyword: &str) -> bool {
         && !value.contains("placeholder")
 }
 
+fn contains_call(line: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    line.match_indices(&needle).any(|(index, _)| {
+        let quoted = line[..index]
+            .char_indices()
+            .filter(|(position, character)| {
+                *character == '"'
+                    && (*position == 0 || line.as_bytes().get(position - 1).copied() != Some(b'\\'))
+            })
+            .count()
+            % 2
+            == 1;
+        !quoted
+            && (index == 0
+                || line[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_'))
+    })
+}
+
 /// 변경 파일들의 텍스트를 스캔한다 (S5). 발견 목록이 비어 있어야 통과다.
 pub fn scan(file: &str, text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -62,7 +86,13 @@ pub fn scan(file: &str, text: &str) -> Vec<Finding> {
         || lower_path.contains("example")
         || lower_path.ends_with(".md");
 
-    for (line_no, line) in text.lines().enumerate() {
+    let lines = text.lines().collect::<Vec<_>>();
+    let scan_lines = if lower_path.ends_with(".rs") {
+        super::production_scan_limit(&lines)
+    } else {
+        lines.len()
+    };
+    for (line_no, line) in lines.into_iter().take(scan_lines).enumerate() {
         let no = line_no + 1;
         // 1) 시크릿 하드코딩
         if !is_testish {
@@ -88,7 +118,10 @@ pub fn scan(file: &str, text: &str) -> Vec<Finding> {
             .iter()
             .any(|k| lower.contains(k));
         if sql_keyword
-            && (line.contains("\" +") || line.contains("+ \"") || line.contains("' +") || line.contains("+ '")
+            && (line.contains("\" +")
+                || line.contains("+ \"")
+                || line.contains("' +")
+                || line.contains("+ '")
                 || line.contains("{") && line.contains("}"))
             && !lower.contains("?")
             && !line.contains("-- ")
@@ -101,10 +134,12 @@ pub fn scan(file: &str, text: &str) -> Vec<Finding> {
             });
         }
         // 3) 에러 메시지 내부 정보 노출 (레드팀 시나리오 9)
-        let exposes_stack = lower.contains("e.stack")
-            || lower.contains("backtrace()")
-            || lower.contains("format!(\"{:?}\", err")
-            || (lower.contains("500") && lower.contains("internal error") && lower.contains("path"));
+        let exposes_stack = super::code_contains_pattern(&lower, "e.stack")
+            || super::code_contains_pattern(&lower, "backtrace()")
+            || super::code_contains_pattern(&lower, "format!(\"{:?}\", err")
+            || (super::code_contains_pattern(&lower, "500")
+                && super::code_contains_pattern(&lower, "internal error")
+                && super::code_contains_pattern(&lower, "path"));
         if exposes_stack {
             findings.push(Finding {
                 kind: "error-exposure",
@@ -114,10 +149,7 @@ pub fn scan(file: &str, text: &str) -> Vec<Finding> {
             });
         }
         // 4) 위험 함수 — eval 계열
-        if (lower.contains("eval(") && !lower.contains("evaluat"))
-            || lower.contains("exec(")
-                && !lower.contains("execute(")
-        {
+        if contains_call(&lower, "eval") || contains_call(&lower, "exec") {
             findings.push(Finding {
                 kind: "dangerous-call",
                 file: file.to_string(),
@@ -213,7 +245,11 @@ mod tests {
     #[test]
     fn test_files_skip_secret_scan() {
         let code = "let t = test_password: \"dummy-12345678\";";
-        assert!(scan("tests/fixtures.rs", code).iter().all(|f| f.kind != "secret"));
+        assert!(
+            scan("tests/fixtures.rs", code)
+                .iter()
+                .all(|f| f.kind != "secret")
+        );
     }
 
     #[test]
@@ -229,7 +265,21 @@ mod tests {
     #[test]
     fn parameterized_query_passes() {
         let code = "let q = \"SELECT * FROM users WHERE name = ?\";";
-        assert!(scan("src/db.rs", code).iter().all(|f| f.kind != "sql-injection"));
+        assert!(
+            scan("src/db.rs", code)
+                .iter()
+                .all(|f| f.kind != "sql-injection")
+        );
+    }
+
+    #[test]
+    fn pre_exec_is_not_misclassified_as_exec() {
+        assert!(scan("src/process.rs", "command.pre_exec(|| Ok(()));").is_empty());
+        assert!(
+            scan("src/process.rs", "exec(user_input);")
+                .iter()
+                .any(|finding| finding.kind == "dangerous-call")
+        );
     }
 
     #[test]

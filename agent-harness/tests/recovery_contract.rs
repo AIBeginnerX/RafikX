@@ -123,7 +123,7 @@ document.addEventListener('keydown', event => {
   if (event.code === 'Space' && game.mode === 'ready') game.mode = 'playing';
   else if (event.code === 'KeyP' && game.mode === 'playing') game.mode = 'paused';
   else if (event.code === 'KeyP' && game.mode === 'paused') game.mode = 'playing';
-  else if (event.code === 'KeyR') restart();
+  else if (event.code === 'KeyR' && game.mode === 'lost') restart();
   render();
 });
 window.__rafikxGameTest = {
@@ -193,9 +193,21 @@ fn scripted_game_response(index: usize) -> String {
                 "todo_write",
                 json!({"todos":[{"content":"브라우저 게임 생성과 검증","status":"in_progress","priority":"high"}]}),
             ),
-            ("write-html", "write_file", json!({"path":"index.html","content":game_e2e_html()})),
-            ("write-css", "write_file", json!({"path":"style.css","content":game_e2e_style()})),
-            ("write-broken", "write_file", json!({"path":"game.js","content":"const canvas = document.querySelector('#game'); missingGameLoop(canvas);"})),
+            (
+                "write-html",
+                "write_file",
+                json!({"path":"index.html","content":game_e2e_html()}),
+            ),
+            (
+                "write-css",
+                "write_file",
+                json!({"path":"style.css","content":game_e2e_style()}),
+            ),
+            (
+                "write-broken",
+                "write_file",
+                json!({"path":"game.js","content":"const canvas = document.querySelector('#game'); missingGameLoop(canvas);"}),
+            ),
         ]),
         1 => scripted_tool_response(vec![(
             "todo-complete",
@@ -258,11 +270,8 @@ async fn read_http_body(stream: &mut TcpStream) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buffer[header_end..header_end + content_length]).into_owned())
 }
 
-async fn start_scripted_game_model() -> (
-    String,
-    Arc<Mutex<Vec<String>>>,
-    tokio::task::JoinHandle<()>,
-) {
+async fn start_scripted_game_model()
+-> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("scripted listener");
@@ -289,11 +298,8 @@ async fn start_scripted_game_model() -> (
     (format!("http://{address}/v1"), requests, server)
 }
 
-async fn start_scripted_budget_model() -> (
-    String,
-    Arc<Mutex<Vec<String>>>,
-    tokio::task::JoinHandle<()>,
-) {
+async fn start_scripted_budget_model()
+-> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("budget listener");
@@ -335,11 +341,8 @@ async fn start_scripted_budget_model() -> (
     (format!("http://{address}/v1"), requests, server)
 }
 
-async fn start_scripted_child_failure_model() -> (
-    String,
-    Arc<Mutex<Vec<String>>>,
-    tokio::task::JoinHandle<()>,
-) {
+async fn start_scripted_child_failure_model()
+-> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("child failure listener");
@@ -365,13 +368,9 @@ async fn start_scripted_child_failure_model() -> (
                         json!({"prompt":"child succeeds","class":"simple","role":"quick","model":"scripted-model"}),
                     ),
                 ])
-            } else if request.contains("child must fail")
-                && !request.contains("child succeeds")
-            {
+            } else if request.contains("child must fail") && !request.contains("child succeeds") {
                 scripted_limited_response("partial child output")
-            } else if request.contains("child succeeds")
-                && !request.contains("child must fail")
-            {
+            } else if request.contains("child succeeds") && !request.contains("child must fail") {
                 scripted_text_response("child completed")
             } else {
                 scripted_text_response("parent declares completion")
@@ -394,11 +393,8 @@ async fn start_scripted_child_failure_model() -> (
     (format!("http://{address}/v1"), requests, server)
 }
 
-async fn start_scripted_child_retry_model() -> (
-    String,
-    Arc<Mutex<Vec<String>>>,
-    tokio::task::JoinHandle<()>,
-) {
+async fn start_scripted_child_retry_model()
+-> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("child retry listener");
@@ -417,7 +413,11 @@ async fn start_scripted_child_retry_model() -> (
                 .push(request);
             let body = match index {
                 0 | 2 => scripted_tool_response(vec![(
-                    if index == 0 { "task-first" } else { "task-retry" },
+                    if index == 0 {
+                        "task-first"
+                    } else {
+                        "task-retry"
+                    },
                     "task",
                     json!({"prompt":"retry identical child","class":"simple","role":"quick","model":"scripted-model"}),
                 )]),
@@ -449,11 +449,23 @@ fn english_game_creation_routes_to_dev_tools() {
 
     // Then: it must receive the tool-capable development profile.
     assert_eq!(class, TaskClass::Dev);
-    assert_eq!(classify_rules("write a browser game", false), TaskClass::Dev);
+    assert_eq!(
+        classify_rules("write a browser game", false),
+        TaskClass::Dev
+    );
     assert_eq!(classify_rules("fix my browser game", false), TaskClass::Dev);
-    assert_eq!(classify_rules("add a button to the app", false), TaskClass::Dev);
-    assert_eq!(classify_rules("remove obsolete function", false), TaskClass::Dev);
-    assert_eq!(classify_rules("delete the old endpoint", false), TaskClass::Dev);
+    assert_eq!(
+        classify_rules("add a button to the app", false),
+        TaskClass::Dev
+    );
+    assert_eq!(
+        classify_rules("remove obsolete function", false),
+        TaskClass::Dev
+    );
+    assert_eq!(
+        classify_rules("delete the old endpoint", false),
+        TaskClass::Dev
+    );
     assert_eq!(classify_rules("add sugar to tea", false), TaskClass::Simple);
     assert_eq!(classify_rules("make me happy", false), TaskClass::Simple);
 }
@@ -545,11 +557,13 @@ async fn bash_created_files_are_recorded_as_execution_evidence() {
 
     assert_eq!(
         run.committed_paths(),
-        vec![workspace
-            .path()
-            .join("game.html")
-            .canonicalize()
-            .expect("canonical game")]
+        vec![
+            workspace
+                .path()
+                .join("game.html")
+                .canonicalize()
+                .expect("canonical game")
+        ]
     );
 }
 
@@ -566,33 +580,29 @@ async fn reverted_bash_changes_are_not_execution_evidence() {
     let registry = ToolRegistry::all();
     let bash = registry.get("bash").expect("bash tool");
 
-    bash.run(
-        json!({"command": "printf changed > game.js"}),
-        &context,
-    )
-    .expect("bash change");
+    bash.run(json!({"command": "printf changed > game.js"}), &context)
+        .expect("bash change");
     assert_eq!(
         run.committed_paths(),
-        vec![workspace
-            .path()
-            .join("game.js")
-            .canonicalize()
-            .expect("canonical game")]
+        vec![
+            workspace
+                .path()
+                .join("game.js")
+                .canonicalize()
+                .expect("canonical game")
+        ]
     );
 
-    bash.run(
-        json!({"command": "printf original > game.js"}),
-        &context,
-    )
-    .expect("bash revert");
+    bash.run(json!({"command": "printf original > game.js"}), &context)
+        .expect("bash revert");
     assert!(run.committed_paths().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrackable_workspace_prevents_bash_execution() {
     let workspace = TestWorkspace::new("bash-tracking-cap");
-    let oversized = fs::File::create(workspace.path().join("oversized.bin"))
-        .expect("oversized fixture");
+    let oversized =
+        fs::File::create(workspace.path().join("oversized.bin")).expect("oversized fixture");
     oversized
         .set_len(64 * 1024 * 1024 + 1)
         .expect("sparse oversized fixture");
@@ -685,10 +695,7 @@ async fn mixed_symlink_alias_tools_share_one_final_baseline() {
     registry
         .get("write_file")
         .expect("write tool")
-        .run(
-            json!({"path": "game.js", "content": "original"}),
-            &context,
-        )
+        .run(json!({"path": "game.js", "content": "original"}), &context)
         .expect("file-tool revert");
 
     assert!(run.committed_paths().is_empty());
@@ -749,8 +756,33 @@ async fn browser_game_quality_gate_rejects_broken_and_accepts_repaired() {
     .expect("broken game source");
     let changed = vec!["index.html".into(), "style.css".into(), "game.js".into()];
 
+    let missing_contract = run_quality_gate(workspace.path(), &changed).await;
+    assert!(!missing_contract.passed, "missing game contract passed");
+    assert!(
+        missing_contract
+            .steps
+            .iter()
+            .filter_map(|step| step.note.as_deref())
+            .any(|note| note.contains("계약 meta")),
+        "missing contract evidence: {missing_contract:?}"
+    );
+
+    fs::write(
+        workspace.path().join("index.html"),
+        r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"><link rel="stylesheet" href="style.css"></head><body><main><h1>Rafik Run</h1><canvas id="game" width="640" height="360"></canvas><p id="status">READY</p></main><script src="game.js"></script></body></html>"#,
+    )
+    .expect("contract game html");
+
     let broken = run_quality_gate(workspace.path(), &changed).await;
     assert!(!broken.passed, "runtime failure passed: {broken:?}");
+    assert!(
+        broken
+            .steps
+            .iter()
+            .filter_map(|step| step.note.as_deref())
+            .any(|note| note.contains("missingGameLoop") || note.contains("ReferenceError")),
+        "runtime evidence missing: {broken:?}"
+    );
 
     fs::write(
         workspace.path().join("game.js"),
@@ -758,7 +790,11 @@ async fn browser_game_quality_gate_rejects_broken_and_accepts_repaired() {
 const context = canvas.getContext('2d');
 const status = document.querySelector('#status');
 const game = { mode: 'ready', x: 24, y: 280, velocity: 0 };
-function reset() { game.mode = 'ready'; game.x = 24; game.y = 280; game.velocity = 0; }
+let restartCount = 0;
+function reset(restarted = false) {
+  game.mode = 'ready'; game.x = 24; game.y = 280; game.velocity = 0;
+  if (restarted) restartCount += 1;
+}
 function render() {
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.fillStyle = '#4f46e5';
@@ -779,9 +815,14 @@ document.addEventListener('keydown', (event) => {
   if (event.code === 'Space' && game.mode === 'ready') game.mode = 'playing';
   if (event.code === 'KeyP' && game.mode === 'playing') game.mode = 'paused';
   else if (event.code === 'KeyP' && game.mode === 'paused') game.mode = 'playing';
-  if (event.code === 'KeyR') reset();
+  if (event.code === 'KeyR' && game.mode === 'lost') reset(true);
   if (event.code === 'ArrowUp' && game.mode === 'playing' && game.y === 280) game.velocity = -8;
 });
+window.__rafikxGameTest = {
+  state: () => game.mode,
+  forceLoss: () => { game.mode = 'lost'; },
+  restarts: () => restartCount,
+};
 reset();
 frame();"#,
     )
@@ -942,8 +983,15 @@ async fn browser_game_agent_repair_e2e() {
         .expect("scripted server timeout")
         .expect("scripted server task");
 
-    assert_eq!(outcome.status, "ok", "pipeline outcome: {:?}", outcome.error);
-    assert!(outcome.verify_recovered.is_some(), "repair evidence missing");
+    assert_eq!(
+        outcome.status, "ok",
+        "pipeline outcome: {:?}",
+        outcome.error
+    );
+    assert!(
+        outcome.verify_recovered.is_some(),
+        "repair evidence missing"
+    );
     let mut changed = outcome.changed_files.clone();
     changed.sort();
     assert_eq!(changed, ["game.js", "index.html", "style.css"]);
