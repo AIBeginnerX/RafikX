@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 use super::{
     ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, StreamEvent,
@@ -9,11 +10,163 @@ use super::{
 
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const TOOL_ARGS_STEP: usize = 8 * 1024;
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
     token: String,
     oauth: bool,
+}
+
+enum StreamingContentBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+        stopped: bool,
+    },
+}
+
+#[derive(Default)]
+struct AnthropicStreamAccumulator {
+    blocks: BTreeMap<usize, StreamingContentBlock>,
+    tool_args_marks: BTreeMap<usize, usize>,
+}
+
+impl AnthropicStreamAccumulator {
+    fn content_block_start(&mut self, event: &Value) {
+        let Some(index) = stream_index(event) else {
+            return;
+        };
+        let Some(block) = event.get("content_block") else {
+            return;
+        };
+        match block.get("type").and_then(|value| value.as_str()) {
+            Some("text") => {
+                self.blocks
+                    .insert(index, StreamingContentBlock::Text(String::new()));
+            }
+            Some("tool_use") => {
+                let id = block
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                self.blocks.insert(
+                    index,
+                    StreamingContentBlock::ToolUse {
+                        id,
+                        name,
+                        input_json: String::new(),
+                        stopped: false,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn text_delta(&mut self, event: &Value) {
+        let Some(index) = stream_index(event) else {
+            return;
+        };
+        let Some(piece) = event
+            .pointer("/delta/text")
+            .and_then(|value| value.as_str())
+        else {
+            return;
+        };
+        if piece.is_empty() {
+            return;
+        }
+        match self.blocks.entry(index) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(StreamingContentBlock::Text(piece.to_string()));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if let StreamingContentBlock::Text(text) = entry.get_mut() {
+                    text.push_str(piece);
+                }
+            }
+        }
+    }
+
+    fn input_json_delta(&mut self, event: &Value) -> Option<(String, usize)> {
+        let index = stream_index(event)?;
+        let piece = event
+            .pointer("/delta/partial_json")
+            .and_then(|value| value.as_str())?;
+        let StreamingContentBlock::ToolUse {
+            name, input_json, ..
+        } = self.blocks.get_mut(&index)?
+        else {
+            return None;
+        };
+        input_json.push_str(piece);
+        let total_bytes = input_json.len();
+        if tool_args_due(&mut self.tool_args_marks, index, total_bytes) {
+            Some((name.clone(), total_bytes))
+        } else {
+            None
+        }
+    }
+
+    fn content_block_stop(&mut self, event: &Value) {
+        let Some(index) = stream_index(event) else {
+            return;
+        };
+        if let Some(StreamingContentBlock::ToolUse { stopped, .. }) = self.blocks.get_mut(&index) {
+            *stopped = true;
+        }
+    }
+
+    fn finish(self, stop_reason: StopReason) -> Vec<ContentBlock> {
+        let mut content = Vec::new();
+        for block in self.blocks.into_values() {
+            match block {
+                StreamingContentBlock::Text(text) if !text.is_empty() => {
+                    content.push(ContentBlock::Text { text });
+                }
+                StreamingContentBlock::ToolUse {
+                    id,
+                    name,
+                    input_json,
+                    stopped: true,
+                } if stop_reason != StopReason::MaxTokens && !id.is_empty() && !name.is_empty() => {
+                    let Ok(input) = serde_json::from_str::<Value>(&input_json) else {
+                        continue;
+                    };
+                    if input.is_object() {
+                        content.push(ContentBlock::ToolUse { id, name, input });
+                    }
+                }
+                _ => {}
+            }
+        }
+        content
+    }
+}
+
+fn stream_index(event: &Value) -> Option<usize> {
+    event
+        .get("index")
+        .and_then(|value| value.as_u64())
+        .and_then(|index| usize::try_from(index).ok())
+}
+
+fn tool_args_due(marks: &mut BTreeMap<usize, usize>, index: usize, total_bytes: usize) -> bool {
+    let mark = marks.entry(index).or_default();
+    if total_bytes < TOOL_ARGS_STEP || total_bytes.saturating_sub(*mark) < TOOL_ARGS_STEP {
+        return false;
+    }
+    *mark = total_bytes;
+    true
 }
 
 /// 멀티바이트(한글 3바이트)가 청크 경계에서 잘려도 깨지지 않게
@@ -119,6 +272,7 @@ impl AnthropicProvider {
         let mut cache_reported = false;
         let mut stop_reason = StopReason::Other;
         let mut thinking_started = false;
+        let mut content = AnthropicStreamAccumulator::default();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("응답 스트림이 중간에 끊겼습니다")?;
@@ -147,6 +301,7 @@ impl AnthropicProvider {
                                 &mut cache_reported,
                             );
                         }
+                        Some("content_block_start") => content.content_block_start(&v),
                         Some("content_block_delta") => {
                             if v.pointer("/delta/type").and_then(|x| x.as_str())
                                 == Some("text_delta")
@@ -161,6 +316,7 @@ impl AnthropicProvider {
                                     }
                                     on_event(StreamEvent::Text(piece));
                                     full_text.push_str(piece);
+                                    content.text_delta(&v);
                                 }
                             } else if v.pointer("/delta/type").and_then(|x| x.as_str())
                                 == Some("thinking_delta")
@@ -173,8 +329,15 @@ impl AnthropicProvider {
                                     thinking_started = true;
                                 }
                                 on_event(StreamEvent::Text(piece));
+                            } else if v.pointer("/delta/type").and_then(|x| x.as_str())
+                                == Some("input_json_delta")
+                                && let Some((name, total_bytes)) = content.input_json_delta(&v)
+                            {
+                                let name = if name.is_empty() { "tool" } else { &name };
+                                on_event(StreamEvent::ToolArgs { name, total_bytes });
                             }
                         }
+                        Some("content_block_stop") => content.content_block_stop(&v),
                         Some("message_delta") => {
                             stop_reason = map_stop_reason(
                                 v.pointer("/delta/stop_reason").and_then(|x| x.as_str()),
@@ -195,7 +358,7 @@ impl AnthropicProvider {
                             }
                             return Ok(ChatResponse {
                                 model: stream_model.clone(),
-                                content: vec![ContentBlock::Text { text: full_text }],
+                                content: content.finish(stop_reason),
                                 stop_reason,
                                 input_tokens,
                                 output_tokens,
@@ -401,6 +564,101 @@ fn api_error(status: u16, _body: &str, hint: &LimitHint) -> anyhow::Error {
 #[cfg(test)]
 mod streaming_usage_tests {
     use super::*;
+
+    #[test]
+    fn stream_accumulator_keeps_interleaved_blocks_in_index_order() {
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        accumulator.content_block_start(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text"}
+        }));
+        accumulator.text_delta(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "먼저 "}
+        }));
+        accumulator.content_block_start(&json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "call-1", "name": "write_file"}
+        }));
+        for partial_json in [r#"{"path":"game.html", "#, r#""content":"<canvas/>"}"#] {
+            accumulator.input_json_delta(&json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": partial_json}
+            }));
+        }
+        accumulator.content_block_stop(&json!({"type": "content_block_stop", "index": 1}));
+        accumulator.text_delta(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "다음"}
+        }));
+
+        let content = accumulator.finish(StopReason::ToolUse);
+        assert_eq!(content.len(), 2);
+        match &content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "먼저 다음"),
+            block => panic!("expected text block, got {block:?}"),
+        }
+        match &content[1] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "write_file");
+                assert_eq!(input, &json!({"path": "game.html", "content": "<canvas/>"}));
+            }
+            block => panic!("expected tool block, got {block:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_accumulator_reports_large_tool_input_progress() {
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        accumulator.content_block_start(&json!({
+            "type": "content_block_start",
+            "index": 3,
+            "content_block": {"type": "tool_use", "id": "call-3", "name": "write_file"}
+        }));
+        let partial_json = "x".repeat(TOOL_ARGS_STEP);
+        let progress = accumulator.input_json_delta(&json!({
+            "type": "content_block_delta",
+            "index": 3,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json}
+        }));
+        assert_eq!(progress, Some(("write_file".into(), TOOL_ARGS_STEP)));
+    }
+
+    #[test]
+    fn stream_accumulator_never_returns_truncated_or_invalid_tool_input() {
+        let mut truncated = AnthropicStreamAccumulator::default();
+        truncated.content_block_start(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "call-truncated", "name": "write_file"}
+        }));
+        truncated.input_json_delta(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"game.html\""}
+        }));
+        assert!(truncated.finish(StopReason::MaxTokens).is_empty());
+
+        let mut invalid = AnthropicStreamAccumulator::default();
+        invalid.content_block_start(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "call-invalid", "name": "write_file"}
+        }));
+        invalid.input_json_delta(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"path\":}"}
+        }));
+        invalid.content_block_stop(&json!({"type": "content_block_stop", "index": 0}));
+        assert!(invalid.finish(StopReason::ToolUse).is_empty());
+    }
 
     #[test]
     fn message_start_keeps_cache_read_tokens_until_stop() {

@@ -1,3 +1,3 @@
-완료: ULW가 같은 observer를 재사용해도 각 루트 실행이 새 lifecycle epoch를 소유하며, boot 완료 뒤 Ready 화면은 tick redraw와 sparkle을 모두 멈춘다.
-검증: 이전 루트의 늦은 AnswerStarted 격리와 정착 배너 회귀가 통과했고, 실제 PTY는 Ready 뒤 0.5초 동안 추가 출력이 없었으며 Node 문법 검사도 통과했다.
-다음: Anthropic 스트리밍 tool_use를 복원한 뒤 내부 semantic stream 경계로 추론·후보 본문·최종 답변을 구분해 첫 답변보다 Answering을 먼저 표시한다. 데스크탑은 계속 제외한다.
+완료: Anthropic 스트리밍이 블록 index 순서대로 text와 tool_use를 복원하고, 분할 input_json_delta를 완성된 객체로 만든 뒤에만 도구 호출로 전달한다.
+검증: 교차 블록·분할 JSON·8KB 진행·잘못된 입력·max_tokens 절단 회귀를 포함한 Anthropic 테스트 5개와 cargo check가 통과했으며 기존 경고만 남았다.
+다음: 공개 StreamEvent 호환성을 유지하는 내부 semantic stream으로 추론·후보 본문·최종 답변을 구분해 첫 답변보다 Answering을 먼저 표시한다. 데스크탑은 계속 제외한다.
