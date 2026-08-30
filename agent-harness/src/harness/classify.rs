@@ -122,7 +122,45 @@ const ENGLISH_ARTIFACTS: &[&str] = &[
 pub(crate) fn browser_game_intent(text: &str) -> bool {
     let operative = strip_quoted(text);
     let lower = operative.to_ascii_lowercase();
-    let dashboard_or_chart = ["dashboard", "chart", "대시보드", "차트"]
+    let reporting_surface = ["dashboard", "chart", "대시보드", "차트"]
+        .iter()
+        .any(|signal| lower.contains(signal));
+    let playable_detail = [
+        "snake",
+        "tetris",
+        "pong",
+        "breakout",
+        "pacman",
+        "platformer",
+        "super mario",
+        "game and",
+        "game plus",
+        "game with",
+        "game in html",
+        "game in javascript",
+        "game in js",
+        "게임과",
+        "게임 및",
+        "게임도",
+        "테트리스",
+        "핑퐁",
+        "벽돌깨기",
+        "플랫포머",
+        "슈퍼마리오",
+        "슈퍼 마리오",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal));
+    let reporting_only = reporting_surface
+        && !playable_detail
+        && [
+            "dashboard for game",
+            "chart for game",
+            "game analytics",
+            "game scores",
+            "게임 통계",
+            "게임 점수",
+        ]
         .iter()
         .any(|signal| lower.contains(signal));
     let game_signal = contains_english_term(&lower, "game")
@@ -162,7 +200,7 @@ pub(crate) fn browser_game_intent(text: &str) -> bool {
         ]
         .iter()
         .any(|signal| lower.contains(signal));
-    game_signal && browser_signal && !dashboard_or_chart
+    game_signal && browser_signal && !reporting_only
 }
 
 pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
@@ -557,6 +595,9 @@ mod intent_gate_tests {
             "create a Snake game in HTML",
             "Build an HTML5 Pong game",
             "make a Breakout game in JS",
+            "Build an HTML5 Snake game with a score chart",
+            "Build a browser game and dashboard for game analytics",
+            "브라우저 게임과 점수 대시보드를 만들어줘",
             "HTML 게임 만들어줘",
             "캔버스 테트리스 구현",
         ] {

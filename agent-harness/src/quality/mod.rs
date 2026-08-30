@@ -486,12 +486,8 @@ fn package_free_javascript_fallback(
         })
 }
 
-fn browser_game_contract_target(html: &str, required: bool, entry_count: usize) -> bool {
+fn browser_game_contract_target(_html: &str, required: bool, _entry_count: usize) -> bool {
     required
-        && (entry_count == 1
-            || browser::entry_requires_game_contract(html)
-            || browser::entry_has_canvas(html)
-            || browser::entry_looks_like_browser_game(html))
 }
 
 fn has_adjacent_safety_justification(lines: &[&str], line: usize) -> bool {
@@ -556,11 +552,12 @@ fn rust_char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
     (bytes.get(cursor) == Some(&b'\'')).then_some(cursor + 1)
 }
 
-fn rust_brace_counts(line: &str, state: &mut RustScanState) -> (i32, i32) {
+fn rust_line_facts(line: &str, state: &mut RustScanState) -> (i32, i32, bool) {
     let bytes = line.as_bytes();
     let mut cursor = 0usize;
     let mut opens = 0i32;
     let mut closes = 0i32;
+    let mut unsafe_token = false;
     while cursor < bytes.len() {
         if let Some(hashes) = state.raw_hashes {
             if bytes[cursor] == b'"'
@@ -633,17 +630,38 @@ fn rust_brace_counts(line: &str, state: &mut RustScanState) -> (i32, i32) {
                 closes += 1;
                 cursor += 1;
             }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = cursor;
+                cursor += 1;
+                while cursor < bytes.len()
+                    && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+                {
+                    cursor += 1;
+                }
+                unsafe_token |= &line[start..cursor] == "unsafe";
+            }
             _ => cursor += 1,
         }
     }
-    (opens, closes)
+    (opens, closes, unsafe_token)
+}
+
+fn rust_unsafe_line_mask(lines: &[&str]) -> Vec<bool> {
+    let mut lexer = RustScanState::default();
+    lines
+        .iter()
+        .map(|line| rust_line_facts(line, &mut lexer).2)
+        .collect()
 }
 
 pub(super) fn production_line_mask(lines: &[&str]) -> Vec<bool> {
     let mut lexer = RustScanState::default();
     let braces = lines
         .iter()
-        .map(|line| rust_brace_counts(line, &mut lexer))
+        .map(|line| {
+            let (opens, closes, _) = rust_line_facts(line, &mut lexer);
+            (opens, closes)
+        })
         .collect::<Vec<_>>();
     let mut mask = vec![true; lines.len()];
     let mut pending_cfg = None;
@@ -747,45 +765,40 @@ async fn run_quality_gate_with_contract(
     }
 
     // S3-syntax — node --check 파일별 구문 검사 (JS 계열, node 있을 때).
-    if matches!(
-        lang,
-        Language::JavaScript | Language::TypeScript | Language::Unknown
-    ) {
-        let node_available = profile::tool_available("node");
-        for file in changed {
-            if is_node_syntax_source(file) {
-                match validated_changed_arg(workspace, file) {
-                    Ok(Some(file)) => {
-                        if node_available {
-                            steps.push(
-                                run_argv_step(
-                                    "S3-syntax",
-                                    format!("node --check {file:?}"),
-                                    "node".into(),
-                                    vec!["--check".into(), file],
-                                    workspace,
-                                )
-                                .await,
-                            );
-                        } else {
-                            steps.push(GateStep {
-                                stage: "S3-syntax",
-                                command: format!("node --check {file:?}"),
-                                passed: false,
-                                exit_code: None,
-                                note: Some("필수 JavaScript 구문 검사기 node 미설치".into()),
-                            });
-                        }
+    let node_available = profile::tool_available("node");
+    for file in changed {
+        if is_node_syntax_source(file) {
+            match validated_changed_arg(workspace, file) {
+                Ok(Some(file)) => {
+                    if node_available {
+                        steps.push(
+                            run_argv_step(
+                                "S3-syntax",
+                                format!("node --check {file:?}"),
+                                "node".into(),
+                                vec!["--check".into(), file],
+                                workspace,
+                            )
+                            .await,
+                        );
+                    } else {
+                        steps.push(GateStep {
+                            stage: "S3-syntax",
+                            command: format!("node --check {file:?}"),
+                            passed: false,
+                            exit_code: None,
+                            note: Some("필수 JavaScript 구문 검사기 node 미설치".into()),
+                        });
                     }
-                    Ok(None) => {}
-                    Err(error) => steps.push(GateStep {
-                        stage: "S3-syntax",
-                        command: format!("node --check {file:?}"),
-                        passed: false,
-                        exit_code: None,
-                        note: Some(error),
-                    }),
                 }
+                Ok(None) => {}
+                Err(error) => steps.push(GateStep {
+                    stage: "S3-syntax",
+                    command: format!("node --check {file:?}"),
+                    passed: false,
+                    exit_code: None,
+                    note: Some(error),
+                }),
             }
         }
     }
@@ -804,18 +817,24 @@ async fn run_quality_gate_with_contract(
         if let Ok(text) = std::fs::read_to_string(&path) {
             let lines = text.lines().collect::<Vec<_>>();
             let production = production_line_mask(&lines);
+            let unsafe_lines = rust_unsafe_line_mask(&lines);
             for (line_no, line) in lines.iter().enumerate() {
                 if !production[line_no] {
                     continue;
                 }
                 for (pattern, why) in &profile.forbidden_patterns {
+                    let found = if pattern == "unsafe " {
+                        unsafe_lines[line_no]
+                    } else {
+                        code_contains_pattern(line, pattern)
+                    };
                     if pattern == "unsafe "
-                        && code_contains_pattern(line, pattern)
+                        && found
                         && has_adjacent_safety_justification(&lines, line_no)
                     {
                         continue;
                     }
-                    if code_contains_pattern(line, pattern) {
+                    if found {
                         findings.push(security::Finding {
                             kind: "idiom",
                             file: file.to_string(),
@@ -1054,6 +1073,36 @@ fn looks_like_high_entropy_secret(token: &str) -> bool {
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn looks_like_telegram_bot_token(token: &str) -> bool {
+    let value = token.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, ':' | '-' | '_')
+    });
+    let value = value.strip_prefix("bot").unwrap_or(value);
+    let Some((id, secret)) = value.split_once(':') else {
+        return false;
+    };
+    (6..=12).contains(&id.len())
+        && id.chars().all(|character| character.is_ascii_digit())
+        && secret.starts_with("AA")
+        && (20..=128).contains(&secret.len())
+        && secret
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn looks_like_aws_access_key(token: &str) -> bool {
+    let value = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+    value.len() == 20
+        && [
+            "AIDA", "AIPA", "AKIA", "ANPA", "ANVA", "AROA", "ASCA", "ASIA",
+        ]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+        && value
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
 }
 
 fn looks_like_sensitive_key(key: &str) -> bool {
@@ -1313,6 +1362,8 @@ fn redact_output_token(token: &str, redact_next: &mut bool) -> String {
         || lower.starts_with("ghp_")
         || lower.starts_with("github_pat_")
         || lower.starts_with("xoxb-")
+        || looks_like_telegram_bot_token(token)
+        || looks_like_aws_access_key(token)
         || looks_like_high_entropy_secret(token)
     {
         return "[redacted]".to_string();
@@ -1431,6 +1482,38 @@ mod tests {
         );
         assert!(!root.join("PWNED").exists());
         assert!(!root.join("ALSO_PWNED").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mixed_rust_and_javascript_changes_always_run_node_syntax() {
+        if !profile::tool_available("node") {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-mixed-syntax-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("temp workspace");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"mixed_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(root.join("src/lib.rs"), "pub fn ready() -> bool { true }\n")
+            .expect("Rust fixture");
+        std::fs::write(root.join("app.js"), "const broken = ;\n").expect("JavaScript fixture");
+
+        let report = run_quality_gate(&root, &["src/lib.rs".into(), "app.js".into()]).await;
+        let syntax = report
+            .steps
+            .iter()
+            .find(|step| step.stage == "S3-syntax" && step.command.contains("app.js"))
+            .expect("mixed JavaScript syntax step");
+        assert!(
+            !syntax.passed,
+            "syntax step unexpectedly passed: {syntax:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1634,6 +1717,21 @@ mod tests {
     }
 
     #[test]
+    fn bare_service_credentials_are_redacted_without_hiding_ratios() {
+        let output = concat!(
+            "123456789:AAabcdefghijklmnopqrstuvwx\n",
+            "AKIA1234567890ABCDEF\n",
+            "ratio 123:456 build ABCD1234\n",
+        );
+        let redacted = redact_tool_output(output, Path::new("/tmp/workspace"));
+        assert_eq!(redacted.matches("[redacted]").count(), 2);
+        assert!(!redacted.contains("AAabcdefghijklmnopqrstuvwx"));
+        assert!(!redacted.contains("AKIA1234567890ABCDEF"));
+        assert!(redacted.contains("123:456"));
+        assert!(redacted.contains("ABCD1234"));
+    }
+
+    #[test]
     fn unsafe_idiom_requires_an_adjacent_safety_justification() {
         let justified = ["// SAFETY: checked ABI", "unsafe { call(); }"];
         let unproved = ["// ordinary note", "unsafe { call(); }"];
@@ -1644,6 +1742,16 @@ mod tests {
             "unsafe "
         ));
         assert!(!code_contains_pattern("let rule = \"unsafe \";", "unsafe "));
+        let unsafe_lines = [
+            "unsafe/* missing proof */{ call(); }",
+            "let text = \"unsafe { not code }\";",
+            "/* unsafe { not code } */ fn safe() {}",
+            "let raw = r#\"unsafe { not code }\"#;",
+        ];
+        assert_eq!(
+            rust_unsafe_line_mask(&unsafe_lines),
+            [true, false, false, false]
+        );
         let lines = [
             "fn before() {}",
             "#[cfg(test)]",
@@ -1691,13 +1799,13 @@ mod tests {
     }
 
     #[test]
-    fn browser_game_task_targets_every_canvas_entry_in_multi_entry_workspaces() {
+    fn browser_game_task_targets_every_entry_in_multi_entry_workspaces() {
         let decoy = r#"<canvas id="game"></canvas><script src="game.js"></script>"#;
         let actual = r#"<canvas id="board"></canvas><script src="snake-engine.js"></script>"#;
         let dashboard = r#"<main id="dashboard"></main><script src="charts.js"></script>"#;
         assert!(browser_game_contract_target(decoy, true, 3));
         assert!(browser_game_contract_target(actual, true, 3));
-        assert!(!browser_game_contract_target(dashboard, true, 3));
+        assert!(browser_game_contract_target(dashboard, true, 3));
         assert!(!browser_game_contract_target(actual, false, 3));
     }
 }

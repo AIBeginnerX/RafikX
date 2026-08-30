@@ -76,15 +76,59 @@ fn contains_call(line: &str, name: &str) -> bool {
     })
 }
 
+fn is_testish_path(file: &str) -> bool {
+    let normalized = file.replace('\\', "/");
+    let path = std::path::Path::new(&normalized);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        return true;
+    }
+    let components = normalized
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|component| {
+            matches!(
+                component.as_str(),
+                "__tests__"
+                    | "example"
+                    | "examples"
+                    | "fixture"
+                    | "fixtures"
+                    | "test"
+                    | "testdata"
+                    | "tests"
+            )
+        })
+    {
+        return true;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(stem.as_str(), "fixture" | "fixtures" | "test" | "tests")
+        || stem.starts_with("fixture_")
+        || stem.starts_with("test_")
+        || stem.ends_with("_fixture")
+        || stem.ends_with("_test")
+        || stem.ends_with(".spec")
+        || stem.ends_with(".test")
+}
+
 /// 변경 파일들의 텍스트를 스캔한다 (S5). 발견 목록이 비어 있어야 통과다.
 pub fn scan(file: &str, text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     let lower_path = file.to_lowercase();
-    // 테스트·픽스처·문서 파일은 더미 시크릿이 흔하므로 시크릿 스캔 제외.
-    let is_testish = lower_path.contains("test")
-        || lower_path.contains("fixture")
-        || lower_path.contains("example")
-        || lower_path.ends_with(".md");
+    let is_testish = is_testish_path(file);
 
     let lines = text.lines().collect::<Vec<_>>();
     let production = if lower_path.ends_with(".rs") {
@@ -275,6 +319,22 @@ mod tests {
                 .iter()
                 .all(|f| f.kind != "secret")
         );
+    }
+
+    #[test]
+    fn production_names_containing_test_or_example_are_still_scanned() {
+        let code = "let api_key = \"sk-live-1234567890abcdef\";";
+        for file in ["src/contest.rs", "src/latest.rs", "src/example_client.rs"] {
+            assert!(
+                scan(file, code)
+                    .iter()
+                    .any(|finding| finding.kind == "secret"),
+                "production secret was skipped: {file}"
+            );
+        }
+        assert!(is_testish_path("tests/fixture.rs"));
+        assert!(is_testish_path("src/client.test.ts"));
+        assert!(!is_testish_path("src/contest.rs"));
     }
 
     #[test]

@@ -172,6 +172,20 @@ fn sanitize_pipeline_result(result: &mut Result<AgentOutcome>, workspace: &std::
             if let Some(error) = outcome.error.as_deref() {
                 outcome.error = Some(crate::quality::redact_bounded_error(error, workspace));
             }
+            for error in &mut outcome.tool_errors {
+                *error = crate::quality::redact_bounded_error(error, workspace);
+            }
+            for reason in &mut outcome.deny_reasons {
+                *reason = crate::quality::redact_bounded_error(reason, workspace);
+            }
+            if let Some(failure) = outcome.verify_fail.as_deref() {
+                outcome.verify_fail =
+                    Some(crate::quality::redact_bounded_error(failure, workspace));
+            }
+            if let Some(recovered) = outcome.verify_recovered.as_deref() {
+                outcome.verify_recovered =
+                    Some(crate::quality::redact_bounded_error(recovered, workspace));
+            }
         }
         Err(error) => {
             *error = anyhow::anyhow!(crate::quality::redact_bounded_error(
@@ -1656,8 +1670,13 @@ async fn approve_bash_command(
         return Ok(BashApproval::Allowed);
     }
     let preview = match tools::approval_preview("bash", input, ctx) {
-        Ok(p) => p,
-        Err(e) => return Ok(BashApproval::Blocked(e.to_string())),
+        Ok(preview) => crate::quality::redact_tool_output(&preview, &ctx.workspace),
+        Err(error) => {
+            return Ok(BashApproval::Blocked(crate::quality::redact_bounded_error(
+                &format!("{error:#}"),
+                &ctx.workspace,
+            )));
+        }
     };
     crate::ui::live_line_in(run_context, &preview);
     let denied = if let Some(ask) = local_ask {
@@ -1685,19 +1704,6 @@ async fn approve_bash_command(
     })
 }
 
-fn is_web_change(path: &str) -> bool {
-    matches!(
-        std::path::Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str()),
-        Some("html" | "js" | "mjs" | "cjs" | "css")
-    )
-}
-
-fn has_web_changes(changed: &[String]) -> bool {
-    changed.iter().any(|path| is_web_change(path))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_quality_repair(
     cfg: &Config,
@@ -1710,22 +1716,11 @@ async fn run_quality_repair(
     remote: &Option<agent::RemoteApproval>,
     local_ask: &Option<agent::LocalAsk>,
     run_context: &RunContext,
-    web_only: bool,
 ) -> Result<AgentOutcome> {
     for round in 0..3 {
-        let gate_files = if web_only {
-            outcome
-                .changed_files
-                .iter()
-                .filter(|path| is_web_change(path))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            outcome.changed_files.clone()
-        };
         let report = crate::quality::run_quality_gate_for_task(
             &cfg.workspace,
-            &gate_files,
+            &outcome.changed_files,
             browser_game_intent(task),
         )
         .await;
@@ -1835,7 +1830,6 @@ async fn run_verify(
             &remote,
             &local_ask,
             &run_context,
-            false,
         )
         .await;
     }
@@ -1856,9 +1850,10 @@ async fn run_verify(
     ctx.run = Some(run_context.clone());
 
     let yes = agent::effective_yes(yes, &remote);
+    let public_cmd = crate::quality::redact_bounded_error(&cmd, &cfg.workspace);
     for round in 0..3 {
-        crate::ui::live_line_in(&run_context, &format!("[검증] {cmd}"));
-        crate::spinner::set_label_in(&run_context, &format!("검증 실행: {cmd}"));
+        crate::ui::live_line_in(&run_context, &format!("[검증] {public_cmd}"));
+        crate::spinner::set_label_in(&run_context, &format!("검증 실행: {public_cmd}"));
         let input = serde_json::json!({"command": cmd});
         match approve_bash_command(&input, tool, &ctx, yes, &remote, &local_ask, &run_context)
             .await?
@@ -1870,7 +1865,10 @@ async fn run_verify(
                 return Ok(outcome);
             }
             BashApproval::Blocked(e) => {
-                let failure = format!("검증 명령이 안전 정책에 차단되었습니다: {e}");
+                let failure = crate::quality::redact_bounded_error(
+                    &format!("검증 명령이 안전 정책에 차단되었습니다: {e}"),
+                    &cfg.workspace,
+                );
                 crate::ui::live_line_in(&run_context, &failure);
                 mark_verification_failure(&mut outcome, failure);
                 return Ok(outcome);
@@ -1881,31 +1879,30 @@ async fn run_verify(
                 // 성공 시 원문 대신 요약 한 줄 — 실패했을 때만 상세가 필요하다.
                 let lines = out.trim().lines().count();
                 crate::ui::live_line_in(&run_context, &format!("검증 성공 ({lines}줄 출력)"));
-                if has_web_changes(&outcome.changed_files) {
-                    return run_quality_repair(
-                        cfg,
-                        binding,
-                        turn_iteration_limit,
-                        task,
-                        yes,
-                        &system,
-                        outcome,
-                        &remote,
-                        &local_ask,
-                        &run_context,
-                        true,
-                    )
-                    .await;
+                if outcome.changed_files.is_empty() {
+                    mark_verify_recovered(&mut outcome);
+                    return Ok(outcome);
                 }
-                mark_verify_recovered(&mut outcome);
-                return Ok(outcome);
+                return run_quality_repair(
+                    cfg,
+                    binding,
+                    turn_iteration_limit,
+                    task,
+                    yes,
+                    &system,
+                    outcome,
+                    &remote,
+                    &local_ask,
+                    &run_context,
+                )
+                .await;
             }
             other => {
                 let err = match other {
                     Ok(o) => o,
                     Err(e) => e.to_string(),
                 };
-                let safe_err = crate::quality::redact_local_output(&err, &cfg.workspace);
+                let safe_err = crate::quality::redact_bounded_error(&err, &cfg.workspace);
                 if round >= 2 {
                     crate::ui::live_line_in(&run_context, "검증이 2회 재시도 후에도 실패했습니다.");
                     crate::ui::live_line_in(&run_context, &safe_err);
@@ -2250,13 +2247,25 @@ async fn run_review_once(
 fn reviewer_registry(requested: &[String]) -> Result<ToolRegistry> {
     let allowlist = crate::harness::lane_tool_allowlist("reviewer")
         .ok_or_else(|| anyhow!("reviewer 도구 허용목록이 없습니다"))?;
-    if let Some(name) = requested
-        .iter()
-        .find(|name| !allowlist.contains(&name.as_str()))
+    if requested.len() != allowlist.len()
+        || allowlist.iter().any(|required| {
+            requested
+                .iter()
+                .filter(|name| name.as_str() == *required)
+                .count()
+                != 1
+        })
     {
-        anyhow::bail!("reviewer 허용목록 밖의 도구입니다: {name}");
+        anyhow::bail!(
+            "reviewer 도구는 정확히 다음 네 개여야 합니다: {}",
+            allowlist.join(", ")
+        );
     }
-    ToolRegistry::with_exact_names(requested)
+    let canonical = allowlist
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    ToolRegistry::with_exact_names(&canonical)
 }
 
 fn record_reviewer_workspace_delta(
@@ -2888,9 +2897,13 @@ pub(crate) fn graph_retry_prompt(prompt: &str, reason: &str, changed: &[String])
     s
 }
 
-/// 노드 경계 검증 — 노드가 끝날 때마다 자동 감지된 검증 명령을 한 번 돌린다.
-/// 실패 출력을 돌려주면 호출자가 그 노드의 재시도 사유로 합류시킨다.
-/// 명령이 없거나 승인되지 않으면 None (검증 생략은 실패가 아니다).
+enum GraphBoundaryVerdict {
+    NotApplicable,
+    Passed,
+    Failed(String),
+    Denied,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn graph_node_boundary_check(
     cfg: &Config,
@@ -2899,13 +2912,15 @@ async fn graph_node_boundary_check(
     remote: &Option<agent::RemoteApproval>,
     local_ask: &Option<agent::LocalAsk>,
     run_context: &RunContext,
-) -> Option<String> {
+) -> GraphBoundaryVerdict {
     let cmd = auto_verify_command(cfg, changed);
     if cmd.is_empty() {
-        return None;
+        return GraphBoundaryVerdict::NotApplicable;
     }
     let registry = ToolRegistry::all();
-    let tool = registry.get("bash")?;
+    let Some(tool) = registry.get("bash") else {
+        return GraphBoundaryVerdict::Failed("노드 경계 검증용 bash 도구가 없습니다".into());
+    };
     let mut ctx = ToolCtx::new(cfg.workspace.clone());
     ctx.vault = Some(crate::config::expand_tilde(&cfg.file.obsidian.vault_path));
     ctx.db_path = crate::config::expand_tilde(&cfg.file.obsidian.db_path);
@@ -2914,19 +2929,30 @@ async fn graph_node_boundary_check(
     ctx.remote = remote.clone();
     ctx.run = Some(run_context.clone());
     let input = serde_json::json!({ "command": cmd });
-    // 노드마다 승인을 되묻지 않는다 — 이미 허용된 실행에서만 돌린다.
     let allowed = agent::effective_yes(yes, remote) || run_context.run_tree_approved();
-    if !matches!(
-        approve_bash_command(&input, tool, &ctx, allowed, remote, local_ask, run_context).await,
-        Ok(BashApproval::Allowed)
-    ) {
-        return None;
+    match approve_bash_command(&input, tool, &ctx, allowed, remote, local_ask, run_context).await {
+        Ok(BashApproval::Allowed) => {}
+        Ok(BashApproval::Denied) => {
+            return GraphBoundaryVerdict::Denied;
+        }
+        Ok(BashApproval::Blocked(error)) => {
+            return GraphBoundaryVerdict::Failed(format!(
+                "노드 경계 검증이 차단되었습니다: {error}"
+            ));
+        }
+        Err(error) => {
+            return GraphBoundaryVerdict::Failed(crate::quality::redact_bounded_error(
+                &format!("노드 경계 검증 승인 실패: {error:#}"),
+                &cfg.workspace,
+            ));
+        }
     }
-    crate::spinner::set_label_in(run_context, &format!("노드 경계 검증: {cmd}"));
+    let public_cmd = crate::quality::redact_bounded_error(&cmd, &cfg.workspace);
+    crate::spinner::set_label_in(run_context, &format!("노드 경계 검증: {public_cmd}"));
     match tool.run(input, &ctx) {
         Ok(out) if !out.contains("[exit") => {
-            crate::ui::live_line_in(run_context, &format!("[노드 검증] {cmd} — 통과"));
-            None
+            crate::ui::live_line_in(run_context, &format!("[노드 검증] {public_cmd} — 통과"));
+            GraphBoundaryVerdict::Passed
         }
         other => {
             let err = match other {
@@ -2935,14 +2961,11 @@ async fn graph_node_boundary_check(
             };
             crate::ui::live_warn_in(
                 run_context,
-                &format!("[노드 검증] {cmd} 실패 — 이 노드에서 바로잡습니다."),
+                &format!("[노드 검증] {public_cmd} 실패 — 이 노드에서 바로잡습니다."),
             );
-            Some(format!(
-                "노드 경계 검증 실패 ({cmd}):\n{}",
-                crate::quality::redact_local_output(&err, &cfg.workspace)
-                    .chars()
-                    .take(1500)
-                    .collect::<String>()
+            GraphBoundaryVerdict::Failed(format!(
+                "노드 경계 검증 실패 ({public_cmd}):\n{}",
+                crate::quality::redact_bounded_error(&err, &cfg.workspace)
             ))
         }
     }
@@ -3068,12 +3091,8 @@ async fn run_graph_discipline(
             if outcome.status == "cancelled" || run_context.is_cancelled() {
                 return Ok(cancelled_outcome());
             }
-            // 노드 경계 검증 — 깨진 상태가 다음 노드로 전파되지 않게 한다(§15.5).
-            // 재시도 여지가 있는 첫 시도에서만 돌린다(검증은 무겁고, 마지막 시도 뒤에는
-            // 어차피 그래프 종료 후 종료 검증이 같은 명령을 다시 돌린다).
-            if ok
-                && attempt == 0
-                && let Some(fail) = graph_node_boundary_check(
+            if ok {
+                match graph_node_boundary_check(
                     cfg,
                     &agg.changed_files,
                     yes,
@@ -3082,9 +3101,18 @@ async fn run_graph_discipline(
                     &run_context,
                 )
                 .await
-            {
-                ok = false;
-                reason = fail;
+                {
+                    GraphBoundaryVerdict::NotApplicable | GraphBoundaryVerdict::Passed => {}
+                    GraphBoundaryVerdict::Failed(failure) => {
+                        ok = false;
+                        reason = failure;
+                    }
+                    GraphBoundaryVerdict::Denied => {
+                        agg.status = "denied".into();
+                        agg.error = Some(format!("그래프 중단: 노드 {id} 검증 승인 거부"));
+                        return Ok(agg);
+                    }
+                }
             }
             if ok {
                 produced.push((id.to_string(), graph_node_summary(&outcome)));
@@ -3246,19 +3274,25 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_registry_rejects_capability_expansion() {
+    fn reviewer_registry_requires_the_exact_read_only_toolset() {
         for tools in [
             vec!["read_file".to_string(), "todo_write".to_string()],
             vec!["bash".to_string()],
             vec!["*".to_string()],
             vec!["read_file".to_string(), "read_file".to_string()],
+            vec!["read_file".to_string()],
+            Vec::new(),
         ] {
             assert!(reviewer_registry(&tools).is_err(), "accepted {tools:?}");
         }
-        let reduced = reviewer_registry(&["read_file".to_string()]).expect("reduced registry");
-        assert_eq!(reduced.specs().len(), 1);
-        assert!(reduced.get("read_file").is_some());
-        assert!(reduced.get("list_dir").is_none());
+        let reordered = ["glob", "grep", "list_dir", "read_file"]
+            .map(str::to_string)
+            .to_vec();
+        let exact = reviewer_registry(&reordered).expect("exact registry");
+        assert_eq!(exact.specs().len(), 4);
+        for name in ["read_file", "list_dir", "grep", "glob"] {
+            assert!(exact.get(name).is_some());
+        }
     }
 
     #[test]
@@ -3283,14 +3317,36 @@ mod tests {
         .expect("run start");
         let mut receiver = run.subscribe_lifecycle();
         let secret = "Authorization: Bearer PIPELINE-SECRET TOKEN=SECOND-SECRET";
-        let mut result: Result<AgentOutcome> = Err(anyhow::anyhow!(secret));
+        let mut result: Result<AgentOutcome> = Ok(AgentOutcome {
+            error: Some(secret.into()),
+            tool_errors: vec!["AKIA1234567890ABCDEF".into()],
+            deny_reasons: vec!["123456789:AAabcdefghijklmnopqrstuvwx".into()],
+            verify_fail: Some("TOKEN=VERIFY-SECRET".into()),
+            verify_recovered: Some("Bearer RECOVERED-SECRET".into()),
+            ..AgentOutcome::default()
+        });
         sanitize_pipeline_result(&mut result, &cfg.workspace);
         let safe = match result {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("pipeline error was replaced with success"),
+            Ok(outcome) => format!(
+                "{}\n{}\n{}\n{}\n{}",
+                outcome.error.unwrap_or_default(),
+                outcome.tool_errors.join("\n"),
+                outcome.deny_reasons.join("\n"),
+                outcome.verify_fail.unwrap_or_default(),
+                outcome.verify_recovered.unwrap_or_default(),
+            ),
+            Err(error) => panic!("pipeline outcome was replaced with error: {error}"),
         };
-        assert!(!safe.contains("PIPELINE-SECRET"));
-        assert!(!safe.contains("SECOND-SECRET"));
+        for secret in [
+            "PIPELINE-SECRET",
+            "SECOND-SECRET",
+            "AKIA1234567890ABCDEF",
+            "AAabcdefghijklmnopqrstuvwx",
+            "VERIFY-SECRET",
+            "RECOVERED-SECRET",
+        ] {
+            assert!(!safe.contains(secret), "leaked {secret}: {safe}");
+        }
         run.finish_with_error(TerminalState::Failed, Some(safe));
 
         let live = receiver.try_recv().expect("live finish event");

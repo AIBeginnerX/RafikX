@@ -327,7 +327,7 @@ async fn start_scripted_tool_redaction_model()
                     (
                         "bash-success",
                         "bash",
-                        json!({"command":"printf 'TO\\033[31mKEN\\033[0m=%s%s\n' 'SUCCESS-' 'SECRET'; pwd"}),
+                        json!({"command":"printf 'TO\\033[31mKEN\\033[0m=%s%s\n' 'SUCCESS-' 'SECRET'; printf '%s%s\n' '123456789:AAabcdefghij' 'klmnopqrstuvwx'; printf '%s%s\n' 'AKIA123456' '7890ABCDEF'; pwd"}),
                     ),
                 ])
             } else {
@@ -639,7 +639,12 @@ async fn tool_outputs_are_redacted_before_live_transcript_and_returned_errors() 
         sanitized_sinks,
         requests.lock().expect("request evidence").join("\n"),
     );
-    for secret in ["FAIL-SECRET", "SUCCESS-SECRET"] {
+    for secret in [
+        "FAIL-SECRET",
+        "SUCCESS-SECRET",
+        "123456789:AAabcdefghijklmnopqrstuvwx",
+        "AKIA1234567890ABCDEF",
+    ] {
         assert!(!evidence.contains(secret), "leaked {secret}: {evidence}");
     }
     assert!(evidence.contains("[redacted]"), "{evidence}");

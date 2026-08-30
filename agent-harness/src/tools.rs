@@ -1020,6 +1020,23 @@ fn truncate_bash_output(mut output: String) -> String {
     output
 }
 
+async fn read_bounded_prefix<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut retained = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = (MAX_BASH_OUTPUT + 1).saturating_sub(retained.len());
+        retained.extend_from_slice(&chunk[..read.min(remaining)]);
+    }
+    Ok(retained)
+}
+
 async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Result<String> {
     #[cfg(windows)]
     let mut cmd = {
@@ -1040,45 +1057,22 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
         .stdin(Stdio::null());
     let (mut child, process_scope) = crate::process_tree::spawn_scoped(&mut cmd)
         .map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("명령 stdout 파이프를 열지 못했습니다"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| anyhow!("명령 stderr 파이프를 열지 못했습니다"))?;
-    let mut out_buf = Vec::new();
-    let mut err_buf = Vec::new();
 
     let wait = timeout(Duration::from_secs(timeout_secs), async {
-        let mut tmp_out = [0u8; 4096];
-        let mut tmp_err = [0u8; 4096];
-        let mut stdout_done = false;
-        let mut stderr_done = false;
-        loop {
-            tokio::select! {
-                n = stdout.read(&mut tmp_out), if !stdout_done => {
-                    match n {
-                        Ok(0) => stdout_done = true,
-                        Ok(n) => out_buf.extend_from_slice(&tmp_out[..n]),
-                        Err(_) => stdout_done = true,
-                    }
-                }
-                n = stderr.read(&mut tmp_err), if !stderr_done => {
-                    match n {
-                        Ok(0) => stderr_done = true,
-                        Ok(n) => err_buf.extend_from_slice(&tmp_err[..n]),
-                        Err(_) => stderr_done = true,
-                    }
-                }
-                else => break,
-            }
-            if out_buf.len() + err_buf.len() > MAX_BASH_OUTPUT * 2 {
-                break;
-            }
-        }
-        child.wait().await
+        let (status, out_buf, err_buf) = tokio::try_join!(
+            child.wait(),
+            read_bounded_prefix(stdout),
+            read_bounded_prefix(stderr),
+        )?;
+        Ok::<_, std::io::Error>((status, out_buf, err_buf))
     })
     .await;
 
@@ -1095,7 +1089,7 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
                 .map_err(|error| anyhow!("명령 대기 실패 후 프로세스 정리 실패: {error}"))?;
             Err(anyhow!("명령 실행 오류: {e}"))
         }
-        Ok(Ok(status)) => {
+        Ok(Ok((status, out_buf, err_buf))) => {
             crate::process_tree::terminate(&mut child, &process_scope)
                 .await
                 .map_err(|error| anyhow!("명령 종료 후 프로세스 정리 실패: {error}"))?;
@@ -1209,6 +1203,26 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!root.join("DESCENDANT_SURVIVED").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_drains_verbose_finite_output_after_capture_limit() {
+        let root =
+            std::env::temp_dir().join(format!("rafikx-bash-drain-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let command = concat!(
+            "i=0; while [ $i -lt 4096 ]; do ",
+            "printf 'stdout-0123456789-0123456789-0123456789-0123456789\\n'; ",
+            "printf 'stderr-0123456789-0123456789-0123456789-0123456789\\n' >&2; ",
+            "i=$((i + 1)); done",
+        );
+        let output = run_bash(command.into(), root.clone(), 3)
+            .await
+            .expect("verbose finite command");
+        assert!(output.contains("출력이 20KB에서 잘렸습니다"));
+        assert!(output.len() < MAX_BASH_OUTPUT + 100);
         let _ = std::fs::remove_dir_all(root);
     }
 

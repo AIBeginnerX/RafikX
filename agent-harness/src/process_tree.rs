@@ -359,7 +359,8 @@ async fn run_killer(program: &str, args: &[String]) -> Result<(), String> {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     let status = tokio::time::timeout(Duration::from_secs(2), command.status())
         .await
         .map_err(|_| format!("{program} 시간 초과"))?
@@ -607,10 +608,53 @@ async fn signal_pids(program: &str, signal: &str, pids: &[u32]) -> Result<(), St
     run_killer(program, &args).await
 }
 
+#[cfg(unix)]
+async fn deliver_sigkill(
+    program: &str,
+    pids: &[u32],
+    delivered: &mut std::collections::BTreeSet<u32>,
+    failures: &mut std::collections::BTreeMap<u32, String>,
+) {
+    for pid in pids.iter().copied() {
+        if delivered.contains(&pid) {
+            continue;
+        }
+        match run_killer(program, &["-KILL".into(), pid.to_string()]).await {
+            Ok(()) => {
+                delivered.insert(pid);
+                failures.remove(&pid);
+            }
+            Err(error) => {
+                failures.insert(pid, error);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unresolved_kill_failures(
+    delivered: &std::collections::BTreeSet<u32>,
+    failures: &std::collections::BTreeMap<u32, String>,
+    currently_scoped: &[u32],
+) -> Vec<String> {
+    currently_scoped
+        .iter()
+        .filter(|pid| !delivered.contains(pid))
+        .map(|pid| {
+            failures.get(pid).map_or_else(
+                || format!("PID {pid}에 SIGKILL을 전달하지 못했습니다"),
+                |error| format!("PID {pid} SIGKILL 실패: {error}"),
+            )
+        })
+        .collect()
+}
+
 pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result<(), String> {
     let mut cleanup_errors = Vec::new();
     #[cfg(unix)]
     {
+        let mut delivered = std::collections::BTreeSet::new();
+        let mut kill_failures = std::collections::BTreeMap::new();
         let root = child.id();
         let program = if std::path::Path::new("/bin/kill").is_file() {
             "/bin/kill"
@@ -665,7 +709,7 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
             let _ = signal_pids(program, "-STOP", &added).await;
             tokio::task::yield_now().await;
         }
-        let _ = signal_pids(program, "-KILL", &targets).await;
+        deliver_sigkill(program, &targets, &mut delivered, &mut kill_failures).await;
         if let Some(pid) = root {
             let group = format!("-{pid}");
             let _ = run_killer(program, &["-KILL".to_string(), "--".to_string(), group]).await;
@@ -681,24 +725,17 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
             if remaining.is_empty() {
                 break;
             }
-            let _ = signal_pids(program, "-KILL", &remaining).await;
+            deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
         }
-    }
-    #[cfg(windows)]
-    if let Err(error) = scope.job.terminate() {
-        cleanup_errors.push(format!("Windows Job Object 종료 실패: {error}"));
-    }
-    if child.id().is_some() {
-        let _ = child.kill().await;
-        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => cleanup_errors.push(format!("루트 프로세스 대기 실패: {error}")),
-            Err(_) => cleanup_errors.push("루트 프로세스 종료 확인 시간 초과".into()),
+        if child.id().is_some() {
+            let _ = child.kill().await;
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => cleanup_errors.push(format!("루트 프로세스 대기 실패: {error}")),
+                Err(_) => cleanup_errors.push("루트 프로세스 종료 확인 시간 초과".into()),
+            }
         }
-    }
-    #[cfg(unix)]
-    {
-        for _ in 0..20 {
+        for _ in 0..4 {
             let mut remaining = scoped_pids(scope).await;
             match inherited_scope_pids(scope).await {
                 Ok(pids) => remaining.extend(pids),
@@ -706,15 +743,10 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
             }
             remaining.sort_unstable();
             remaining.dedup();
-            if remaining.is_empty() {
+            if remaining.iter().all(|pid| delivered.contains(pid)) {
                 break;
             }
-            let program = if std::path::Path::new("/bin/kill").is_file() {
-                "/bin/kill"
-            } else {
-                "/usr/bin/kill"
-            };
-            let _ = signal_pids(program, "-KILL", &remaining).await;
+            deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let mut remaining = scoped_pids(scope).await;
@@ -724,11 +756,34 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
         }
         remaining.sort_unstable();
         remaining.dedup();
-        if !remaining.is_empty() {
-            cleanup_errors.push(format!(
-                "프로세스 scope 정리 후에도 {}개 자식이 남았습니다: {remaining:?}",
-                remaining.len(),
-            ));
+        deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
+        cleanup_errors.extend(unresolved_kill_failures(
+            &delivered,
+            &kill_failures,
+            &remaining,
+        ));
+    }
+    #[cfg(windows)]
+    {
+        if let Err(error) = scope.job.terminate() {
+            cleanup_errors.push(format!("Windows Job Object 종료 실패: {error}"));
+        }
+        if child.id().is_some() {
+            let _ = child.kill().await;
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => cleanup_errors.push(format!("루트 프로세스 대기 실패: {error}")),
+                Err(_) => cleanup_errors.push("루트 프로세스 종료 확인 시간 초과".into()),
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    if child.id().is_some() {
+        let _ = child.kill().await;
+        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => cleanup_errors.push(format!("루트 프로세스 대기 실패: {error}")),
+            Err(_) => cleanup_errors.push("루트 프로세스 종료 확인 시간 초과".into()),
         }
     }
     cleanup_errors.sort();
@@ -743,6 +798,25 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_sigkill_delivery_is_not_failed_by_a_stale_process_listing() {
+        let delivered = std::collections::BTreeSet::from([42]);
+        let failures = std::collections::BTreeMap::from([
+            (43, "permission denied".to_string()),
+            (45, "already gone".to_string()),
+        ]);
+        assert!(unresolved_kill_failures(&delivered, &failures, &[42]).is_empty());
+        assert_eq!(
+            unresolved_kill_failures(&delivered, &failures, &[43]),
+            ["PID 43 SIGKILL 실패: permission denied"]
+        );
+        assert!(unresolved_kill_failures(&delivered, &failures, &[]).is_empty());
+        assert_eq!(
+            unresolved_kill_failures(&delivered, &failures, &[44]),
+            ["PID 44에 SIGKILL을 전달하지 못했습니다"]
+        );
+    }
 
     #[test]
     fn process_scope_matching_requires_a_complete_environment_token() {
