@@ -206,7 +206,7 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
                             Style::default()
                                 .fg(palette.text)
                                 .add_modifier(Modifier::BOLD)
-                        } else if !reduced_motion(app) && spark(app.motion_tick, row_index, col) {
+                        } else if booting(app) && spark(app.motion_tick, row_index, col) {
                             // 반짝임은 마크를 파지 않고 색만 밝힌다 — 항상 완전.
                             Style::default()
                                 .fg(palette.text)

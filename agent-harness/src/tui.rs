@@ -397,16 +397,14 @@ pub async fn run(
             _ = tick.tick() => {
                 // 스피너가 돌 때만 주기 리드로우 — 유휴 상태에서는 이벤트가
                 // 있을 때만 그린다 (초당 12.5회 무조건 리드로우 제거).
-                // 시작 화면에선 배너 애니메이션(마키·반짝임)을 위해 2틱마다 —
-                // reduced_motion 이면 애니메이션 없이 이벤트 기반만.
-                if app.show_start && app.motion_tick < 16 {
+                // 시작 화면은 부팅 구간에서만 배너 애니메이션을 그리고, Ready 이후와
+                // reduced_motion 에서는 이벤트 기반으로만 갱신한다.
+                if app.show_start
+                    && app.motion_tick < 16
+                    && !crate::tui::start::terminal_reduced_motion(&app.session)
+                {
                     app.motion_tick += 1;
                     dirty = true;
-                } else if app.show_start && !crate::tui::start::terminal_reduced_motion(&app.session) {
-                    app.motion_tick = app.motion_tick.wrapping_add(1);
-                    if app.motion_tick % 2 == 0 {
-                        dirty = true;
-                    }
                 } else if app.busy || app.upgrading {
                     app.motion_tick = app.motion_tick.wrapping_add(1);
                     dirty = true;
@@ -1049,7 +1047,7 @@ fn make_turn_observer(
         let mut events = run.subscribe_lifecycle();
         let state = Arc::clone(&lifecycle_state);
         let state_epoch = Arc::clone(&lifecycle_epoch);
-        let observed_epoch = state_epoch.load(Ordering::Acquire);
+        let observed_epoch = state_epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         if let Ok(mut current) = state.lock()
             && state_epoch.load(Ordering::Acquire) == observed_epoch
         {
@@ -2854,6 +2852,54 @@ mod upgrade_tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(*lifecycle_state.lock().expect("lifecycle lock"), None);
+    }
+
+    #[tokio::test]
+    async fn reused_observer_rejects_late_events_from_the_previous_root() {
+        use crate::lifecycle::{LifecycleEventData, LifecycleState};
+        use crate::run::{RunContext, RunId};
+
+        let lifecycle_state = Arc::new(Mutex::new(None));
+        let lifecycle_epoch = Arc::new(AtomicU64::new(0));
+        let observer = make_turn_observer(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&lifecycle_state),
+            Arc::clone(&lifecycle_epoch),
+        );
+        let first = RunContext::isolated(RunId::new("ulw-root-1"), std::env::temp_dir());
+        let second = RunContext::isolated(RunId::new("ulw-root-2"), std::env::temp_dir());
+
+        observer(first.clone());
+        first
+            .transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("first root starts");
+        observer(second.clone());
+        second
+            .transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("second root starts");
+
+        for _ in 0..64 {
+            if *lifecycle_state.lock().expect("lifecycle lock") == Some(LifecycleState::Running) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *lifecycle_state.lock().expect("lifecycle lock"),
+            Some(LifecycleState::Running)
+        );
+
+        first
+            .transition_lifecycle(LifecycleEventData::AnswerStarted)
+            .expect("late first-root answer state");
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *lifecycle_state.lock().expect("lifecycle lock"),
+            Some(LifecycleState::Running)
+        );
     }
 
     #[test]

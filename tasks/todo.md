@@ -21,7 +21,9 @@
 - [x] 정리 세션 허가와 실제 프로세스 스캔 허가를 분리하고 중복 pre-KILL 전체 스캔 제거
 - [x] Anthropic·OpenAI 오류 본문과 PTY 환경 전달의 비밀·메모리 경계 고정
 - [x] 메시지 예산 0인 요청의 provider 호출 차단과 현재 사용자 작업 보존
-- [ ] (진행) ULW 연속 실행 epoch와 정적인 Ready·실제 Answering lifecycle 고정
+- [x] ULW 연속 루트 epoch 격리와 boot 이후 정적인 Ready 화면 고정
+- [ ] (진행) Anthropic 스트리밍 tool_use·input_json_delta 복원
+- [ ] (대기) 내부 semantic stream으로 추론·후보 본문·최종 Answering 표시 순서 고정
 - [ ] (대기) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 
