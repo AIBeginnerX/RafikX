@@ -19,7 +19,7 @@ Harness v2: 실행 방식을 두 축으로 고릅니다.
 - 분야 3종 — `/discipline harness|loop|graph`. 기본 파이프라인, 정체를 감지하면 전략을 바꾸는 루프 강화, 계획이 낳은 노드 DAG를 위상순으로 따로 실행하는 그래프.
 - 전문가 프로파일 — `planner · frontend · backend · reviewer` 가 내장되어, 큰 작업은 기획 → 구현 → 리뷰로 나눠 맡깁니다.
 - 팀 모드 — `/team single|multi`. multi면 역할별 모델 지정(`SubAgentConfig.model`)과 위임 계약 주입으로 독립 단계를 역할 서브에이전트가 병렬 실행합니다.
-- 독립 검증자 게이트 — claude·kimi 엔진은 완료를 선언하기 전에 신선한 컨텍스트의 리뷰어가 완료 기준과 대조합니다 (`[harness] strict_gate`).
+- 독립 검증자 게이트 — 기본 rafikx와 Strict 정책 엔진은 완료를 선언하기 전에 신선한 컨텍스트의 리뷰어가 완료 기준과 대조하고, 통과한 최신 파일을 기계 검증으로 한 번 더 확인합니다 (`[harness] strict_gate`).
 - 자기개선 — `/selfharness on` 이면 어떤 엔진 위에서도 실패를 채굴해 Harness 자신을 고칩니다.
 - 운영 편의 — `/model refresh` 가 연결된 모든 프로바이더의 실시간 모델 목록을 가져오고, 설정 변경은 핫리로드로 즉시 반영됩니다.
 

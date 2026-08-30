@@ -316,10 +316,7 @@ async fn main() -> ExitCode {
         Some(Commands::InitDeep) => cmd_init_deep(&cli),
         Some(Commands::Quota) => cmd_quota(&cli),
         Some(Commands::QualityGate { changed }) => {
-            let files: Vec<String> = changed
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
+            let files: Vec<String> = changed.split_whitespace().map(str::to_string).collect();
             cmd_quality_gate(&files).await
         }
         Some(Commands::VerifyTask { path }) => cmd_verify_task(path).await,
@@ -959,7 +956,7 @@ async fn cmd_ask(cli: &Cli, prompt: &str, obsidian: bool) -> Result<()> {
         &cfg,
         &binding,
         &task,
-        cli.yes || cfg.file.general.approval.eq_ignore_ascii_case("yolo"),  // chat 경로(open_session)와 같은 yolo 규칙 (B2 수정)
+        cli.yes || cfg.file.general.approval.eq_ignore_ascii_case("yolo"), // chat 경로(open_session)와 같은 yolo 규칙 (B2 수정)
         cli.provider.as_deref(),
         None,
         None,
@@ -1049,11 +1046,16 @@ async fn cmd_watch(cli: &Cli) -> Result<()> {
 async fn cmd_quality_gate(changed: &[String]) -> Result<()> {
     let workspace = std::env::current_dir()?;
     let report = rafikx::quality::run_quality_gate(&workspace, changed).await;
-    print!("{}", rafikx::quality::render_report(&report));
+    print!(
+        "{}",
+        rafikx::quality::render_report_in_workspace(&report, &workspace)
+    );
     if report.passed {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("품질 게이트 실패 — 위 지적을 수정한 뒤 재실행"))
+        Err(anyhow::anyhow!(
+            "품질 게이트 실패 — 위 지적을 수정한 뒤 재실행"
+        ))
     }
 }
 
@@ -1192,7 +1194,8 @@ async fn cmd_plan_rollback(plan: &str, task: &str) -> Result<()> {
         .map(|d| d.join("LEDGER.jsonl"))
         .unwrap_or_else(|| std::path::PathBuf::from("LEDGER.jsonl"));
     let workspace = std::env::current_dir()?;
-    let msg = rafikx::verify::orchestrator::rollback_task(&mut work, task, &workspace, &ledger).await?;
+    let msg =
+        rafikx::verify::orchestrator::rollback_task(&mut work, task, &workspace, &ledger).await?;
     println!("[plan-rollback] {msg}");
     Ok(())
 }
@@ -1234,7 +1237,9 @@ fn cmd_plan_report(path: &str) -> Result<()> {
         }
     }
     println!("=== 원장 리포트 ({path}) ===");
-    println!("검증 실행: {verifications}회 · 완료 태스크: {done}개 · 최고 통과 테스트: {peak_tests}개");
+    println!(
+        "검증 실행: {verifications}회 · 완료 태스크: {done}개 · 최고 통과 테스트: {peak_tests}개"
+    );
     if escalated.is_empty() {
         println!("에스컬레이션: 없음");
     } else {
@@ -1264,10 +1269,7 @@ async fn cmd_run_plan(path: &str, yes: bool, no_checkpoint: bool) -> Result<()> 
     let done_before = work.done_count();
     println!(
         "[run-plan] {} — 태스크 {}/{} 완료 상태에서 재개합니다 (executor: {})",
-        work.plan.id,
-        done_before,
-        total,
-        work.config.executor
+        work.plan.id, done_before, total, work.config.executor
     );
     let ledger = work
         .plan_path
@@ -1285,7 +1287,9 @@ async fn cmd_run_plan(path: &str, yes: bool, no_checkpoint: bool) -> Result<()> 
             .unwrap_or_default();
         println!("  {:?} {} (시도 {}회){reason}", r.state, r.id, r.attempts);
     }
-    let all_done = reports.iter().all(|r| r.state == rafikx::verify::TaskState::Done);
+    let all_done = reports
+        .iter()
+        .all(|r| r.state == rafikx::verify::TaskState::Done);
     if all_done {
         println!("[run-plan] 계획 전체 완료 — 각 태스크는 시스템 검증을 통과했다.");
         Ok(())
@@ -1340,7 +1344,11 @@ fn cmd_facts(cli: &Cli) -> Result<()> {
         return Ok(());
     }
     for r in rows {
-        let scope = if r.project_id.is_empty() { "전역" } else { "프로젝트" };
+        let scope = if r.project_id.is_empty() {
+            "전역"
+        } else {
+            "프로젝트"
+        };
         println!("({}·{}) {}: {}", r.kind, scope, r.key, r.value);
     }
     Ok(())

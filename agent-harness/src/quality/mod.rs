@@ -552,8 +552,9 @@ fn rust_char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
     (bytes.get(cursor) == Some(&b'\'')).then_some(cursor + 1)
 }
 
-fn rust_line_facts(line: &str, state: &mut RustScanState) -> (i32, i32, bool) {
+fn rust_line_facts(line: &str, state: &mut RustScanState) -> (i32, i32, bool, String) {
     let bytes = line.as_bytes();
+    let mut visible = vec![b' '; bytes.len()];
     let mut cursor = 0usize;
     let mut opens = 0i32;
     let mut closes = 0i32;
@@ -624,10 +625,12 @@ fn rust_line_facts(line: &str, state: &mut RustScanState) -> (i32, i32, bool) {
             }
             b'{' => {
                 opens += 1;
+                visible[cursor] = bytes[cursor];
                 cursor += 1;
             }
             b'}' => {
                 closes += 1;
+                visible[cursor] = bytes[cursor];
                 cursor += 1;
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' => {
@@ -638,12 +641,21 @@ fn rust_line_facts(line: &str, state: &mut RustScanState) -> (i32, i32, bool) {
                 {
                     cursor += 1;
                 }
+                visible[start..cursor].copy_from_slice(&bytes[start..cursor]);
                 unsafe_token |= &line[start..cursor] == "unsafe";
             }
-            _ => cursor += 1,
+            _ => {
+                visible[cursor] = bytes[cursor];
+                cursor += 1;
+            }
         }
     }
-    (opens, closes, unsafe_token)
+    (
+        opens,
+        closes,
+        unsafe_token,
+        String::from_utf8_lossy(&visible).into_owned(),
+    )
 }
 
 fn rust_unsafe_line_mask(lines: &[&str]) -> Vec<bool> {
@@ -656,23 +668,20 @@ fn rust_unsafe_line_mask(lines: &[&str]) -> Vec<bool> {
 
 pub(super) fn production_line_mask(lines: &[&str]) -> Vec<bool> {
     let mut lexer = RustScanState::default();
-    let braces = lines
+    let facts = lines
         .iter()
-        .map(|line| {
-            let (opens, closes, _) = rust_line_facts(line, &mut lexer);
-            (opens, closes)
-        })
+        .map(|line| rust_line_facts(line, &mut lexer))
         .collect::<Vec<_>>();
     let mut mask = vec![true; lines.len()];
     let mut pending_cfg = None;
     let mut active = false;
     let mut opened = false;
     let mut depth = 0i32;
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
+    for index in 0..lines.len() {
+        let trimmed = facts[index].3.trim_start();
         if active {
             mask[index] = false;
-            let (opens, closes) = braces[index];
+            let (opens, closes) = (facts[index].0, facts[index].1);
             opened |= opens > 0;
             depth += opens - closes;
             if (opened && depth <= 0) || (!opened && trimmed.ends_with(';')) {
@@ -707,7 +716,7 @@ pub(super) fn production_line_mask(lines: &[&str]) -> Vec<bool> {
         }
         let start = pending_cfg.take().unwrap_or(index);
         mask[start..=index].fill(false);
-        let (opens, closes) = braces[index];
+        let (opens, closes) = (facts[index].0, facts[index].1);
         opened = opens > 0;
         depth = opens - closes;
         active = (!opened || depth > 0) && !trimmed.ends_with(';');
@@ -803,6 +812,90 @@ async fn run_quality_gate_with_contract(
         }
     }
 
+    let python = ["python3", "python"]
+        .into_iter()
+        .find(|program| profile::tool_available(program));
+    for file in changed.iter().filter(|file| {
+        Path::new(file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("py"))
+    }) {
+        match validated_changed_arg(workspace, file) {
+            Ok(Some(file)) => {
+                if let Some(program) = python {
+                    steps.push(
+                        run_argv_step(
+                            "S3-syntax",
+                            format!("{program} -m py_compile {file:?}"),
+                            program.into(),
+                            vec!["-m".into(), "py_compile".into(), file],
+                            workspace,
+                        )
+                        .await,
+                    );
+                } else {
+                    steps.push(GateStep {
+                        stage: "S3-syntax",
+                        command: format!("python -m py_compile {file:?}"),
+                        passed: false,
+                        exit_code: None,
+                        note: Some("필수 Python 구문 검사기 미설치".into()),
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(error) => steps.push(GateStep {
+                stage: "S3-syntax",
+                command: format!("python -m py_compile {file:?}"),
+                passed: false,
+                exit_code: None,
+                note: Some(error),
+            }),
+        }
+    }
+
+    let gofmt_available = profile::tool_available("gofmt");
+    for file in changed.iter().filter(|file| {
+        Path::new(file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+    }) {
+        match validated_changed_arg(workspace, file) {
+            Ok(Some(file)) => {
+                if gofmt_available {
+                    steps.push(
+                        run_argv_step(
+                            "S3-syntax",
+                            format!("gofmt -d {file:?}"),
+                            "gofmt".into(),
+                            vec!["-d".into(), file],
+                            workspace,
+                        )
+                        .await,
+                    );
+                } else {
+                    steps.push(GateStep {
+                        stage: "S3-syntax",
+                        command: format!("gofmt -d {file:?}"),
+                        passed: false,
+                        exit_code: None,
+                        note: Some("필수 Go 구문 검사기 gofmt 미설치".into()),
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(error) => steps.push(GateStep {
+                stage: "S3-syntax",
+                command: format!("gofmt -d {file:?}"),
+                passed: false,
+                exit_code: None,
+                note: Some(error),
+            }),
+        }
+    }
+
     // S5 — 보안. 내장 스캐너는 변경 파일 원문을 직접 검사한다 (항상 강제).
     let mut findings = Vec::new();
     for file in changed {
@@ -878,7 +971,7 @@ async fn run_quality_gate_with_contract(
     }
 
     // S4-smoke — 브라우저 런타임 스모크 (HTML/JS 산출물). 실측 실패(camTarget) 이후 추가된 게이트.
-    match browser::discover_entries(workspace, changed) {
+    match browser::discover_entries_for_task(workspace, changed, browser_game_required) {
         Err(error) => steps.push(GateStep {
             stage: "S4-smoke",
             command: "browser entry discovery".into(),
@@ -1035,8 +1128,19 @@ pub fn detect_duplicate_blocks(file: &str, text: &str) -> Vec<String> {
     findings
 }
 
-/// 리포트 렌더 — 사람이 읽는 형태.
-pub fn render_report(report: &QualityReport) -> String {
+const MAX_PUBLIC_REPORT_CHARS: usize = 40_000;
+
+fn public_report_field(value: &str, workspace: &Path, limit: usize) -> String {
+    let redacted = redact_tool_output(value, workspace);
+    let mut bounded = redacted.chars().take(limit).collect::<String>();
+    if redacted.chars().count() > limit {
+        bounded.push_str(" …[truncated]");
+    }
+    bounded
+}
+
+/// 리포트 렌더 — 공개 터미널·라이브 싱크에 안전한 사람이 읽는 형태.
+pub fn render_report_in_workspace(report: &QualityReport, workspace: &Path) -> String {
     let mut out = format!(
         "=== 품질 게이트 ({}) — {} ===\n",
         report.language.name(),
@@ -1044,8 +1148,13 @@ pub fn render_report(report: &QualityReport) -> String {
     );
     for s in &report.steps {
         let mark = if s.passed { "✓" } else { "✗" };
-        out.push_str(&format!("{mark} [{}] {}\n", s.stage, s.command));
+        out.push_str(&format!(
+            "{mark} [{}] {}\n",
+            s.stage,
+            public_report_field(&s.command, workspace, 1000)
+        ));
         if let Some(note) = &s.note {
+            let note = public_report_field(note, workspace, 4000);
             for line in note.lines().take(4) {
                 out.push_str(&format!("    │ {line}\n"));
             }
@@ -1054,10 +1163,27 @@ pub fn render_report(report: &QualityReport) -> String {
     for f in &report.findings {
         out.push_str(&format!(
             "✗ [S5-{}] {}:{} — {}\n",
-            f.kind, f.file, f.line, f.detail
+            f.kind,
+            public_report_field(&f.file, workspace, 1000),
+            f.line,
+            public_report_field(&f.detail, workspace, 2000)
         ));
     }
-    out
+    let redacted = redact_tool_output(&out, workspace);
+    let mut bounded = redacted
+        .chars()
+        .take(MAX_PUBLIC_REPORT_CHARS)
+        .collect::<String>();
+    if redacted.chars().count() > MAX_PUBLIC_REPORT_CHARS {
+        bounded.push_str("\n…[report truncated]\n");
+    }
+    bounded
+}
+
+/// 하위 호환 공개 API. 현재 디렉터리를 워크스페이스 경계로 사용한다.
+pub fn render_report(report: &QualityReport) -> String {
+    let workspace = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    render_report_in_workspace(report, &workspace)
 }
 
 fn looks_like_high_entropy_secret(token: &str) -> bool {
@@ -1223,18 +1349,39 @@ fn redact_url(token: &str) -> Option<String> {
         .find(['/', '?', '#'])
         .map(|index| scheme_end + index)
         .unwrap_or(token.len());
-    let mut sanitized = token.to_string();
+    let suffix_start = token[authority_end..]
+        .find(['?', '#'])
+        .map(|index| authority_end + index)
+        .unwrap_or(token.len());
+    let authority = &token[scheme_end..authority_end];
+    let mut safe_authority = authority.to_string();
     let mut changed = false;
-    if let Some(at) = token[scheme_end..authority_end].rfind('@') {
-        sanitized.replace_range(scheme_end..scheme_end + at, "[redacted]");
+    if let Some(at) = authority.rfind('@') {
+        safe_authority.replace_range(..at, "[redacted]");
         changed = true;
     }
-    if let Some(split) = sanitized.find(['?', '#']) {
-        sanitized.truncate(split);
-        sanitized.push_str("?[redacted]");
+    let safe_path = token[authority_end..suffix_start]
+        .split('/')
+        .map(|segment| {
+            if looks_like_telegram_bot_token(segment) || looks_like_aws_access_key(segment) {
+                changed = true;
+                "[redacted]"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if suffix_start < token.len() {
         changed = true;
     }
-    changed.then_some(sanitized)
+    changed.then(|| {
+        let mut sanitized = format!("{}{}{}", &token[..scheme_end], safe_authority, safe_path);
+        if suffix_start < token.len() {
+            sanitized.push_str("?[redacted]");
+        }
+        sanitized
+    })
 }
 
 fn redact_spaced_assignments(text: &str) -> String {
@@ -1517,6 +1664,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn mixed_rust_python_and_go_changes_run_each_syntax_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-mixed-language-syntax-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("temp workspace");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"mixed_language_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(root.join("src/lib.rs"), "pub fn ready() -> bool { true }\n")
+            .expect("Rust fixture");
+        std::fs::write(root.join("broken.py"), "def broken(:\n").expect("Python fixture");
+        std::fs::write(root.join("broken.go"), "package main\nfunc broken( {\n")
+            .expect("Go fixture");
+
+        let report = run_quality_gate(
+            &root,
+            &["src/lib.rs".into(), "broken.py".into(), "broken.go".into()],
+        )
+        .await;
+        for file in ["broken.py", "broken.go"] {
+            let syntax = report
+                .steps
+                .iter()
+                .find(|step| step.stage == "S3-syntax" && step.command.contains(file))
+                .unwrap_or_else(|| panic!("missing syntax step for {file}"));
+            assert!(!syntax.passed, "invalid {file} unexpectedly passed");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn only_package_free_javascript_can_skip_external_profile_tools() {
         let root = std::env::temp_dir().join(format!(
@@ -1732,6 +1913,51 @@ mod tests {
     }
 
     #[test]
+    fn service_credentials_in_url_paths_are_redacted() {
+        let telegram =
+            "https://api.telegram.org/bot123456789:AAabcdefghijklmnopqrstuvwx/sendMessage";
+        let aws = "https://example.test/build/AKIA1234567890ABCDEF/artifact";
+        let redacted =
+            redact_tool_output(&format!("{telegram}\n{aws}"), Path::new("/tmp/workspace"));
+        assert!(!redacted.contains("AAabcdefghijklmnopqrstuvwx"));
+        assert!(!redacted.contains("AKIA1234567890ABCDEF"));
+        assert_eq!(redacted.matches("[redacted]").count(), 2);
+        assert!(redacted.contains("/sendMessage"));
+        assert!(redacted.contains("/artifact"));
+    }
+
+    #[test]
+    fn public_quality_report_redacts_every_field_and_has_a_total_bound() {
+        let telegram = "123456789:AAabcdefghijklmnopqrstuvwx";
+        let aws = "AKIA1234567890ABCDEF";
+        let steps = (0..50)
+            .map(|_| GateStep {
+                stage: "S3-test",
+                command: format!("check https://api.telegram.org/bot{telegram}/run"),
+                passed: false,
+                exit_code: Some(1),
+                note: Some(format!("{aws} {}", "x".repeat(5000))),
+            })
+            .collect();
+        let report = QualityReport {
+            language: Language::Unknown,
+            steps,
+            findings: vec![security::Finding {
+                kind: "secret",
+                file: format!("src/{telegram}.rs"),
+                line: 1,
+                detail: aws.into(),
+            }],
+            passed: false,
+        };
+        let rendered = render_report_in_workspace(&report, Path::new("/tmp/workspace"));
+        assert!(!rendered.contains(telegram));
+        assert!(!rendered.contains(aws));
+        assert!(rendered.contains("[redacted]"));
+        assert!(rendered.chars().count() <= MAX_PUBLIC_REPORT_CHARS + 24);
+    }
+
+    #[test]
     fn unsafe_idiom_requires_an_adjacent_safety_justification() {
         let justified = ["// SAFETY: checked ABI", "unsafe { call(); }"];
         let unproved = ["// ordinary note", "unsafe { call(); }"];
@@ -1764,6 +1990,22 @@ mod tests {
             production_line_mask(&lines),
             [true, false, false, false, false, true]
         );
+        let disguised = [
+            "pub fn exploit() {",
+            "/*",
+            "#[cfg(test)]",
+            "mod tests {",
+            "*/",
+            "let value = 1;",
+            "let _ = unsafe/* missing proof */ { std::ptr::read_volatile(&value) };",
+            "}",
+        ];
+        assert!(
+            production_line_mask(&disguised)
+                .into_iter()
+                .all(|line| line)
+        );
+        assert!(rust_unsafe_line_mask(&disguised)[6]);
     }
 
     #[test]

@@ -757,10 +757,31 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
         remaining.sort_unstable();
         remaining.dedup();
         deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
+        let mut currently_scoped = scoped_pids(scope).await;
+        match inherited_scope_pids(scope).await {
+            Ok(pids) => currently_scoped.extend(pids),
+            Err(error) => cleanup_errors.push(error),
+        }
+        currently_scoped.sort_unstable();
+        currently_scoped.dedup();
+        deliver_sigkill(
+            program,
+            &currently_scoped,
+            &mut delivered,
+            &mut kill_failures,
+        )
+        .await;
+        let mut verdict_scope = scoped_pids(scope).await;
+        match inherited_scope_pids(scope).await {
+            Ok(pids) => verdict_scope.extend(pids),
+            Err(error) => cleanup_errors.push(error),
+        }
+        verdict_scope.sort_unstable();
+        verdict_scope.dedup();
         cleanup_errors.extend(unresolved_kill_failures(
             &delivered,
             &kill_failures,
-            &remaining,
+            &verdict_scope,
         ));
     }
     #[cfg(windows)]

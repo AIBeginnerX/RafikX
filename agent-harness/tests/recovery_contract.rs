@@ -130,7 +130,8 @@ document.addEventListener('keydown', event => {
 window.__rafikxGameTest = {
   state: () => game.mode,
   restarts: () => game.restarts,
-  forceLoss: () => { game.mode = 'lost'; render(); }
+  forceLoss: () => { game.mode = 'lost'; render(); },
+  surface: () => document.querySelector('main')
 };
 render();"#
 }
@@ -222,6 +223,17 @@ fn scripted_game_response(index: usize) -> String {
             json!({"path":"game.js","content":game_e2e_repaired_source()}),
         )]),
         4 => scripted_text_response("런타임 오류와 상태 전이를 수정했습니다."),
+        5 => scripted_tool_response(vec![
+            ("review-html", "read_file", json!({"path":"index.html"})),
+            ("review-js", "read_file", json!({"path":"game.js"})),
+        ]),
+        6 => scripted_text_response(
+            "[판정-정확성] pass — 실제 게임 파일과 상태 계약 확인\n\
+             [판정-보안] pass — 읽기 전용 검토 확인\n\
+             [판정-성능] pass — 유한 상태 전이 확인\n\
+             [판정-가독성] pass — 단일 상태 머신 확인\n\
+             [판정-API설계] pass — 공개 게임 계약 확인",
+        ),
         other => scripted_text_response(&format!("unexpected request {other}")),
     }
 }
@@ -280,7 +292,7 @@ async fn start_scripted_game_model()
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&requests);
     let server = tokio::spawn(async move {
-        for index in 0..5 {
+        for index in 0..7 {
             let (mut stream, _) = listener.accept().await.expect("scripted accept");
             let body = read_http_body(&mut stream).await.expect("scripted request");
             captured.lock().expect("request log").push(body);
@@ -936,6 +948,7 @@ window.__rafikxGameTest = {
   state: () => game.mode,
   forceLoss: () => { game.mode = 'lost'; },
   restarts: () => restartCount,
+  surface: () => document.querySelector('main'),
 };
 reset();
 frame();"#,
@@ -1070,7 +1083,10 @@ async fn browser_game_agent_repair_e2e() {
 
     let workspace = TestWorkspace::new("browser-game-agent-e2e");
     let (base_url, requests, server) = start_scripted_game_model().await;
-    let cfg = scripted_config(workspace.path(), base_url, 32_000);
+    let mut cfg = scripted_config(workspace.path(), base_url, 32_000);
+    cfg.file.harness.strict_gate = true;
+    cfg.file.harness.review_committee = false;
+    cfg.file.harness.manual_verify = Some("scripted:scripted-model".into());
     let binding = scripted_binding(
         TaskClass::Dev,
         &["todo_write", "write_file"],
@@ -1109,8 +1125,8 @@ async fn browser_game_agent_repair_e2e() {
     let mut changed = outcome.changed_files.clone();
     changed.sort();
     assert_eq!(changed, ["game.js", "index.html", "style.css"]);
-    let captured = requests.lock().expect("request log");
-    assert_eq!(captured.len(), 5);
+    let captured = requests.lock().expect("request log").clone();
+    assert_eq!(captured.len(), 7);
     assert!(
         captured[0].contains("rafikx-browser-game-contract")
             && captured[0].contains("__rafikxGameTest"),
@@ -1126,8 +1142,17 @@ async fn browser_game_agent_repair_e2e() {
         }),
         "quality repair feedback was not sent"
     );
-    drop(captured);
-
+    assert!(
+        captured
+            .iter()
+            .any(|request| request.contains("[기계 검증]"))
+            && captured.iter().any(|request| {
+                request.contains("read_file")
+                    && request.contains("index.html")
+                    && request.contains("game.js")
+            }),
+        "fresh reviewer did not inspect the repaired game"
+    );
     let report = run_quality_gate(
         workspace.path(),
         &["index.html".into(), "style.css".into(), "game.js".into()],

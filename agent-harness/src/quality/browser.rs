@@ -54,13 +54,49 @@ const PROBE_SCRIPT: &str = r#"(() => {
     if (actual !== expected) throw new Error(`expected ${expected}, got ${actual}`);
   };
   const press = code => document.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
+  const hash = value => {
+    let result = 2166136261;
+    const stride = Math.max(1, Math.floor(value.length / 50000));
+    for (let index = 0; index < value.length; index += stride) {
+      result ^= value.charCodeAt(index);
+      result = Math.imul(result, 16777619);
+    }
+    return String(result >>> 0);
+  };
+  const gameSurface = api => {
+    if (typeof api.surface !== 'function') throw new Error('window.__rafikxGameTest.surface is missing');
+    const candidate = api.surface();
+    const surface = typeof candidate === 'string' ? document.querySelector(candidate) : candidate;
+    if (!(surface instanceof Element)) throw new Error('game surface is not an Element or selector');
+    const style = getComputedStyle(surface);
+    const rect = surface.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || rect.width * rect.height < 256) {
+      throw new Error('game surface is not visibly rendered');
+    }
+    return surface;
+  };
+  const surfaceFingerprint = surface => {
+    const clone = surface.cloneNode(true);
+    clone.querySelectorAll?.('script,style,noscript').forEach(node => node.remove());
+    const parts = [clone.outerHTML || clone.textContent || ''];
+    const canvases = surface.matches('canvas') ? [surface] : Array.from(surface.querySelectorAll('canvas'));
+    for (const canvas of canvases) {
+      try { parts.push(canvas.toDataURL()); } catch (error) { parts.push(String(error)); }
+    }
+    return hash(parts.join('\n'));
+  };
+  const expectSurfaceChange = (before, after, transition) => {
+    if (before === after) throw new Error(`game surface did not change for ${transition}`);
+  };
   const runGameContract = async () => {
     if (!document.querySelector('meta[name="rafikx-browser-game-contract"][content="v1"]')) return;
     const api = window.__rafikxGameTest;
     if (!api || typeof api.state !== 'function' || typeof api.forceLoss !== 'function' || typeof api.restarts !== 'function') {
       throw new Error('window.__rafikxGameTest contract is missing');
     }
+    const surface = gameSurface(api);
     expectState(api, 'ready');
+    const readySurface = surfaceFingerprint(surface);
     const initialRestarts = Number(api.restarts());
     press('KeyR');
     await frame();
@@ -69,6 +105,8 @@ const PROBE_SCRIPT: &str = r#"(() => {
     press('Space');
     await frame();
     expectState(api, 'playing');
+    const playingSurface = surfaceFingerprint(surface);
+    expectSurfaceChange(readySurface, playingSurface, 'ready→playing');
     press('KeyR');
     await frame();
     expectState(api, 'playing');
@@ -76,6 +114,8 @@ const PROBE_SCRIPT: &str = r#"(() => {
     press('KeyP');
     await frame();
     expectState(api, 'paused');
+    const pausedSurface = surfaceFingerprint(surface);
+    expectSurfaceChange(playingSurface, pausedSurface, 'playing→paused');
     press('KeyR');
     await frame();
     expectState(api, 'paused');
@@ -83,14 +123,19 @@ const PROBE_SCRIPT: &str = r#"(() => {
     press('KeyP');
     await frame();
     expectState(api, 'playing');
+    const resumedSurface = surfaceFingerprint(surface);
+    expectSurfaceChange(pausedSurface, resumedSurface, 'paused→playing');
     api.forceLoss();
     await frame();
     expectState(api, 'lost');
+    const lostSurface = surfaceFingerprint(surface);
+    expectSurfaceChange(resumedSurface, lostSurface, 'playing→lost');
     const restarts = Number(api.restarts());
     press('KeyR');
     await frame();
     expectState(api, 'ready');
     if (Number(api.restarts()) !== restarts + 1) throw new Error('restart counter did not advance');
+    expectSurfaceChange(lostSurface, surfaceFingerprint(surface), 'lost→ready');
     console.log('__RAFIKX_GAME_SEQUENCE_READY__');
   };
   window.addEventListener('load', () => setTimeout(async () => {
@@ -116,7 +161,21 @@ pub(crate) fn entry_has_canvas(html: &str) -> bool {
 
 pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
-    entry_has_canvas(&lower)
+    let explicit_surface = entry_has_canvas(&lower)
+        || lower.contains("<svg")
+        || [
+            "id=\"game\"",
+            "id='game'",
+            "id=\"arena\"",
+            "id='arena'",
+            "id=\"board\"",
+            "id='board'",
+            "role=\"application\"",
+            "role='application'",
+        ]
+        .iter()
+        .any(|signal| lower.contains(signal));
+    explicit_surface
         && [
             "id=\"game\"",
             "id='game'",
@@ -133,6 +192,10 @@ pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
             "score",
             "lives",
             "restart",
+            "playable",
+            "controls",
+            "pause",
+            "start game",
             "game over",
             "level",
             "게임",
@@ -933,9 +996,26 @@ fn entry_reaches_changed_sources(
     Ok(matched.into_iter().collect())
 }
 
+#[cfg(test)]
 pub(crate) fn discover_entries(
     workspace: &Path,
     changed: &[String],
+) -> anyhow::Result<Vec<PathBuf>> {
+    discover_entries_with_mode(workspace, changed, false)
+}
+
+pub(crate) fn discover_entries_for_task(
+    workspace: &Path,
+    changed: &[String],
+    exhaustive: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    discover_entries_with_mode(workspace, changed, exhaustive)
+}
+
+fn discover_entries_with_mode(
+    workspace: &Path,
+    changed: &[String],
+    exhaustive: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let root = workspace.canonicalize()?;
     let started = Instant::now();
@@ -1048,9 +1128,10 @@ pub(crate) fn discover_entries(
             }
         }
     }
-    if changed_sources
-        .iter()
-        .all(|source| covered_sources.contains(source))
+    if !exhaustive
+        && changed_sources
+            .iter()
+            .all(|source| covered_sources.contains(source))
     {
         return Ok(entries.into_iter().collect());
     }
@@ -1693,6 +1774,9 @@ mod tests {
         assert!(entry_looks_like_browser_game(
             r#"<canvas id="board"></canvas><script src="tetris-engine.js"></script>"#
         ));
+        assert!(entry_looks_like_browser_game(
+            r#"<svg id="arena"></svg><button>Start game</button>"#
+        ));
         assert!(!entry_looks_like_browser_game(
             r#"<canvas id="chart"></canvas><script src="chart.js"></script>"#
         ));
@@ -1751,6 +1835,34 @@ mod tests {
                     .expect("entry")
             ]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn game_discovery_finds_every_entry_reaching_a_shared_source() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-exhaustive-game-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("shared")).expect("source directory");
+        std::fs::write(root.join("shared/runtime.js"), "console.log('game')")
+            .expect("source fixture");
+        std::fs::write(
+            root.join("index.html"),
+            "<script src=\"shared/runtime.js\"></script>",
+        )
+        .expect("index entry");
+        std::fs::write(
+            root.join("game.html"),
+            "<script src=\"shared/runtime.js\"></script>",
+        )
+        .expect("game entry");
+
+        let entries = discover_entries_for_task(&root, &["shared/runtime.js".into()], true)
+            .expect("discover every game entry");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&root.join("index.html").canonicalize().expect("index")));
+        assert!(entries.contains(&root.join("game.html").canonicalize().expect("game")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2137,6 +2249,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn detached_game_test_state_cannot_validate_a_static_surface() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-detached-contract-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(
+            root.join("index.html"),
+            r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"></head><body><canvas id="game" width="320" height="180"></canvas><script>
+const fake = { state: 'ready', restarts: 0 };
+document.addEventListener('keydown', event => {
+  if (event.code === 'Space' && fake.state === 'ready') fake.state = 'playing';
+  else if (event.code === 'KeyP' && fake.state === 'playing') fake.state = 'paused';
+  else if (event.code === 'KeyP' && fake.state === 'paused') fake.state = 'playing';
+  else if (event.code === 'KeyR' && fake.state === 'lost') { fake.state = 'ready'; fake.restarts += 1; }
+});
+window.__rafikxGameTest = {
+  state: () => fake.state,
+  restarts: () => fake.restarts,
+  forceLoss: () => { fake.state = 'lost'; },
+  surface: () => document.querySelector('#game')
+};
+</script></body></html>"#,
+        )
+        .expect("detached fixture");
+
+        let error = smoke_test_in_workspace_with_contract(&root, &root.join("index.html"), true)
+            .await
+            .expect_err("detached state must fail");
+        assert!(
+            error.to_string().contains("surface did not change"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn staging_entry_limit_fails_closed() {
         let root =
@@ -2150,8 +2302,7 @@ mod tests {
 
         let error =
             stage_web_root_with_limits(&workspace, &entry, &stage, 1, Duration::from_secs(1))
-                .err()
-                .expect("entry limit must fail");
+                .expect_err("entry limit must fail");
         assert!(error.to_string().contains("항목 수"), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }

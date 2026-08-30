@@ -217,7 +217,7 @@ strategy = "single"            # single | multi  (한 모델 고정 | 역할별 
 # manual_verify = ""           # 검증 · 독립 검증자 게이트가 쓰는 모델
 # manual_debug = ""            # 디버깅 (dev)
 # manual_model = ""            # 전역 수동 모델 (provider:model)
-# strict_gate = true           # 독립 검증자 게이트 (claude/kimi 엔진 · dev|advanced 에서 동작)
+# strict_gate = true           # 독립 검증자 게이트 (기본 rafikx와 Strict 엔진 · dev|advanced)
 # review_committee = true     # 위원회 모드 — 게이트를 5개 독립 관점(정확성·보안·성능·가독성·API)으로 순차 심사
 # team = "single"              # single | multi  (/team 으로 변경)
                                # multi 는 계획 확정 후 독립 단계를 역할 서브에이전트로 위임합니다 (연속 위임은 병렬 실행).

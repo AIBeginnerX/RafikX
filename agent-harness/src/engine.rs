@@ -173,7 +173,7 @@ static CATALOG: &[EngineSpec] = &[
         prompt_block: Cow::Borrowed(""),
         force_staged: false,
         plan_depth: PlanDepth::Brief,
-        verify_policy: VerifyPolicy::Auto,
+        verify_policy: VerifyPolicy::Strict,
         max_continuations: 8,
         pin_provider: None,
         pin_strict: false,
@@ -494,7 +494,9 @@ mod tests {
         let qwen = resolve("qwen").expect("qwen");
         assert_eq!(qwen.verify_policy, VerifyPolicy::Auto);
         // 기본 엔진은 증강하지 않는다.
-        assert!(resolve("rafikx").expect("rafikx").prompt_block.is_empty());
+        let rafikx = resolve("rafikx").expect("rafikx");
+        assert!(rafikx.prompt_block.is_empty());
+        assert_eq!(rafikx.verify_policy, VerifyPolicy::Strict);
         // 나머지는 모두 프롬프트 블록을 갖는다.
         for spec in catalog().iter().filter(|s| s.name != "rafikx") {
             assert!(!spec.prompt_block.is_empty(), "{} 블록 없음", spec.name);
