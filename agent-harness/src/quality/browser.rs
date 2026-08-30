@@ -91,6 +91,25 @@ const PROBE_SCRIPT: &str = r#"(() => {
   const normalizedNumber = value => Number.isFinite(Number(value))
     ? String(Math.round(Number(value) * 1000) / 1000)
     : String(value);
+  const matrixEvidence = value => {
+    if (value === undefined || value === null) return 'matrix:1:0:0:1:0:0';
+    try {
+      const component = (primary, alias, fallback) => {
+        const candidate = value[primary] ?? value[alias] ?? fallback;
+        return Number.isFinite(Number(candidate)) ? normalizedNumber(candidate) : null;
+      };
+      const components = [
+        component('a', 'm11', 1), component('b', 'm12', 0),
+        component('c', 'm21', 0), component('d', 'm22', 1),
+        component('e', 'm41', 0), component('f', 'm42', 0),
+      ];
+      return components.some(component => component === null)
+        ? null
+        : `matrix:${components.join(':')}`;
+    } catch (_) {
+      return null;
+    }
+  };
   const mix = (seed, value) => {
     let result = seed >>> 0;
     for (let index = 0; index < value.length; index += 1) {
@@ -164,9 +183,10 @@ const PROBE_SCRIPT: &str = r#"(() => {
         const tracker = pathTrackers.get(this) || newPathTracker();
         if (method === 'addPath' && args[0] instanceof nativePath2D) {
           const source = pathTrackers.get(args[0]);
-          if (!source?.trusted) tracker.trusted = false;
+          const transform = matrixEvidence(args[1]);
+          if (!source?.trusted || transform === null) tracker.trusted = false;
           else {
-            pathCommand(tracker, 'addPath', [source.digest, source.commands, args[1] || '']);
+            pathCommand(tracker, 'addPath', [source.digest, source.commands, transform]);
             tracker.drawable ||= source.drawable;
           }
         } else {
@@ -237,6 +257,12 @@ const PROBE_SCRIPT: &str = r#"(() => {
   const trackedCanvasEvidence = source => {
     const tracker = canvasTrackers.get(source);
     if (!tracker?.trusted || !tracker.hasEligibleContent) return null;
+    if (!(source.width > 0 && source.height > 0)
+        || source.width > MAX_CANVAS_DIMENSION || source.height > MAX_CANVAS_DIMENSION
+        || source.width * source.height > MAX_CANVAS_PIXELS) {
+      tracker.trusted = false;
+      return null;
+    }
     if (tracker.frameOperations.size > 0) {
       tracker.lastContentDigest = canvasFrameDigest(tracker);
       if (!tracker.observing) resetCanvasFrame(tracker);
@@ -408,17 +434,72 @@ const PROBE_SCRIPT: &str = r#"(() => {
   };
   wrapGetContext(globalThis.HTMLCanvasElement);
   wrapGetContext(globalThis.OffscreenCanvas);
+  const imageBitmapArgumentEvidence = args => {
+    if (args.length > 5) return null;
+    try {
+      const values = args.map(value => {
+        if (typeof value === 'number') return `number:${normalizedNumber(value)}`;
+        if (value === undefined) return 'undefined';
+        if (value === null || typeof value !== 'object') return null;
+        const keys = [
+          'imageOrientation', 'premultiplyAlpha', 'colorSpaceConversion',
+          'resizeWidth', 'resizeHeight', 'resizeQuality',
+        ];
+        return `options:${keys.map(key => {
+          const candidate = value[key];
+          return `${key}=${typeof candidate === 'number' ? normalizedNumber(candidate) : String(candidate ?? '')}`;
+        }).join(',')}`;
+      });
+      const rendered = values.some(value => value === null) ? null : values.join('|');
+      return rendered !== null && rendered.length <= MAX_CANVAS_OPERATION_BYTES ? rendered : null;
+    } catch (_) {
+      return null;
+    }
+  };
   if (typeof globalThis.createImageBitmap === 'function') {
     const original = globalThis.createImageBitmap;
     globalThis.createImageBitmap = async function(source, ...args) {
-      const bitmap = await Reflect.apply(original, this, [source, ...args]);
-      const digest = ((typeof HTMLCanvasElement !== 'undefined' && source instanceof HTMLCanvasElement)
+      const sourceDigest = ((typeof HTMLCanvasElement !== 'undefined' && source instanceof HTMLCanvasElement)
           || (typeof OffscreenCanvas !== 'undefined' && source instanceof OffscreenCanvas))
         ? trackedCanvasEvidence(source)
         : null;
-      if (digest) bitmapTrackers.set(bitmap, { trusted: true, eligible: true, digest });
+      const argumentDigest = imageBitmapArgumentEvidence(args);
+      const bitmap = await Reflect.apply(original, this, [source, ...args]);
+      if (sourceDigest && argumentDigest !== null) {
+        bitmapTrackers.set(bitmap, {
+          trusted: true,
+          eligible: true,
+          digest: hash(`${sourceDigest}|createImageBitmap|${argumentDigest}`),
+        });
+      }
       return bitmap;
     };
+  }
+  if (typeof globalThis.OffscreenCanvas === 'function') {
+    const original = globalThis.OffscreenCanvas.prototype.transferToImageBitmap;
+    if (typeof original === 'function' && !original[wrappedMethod]) {
+      const wrapped = function(...args) {
+        const sourceDigest = trackedCanvasEvidence(this);
+        const bitmap = Reflect.apply(original, this, args);
+        if (sourceDigest) {
+          bitmapTrackers.set(bitmap, {
+            trusted: true,
+            eligible: true,
+            digest: hash(`${sourceDigest}|transferToImageBitmap`),
+          });
+        }
+        const tracker = canvasTrackers.get(this);
+        if (tracker) {
+          resetCanvasFrame(tracker);
+          tracker.hasEligibleContent = false;
+          tracker.lastContentDigest = '';
+          tracker.samples = [];
+        }
+        return bitmap;
+      };
+      wrapped[wrappedMethod] = true;
+      globalThis.OffscreenCanvas.prototype.transferToImageBitmap = wrapped;
+    }
   }
   const canvasVisualFingerprint = tracker => {
     const canvas = tracker.canvas;
@@ -504,12 +585,24 @@ const PROBE_SCRIPT: &str = r#"(() => {
     }
   };
   const visiblyRendered = element => {
-    const style = getComputedStyle(element);
+    let current = element;
+    while (current instanceof Element) {
+      const style = getComputedStyle(current);
+      if (style.display === 'none'
+          || style.visibility === 'hidden'
+          || style.visibility === 'collapse'
+          || style.contentVisibility === 'hidden'
+          || Number(style.opacity) <= 0) return false;
+      if (current.parentElement) current = current.parentElement;
+      else {
+        const root = current.getRootNode();
+        current = typeof ShadowRoot !== 'undefined' && root instanceof ShadowRoot
+          ? root.host
+          : null;
+      }
+    }
     const rect = element.getBoundingClientRect();
-    return style.display !== 'none'
-      && style.visibility !== 'hidden'
-      && Number(style.opacity) !== 0
-      && rect.width * rect.height >= 1
+    return rect.width * rect.height >= 1
       && rect.bottom > 0
       && rect.right > 0
       && rect.top < innerHeight
@@ -3099,6 +3192,138 @@ const drawPlaying = tick => {
         .expect("moving Path2D contract")
         .expect("installed browser");
         assert!(errors.is_empty(), "browser errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    async fn path2d_dictionary_transform_changes_are_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let errors = canvas_contract_fixture(
+            "path2d-transform",
+            r#"
+const unit = new Path2D();
+unit.rect(0, 0, 32, 32);
+const drawPlaying = tick => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  const path = new Path2D();
+  path.addPath(unit, { e: 20 + (tick % 120), f: 70 });
+  context.fillStyle = '#a855f7';
+  context.fill(path);
+};
+"#,
+        )
+        .await
+        .expect("Path2D dictionary transform contract")
+        .expect("installed browser");
+        assert!(errors.is_empty(), "browser errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    async fn real_offscreen_canvas_bitmap_paths_are_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let errors = canvas_contract_fixture(
+            "offscreen-bitmap",
+            r#"
+const source = new OffscreenCanvas(canvas.width, canvas.height);
+const sourceContext = source.getContext('2d');
+const drawPlaying = tick => {
+  sourceContext.clearRect(0, 0, source.width, source.height);
+  sourceContext.fillStyle = '#f97316';
+  sourceContext.fillRect(20 + (tick % 120), 70, 32, 32);
+  const bitmap = source.transferToImageBitmap();
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0);
+  bitmap.close();
+};
+"#,
+        )
+        .await
+        .expect("real OffscreenCanvas transfer contract")
+        .expect("installed browser");
+        assert!(errors.is_empty(), "browser errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    async fn create_image_bitmap_crop_and_resize_are_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let errors = canvas_contract_fixture(
+            "bitmap-crop-resize",
+            r#"
+const source = new OffscreenCanvas(640, 180);
+const sourceContext = source.getContext('2d');
+for (let index = 0; index < 20; index += 1) {
+  sourceContext.fillStyle = `hsl(${index * 18} 80% 55%)`;
+  sourceContext.fillRect(index * 32, 0, 32, source.height);
+}
+let latestBitmap;
+const drawPlaying = async tick => {
+  const bitmap = await createImageBitmap(source, tick % 320, 0, 320, 180, {
+    resizeWidth: 320, resizeHeight: 180, resizeQuality: 'pixelated'
+  });
+  latestBitmap?.close();
+  latestBitmap = bitmap;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0);
+};
+"#,
+        )
+        .await
+        .expect("createImageBitmap crop and resize contract")
+        .expect("installed browser");
+        assert!(errors.is_empty(), "browser errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    async fn oversized_offscreen_source_cannot_prove_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let error = canvas_contract_fixture(
+            "oversized-offscreen",
+            r#"
+const source = new OffscreenCanvas(8193, 1);
+const sourceContext = source.getContext('2d');
+const drawPlaying = tick => {
+  sourceContext.clearRect(0, 0, source.width, source.height);
+  sourceContext.fillStyle = '#0ea5e9';
+  sourceContext.fillRect((tick * 10) % 8000, 0, 193, 1);
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+};
+"#,
+        )
+        .await
+        .expect_err("oversized OffscreenCanvas source must fail closed");
+        assert!(
+            error.to_string().contains("playing gameplay progress"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_canvas_ancestor_cannot_satisfy_the_game_contract() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let error = canvas_contract_fixture(
+            "hidden-ancestor",
+            r#"
+document.body.style.opacity = '0';
+const drawPlaying = tick => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#22c55e';
+  context.fillRect(20 + (tick % 120), 70, 32, 32);
+};
+"#,
+        )
+        .await
+        .expect_err("Canvas under a transparent ancestor must fail closed");
+        assert!(error.to_string().contains("visibly rendered"), "{error}");
     }
 
     #[tokio::test]

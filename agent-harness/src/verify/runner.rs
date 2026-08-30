@@ -2,11 +2,9 @@
 //! exit code·diff·무결성 가드 결과를 증거로 수집한다. 모델 출력은 어디에도
 //! 판정 입력으로 쓰이지 않는다.
 
-use std::process::Stdio;
 use std::time::Instant;
 
 use anyhow::Result;
-use tokio::process::Command;
 
 use super::guard;
 use super::task::{CmdResults, DiffInfo, Evidence, TaskDoc, TaskOutcome, VerifiedReport};
@@ -14,56 +12,56 @@ use crate::verify::task::VerifierVerdict;
 
 /// 한 명령을 직접 실행해 증거로 변환한다. 모델이 본 텍스트를 넘겨도 무의미하다 —
 /// 판정 근거는 이 함수가 반환하는 exit code 뿐이다 (레드팀 시나리오 2).
-async fn run_cmd(cmd: &str, timeout_secs: u64) -> Evidence {
+async fn run_cmd(cmd: &str, timeout_secs: u64, workspace: &std::path::Path) -> Evidence {
     let started = Instant::now();
-    let output = tokio::time::timeout(
+    #[cfg(windows)]
+    let (program, args) = (
+        "cmd",
+        vec![
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            cmd.to_string(),
+        ],
+    );
+    #[cfg(not(windows))]
+    let (program, args) = ("sh", vec!["-c".to_string(), cmd.to_string()]);
+    let output = crate::quality::run_bounded_command(
+        program,
+        &args,
+        workspace,
         std::time::Duration::from_secs(timeout_secs),
-        Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
     )
     .await;
     let duration_ms = started.elapsed().as_millis();
     match output {
-        Err(_) => Evidence {
+        Err(error) => Evidence {
             cmd: cmd.to_string(),
             exit_code: None,
             expect_exit: 0,
             passed: false,
             duration_ms,
-            output_tail: format!("시간 초과 ({timeout_secs}초)"),
+            output_tail: error,
             diff_stat: None,
             guard: None,
             tests_passed: None,
             recorded_at: now_secs(),
         },
-        Ok(Err(e)) => Evidence {
-            cmd: cmd.to_string(),
-            exit_code: None,
-            expect_exit: 0,
-            passed: false,
-            duration_ms,
-            output_tail: format!("실행 실패: {e}"),
-            diff_stat: None,
-            guard: None,
-            tests_passed: None,
-            recorded_at: now_secs(),
-        },
-        Ok(Ok(out)) => {
-            let exit_code = out.status.code();
+        Ok(out) => {
+            let exit_code = (!out.overflow).then(|| out.status.code()).flatten();
             let combined = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            let tail: String = {
+            let mut tail: String = {
                 let lines: Vec<&str> = combined.lines().collect();
                 let skip = lines.len().saturating_sub(20);
                 lines[skip..].join("\n").chars().take(2000).collect()
             };
+            if out.overflow {
+                tail = format!("출력 상한 초과 — 검증을 신뢰할 수 없습니다\n{tail}");
+            }
             Evidence {
                 cmd: cmd.to_string(),
                 exit_code,
@@ -157,28 +155,35 @@ fn now_secs() -> i64 {
 }
 
 /// 워크스페이스의 변경 요약을 수집한다 (git 있으면 diff, 없으면 None).
-async fn collect_diff(workspace: &std::path::Path) -> DiffInfo {
-    let stat = Command::new("git")
-        .args(["diff", "--stat", "HEAD"])
-        .current_dir(workspace)
-        .output()
-        .await
-        .ok();
-    let diff = Command::new("git")
-        .args(["diff", "HEAD"])
-        .current_dir(workspace)
-        .output()
-        .await
-        .ok();
-    let read = |out: &Option<std::process::Output>| {
-        out.as_ref()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-    };
-    DiffInfo {
-        stat: read(&stat),
-        diff_text: read(&diff),
+async fn collect_git_output(
+    workspace: &std::path::Path,
+    args: &[&str],
+) -> Result<Option<String>, String> {
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let output = crate::quality::run_bounded_command(
+        "git",
+        &args,
+        workspace,
+        std::time::Duration::from_secs(10),
+    )
+    .await?;
+    if output.overflow {
+        return Err(format!("git {} 출력 상한 초과", args.join(" ")));
     }
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string()))
+}
+
+async fn collect_diff(workspace: &std::path::Path) -> Result<DiffInfo, String> {
+    Ok(DiffInfo {
+        stat: collect_git_output(workspace, &["diff", "--stat", "HEAD"]).await?,
+        diff_text: collect_git_output(workspace, &["diff", "HEAD"]).await?,
+    })
 }
 
 /// 태스크 검증 전체 흐름 — 명령 실행 → diff 수집 → 무결성 가드 → 판정.
@@ -190,7 +195,7 @@ pub async fn run_task_verification(
     // 1) 명령 실행 — 시스템이 직접.
     let mut evidences = Vec::new();
     for vc in &task.verification {
-        let mut ev = run_cmd(&vc.cmd, vc.timeout_secs).await;
+        let mut ev = run_cmd(&vc.cmd, vc.timeout_secs, workspace).await;
         ev.expect_exit = vc.expect_exit;
         ev.passed = ev.exit_code == Some(vc.expect_exit);
         evidences.push(ev);
@@ -198,7 +203,10 @@ pub async fn run_task_verification(
     let results = CmdResults::new(evidences);
 
     // 2) diff 수집 — "수정 없는 완료" 차단의 근거.
-    let diff = collect_diff(workspace).await;
+    let diff = match collect_diff(workspace).await {
+        Ok(diff) => diff,
+        Err(error) => return TaskOutcome::Rework(format!("diff 수집 실패: {error}")),
+    };
     let diff_empty = diff
         .stat
         .as_deref()
@@ -316,6 +324,62 @@ mod tests {
         let state = t.apply(outcome);
         assert_eq!(*state, TaskState::Rework, "diff 부재는 Rework");
         assert!(t.evidence.last().unwrap().output_tail.contains("diff 부재"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_verification_cleans_up_descendants() {
+        let dir =
+            std::env::temp_dir().join(format!("rk-verify-timeout-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("escaped");
+        let command = format!(
+            "(sleep 2; printf escaped > \"{}\") & sleep 30",
+            marker.display()
+        );
+
+        let evidence = run_cmd(&command, 1, &dir).await;
+
+        assert!(!evidence.passed);
+        assert!(evidence.output_tail.contains("시간 초과"));
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert!(
+            !marker.exists(),
+            "시간 초과한 자손 프로세스가 살아남았습니다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_verification_output_fails_closed() {
+        let evidence = run_cmd(
+            "yes rafikx | head -c 300000",
+            5,
+            std::env::temp_dir().as_path(),
+        )
+        .await;
+
+        assert!(!evidence.passed);
+        assert_eq!(evidence.exit_code, None);
+        assert!(evidence.output_tail.contains("출력 상한 초과"));
+    }
+
+    #[tokio::test]
+    async fn verification_command_runs_in_the_task_workspace() {
+        let dir =
+            std::env::temp_dir().join(format!("rk-verify-workspace-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("workspace-marker"), "ok").unwrap();
+
+        #[cfg(windows)]
+        let command = "if exist workspace-marker (exit 0) else (exit 7)";
+        #[cfg(not(windows))]
+        let command = "test -f workspace-marker";
+        let evidence = run_cmd(command, 5, &dir).await;
+
+        assert!(evidence.passed, "{}", evidence.output_tail);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

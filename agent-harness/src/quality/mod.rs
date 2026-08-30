@@ -47,11 +47,11 @@ pub struct QualityReport {
 const MAX_QUALITY_STREAM_BYTES: usize = 128 * 1024;
 const QUALITY_READER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-pub(super) struct BoundedCommandOutput {
-    pub(super) status: ExitStatus,
-    pub(super) stdout: Vec<u8>,
-    pub(super) stderr: Vec<u8>,
-    pub(super) overflow: bool,
+pub(crate) struct BoundedCommandOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) overflow: bool,
 }
 
 async fn read_bounded_tail<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
@@ -107,7 +107,7 @@ async fn await_bounded_readers(
     Ok((stdout, stderr, stdout_overflow || stderr_overflow))
 }
 
-pub(super) async fn run_bounded_command(
+pub(crate) async fn run_bounded_command(
     program: &str,
     args: &[String],
     workspace: &Path,

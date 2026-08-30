@@ -3,11 +3,15 @@ use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::ExitStatus;
 use std::process::Stdio;
 #[cfg(unix)]
 use std::sync::Mutex;
@@ -19,7 +23,7 @@ use std::time::Duration;
 use windows_job::WindowsJob;
 
 #[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 #[cfg(unix)]
@@ -30,6 +34,213 @@ static PROCESS_SCOPE_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 const PROCESS_SCOPE_ENV: &str = "RAFIKX_PROCESS_SCOPE";
 #[cfg(unix)]
 const MAX_SCOPE_SCAN_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+const PROCESS_STOP_SIGNAL: i32 = 19;
+#[cfg(all(unix, not(target_os = "linux")))]
+const PROCESS_STOP_SIGNAL: i32 = 17;
+#[cfg(unix)]
+const PROCESS_KILL_SIGNAL: i32 = 9;
+
+#[cfg(unix)]
+trait GenerationBoundProcess {
+    fn pid(&self) -> u32;
+    fn signal(&self, signal: i32) -> Result<(), String>;
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ProcessIdentity {
+    pid: u32,
+    pidfd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+// SAFETY: `syscall` uses the platform C ABI. Calls below pass only integer values and a null
+// siginfo pointer for Linux pidfd_open/pidfd_send_signal, and check -1 through errno.
+unsafe extern "C" {
+    fn syscall(number: std::os::raw::c_long, ...) -> std::os::raw::c_long;
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessIdentity {
+    const PIDFD_OPEN: std::os::raw::c_long = 434;
+    const PIDFD_SEND_SIGNAL: std::os::raw::c_long = 424;
+
+    fn capture(pid: u32) -> Result<Option<Self>, String> {
+        // SAFETY: pidfd_open takes a numeric pid and zero flags and returns a new descriptor.
+        let descriptor = unsafe { syscall(Self::PIDFD_OPEN, pid as i32, 0u32) };
+        if descriptor == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(3) {
+                return Ok(None);
+            }
+            return Err(format!("PID {pid} pidfd 획득 실패: {error}"));
+        }
+        // SAFETY: A successful pidfd_open returns a uniquely owned descriptor.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+        Ok(Some(Self { pid, pidfd }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl GenerationBoundProcess for ProcessIdentity {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn signal(&self, signal: i32) -> Result<(), String> {
+        // SAFETY: The pidfd is live and owned by `self`; null siginfo with zero flags requests the
+        // ordinary signal operation for exactly the process generation captured by this fd.
+        let result = unsafe {
+            syscall(
+                Self::PIDFD_SEND_SIGNAL,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<std::ffi::c_void>(),
+                0u32,
+            )
+        };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(3) {
+                return Ok(());
+            }
+            return Err(format!(
+                "PID {} pidfd 신호 {signal} 실패: {error}",
+                self.pid
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct AuditToken {
+    value: [u32; 8],
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct ProcessIdentity {
+    pid: u32,
+    audit_token: AuditToken,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Debug, Default)]
+struct ProcUniqueIdentifierInfo {
+    executable_uuid: [u8; 16],
+    unique_id: u64,
+    parent_unique_id: u64,
+    pid_version: i32,
+    reserved_2: u32,
+    reserved_3: u64,
+    reserved_4: u64,
+}
+
+#[cfg(target_os = "macos")]
+// SAFETY: These signatures and layouts match libproc's proc_pidinfo and audit-token APIs.
+unsafe extern "C" {
+    fn proc_pidinfo(
+        pid: i32,
+        flavor: i32,
+        arg: u64,
+        buffer: *mut std::ffi::c_void,
+        size: i32,
+    ) -> i32;
+    fn proc_signal_with_audittoken(token: *mut AuditToken, signal: i32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessIdentity {
+    const PROC_PID_UNIQUE_IDENTIFIER_INFO: i32 = 17;
+
+    fn capture(pid: u32) -> Result<Option<Self>, String> {
+        let mut identity = ProcUniqueIdentifierInfo::default();
+        let expected = std::mem::size_of::<ProcUniqueIdentifierInfo>() as i32;
+        // SAFETY: `identity` is a writable buffer with the size and repr(C) layout for flavor 17.
+        let read = unsafe {
+            proc_pidinfo(
+                pid as i32,
+                Self::PROC_PID_UNIQUE_IDENTIFIER_INFO,
+                0,
+                (&raw mut identity).cast(),
+                expected,
+            )
+        };
+        if read != expected || identity.unique_id == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(3) {
+                return Ok(None);
+            }
+            return Err(format!("PID {pid} 고유 신원 조회 실패: {error}"));
+        }
+        let mut token = AuditToken { value: [0; 8] };
+        token.value[5] = pid;
+        token.value[7] = identity.pid_version as u32;
+        Ok(Some(Self {
+            pid,
+            audit_token: token,
+        }))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl GenerationBoundProcess for ProcessIdentity {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn signal(&self, signal: i32) -> Result<(), String> {
+        let mut token = self.audit_token;
+        // SAFETY: `token` contains the captured pid-version and remains writable for libproc.
+        let error = unsafe { proc_signal_with_audittoken(&raw mut token, signal) };
+        if error != 0 {
+            if error == 3 {
+                return Ok(());
+            }
+            return Err(format!(
+                "PID {} audit-token 신호 {signal} 실패: {}",
+                self.pid,
+                std::io::Error::from_raw_os_error(error)
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[derive(Debug)]
+struct ProcessIdentity {
+    pid: u32,
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+impl ProcessIdentity {
+    fn capture(pid: u32) -> Result<Option<Self>, String> {
+        Err(format!(
+            "PID {pid}: 이 Unix 플랫폼에는 세대 고정 프로세스 신원 API가 없습니다"
+        ))
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+impl GenerationBoundProcess for ProcessIdentity {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn signal(&self, _signal: i32) -> Result<(), String> {
+        Err(format!(
+            "PID {}: 세대가 확인되지 않은 프로세스에는 신호를 보내지 않습니다",
+            self.pid
+        ))
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ProcessScope {
@@ -395,25 +606,86 @@ async fn run_killer(program: &str, args: &[String]) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-async fn descendant_pids(root: u32) -> Vec<u32> {
+async fn read_bounded_output<R>(mut reader: R) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let mut overflow = false;
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_SCOPE_SCAN_BYTES.saturating_sub(output.len());
+        output.extend_from_slice(&chunk[..read.min(remaining)]);
+        overflow |= read > remaining;
+    }
+    Ok((output, overflow))
+}
+
+#[cfg(unix)]
+async fn run_bounded_utility(
+    command: &mut Command,
+    label: &str,
+    deadline: Duration,
+) -> Result<(ExitStatus, Vec<u8>), String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{label} 실행 실패: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label} 표준 출력을 열 수 없습니다"))?;
+    let reader = tokio::spawn(read_bounded_output(stdout));
+    let status = match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = reader.await;
+            return Err(format!("{label} 대기 실패: {error}"));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = reader.await;
+            return Err(format!("{label} 시간 초과"));
+        }
+    };
+    let (output, overflow) = reader
+        .await
+        .map_err(|error| format!("{label} 출력 작업 실패: {error}"))?
+        .map_err(|error| format!("{label} 출력 수집 실패: {error}"))?;
+    if overflow {
+        return Err(format!("{label} 출력 상한을 초과했습니다"));
+    }
+    Ok((status, output))
+}
+
+#[cfg(unix)]
+async fn descendant_pids(root: u32) -> Result<Vec<u32>, String> {
     let program = if std::path::Path::new("/bin/ps").is_file() {
         "/bin/ps"
     } else {
         "/usr/bin/ps"
     };
     let mut command = Command::new(program);
-    command
-        .args(["-axo", "pid=,ppid="])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(2), command.output()).await
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
+    command.args(["-axo", "pid=,ppid="]);
+    let (status, output) =
+        run_bounded_utility(&mut command, "프로세스 트리 조회", Duration::from_secs(2)).await?;
+    if !status.success() {
+        return Err(format!(
+            "프로세스 트리 조회 실패 (exit {:?})",
+            status.code()
+        ));
     }
-    let relations = String::from_utf8_lossy(&output.stdout)
+    let relations = String::from_utf8_lossy(&output)
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
@@ -432,74 +704,46 @@ async fn descendant_pids(root: u32) -> Vec<u32> {
             }
         }
     }
-    descendants.into_iter().collect()
+    Ok(descendants.into_iter().collect())
 }
 
 #[cfg(unix)]
-async fn scoped_pids(scope: &ProcessScope) -> Vec<u32> {
+async fn scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
     let program = if std::path::Path::new("/bin/ps").is_file() {
         "/bin/ps"
     } else {
         "/usr/bin/ps"
     };
     let mut command = Command::new(program);
-    command
-        .args(["eww", "-axo", "pid=,command="])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return Vec::new();
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        return Vec::new();
-    };
-    let needle = format!("{PROCESS_SCOPE_ENV}={}", scope.marker).into_bytes();
-    let scan = async move {
-        let mut reader = BufReader::new(stdout);
-        let mut line = Vec::new();
-        let mut total = 0usize;
-        let mut matches = std::collections::BTreeSet::new();
-        loop {
-            line.clear();
-            let read = match reader.read_until(b'\n', &mut line).await {
-                Ok(read) => read,
-                Err(_) => break,
-            };
-            if read == 0 {
-                break;
-            }
-            total = total.saturating_add(read);
-            if total > MAX_SCOPE_SCAN_BYTES {
-                break;
-            }
-            if contains_scope_marker(&line, &needle)
-                && let Some(pid) = String::from_utf8_lossy(&line)
-                    .split_whitespace()
-                    .next()
-                    .and_then(|field| field.parse::<u32>().ok())
-            {
-                matches.insert(pid);
-            }
-        }
-        matches.into_iter().collect::<Vec<_>>()
-    };
-    let matches = match tokio::time::timeout(Duration::from_secs(2), scan).await {
-        Ok(matches) => matches,
-        Err(_) => {
-            let _ = child.kill().await;
-            Vec::new()
-        }
-    };
-    if tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    command.args(["eww", "-axo", "pid=,command="]);
+    let (status, output) = run_bounded_utility(
+        &mut command,
+        "프로세스 scope 환경 조회",
+        Duration::from_secs(2),
+    )
+    .await?;
+    if !status.success() {
+        return Err(format!(
+            "프로세스 scope 환경 조회 실패 (exit {:?})",
+            status.code()
+        ));
     }
-    matches
+    let needle = format!("{PROCESS_SCOPE_ENV}={}", scope.marker).into_bytes();
+    Ok(output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            contains_scope_marker(line, &needle)
+                .then(|| {
+                    String::from_utf8_lossy(line)
+                        .split_whitespace()
+                        .next()
+                        .and_then(|field| field.parse::<u32>().ok())
+                })
+                .flatten()
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -552,30 +796,18 @@ async fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
     let mut last_failure = String::new();
     for attempt in 0..2 {
         let mut command = Command::new(program);
-        command
-            .args(["-Fp", "--"])
-            .arg(&scope.marker_path)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-        let output = tokio::time::timeout(Duration::from_secs(3), command.output())
-            .await
-            .map_err(|_| "프로세스 scope lsof 시간 초과".to_string())?
-            .map_err(|error| format!("프로세스 scope lsof 실패: {error}"))?;
-        if output.stdout.len() > MAX_SCOPE_SCAN_BYTES {
-            return Err("프로세스 scope lsof 출력 상한을 초과했습니다".into());
-        }
-        if output.status.success() || output.status.code() == Some(1) {
-            return Ok(String::from_utf8_lossy(&output.stdout)
+        command.args(["-Fp", "--"]).arg(&scope.marker_path);
+        let (status, output) =
+            run_bounded_utility(&mut command, "프로세스 scope lsof", Duration::from_secs(3))
+                .await?;
+        if status.success() || status.code() == Some(1) {
+            return Ok(String::from_utf8_lossy(&output)
                 .lines()
                 .filter_map(|line| line.strip_prefix('p')?.parse::<u32>().ok())
                 .filter(|pid| *pid != std::process::id())
                 .collect());
         }
-        last_failure = format!(
-            "종료 코드 {:?}, 신호 {:?}",
-            output.status.code(),
-            output.status.signal()
-        );
+        last_failure = format!("종료 코드 {:?}, 신호 {:?}", status.code(), status.signal());
         if attempt == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -614,63 +846,77 @@ fn contains_scope_marker(line: &[u8], needle: &[u8]) -> bool {
 }
 
 #[cfg(unix)]
-async fn signal_pids(program: &str, signal: &str, pids: &[u32]) -> Result<(), String> {
-    if pids.is_empty() {
-        return Ok(());
+async fn discover_scope_pids(
+    scope: &ProcessScope,
+    root: Option<u32>,
+    cleanup_errors: &mut Vec<String>,
+) -> Vec<u32> {
+    let mut discovered = match scoped_pids(scope).await {
+        Ok(pids) => pids,
+        Err(error) => {
+            cleanup_errors.push(error);
+            Vec::new()
+        }
+    };
+    match inherited_scope_pids(scope).await {
+        Ok(pids) => discovered.extend(pids),
+        Err(error) => cleanup_errors.push(error),
     }
-    let mut args = Vec::with_capacity(pids.len() + 1);
-    args.push(signal.to_string());
-    args.extend(pids.iter().map(u32::to_string));
-    run_killer(program, &args).await
+    if let Some(pid) = root {
+        match descendant_pids(pid).await {
+            Ok(pids) => discovered.extend(pids),
+            Err(error) => cleanup_errors.push(error),
+        }
+    }
+    discovered.retain(|pid| Some(*pid) != root && *pid != std::process::id());
+    discovered.sort_unstable();
+    discovered.dedup();
+    discovered
 }
 
 #[cfg(unix)]
-async fn deliver_sigkill(
-    program: &str,
-    pids: &[u32],
-    delivered: &mut std::collections::BTreeSet<u32>,
-    failures: &mut std::collections::BTreeMap<u32, String>,
+async fn capture_scoped_identities(
+    scope: &ProcessScope,
+    root: Option<u32>,
+    cleanup_errors: &mut Vec<String>,
+) -> (Vec<ProcessIdentity>, Vec<u32>) {
+    let candidates = discover_scope_pids(scope, root, cleanup_errors).await;
+    let mut captured = Vec::new();
+    let mut capture_failures = Vec::new();
+    for pid in candidates {
+        match ProcessIdentity::capture(pid) {
+            Ok(Some(identity)) => captured.push(identity),
+            Ok(None) => {}
+            Err(error) => capture_failures.push((pid, error)),
+        }
+    }
+    let revalidated = discover_scope_pids(scope, root, cleanup_errors).await;
+    captured.retain(|identity| revalidated.binary_search(&identity.pid()).is_ok());
+    for (pid, error) in capture_failures {
+        if revalidated.binary_search(&pid).is_ok() {
+            cleanup_errors.push(error);
+        }
+    }
+    (captured, revalidated)
+}
+
+#[cfg(unix)]
+fn signal_captured_processes<T: GenerationBoundProcess>(
+    identities: &[T],
+    signal: i32,
+    cleanup_errors: &mut Vec<String>,
 ) {
-    for pid in pids.iter().copied() {
-        if delivered.contains(&pid) {
-            continue;
-        }
-        match run_killer(program, &["-KILL".into(), pid.to_string()]).await {
-            Ok(()) => {
-                delivered.insert(pid);
-                failures.remove(&pid);
-            }
-            Err(error) => {
-                failures.insert(pid, error);
-            }
+    for identity in identities {
+        if let Err(error) = identity.signal(signal) {
+            cleanup_errors.push(error);
         }
     }
-}
-
-#[cfg(unix)]
-fn unresolved_kill_failures(
-    delivered: &std::collections::BTreeSet<u32>,
-    failures: &std::collections::BTreeMap<u32, String>,
-    currently_scoped: &[u32],
-) -> Vec<String> {
-    currently_scoped
-        .iter()
-        .filter(|pid| !delivered.contains(pid))
-        .map(|pid| {
-            failures.get(pid).map_or_else(
-                || format!("PID {pid}에 SIGKILL을 전달하지 못했습니다"),
-                |error| format!("PID {pid} SIGKILL 실패: {error}"),
-            )
-        })
-        .collect()
 }
 
 pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result<(), String> {
     let mut cleanup_errors = Vec::new();
     #[cfg(unix)]
     {
-        let mut delivered = std::collections::BTreeSet::new();
-        let mut kill_failures = std::collections::BTreeMap::new();
         let root = child.id();
         let program = if std::path::Path::new("/bin/kill").is_file() {
             "/bin/kill"
@@ -685,63 +931,26 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
             )
             .await;
         }
-        let mut targets = if let Some(pid) = root {
-            descendant_pids(pid).await
-        } else {
-            Vec::new()
-        };
-        match inherited_scope_pids(scope).await {
-            Ok(pids) => {
-                for pid in pids {
-                    if !targets.contains(&pid) {
-                        targets.push(pid);
-                    }
-                }
-            }
-            Err(error) => cleanup_errors.push(error),
-        }
-        for pid in scoped_pids(scope).await {
-            if !targets.contains(&pid) {
-                targets.push(pid);
-            }
-        }
-        let _ = signal_pids(program, "-STOP", &targets).await;
-        for _ in 0..2 {
-            let mut discovered = scoped_pids(scope).await;
-            match inherited_scope_pids(scope).await {
-                Ok(pids) => discovered.extend(pids),
-                Err(error) => cleanup_errors.push(error),
-            }
-            if let Some(pid) = root {
-                discovered.extend(descendant_pids(pid).await);
-            }
-            let mut added = Vec::new();
-            for pid in discovered {
-                if !targets.contains(&pid) {
-                    targets.push(pid);
-                    added.push(pid);
-                }
-            }
-            let _ = signal_pids(program, "-STOP", &added).await;
+        let mut captured = Vec::new();
+        for _ in 0..3 {
+            let (round, _) = capture_scoped_identities(scope, root, &mut cleanup_errors).await;
+            signal_captured_processes(&round, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
+            captured.extend(round);
             tokio::task::yield_now().await;
         }
-        deliver_sigkill(program, &targets, &mut delivered, &mut kill_failures).await;
+        signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
         if let Some(pid) = root {
             let group = format!("-{pid}");
             let _ = run_killer(program, &["-KILL".to_string(), "--".to_string(), group]).await;
         }
         for _ in 0..2 {
-            let mut remaining = scoped_pids(scope).await;
-            match inherited_scope_pids(scope).await {
-                Ok(pids) => remaining.extend(pids),
-                Err(error) => cleanup_errors.push(error),
-            }
-            remaining.sort_unstable();
-            remaining.dedup();
-            if remaining.is_empty() {
+            let (remaining, revalidated) =
+                capture_scoped_identities(scope, root, &mut cleanup_errors).await;
+            signal_captured_processes(&remaining, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
+            signal_captured_processes(&remaining, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
+            if revalidated.is_empty() {
                 break;
             }
-            deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
         }
         if child.id().is_some() {
             let _ = child.kill().await;
@@ -752,33 +961,27 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
             }
         }
         let mut settled_rounds = 0;
-        let mut verdict_scope = Vec::new();
         for _ in 0..8 {
-            let mut remaining = scoped_pids(scope).await;
-            match inherited_scope_pids(scope).await {
-                Ok(pids) => remaining.extend(pids),
-                Err(error) => cleanup_errors.push(error),
-            }
-            remaining.sort_unstable();
-            remaining.dedup();
-            let discovered = remaining.iter().any(|pid| !delivered.contains(pid));
-            deliver_sigkill(program, &remaining, &mut delivered, &mut kill_failures).await;
-            verdict_scope = remaining;
-            if discovered {
-                settled_rounds = 0;
-            } else {
+            let (remaining, revalidated) =
+                capture_scoped_identities(scope, None, &mut cleanup_errors).await;
+            signal_captured_processes(&remaining, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
+            signal_captured_processes(&remaining, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
+            if revalidated.is_empty() {
                 settled_rounds += 1;
                 if settled_rounds == 2 {
                     break;
                 }
+            } else {
+                settled_rounds = 0;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        cleanup_errors.extend(unresolved_kill_failures(
-            &delivered,
-            &kill_failures,
-            &verdict_scope,
-        ));
+        let verdict_scope = discover_scope_pids(scope, None, &mut cleanup_errors).await;
+        cleanup_errors.extend(
+            verdict_scope
+                .into_iter()
+                .map(|pid| format!("PID {pid}가 프로세스 scope에 남아 있습니다")),
+        );
     }
     #[cfg(windows)]
     {
@@ -816,23 +1019,51 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
 mod tests {
     use super::*;
 
+    struct FakeIdentity<'a> {
+        pid: u32,
+        generation: u64,
+        current_generation: &'a std::cell::Cell<u64>,
+        signaled_generations: &'a std::cell::RefCell<Vec<u64>>,
+    }
+
+    impl GenerationBoundProcess for FakeIdentity<'_> {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        fn signal(&self, _signal: i32) -> Result<(), String> {
+            if self.current_generation.get() == self.generation {
+                self.signaled_generations.borrow_mut().push(self.generation);
+            }
+            Ok(())
+        }
+    }
+
     #[test]
-    fn successful_sigkill_delivery_is_not_failed_by_a_stale_process_listing() {
-        let delivered = std::collections::BTreeSet::from([42]);
-        let failures = std::collections::BTreeMap::from([
-            (43, "permission denied".to_string()),
-            (45, "already gone".to_string()),
-        ]);
-        assert!(unresolved_kill_failures(&delivered, &failures, &[42]).is_empty());
-        assert_eq!(
-            unresolved_kill_failures(&delivered, &failures, &[43]),
-            ["PID 43 SIGKILL 실패: permission denied"]
-        );
-        assert!(unresolved_kill_failures(&delivered, &failures, &[]).is_empty());
-        assert_eq!(
-            unresolved_kill_failures(&delivered, &failures, &[44]),
-            ["PID 44에 SIGKILL을 전달하지 못했습니다"]
-        );
+    fn captured_identity_does_not_signal_a_same_pid_replacement() {
+        let current_generation = std::cell::Cell::new(1);
+        let signaled_generations = std::cell::RefCell::new(Vec::new());
+        let original = FakeIdentity {
+            pid: 42,
+            generation: 1,
+            current_generation: &current_generation,
+            signaled_generations: &signaled_generations,
+        };
+        current_generation.set(2);
+        let mut errors = Vec::new();
+
+        signal_captured_processes(&[original], PROCESS_KILL_SIGNAL, &mut errors);
+
+        assert!(errors.is_empty());
+        assert!(signaled_generations.borrow().is_empty());
+        let replacement = FakeIdentity {
+            pid: 42,
+            generation: 2,
+            current_generation: &current_generation,
+            signaled_generations: &signaled_generations,
+        };
+        signal_captured_processes(&[replacement], PROCESS_KILL_SIGNAL, &mut errors);
+        assert_eq!(*signaled_generations.borrow(), [2]);
     }
 
     #[test]
