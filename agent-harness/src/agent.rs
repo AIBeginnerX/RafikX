@@ -140,6 +140,17 @@ fn worker_activity(run: &RunContext, activity: &str) {
     crate::ui::live_worker_in(run, &crate::ui::worker_id(run), "", "", activity, false);
 }
 
+async fn await_provider_or_cancel<T>(
+    run: &RunContext,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = run.cancelled_reason() => None,
+        result = future => Some(result),
+    }
+}
+
 pub async fn run_agent(run: AgentRun<'_>) -> Result<AgentOutcome> {
     let context = RunContext::isolated(
         RunId::new(format!("agent-{}", crate::db::Db::new_id())),
@@ -246,7 +257,12 @@ async fn run_agent_with_delivery(
     let mut truncation_retries = 0u8;
     let mut leaked_tool_retries = 0u8;
     let max_iter = max_iterations.min(HARD_CAP);
-    run_context.ensure_model_iteration_limit(max_iter);
+    let semantic_limit = run_context.ensure_model_iteration_limit(max_iter);
+    run_context.ensure_provider_attempt_limit(
+        semantic_limit
+            .max(crate::harness::COMBO_MAX_HOPS as u32)
+            .min(HARD_CAP),
+    );
 
     loop {
         if run_context.is_cancelled() {
@@ -384,8 +400,13 @@ async fn run_agent_with_delivery(
                 }
             };
             let response = if combo_chain.is_empty() {
-                Box::pin(crate::harness::stream_semantic_with_fallback(
-                    cfg, &order, "main", req, on_event,
+                Box::pin(crate::harness::stream_semantic_with_fallback_in_run(
+                    cfg,
+                    &run_context,
+                    &order,
+                    "main",
+                    req,
+                    on_event,
                 ))
                     as std::pin::Pin<
                         Box<
@@ -396,8 +417,9 @@ async fn run_agent_with_delivery(
                         >,
                     >
             } else {
-                Box::pin(crate::harness::stream_semantic_with_fallback_combo(
+                Box::pin(crate::harness::stream_semantic_with_fallback_combo_in_run(
                     cfg,
+                    &run_context,
                     &combo_chain,
                     "main",
                     req,
@@ -413,9 +435,8 @@ async fn run_agent_with_delivery(
                     >
             };
             tokio::pin!(response);
-            tokio::select! {
-                result = &mut response => result?,
-                _ = run_context.cancelled_reason() => {
+            match await_provider_or_cancel(&run_context, &mut response).await {
+                None => {
                     return Ok(AgentOutcome {
                         status: "cancelled".into(),
                         iterations,
@@ -433,6 +454,28 @@ async fn run_agent_with_delivery(
                         verify_recovered: None,
                     });
                 }
+                Some(result) => match result {
+                    Ok(value) => value,
+                    Err(error) if crate::harness::is_provider_attempt_limit_exceeded(&error) => {
+                        return Ok(AgentOutcome {
+                            status: "limit".into(),
+                            iterations,
+                            input_tokens,
+                            output_tokens,
+                            context_tokens,
+                            cached_tokens,
+                            cache_reported,
+                            error: Some(error.to_string()),
+                            messages,
+                            changed_files: committed_files(&run_context),
+                            tool_errors,
+                            deny_reasons,
+                            verify_fail: None,
+                            verify_recovered: None,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                },
             }
         };
         crate::graph::node_in(
@@ -1375,6 +1418,19 @@ pub fn record_finish(db: &Db, run_id: &str, outcome: &AgentOutcome) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn provider_wait_prefers_cancellation_when_both_branches_are_ready() {
+        let run = crate::run::RunContext::isolated(
+            crate::run::RunId::new("provider-ready-both-cancel"),
+            std::env::temp_dir(),
+        );
+        assert!(run.cancel("test cancellation"));
+
+        let selected = super::await_provider_or_cancel(&run, async { "provider response" }).await;
+
+        assert_eq!(selected, None);
+    }
+
     #[test]
     fn same_call_streak_resets_when_another_call_intervenes() {
         let mut last = None;

@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::config::Config;
 use crate::provider::{ChatRequest, ContentBlock, Message};
+use crate::run::RunContext;
 
 /// 기본 불확실 신호 — config [fallback] refusal_signals 로 재정의 가능.
 pub const DEFAULT_SIGNALS: &[&str] = &[
@@ -22,8 +23,7 @@ pub const DEFAULT_SIGNALS: &[&str] = &[
     "cannot decide",
 ];
 
-pub const EXTRACT_SYSTEM: &str =
-    "아래 답변에서 실행을 막은 공학 질문만 한 문장으로 추출하라. 질문이 없으면 '없음'이라고만 답하라.";
+pub const EXTRACT_SYSTEM: &str = "아래 답변에서 실행을 막은 공학 질문만 한 문장으로 추출하라. 질문이 없으면 '없음'이라고만 답하라.";
 
 pub const ARCHITECT_SYSTEM: &str = "\
     20년 경력 아키텍트다. 실행을 막은 공학 질문에 트레이드오프를 들어 2~3개 안을 비교하고 \
@@ -42,7 +42,9 @@ pub fn is_refusal_candidate(
 ) -> bool {
     no_changes
         && single_iteration
-        && signals.iter().any(|s| !s.is_empty() && answer.contains(s.as_str()))
+        && signals
+            .iter()
+            .any(|s| !s.is_empty() && answer.contains(s.as_str()))
 }
 
 /// 설정의 신호 목록 — 비어 있으면 기본 목록.
@@ -55,7 +57,14 @@ pub fn refusal_signals(cfg: &Config) -> Vec<String> {
     }
 }
 
-async fn call_once(cfg: &Config, role: &str, system: &str, user: &str, max_tokens: u32) -> Result<String> {
+async fn call_once(
+    cfg: &Config,
+    run: Option<&RunContext>,
+    role: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<String> {
     let order = crate::harness::fallback_order(cfg, &cfg.file.general.default_provider, None);
     let req = ChatRequest {
         model: String::new(),
@@ -65,7 +74,10 @@ async fn call_once(cfg: &Config, role: &str, system: &str, user: &str, max_token
         max_tokens,
         stream: false,
     };
-    let (_name, resp) = crate::harness::chat_with_fallback(cfg, &order, role, req).await?;
+    let (_name, resp) = match run {
+        Some(run) => crate::harness::chat_with_fallback_in_run(cfg, run, &order, role, req).await?,
+        None => crate::harness::chat_with_fallback(cfg, &order, role, req).await?,
+    };
     Ok(resp
         .content
         .iter()
@@ -78,12 +90,35 @@ async fn call_once(cfg: &Config, role: &str, system: &str, user: &str, max_token
 
 /// 아키텍트 상담 — Some(판단)이면 재시도 가치 있음, None 이면 진짜 질문이 아님(발동 안 함).
 pub async fn consult_architect(cfg: &Config, task: &str, answer: &str) -> Result<Option<String>> {
-    let question = call_once(cfg, "small", EXTRACT_SYSTEM, answer, 256).await?;
-    if question.is_empty() || question.trim_start_matches(|c: char| !c.is_alphanumeric()).starts_with("없음") {
+    consult_architect_inner(cfg, None, task, answer).await
+}
+
+pub(crate) async fn consult_architect_in_run(
+    cfg: &Config,
+    run: &RunContext,
+    task: &str,
+    answer: &str,
+) -> Result<Option<String>> {
+    consult_architect_inner(cfg, Some(run), task, answer).await
+}
+
+async fn consult_architect_inner(
+    cfg: &Config,
+    run: Option<&RunContext>,
+    task: &str,
+    answer: &str,
+) -> Result<Option<String>> {
+    let question = call_once(cfg, run, "small", EXTRACT_SYSTEM, answer, 256).await?;
+    if question.is_empty()
+        || question
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .starts_with("없음")
+    {
         return Ok(None);
     }
     let judgment = call_once(
         cfg,
+        run,
         "main",
         ARCHITECT_SYSTEM,
         &format!("원 작업: {task}\n\n실행을 막은 질문: {question}"),
@@ -134,12 +169,22 @@ mod tests {
     #[test]
     fn normal_qa_never_fires() {
         // 도구 필요 없는 정상 질의응답 — 불확실 신호가 없는 한 미발동
-        assert!(!is_refusal_candidate("Rust의 소유권은 이렇게 동작합니다.", true, true, &sig()));
+        assert!(!is_refusal_candidate(
+            "Rust의 소유권은 이렇게 동작합니다.",
+            true,
+            true,
+            &sig()
+        ));
     }
 
     #[test]
     fn signals_cover_english() {
-        assert!(is_refusal_candidate("I can't determine the right approach.", true, true, &sig()));
+        assert!(is_refusal_candidate(
+            "I can't determine the right approach.",
+            true,
+            true,
+            &sig()
+        ));
     }
 
     #[test]
@@ -151,7 +196,17 @@ mod tests {
     #[test]
     fn custom_signals_replace_defaults_via_caller() {
         let custom = vec!["막히네요".to_string()];
-        assert!(is_refusal_candidate("이건 좀 막히네요", true, true, &custom));
-        assert!(!is_refusal_candidate("설계를 먼저 결정해야 합니다", true, true, &custom));
+        assert!(is_refusal_candidate(
+            "이건 좀 막히네요",
+            true,
+            true,
+            &custom
+        ));
+        assert!(!is_refusal_candidate(
+            "설계를 먼저 결정해야 합니다",
+            true,
+            true,
+            &custom
+        ));
     }
 }

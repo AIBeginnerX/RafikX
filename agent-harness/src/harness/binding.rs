@@ -52,6 +52,81 @@ fn warn_model_mismatch(requested: &str, resp: &ChatResponse) {
 /// 콤보 체인 최대 홉 수 — 요청 하나가 체인을 따라갈 수 있는 횟수 상한 (F8).
 pub const COMBO_MAX_HOPS: usize = 3;
 
+#[derive(Debug)]
+pub(crate) struct ProviderAttemptLimitExceeded {
+    pub(crate) limit: u32,
+}
+
+impl std::fmt::Display for ProviderAttemptLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "프로바이더 HTTP 시도 예산 {}회 소진", self.limit)
+    }
+}
+
+impl std::error::Error for ProviderAttemptLimitExceeded {}
+
+pub(crate) fn is_provider_attempt_limit_exceeded(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProviderAttemptLimitExceeded>()
+        .is_some()
+}
+
+struct ProviderAttemptGate<'a> {
+    run: Option<&'a crate::run::RunContext>,
+    local_limit: u32,
+    local_used: u32,
+}
+
+impl<'a> ProviderAttemptGate<'a> {
+    const fn local() -> Self {
+        Self {
+            run: None,
+            local_limit: COMBO_MAX_HOPS as u32,
+            local_used: 0,
+        }
+    }
+
+    fn in_run(run: &'a crate::run::RunContext) -> Self {
+        Self {
+            run: Some(run),
+            local_limit: COMBO_MAX_HOPS as u32,
+            local_used: 0,
+        }
+    }
+
+    fn claim(&mut self) -> Result<()> {
+        if self.local_used >= self.local_limit {
+            return Err(ProviderAttemptLimitExceeded {
+                limit: self.local_limit,
+            }
+            .into());
+        }
+        if let Some(run) = self.run
+            && !run.claim_provider_attempt()
+        {
+            return Err(ProviderAttemptLimitExceeded {
+                limit: run.provider_attempt_limit(),
+            }
+            .into());
+        }
+        self.local_used += 1;
+        Ok(())
+    }
+
+    fn can_dispatch(&self, reserved: u32) -> Result<bool> {
+        if self.local_used < self.local_limit.saturating_sub(reserved) {
+            return Ok(true);
+        }
+        if reserved > 0 {
+            return Ok(false);
+        }
+        Err(ProviderAttemptLimitExceeded {
+            limit: self.local_limit,
+        }
+        .into())
+    }
+}
+
 /// 콤보 바인딩 — [combos.<이름>] chain 을 해석해 첫 쌍은 주 연결로, 전체 쌍은
 /// combo_chain 으로 Binding 에 담는다. config 에 없는 이름·빈 체인은 오류.
 /// 콤보의 체인 스펙 — COMBO_MAX_HOPS 로 자른다 (순수 조회, F8).
@@ -982,7 +1057,13 @@ fn account_ids_for(name: &str) -> Vec<String> {
     }
 }
 
-async fn try_accounts<F, Fut>(cfg: &Config, name: &str, mut call: F) -> Result<ChatResponse>
+async fn try_accounts<F, Fut>(
+    cfg: &Config,
+    name: &str,
+    gate: &mut ProviderAttemptGate<'_>,
+    reserve_fallback_attempt: bool,
+    mut call: F,
+) -> Result<ChatResponse>
 where
     F: FnMut(DynProvider) -> Fut,
     Fut: std::future::Future<Output = Result<ChatResponse>>,
@@ -990,6 +1071,9 @@ where
     let ids = account_ids_for(name);
     let mut last_err = None;
     for (i, id) in ids.iter().enumerate() {
+        if !gate.can_dispatch(u32::from(reserve_fallback_attempt))? {
+            break;
+        }
         let wait = crate::usage::seconds_left(id);
         if wait > 0 && wait <= 20 {
             crate::ui::note(&format!("계정 대기 {wait}초 후 재시도…"));
@@ -1011,35 +1095,32 @@ where
         let Ok(client) = build_provider_account(cfg, name, id) else {
             continue;
         };
-        match call(client).await {
+        gate.claim()?;
+        match call(client).await.and_then(|resp| {
+            crate::provider::validate_chat_response(&resp, "fallback")?;
+            Ok(resp)
+        }) {
             Ok(resp) => {
                 crate::usage::record_success(id, &resp);
                 crate::usage::apply_hint(id, &resp.limit);
                 return Ok(resp);
             }
-            Err(e) if is_rate_limited(&e) => {
-                let secs = crate::usage::parse_retry_after(&format!("{e:#}"));
+            Err(e) if is_typed_rate_limited(&e) => {
+                let secs = rate_limit_retry_after(&e);
                 crate::usage::mark_limited(id, secs);
-                crate::ui::warn(&format!(
-                    "리밋 → 다음 계정으로 전환 ({})",
-                    crate::accounts::get(id)
-                        .map(|a| a.label)
-                        .unwrap_or_else(|| id.clone())
-                ));
+                crate::ui::warn("리밋 → 다음 계정으로 전환");
                 last_err = Some(e);
             }
             Err(e) if is_auth_failure(&e) => {
-                fallback_warn(&format!(
-                    "{name} 키 인증 실패(401/403) — rafikx login 에서 키를 갱신하세요"
-                ));
-                last_err = Some(e);
-            }
-            Err(e) if is_retryable(&e) => {
+                fallback_warn(&e, "authentication rejected; trying next account");
                 last_err = Some(e);
             }
             Err(e) => {
+                let action = nonstream_failure_action(&e);
                 last_err = Some(e);
-                break;
+                if action == NonstreamFailureAction::NextCandidate {
+                    break;
+                }
             }
         }
     }
@@ -1048,8 +1129,50 @@ where
 
 /// 401/403 등 키 문제 — 재시도보다 재연결이 답이다.
 fn is_auth_failure(e: &anyhow::Error) -> bool {
-    let s = format!("{e:#}");
-    s.contains("401") || s.contains("403")
+    request_error_kind(e)
+        .is_some_and(|kind| matches!(kind, crate::provider::ProviderRequestErrorKind::Auth { .. }))
+}
+
+fn request_error_kind(error: &anyhow::Error) -> Option<crate::provider::ProviderRequestErrorKind> {
+    error
+        .downcast_ref::<crate::provider::ProviderRequestError>()
+        .map(crate::provider::ProviderRequestError::kind)
+}
+
+fn is_typed_rate_limited(error: &anyhow::Error) -> bool {
+    request_error_kind(error).is_some_and(|kind| {
+        matches!(
+            kind,
+            crate::provider::ProviderRequestErrorKind::RateLimited { .. }
+        )
+    })
+}
+
+fn request_is_retryable(error: &anyhow::Error) -> bool {
+    match request_error_kind(error) {
+        Some(
+            crate::provider::ProviderRequestErrorKind::RateLimited { .. }
+            | crate::provider::ProviderRequestErrorKind::Server { .. }
+            | crate::provider::ProviderRequestErrorKind::Timeout
+            | crate::provider::ProviderRequestErrorKind::Connect
+            | crate::provider::ProviderRequestErrorKind::BodyRead
+            | crate::provider::ProviderRequestErrorKind::Transport,
+        ) => true,
+        Some(
+            crate::provider::ProviderRequestErrorKind::Auth { .. }
+            | crate::provider::ProviderRequestErrorKind::Client { .. },
+        )
+        | None => false,
+    }
+}
+
+fn rate_limit_retry_after(error: &anyhow::Error) -> u64 {
+    if let Some(error) = error.downcast_ref::<crate::provider::ProviderRequestError>()
+        && let crate::provider::ProviderRequestErrorKind::RateLimited { retry_after } = error.kind()
+    {
+        return retry_after;
+    }
+    45
 }
 
 pub fn fallback_order(cfg: &Config, primary: &str, cli_provider: Option<&str>) -> Vec<String> {
@@ -1159,10 +1282,18 @@ pub fn set_fallback_quiet(quiet: bool) {
     FALLBACK_QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn fallback_warn(msg: &str) {
+fn fallback_summary(error: &anyhow::Error, action: &'static str) -> String {
+    format!("{}; {action}", crate::provider::safe_summary(error))
+}
+
+fn sanitized_provider_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow!(crate::provider::safe_summary(&error))
+}
+
+fn fallback_warn(error: &anyhow::Error, action: &'static str) {
     // 폴백 과정의 개별 실패(503·429·401 등)는 화면에 노출하지 않는다.
     // 폴백이 성공하면 사용자는 최종 답변만 보고, 전부 실패했을 때만 오류가 전달된다.
-    crate::applog::debug(&format!("fallback: {msg}"));
+    crate::applog::debug(&format!("fallback: {}", fallback_summary(error, action)));
 }
 
 pub async fn chat_with_fallback(
@@ -1171,7 +1302,19 @@ pub async fn chat_with_fallback(
     model_role: &str,
     req: ChatRequest,
 ) -> Result<(String, ChatResponse)> {
-    chat_with_fallback_inner(cfg, order, model_role, req, None).await
+    let mut gate = ProviderAttemptGate::local();
+    chat_with_fallback_inner(cfg, order, model_role, req, None, &mut gate).await
+}
+
+pub(crate) async fn chat_with_fallback_in_run(
+    cfg: &Config,
+    run: &crate::run::RunContext,
+    order: &[String],
+    model_role: &str,
+    req: ChatRequest,
+) -> Result<(String, ChatResponse)> {
+    let mut gate = ProviderAttemptGate::in_run(run);
+    chat_with_fallback_inner(cfg, order, model_role, req, None, &mut gate).await
 }
 
 /// 콤보 체인 비스트리밍 호출 (F8) — 계획·상담 등 단발 호출용.
@@ -1181,7 +1324,8 @@ pub async fn chat_with_fallback_combo(
     model_role: &str,
     req: ChatRequest,
 ) -> Result<(String, ChatResponse)> {
-    chat_with_fallback_inner(cfg, &[], model_role, req, Some(combo)).await
+    let mut gate = ProviderAttemptGate::local();
+    chat_with_fallback_inner(cfg, &[], model_role, req, Some(combo), &mut gate).await
 }
 
 #[derive(Clone, Copy)]
@@ -1212,20 +1356,26 @@ fn fallback_candidates<'a>(
     }
 }
 
+const fn reserve_for_secondary(candidate_index: usize, candidate_count: usize) -> bool {
+    candidate_index == 0 && candidate_count > 1
+}
+
 async fn chat_with_fallback_inner(
     cfg: &Config,
     order: &[String],
     model_role: &str,
     mut req: ChatRequest,
     combo: Option<&[(String, String)]>,
+    gate: &mut ProviderAttemptGate<'_>,
 ) -> Result<(String, ChatResponse)> {
     let original_model = req.model.clone();
     let candidates = fallback_candidates(order, combo);
+    let candidate_count = candidates.len();
     let primary = candidates.first().map(|candidate| candidate.provider);
     // 첫 번째(주 연결) 오류를 끝까지 보존한다 — 마지막 폴백의 오류가 원인을 가리지 않게.
     let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err = None;
-    for candidate in candidates {
+    for (candidate_index, candidate) in candidates.into_iter().enumerate() {
         let Some(model) = candidate.combo_model.map(str::to_string).or_else(|| {
             model_for_fallback(
                 cfg,
@@ -1246,10 +1396,16 @@ async fn chat_with_fallback_inner(
             ));
         }
         req.model = model;
-        match try_accounts(cfg, candidate.provider, |client| {
-            let req = req.clone();
-            async move { client.chat(&req).await }
-        })
+        match try_accounts(
+            cfg,
+            candidate.provider,
+            gate,
+            reserve_for_secondary(candidate_index, candidate_count),
+            |client| {
+                let req = req.clone();
+                async move { client.chat(&req).await }
+            },
+        )
         .await
         {
             Ok(resp) => {
@@ -1257,11 +1413,10 @@ async fn chat_with_fallback_inner(
                 return Ok((candidate.provider.to_string(), resp));
             }
             Err(e) => {
-                fallback_warn(&format!(
-                    "{} 호출 실패 ({}) → 다음 연결",
-                    candidate.provider,
-                    short_err(&e)
-                ));
+                if is_provider_attempt_limit_exceeded(&e) {
+                    return Err(e);
+                }
+                fallback_warn(&e, "trying next provider");
                 if Some(candidate.provider) == primary && primary_err.is_none() {
                     primary_err = Some(e);
                 } else {
@@ -1272,17 +1427,13 @@ async fn chat_with_fallback_inner(
     }
     Err(primary_err
         .or(last_err)
+        .map(sanitized_provider_error)
         .unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
 }
 
 /// 도구 인자 생성 구간의 진행 표시 문구 — 스트림 소비자 세 곳이 함께 쓴다.
 pub fn tool_args_label(name: &str, total_bytes: usize) -> String {
     format!("도구 호출 작성 중: {name} · {}KB", total_bytes / 1024)
-}
-
-fn short_err(e: &anyhow::Error) -> String {
-    let s = format!("{e:#}");
-    s.chars().take(120).collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1293,6 +1444,48 @@ enum StreamFailureAction {
     NextCandidate,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum NonstreamFailureAction {
+    NextAccount,
+    NextCandidate,
+}
+
+fn protocol_error_kind(error: &anyhow::Error) -> Option<crate::provider::ProtocolErrorKind> {
+    error
+        .downcast_ref::<crate::provider::ProtocolError>()
+        .map(crate::provider::ProtocolError::kind)
+}
+
+fn protocol_is_retryable_before_output(error: &anyhow::Error) -> bool {
+    match protocol_error_kind(error) {
+        Some(
+            crate::provider::ProtocolErrorKind::EmptyResponse
+            | crate::provider::ProtocolErrorKind::InvalidTool
+            | crate::provider::ProtocolErrorKind::InvalidJson
+            | crate::provider::ProtocolErrorKind::InvalidSequence
+            | crate::provider::ProtocolErrorKind::TruncatedStream
+            | crate::provider::ProtocolErrorKind::UpstreamError,
+        ) => true,
+        Some(crate::provider::ProtocolErrorKind::LimitExceeded) | None => false,
+    }
+}
+
+fn protocol_is_limit(error: &anyhow::Error) -> bool {
+    protocol_error_kind(error) == Some(crate::provider::ProtocolErrorKind::LimitExceeded)
+}
+
+fn nonstream_failure_action(error: &anyhow::Error) -> NonstreamFailureAction {
+    if is_typed_rate_limited(error)
+        || is_auth_failure(error)
+        || protocol_is_retryable_before_output(error)
+        || request_is_retryable(error)
+    {
+        NonstreamFailureAction::NextAccount
+    } else {
+        NonstreamFailureAction::NextCandidate
+    }
+}
+
 fn stream_failure_action(
     error: &anyhow::Error,
     emitted: usize,
@@ -1301,17 +1494,27 @@ fn stream_failure_action(
     if emitted > 0 {
         return StreamFailureAction::AbortAfterEmission;
     }
-    if is_rate_limited(error) || is_auth_failure(error) {
+    if protocol_is_limit(error) {
+        return StreamFailureAction::NextCandidate;
+    }
+    if is_typed_rate_limited(error) || is_auth_failure(error) {
         return StreamFailureAction::NextAccount;
     }
-    if is_retryable(error) {
-        return if attempt < 2 {
+    if protocol_is_retryable_before_output(error) || request_is_retryable(error) {
+        return if attempt == 0 {
             StreamFailureAction::RetrySameAccount
         } else {
-            StreamFailureAction::NextAccount
+            StreamFailureAction::NextCandidate
         };
     }
     StreamFailureAction::NextCandidate
+}
+
+fn can_retry_same_account(
+    gate: &ProviderAttemptGate<'_>,
+    has_fallback_candidate: bool,
+) -> Result<bool> {
+    gate.can_dispatch(u32::from(has_fallback_candidate))
 }
 
 pub async fn stream_with_fallback<F>(
@@ -1325,14 +1528,23 @@ where
     F: FnMut(StreamEvent),
 {
     let mut on_event = on_event;
-    stream_with_fallback_inner(cfg, order, model_role, req, None, true, |event| {
-        on_event(event.public())
-    })
+    let mut gate = ProviderAttemptGate::local();
+    stream_with_fallback_inner(
+        cfg,
+        order,
+        model_role,
+        req,
+        None,
+        true,
+        &mut gate,
+        |event| on_event(event.public()),
+    )
     .await
 }
 
-pub(crate) async fn stream_semantic_with_fallback<F>(
+pub(crate) async fn stream_semantic_with_fallback_in_run<F>(
     cfg: &Config,
+    run: &crate::run::RunContext,
     order: &[String],
     model_role: &str,
     req: ChatRequest,
@@ -1341,7 +1553,11 @@ pub(crate) async fn stream_semantic_with_fallback<F>(
 where
     F: FnMut(SemanticStreamEvent),
 {
-    stream_with_fallback_inner(cfg, order, model_role, req, None, false, on_event).await
+    let mut gate = ProviderAttemptGate::in_run(run);
+    stream_with_fallback_inner(
+        cfg, order, model_role, req, None, false, &mut gate, on_event,
+    )
+    .await
 }
 
 /// 콤보 체인 스트리밍 (F8) — 체인의 (provider, model) 쌍을 순서대로 시도한다.
@@ -1357,14 +1573,23 @@ where
     F: FnMut(StreamEvent),
 {
     let mut on_event = on_event;
-    stream_with_fallback_inner(cfg, &[], model_role, req, Some(combo), true, |event| {
-        on_event(event.public())
-    })
+    let mut gate = ProviderAttemptGate::local();
+    stream_with_fallback_inner(
+        cfg,
+        &[],
+        model_role,
+        req,
+        Some(combo),
+        true,
+        &mut gate,
+        |event| on_event(event.public()),
+    )
     .await
 }
 
-pub(crate) async fn stream_semantic_with_fallback_combo<F>(
+pub(crate) async fn stream_semantic_with_fallback_combo_in_run<F>(
     cfg: &Config,
+    run: &crate::run::RunContext,
     combo: &[(String, String)],
     model_role: &str,
     req: ChatRequest,
@@ -1373,7 +1598,18 @@ pub(crate) async fn stream_semantic_with_fallback_combo<F>(
 where
     F: FnMut(SemanticStreamEvent),
 {
-    stream_with_fallback_inner(cfg, &[], model_role, req, Some(combo), false, on_event).await
+    let mut gate = ProviderAttemptGate::in_run(run);
+    stream_with_fallback_inner(
+        cfg,
+        &[],
+        model_role,
+        req,
+        Some(combo),
+        false,
+        &mut gate,
+        on_event,
+    )
+    .await
 }
 
 async fn stream_with_fallback_inner<F>(
@@ -1383,6 +1619,7 @@ async fn stream_with_fallback_inner<F>(
     mut req: ChatRequest,
     combo: Option<&[(String, String)]>,
     candidates_visible: bool,
+    gate: &mut ProviderAttemptGate<'_>,
     mut on_event: F,
 ) -> Result<(String, ChatResponse)>
 where
@@ -1391,12 +1628,13 @@ where
     use std::sync::atomic::{AtomicUsize, Ordering};
     let original_model = req.model.clone();
     let candidates = fallback_candidates(order, combo);
+    let candidate_count = candidates.len();
     let primary = candidates.first().map(|candidate| candidate.provider);
     let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err: Option<anyhow::Error> = None;
     let emitted = AtomicUsize::new(0);
 
-    'candidates: for candidate in candidates {
+    'candidates: for (candidate_index, candidate) in candidates.into_iter().enumerate() {
         let Some(model) = candidate.combo_model.map(str::to_string).or_else(|| {
             model_for_fallback(
                 cfg,
@@ -1419,6 +1657,12 @@ where
         req.model = model;
         let ids = account_ids_for(candidate.provider);
         for id in &ids {
+            if !gate.can_dispatch(u32::from(reserve_for_secondary(
+                candidate_index,
+                candidate_count,
+            )))? {
+                break;
+            }
             let wait = crate::usage::seconds_left(id);
             if wait > 20 {
                 // retry_after 존중 — 마지막 계정이어도 리밋 중이면 건너뛰고
@@ -1447,7 +1691,14 @@ where
                     emitted.fetch_add(chars, Ordering::Relaxed);
                     on_event(ev);
                 };
-                match client.chat_semantic_stream(&req, &mut track).await {
+                gate.claim()?;
+                match client
+                    .chat_semantic_stream(&req, &mut track)
+                    .await
+                    .and_then(|resp| {
+                        crate::provider::validate_chat_response(&resp, "fallback")?;
+                        Ok(resp)
+                    }) {
                     Ok(resp) => {
                         crate::usage::record_success(id, &resp);
                         crate::usage::apply_hint(id, &resp.limit);
@@ -1455,31 +1706,30 @@ where
                         return Ok((candidate.provider.to_string(), resp));
                     }
                     Err(e) => {
-                        let action = stream_failure_action(
-                            &e,
-                            emitted.load(Ordering::Relaxed),
-                            attempt,
-                        );
-                        if is_rate_limited(&e) {
-                            crate::usage::mark_limited(
-                                id,
-                                crate::usage::parse_retry_after(&format!("{e:#}")),
-                            );
+                        let action =
+                            stream_failure_action(&e, emitted.load(Ordering::Relaxed), attempt);
+                        if is_typed_rate_limited(&e) {
+                            crate::usage::mark_limited(id, rate_limit_retry_after(&e));
                             crate::ui::warn("리밋 → 다음 계정으로 전환");
                         }
                         last_err = Some(e);
                         match action {
                             StreamFailureAction::AbortAfterEmission => {
-                                return Err(last_err.unwrap_or_else(|| {
-                                    anyhow!("응답 도중 스트림이 끊겼습니다")
-                                }));
+                                return Err(last_err
+                                    .take()
+                                    .map(sanitized_provider_error)
+                                    .unwrap_or_else(|| anyhow!("응답 도중 스트림이 끊겼습니다")));
                             }
                             StreamFailureAction::RetrySameAccount => {
+                                if !can_retry_same_account(
+                                    gate,
+                                    reserve_for_secondary(candidate_index, candidate_count),
+                                )? {
+                                    break;
+                                }
                                 attempt += 1;
-                                tokio::time::sleep(Duration::from_millis(
-                                    800 * u64::from(attempt),
-                                ))
-                                .await;
+                                tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt)))
+                                    .await;
                             }
                             StreamFailureAction::NextAccount => break,
                             StreamFailureAction::NextCandidate => continue 'candidates,
@@ -1490,20 +1740,20 @@ where
         }
         if last_err.is_some() && Some(candidate.provider) == primary && primary_err.is_none() {
             primary_err = last_err.take();
-            fallback_warn(&format!(
-                "{} 실패 ({}) → 다음 연결",
-                candidate.provider,
-                primary_err.as_ref().map(short_err).unwrap_or_default()
-            ));
+            if let Some(error) = primary_err.as_ref() {
+                fallback_warn(error, "trying next provider");
+            }
         }
     }
     Err(primary_err
         .or(last_err)
+        .map(sanitized_provider_error)
         .unwrap_or_else(|| anyhow!("사용 가능한 프로바이더가 없습니다")))
 }
 
 pub async fn chat_accounts(cfg: &Config, provider: &str, req: ChatRequest) -> Result<ChatResponse> {
-    try_accounts(cfg, provider, |client| {
+    let mut gate = ProviderAttemptGate::local();
+    try_accounts(cfg, provider, &mut gate, false, |client| {
         let req = req.clone();
         async move { client.chat(&req).await }
     })
@@ -1602,20 +1852,21 @@ pub fn print_binding_table(cfg: &Config) {
 }
 
 pub async fn ping_provider(cfg: &Config, name: &str) -> String {
+    let label = safe_ping_label(name);
     let Ok(p) = cfg.provider(name) else {
-        return format!("{name}: config 없음");
+        return format!("{label}: config 없음");
     };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build();
     let Ok(client) = client else {
-        return format!("{name}: HTTP 클라이언트 실패");
+        return format!("{label}: HTTP 클라이언트 실패");
     };
     let cred = crate::auth::resolve_credential(cfg, name).ok().flatten();
     match p.kind.as_str() {
         "anthropic" => {
             let Some(c) = cred else {
-                return format!("{name}: 미연결 (ping 생략)");
+                return format!("{label}: 미연결 (ping 생략)");
             };
             let req = crate::auth::apply_anthropic_cred(
                 client
@@ -1624,9 +1875,9 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
                 &c,
             );
             match req.send().await {
-                Ok(r) if r.status().is_success() => format!("{name}: ping OK"),
-                Ok(r) => format!("{name}: ping HTTP {}", r.status().as_u16()),
-                Err(e) => format!("{name}: ping 실패 ({e})"),
+                Ok(r) if r.status().is_success() => format!("{label}: ping OK"),
+                Ok(r) => format!("{label}: ping HTTP {}", r.status().as_u16()),
+                Err(error) => ping_failure(label, &error),
             }
         }
         "openai_compat" => {
@@ -1635,7 +1886,7 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
                 "https://chatgpt.com/backend-api/codex/models".to_string()
             } else {
                 let Some(base) = &p.base_url else {
-                    return format!("{name}: base_url 없음");
+                    return format!("{label}: base_url 없음");
                 };
                 format!("{}/models", base.trim_end_matches('/'))
             };
@@ -1652,12 +1903,79 @@ pub async fn ping_provider(cfg: &Config, name: &str) -> String {
                 }
             }
             match req.send().await {
-                Ok(r) if r.status().is_success() => format!("{name}: ping OK"),
-                Ok(r) => format!("{name}: ping HTTP {}", r.status().as_u16()),
-                Err(e) => format!("{name}: ping 실패 ({e})"),
+                Ok(r) if r.status().is_success() => format!("{label}: ping OK"),
+                Ok(r) => format!("{label}: ping HTTP {}", r.status().as_u16()),
+                Err(error) => ping_failure(label, &error),
             }
         }
-        other => format!("{name}: kind={other} ping 생략"),
+        _ => format!("{label}: 지원하지 않는 kind (ping 생략)"),
+    }
+}
+
+fn safe_ping_label(name: &str) -> &str {
+    if !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|character| character.is_alphanumeric() || "_- .".contains(character))
+    {
+        name
+    } else {
+        "provider"
+    }
+}
+
+fn ping_failure(label: &str, error: &reqwest::Error) -> String {
+    let category = if error.is_timeout() {
+        "시간 초과"
+    } else if error.is_connect() {
+        "연결 실패"
+    } else if error.is_body() || error.is_decode() {
+        "응답 읽기 실패"
+    } else {
+        "요청 실패"
+    };
+    format!("{label}: ping 실패 ({category})")
+}
+
+#[cfg(test)]
+mod ping_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ping_failure_never_exposes_configured_url_or_query_secret() {
+        let secret = "do-not-leak";
+        let name = format!("custom?token={secret}");
+        let workspace =
+            std::env::temp_dir().join(format!("rafikx-ping-redaction-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&workspace).expect("ping workspace");
+        let mut cfg = Config::load(Some(&workspace.join("config.toml"))).expect("ping config");
+        cfg.file.providers.insert(
+            name.clone(),
+            ProviderConfig {
+                kind: "openai_compat".into(),
+                auth: "none".into(),
+                api_key_env: String::new(),
+                model: "test-model".into(),
+                small_model: None,
+                base_url: Some(format!(
+                    "http://127.0.0.1:0/v1?api_key={secret}&redirect=https://secret.invalid"
+                )),
+                supports_tools: false,
+                models_url: None,
+                model_auto: false,
+                context_window: Some(8_000),
+                enabled: true,
+            },
+        );
+
+        let result = ping_provider(&cfg, &name).await;
+
+        assert!(result.starts_with("provider: ping 실패 ("));
+        assert!(!result.contains(secret));
+        assert!(!result.contains("api_key"));
+        assert!(!result.contains("secret.invalid"));
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
 
@@ -1815,26 +2133,227 @@ mod combo_tests {
 
     #[test]
     fn stream_failures_rotate_accounts_before_candidates_without_output() {
+        let rate_limited = crate::provider::ProviderRequestError::new(
+            "OpenAI",
+            crate::provider::ProviderRequestErrorKind::RateLimited { retry_after: 7 },
+        )
+        .into();
+        let auth = crate::provider::ProviderRequestError::new(
+            "OpenAI",
+            crate::provider::ProviderRequestErrorKind::Auth { status: 401 },
+        )
+        .into();
+        let timeout = crate::provider::ProviderRequestError::new(
+            "OpenAI",
+            crate::provider::ProviderRequestErrorKind::Timeout,
+        )
+        .into();
+        let client = crate::provider::ProviderRequestError::new(
+            "OpenAI",
+            crate::provider::ProviderRequestErrorKind::Client { status: 400 },
+        )
+        .into();
+        let server = crate::provider::ProviderRequestError::new(
+            "OpenAI",
+            crate::provider::ProviderRequestErrorKind::Server { status: 500 },
+        )
+        .into();
         assert_eq!(
-            stream_failure_action(&anyhow!("HTTP 429"), 0, 0),
+            stream_failure_action(&rate_limited, 0, 0),
+            StreamFailureAction::NextAccount
+        );
+        assert_eq!(rate_limit_retry_after(&rate_limited), 7);
+        assert_eq!(
+            stream_failure_action(&auth, 0, 0),
             StreamFailureAction::NextAccount
         );
         assert_eq!(
-            stream_failure_action(&anyhow!("HTTP 401"), 0, 0),
-            StreamFailureAction::NextAccount
-        );
-        assert_eq!(
-            stream_failure_action(&anyhow!("stream timed out"), 0, 2),
-            StreamFailureAction::NextAccount
-        );
-        assert_eq!(
-            stream_failure_action(&anyhow!("HTTP 400 model not found"), 0, 0),
+            stream_failure_action(&timeout, 0, 2),
             StreamFailureAction::NextCandidate
         );
         assert_eq!(
-            stream_failure_action(&anyhow!("HTTP 500"), 1, 0),
+            stream_failure_action(&client, 0, 0),
+            StreamFailureAction::NextCandidate
+        );
+        assert_eq!(
+            stream_failure_action(&server, 1, 0),
             StreamFailureAction::AbortAfterEmission
         );
+    }
+
+    #[test]
+    fn untyped_http_like_errors_never_control_fallback_routing() {
+        for message in [
+            "HTTP 401 token=secret",
+            "HTTP 429 rate_limited",
+            "stream timed out",
+            "HTTP 500 https://secret.invalid/v1?key=do-not-log",
+        ] {
+            let error = anyhow!(message);
+            assert!(!is_auth_failure(&error));
+            assert!(!is_typed_rate_limited(&error));
+            assert!(!request_is_retryable(&error));
+            assert_eq!(rate_limit_retry_after(&error), 45);
+            assert_eq!(
+                stream_failure_action(&error, 0, 0),
+                StreamFailureAction::NextCandidate
+            );
+            assert_eq!(
+                nonstream_failure_action(&error),
+                NonstreamFailureAction::NextCandidate
+            );
+            assert_eq!(
+                crate::provider::safe_summary(&error),
+                "provider operation failed"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_failures_have_exhaustive_fallback_routing() {
+        use crate::provider::ProtocolErrorKind;
+
+        for kind in [
+            ProtocolErrorKind::EmptyResponse,
+            ProtocolErrorKind::InvalidTool,
+            ProtocolErrorKind::InvalidJson,
+            ProtocolErrorKind::InvalidSequence,
+            ProtocolErrorKind::TruncatedStream,
+            ProtocolErrorKind::UpstreamError,
+        ] {
+            let error = crate::provider::protocol_error("test", kind);
+            assert_eq!(
+                stream_failure_action(&error, 0, 0),
+                StreamFailureAction::RetrySameAccount,
+                "unexpected stream routing for {kind:?}"
+            );
+            assert_eq!(
+                stream_failure_action(&error, 0, 1),
+                StreamFailureAction::NextCandidate,
+                "retryable protocol error must leave the candidate after one retry for {kind:?}"
+            );
+            assert_eq!(
+                nonstream_failure_action(&error),
+                NonstreamFailureAction::NextAccount,
+                "unexpected nonstream routing for {kind:?}"
+            );
+            assert_eq!(
+                stream_failure_action(&error, 1, 0),
+                StreamFailureAction::AbortAfterEmission,
+                "displayed output must win for {kind:?}"
+            );
+        }
+
+        let limit = crate::provider::protocol_error("test", ProtocolErrorKind::LimitExceeded);
+        assert_eq!(
+            stream_failure_action(&limit, 0, 0),
+            StreamFailureAction::NextCandidate
+        );
+        assert_eq!(
+            nonstream_failure_action(&limit),
+            NonstreamFailureAction::NextCandidate
+        );
+        assert_eq!(
+            stream_failure_action(&limit, 1, 0),
+            StreamFailureAction::AbortAfterEmission
+        );
+    }
+
+    #[test]
+    fn in_run_attempt_gate_caps_each_call_without_consuming_the_run_budget() {
+        let run = crate::run::RunContext::isolated(
+            crate::run::RunId::new("dual-provider-attempt-gate"),
+            std::env::temp_dir(),
+        );
+        assert_eq!(run.ensure_provider_attempt_limit(7), 7);
+
+        let mut first_call = ProviderAttemptGate::in_run(&run);
+        assert!(first_call.claim().is_ok());
+        assert!(first_call.claim().is_ok());
+        assert!(first_call.claim().is_ok());
+        let error = first_call
+            .claim()
+            .expect_err("one fallback invocation must stop before a fourth dispatch");
+        assert!(is_provider_attempt_limit_exceeded(&error));
+        assert_eq!(run.provider_attempts_used(), 3);
+
+        let mut second_call = ProviderAttemptGate::in_run(&run);
+        assert!(second_call.claim().is_ok());
+        assert_eq!(run.provider_attempts_used(), 4);
+    }
+
+    #[test]
+    fn primary_account_rotation_reserves_the_third_attempt_for_fallback() {
+        let mut gate = ProviderAttemptGate::local();
+        assert_eq!(gate.can_dispatch(1).expect("first primary slot"), true);
+        assert!(gate.claim().is_ok());
+        assert_eq!(gate.can_dispatch(1).expect("second primary slot"), true);
+        assert!(gate.claim().is_ok());
+        assert_eq!(gate.can_dispatch(1).expect("reserved fallback slot"), false);
+        assert_eq!(gate.can_dispatch(0).expect("fallback slot"), true);
+        assert!(gate.claim().is_ok());
+        assert!(
+            gate.can_dispatch(0)
+                .expect_err("fourth dispatch must report local exhaustion")
+                .is::<ProviderAttemptLimitExceeded>()
+        );
+    }
+
+    #[test]
+    fn only_the_primary_candidate_reserves_a_secondary_slot() {
+        assert!(reserve_for_secondary(0, 3));
+        assert!(!reserve_for_secondary(1, 3));
+        assert!(!reserve_for_secondary(2, 3));
+        assert!(!reserve_for_secondary(0, 1));
+    }
+
+    #[test]
+    fn auth_then_retryable_primary_failure_preserves_the_secondary_slot() {
+        let auth: anyhow::Error = crate::provider::ProviderRequestError::new(
+            "OpenAI",
+            crate::provider::ProviderRequestErrorKind::Auth { status: 401 },
+        )
+        .into();
+        let server: anyhow::Error = crate::provider::ProviderRequestError::new(
+            "OpenAI",
+            crate::provider::ProviderRequestErrorKind::Server { status: 503 },
+        )
+        .into();
+        let mut gate = ProviderAttemptGate::local();
+
+        assert!(gate.claim().is_ok());
+        assert_eq!(
+            stream_failure_action(&auth, 0, 0),
+            StreamFailureAction::NextAccount
+        );
+        assert_eq!(gate.can_dispatch(1).expect("second primary account"), true);
+        assert!(gate.claim().is_ok());
+        assert_eq!(
+            stream_failure_action(&server, 0, 0),
+            StreamFailureAction::RetrySameAccount
+        );
+        assert_eq!(
+            can_retry_same_account(&gate, true).expect("reserved secondary slot"),
+            false
+        );
+        assert_eq!(gate.can_dispatch(0).expect("secondary dispatch"), true);
+        assert!(gate.claim().is_ok());
+    }
+
+    #[test]
+    fn fallback_summary_never_includes_untyped_error_details() {
+        let secret = "https://secret.invalid/v1?api_key=do-not-log";
+        let error = anyhow!("request failed at {secret}");
+
+        let summary = fallback_summary(&error, "trying next provider");
+
+        assert_eq!(summary, "provider operation failed; trying next provider");
+        assert!(!summary.contains(secret));
+        assert!(!summary.contains("api_key"));
+
+        let returned = sanitized_provider_error(error).to_string();
+        assert_eq!(returned, "provider operation failed");
+        assert!(!returned.contains(secret));
     }
 }
 

@@ -30,8 +30,7 @@ pub(crate) use crate::config::{Config, ProviderConfig};
 pub(crate) use crate::db::Db;
 pub(crate) use crate::provider::{
     AnthropicProvider, ChatRequest, ChatResponse, ContentBlock, DynProvider, Message,
-    OpenAiCompatProvider, SemanticStreamEvent, StopReason, StreamEvent, is_rate_limited,
-    is_retryable,
+    OpenAiCompatProvider, SemanticStreamEvent, StopReason, StreamEvent,
 };
 pub(crate) use crate::run::{RunContext, RunId, TerminalState};
 pub(crate) use crate::tools::{self, ToolCtx, ToolRegistry};

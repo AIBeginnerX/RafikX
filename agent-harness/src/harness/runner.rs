@@ -423,6 +423,17 @@ pub(crate) fn extract_plan_section(plan: &str, header: &str) -> String {
     out.join("\n").trim().to_string()
 }
 
+async fn await_or_cancel<T>(
+    run: &RunContext,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = run.cancelled_reason() => None,
+        result = future => Some(result),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // 공개 파이프라인 API: 호출부 호환을 위해 시그니처 유지
 async fn run_pipeline_inner(
     cfg: &Config,
@@ -626,6 +637,11 @@ async fn run_pipeline_inner(
     }
     let turn_iteration_limit = turn_iteration_budget(effective_max_iter);
     run_context.ensure_model_iteration_limit(turn_iteration_limit);
+    run_context.ensure_provider_attempt_limit(
+        turn_iteration_limit
+            .max(crate::harness::COMBO_MAX_HOPS as u32)
+            .min(agent::HARD_CAP),
+    );
 
     // 계획 단계 — 메인 system 을 그대로 이어받아 lessons·system_extra·프로젝트 규칙·
     // 엔진 지시가 계획에도 반영되게 한다 (system 을 통째로 교체하던 결함 수정).
@@ -676,34 +692,63 @@ async fn run_pipeline_inner(
             // 계획은 수십 초가 걸린다 — 비스트리밍이면 그 구간이 통째로 침묵한다.
             stream: true,
         });
+        if run_context.is_cancelled() {
+            return Ok(cancelled_outcome());
+        }
         crate::ui::live_line_in(&run_context, &format!("[계획 수립 중 · {}]", binding.model));
-        let on_plan_event = |ev: SemanticStreamEvent| match ev {
-            SemanticStreamEvent::ReasoningText(piece) => {
-                crate::ui::live_chunk_in(&run_context, piece)
+        let on_plan_event = |ev: SemanticStreamEvent| {
+            if run_context.is_cancelled() {
+                return;
             }
-            SemanticStreamEvent::ContentCandidate(_) => {}
-            SemanticStreamEvent::ToolArgs { name, total_bytes } => {
-                crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
+            match ev {
+                SemanticStreamEvent::ReasoningText(piece) => {
+                    crate::ui::live_chunk_in(&run_context, piece)
+                }
+                SemanticStreamEvent::ContentCandidate(_) => {}
+                SemanticStreamEvent::ToolArgs { name, total_bytes } => {
+                    crate::ui::live_status_in(&run_context, &tool_args_label(name, total_bytes))
+                }
             }
         };
         let plan_call = if let Some(req) = req {
             if binding.combo_chain.is_empty() {
-                stream_semantic_with_fallback(cfg, &order, role, req, on_plan_event).await
+                await_or_cancel(
+                    &run_context,
+                    stream_semantic_with_fallback_in_run(
+                        cfg,
+                        &run_context,
+                        &order,
+                        role,
+                        req,
+                        on_plan_event,
+                    ),
+                )
+                .await
             } else {
-                stream_semantic_with_fallback_combo(
-                    cfg,
-                    &binding.combo_chain,
-                    role,
-                    req,
-                    on_plan_event,
+                await_or_cancel(
+                    &run_context,
+                    stream_semantic_with_fallback_combo_in_run(
+                        cfg,
+                        &run_context,
+                        &binding.combo_chain,
+                        role,
+                        req,
+                        on_plan_event,
+                    ),
                 )
                 .await
             }
         } else {
-            Err(anyhow!(
+            Some(Err(anyhow!(
                 "계획 프롬프트와 현재 작업을 컨텍스트 창에 함께 담을 수 없습니다."
-            ))
+            )))
         };
+        let Some(plan_call) = plan_call else {
+            return Ok(cancelled_outcome());
+        };
+        if run_context.is_cancelled() {
+            return Ok(cancelled_outcome());
+        }
         match plan_call {
             Ok((_n, resp)) => {
                 crate::graph::node_in(&run_context, "plan", "plan_first", "", Some("pre_step"));
@@ -777,6 +822,9 @@ async fn run_pipeline_inner(
                 }
             }
             Err(e) => {
+                if is_provider_attempt_limit_exceeded(&e) {
+                    return Ok(provider_attempt_limit_outcome(e));
+                }
                 crate::ui::live_warn_in(&run_context, &format!("계획 단계 실패(계속 진행): {e}"))
             }
         }
@@ -833,26 +881,33 @@ async fn run_pipeline_inner(
             Box<dyn std::future::Future<Output = Result<(String, ChatResponse)>> + Send + 'a>,
         >;
         let response: MainFuture<'_> = if binding.combo_chain.is_empty() {
-            Box::pin(stream_semantic_with_fallback(
+            Box::pin(stream_semantic_with_fallback_in_run(
                 cfg,
+                &run_context,
                 &order,
                 role,
                 req,
                 on_main_event,
             ))
         } else {
-            Box::pin(stream_semantic_with_fallback_combo(
+            Box::pin(stream_semantic_with_fallback_combo_in_run(
                 cfg,
+                &run_context,
                 &binding.combo_chain,
                 role,
                 req,
                 on_main_event,
             ))
         };
-        tokio::pin!(response);
-        let (_name, resp) = tokio::select! {
-            result = &mut response => result?,
-            _ = run_context.cancelled_reason() => return Ok(cancelled_outcome()),
+        let Some(response) = await_or_cancel(&run_context, response).await else {
+            return Ok(cancelled_outcome());
+        };
+        let (_name, resp) = match response {
+            Ok(response) => response,
+            Err(error) if is_provider_attempt_limit_exceeded(&error) => {
+                return Ok(provider_attempt_limit_outcome(error));
+            }
+            Err(error) => return Err(error),
         };
         let _ = run_context.transition_lifecycle(crate::lifecycle::LifecycleEventData::Tokens {
             input: resp.input_tokens,
@@ -1182,7 +1237,18 @@ async fn run_pipeline_inner(
                     current.error = shared_iteration_limit_outcome(&run_context).error;
                     break current;
                 }
-                match crate::fallback::consult_architect(cfg, task, &answer).await {
+                let Some(architect_call) = await_or_cancel(
+                    &run_context,
+                    crate::fallback::consult_architect_in_run(cfg, &run_context, task, &answer),
+                )
+                .await
+                else {
+                    break cancelled_outcome();
+                };
+                if run_context.is_cancelled() {
+                    break cancelled_outcome();
+                }
+                match architect_call {
                     Ok(Some(judgment)) => {
                         fallback_budget -= 1;
                         crate::ui::live_line_in(
@@ -1246,6 +1312,9 @@ async fn run_pipeline_inner(
                         // 추출 결과 진짜 질문이 아님 — 정상 종료 경로로 본다.
                     }
                     Err(e) => {
+                        if is_provider_attempt_limit_exceeded(&e) {
+                            break provider_attempt_limit_outcome(e);
+                        }
                         crate::ui::live_warn_in(
                             &run_context,
                             &format!("[폴 fallback] 아키텍트 상담 실패(정상 종료로 진행): {e}"),
@@ -1542,6 +1611,14 @@ fn shared_iteration_limit_outcome(run: &RunContext) -> AgentOutcome {
     AgentOutcome {
         status: "limit".into(),
         error: Some(format!("공유 모델 반복 예산 {limit}회 소진")),
+        ..AgentOutcome::default()
+    }
+}
+
+fn provider_attempt_limit_outcome(error: anyhow::Error) -> AgentOutcome {
+    AgentOutcome {
+        status: "limit".into(),
+        error: Some(error.to_string()),
         ..AgentOutcome::default()
     }
 }
@@ -3521,6 +3598,68 @@ mod tests {
         assert!(!no_tool_answer_is_deliverable(&response));
     }
 
+    #[tokio::test]
+    async fn cancelled_race_precedes_an_already_ready_operation() {
+        let run = RunContext::isolated(
+            crate::run::RunId::new("cancel-precedes-ready"),
+            std::env::temp_dir(),
+        );
+        run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        assert!(run.cancel("test cancellation"));
+
+        let result = await_or_cancel(&run, std::future::ready("provider result")).await;
+
+        assert_eq!(result, None);
+        assert_eq!(
+            run.lifecycle_state(),
+            Some(crate::lifecycle::LifecycleState::CancelRequested)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_race_drops_the_pending_operation() {
+        struct PendingOperation(Arc<std::sync::atomic::AtomicBool>);
+
+        impl std::future::Future for PendingOperation {
+            type Output = ();
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingOperation {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let run = RunContext::isolated(
+            crate::run::RunId::new("cancel-drops-pending"),
+            std::env::temp_dir(),
+        );
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(run.cancel("test cancellation"));
+
+        let result = await_or_cancel(&run, PendingOperation(Arc::clone(&dropped))).await;
+
+        assert_eq!(result, None);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn provider_attempt_exhaustion_returns_a_limit_outcome() {
+        let outcome = provider_attempt_limit_outcome(
+            crate::harness::ProviderAttemptLimitExceeded { limit: 3 }.into(),
+        );
+
+        assert_eq!(outcome.status, "limit");
+    }
+
     #[test]
     fn cancellation_after_verification_overrides_success_without_publishing() {
         let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3549,6 +3688,10 @@ mod tests {
 
         let outcome = result.expect("outcome");
         assert_eq!(outcome.status, "cancelled");
+        assert_eq!(
+            run.lifecycle_state(),
+            Some(crate::lifecycle::LifecycleState::CancelRequested)
+        );
         assert!(
             emitted
                 .lock()
@@ -3559,10 +3702,7 @@ mod tests {
 
         let mut error_result: Result<AgentOutcome> = Err(anyhow!("late verification error"));
         finalize_pipeline_delivery(&run, &mut error_result);
-        assert_eq!(
-            error_result.expect("cancelled outcome").status,
-            "cancelled"
-        );
+        assert_eq!(error_result.expect("cancelled outcome").status, "cancelled");
     }
 
     #[test]

@@ -3,8 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rafikx::config::{Config, ProviderConfig};
-use rafikx::harness::{Binding, TaskClass, classify_rules, run_pipeline_with_context};
-use rafikx::provider::ContentBlock;
+use rafikx::harness::{
+    Binding, TaskClass, chat_with_fallback_combo, classify_rules, run_pipeline_with_context,
+    stream_with_fallback_combo,
+};
+use rafikx::provider::{ChatRequest, ContentBlock, Message};
 use rafikx::quality::detect_duplicate_blocks;
 use rafikx::quality::run_quality_gate;
 use rafikx::run::{RunContext, RunId};
@@ -190,6 +193,19 @@ fn scripted_text_response(text: &str) -> String {
         "usage": {"prompt_tokens": 10, "completion_tokens": 4}
     });
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+fn scripted_nonstream_response(text: &str) -> String {
+    json!({
+        "model": "scripted-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 10}
+    })
+    .to_string()
 }
 
 fn scripted_limited_response(text: &str) -> String {
@@ -415,6 +431,43 @@ async fn start_scripted_budget_model()
                 .write_all(response.as_bytes())
                 .await
                 .expect("budget response");
+        }
+    });
+    (format!("http://{address}/v1"), requests, server)
+}
+
+async fn start_scripted_response_sequence(
+    responses: Vec<(u16, String)>,
+) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("sequence listener");
+    let address = listener.local_addr().expect("sequence address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().await.expect("sequence accept");
+            let request = read_http_body(&mut stream).await.expect("sequence request");
+            captured.lock().expect("sequence request log").push(request);
+            let reason = match status {
+                200 => "OK",
+                500 => "Internal Server Error",
+                _ => "Bad Request",
+            };
+            let content_type = if status == 200 {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("sequence response");
         }
     });
     (format!("http://{address}/v1"), requests, server)
@@ -821,6 +874,60 @@ async fn external_symlink_under_excluded_directory_prevents_bash_execution() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_python_symlink_below_venv_prevents_unrelated_bash_execution() {
+    let workspace = TestWorkspace::new("bash-venv-external-python");
+    let outside = TestWorkspace::new("bash-venv-external-python-target");
+    fs::create_dir_all(workspace.path().join(".venv/bin")).expect("venv bin directory");
+    fs::write(outside.path().join("python3"), "outside python").expect("outside python");
+    std::os::unix::fs::symlink(
+        outside.path().join("python3"),
+        workspace.path().join(".venv/bin/python3"),
+    )
+    .expect("external python symlink");
+    let run = RunContext::isolated(
+        RunId::new("bash-venv-external-python-test"),
+        workspace.path().to_path_buf(),
+    );
+    let mut context = ToolCtx::new(workspace.path().to_path_buf());
+    context.run = Some(run);
+    let registry = ToolRegistry::all();
+    let bash = registry.get("bash").expect("bash tool");
+
+    let error = bash
+        .run(json!({"command": "printf ran > marker.txt"}), &context)
+        .expect_err("external venv python symlink must block unrelated bash");
+    assert!(error.to_string().contains("실행 전 변경 추적 실패"));
+    assert!(!workspace.path().join("marker.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn obfuscated_shell_path_through_excluded_external_link_is_blocked() {
+    let workspace = TestWorkspace::new("bash-obfuscated-excluded-link");
+    let outside = TestWorkspace::new("bash-obfuscated-excluded-target");
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join(".cache"))
+        .expect("excluded external symlink");
+    let run = RunContext::isolated(
+        RunId::new("bash-obfuscated-excluded-link-test"),
+        workspace.path().to_path_buf(),
+    );
+    let mut context = ToolCtx::new(workspace.path().to_path_buf());
+    context.run = Some(run);
+    let registry = ToolRegistry::all();
+    let bash = registry.get("bash").expect("bash tool");
+
+    let error = bash
+        .run(
+            json!({"command": "printf escaped > ./.cache/../.cache/obfuscated.txt"}),
+            &context,
+        )
+        .expect_err("excluded external symlink must block obfuscated shell path");
+    assert!(error.to_string().contains("실행 전 변경 추적 실패"));
+    assert!(!outside.path().join("obfuscated.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_symlink_alias_tools_share_one_final_baseline() {
     let workspace = TestWorkspace::new("mixed-alias-real");
     let alias = workspace.path().with_extension("alias");
@@ -1016,6 +1123,436 @@ async fn parallel_delegates_share_the_root_model_iteration_budget() {
     assert_eq!(outcome.iterations, 2);
     assert_ne!(outcome.status, "ok");
     assert_eq!(requests.lock().expect("budget requests").len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_successful_semantic_turn_dispatches_one_http_attempt() {
+    let workspace = TestWorkspace::new("one-turn-one-attempt");
+    let (base_url, requests, server) =
+        start_scripted_response_sequence(vec![(200, scripted_text_response("done"))]).await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let binding = scripted_binding(TaskClass::Simple, &[], 1, false, 8_000);
+    let run = RunContext::for_config(RunId::new("one-turn-one-attempt"), Arc::new(cfg.clone()));
+
+    let outcome = run_pipeline_with_context(
+        &cfg,
+        &binding,
+        "answer once",
+        true,
+        None,
+        None,
+        None,
+        None,
+        run,
+    )
+    .await
+    .expect("single-turn pipeline");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("single-turn server timeout")
+        .expect("single-turn server task");
+
+    assert_eq!(
+        outcome.status, "ok",
+        "single-turn outcome: {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.iterations, 1);
+    assert_eq!(requests.lock().expect("single-turn requests").len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_failure_falls_back_without_an_extra_semantic_iteration() {
+    let workspace = TestWorkspace::new("provider-failure-fallback");
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (400, "{}".into()),
+        (200, scripted_text_response("fallback done")),
+    ])
+    .await;
+    let mut cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let alternate = cfg
+        .file
+        .providers
+        .get("scripted")
+        .expect("scripted provider")
+        .clone();
+    cfg.file.providers.insert("alternate".into(), alternate);
+    cfg.file.harness.fallback = vec!["alternate".into()];
+    let binding = scripted_binding(TaskClass::Simple, &[], 1, false, 8_000);
+    let run = RunContext::for_config(
+        RunId::new("provider-failure-fallback"),
+        Arc::new(cfg.clone()),
+    );
+
+    let outcome = run_pipeline_with_context(
+        &cfg,
+        &binding,
+        "answer through fallback",
+        true,
+        None,
+        None,
+        None,
+        None,
+        run,
+    )
+    .await
+    .expect("fallback pipeline");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("fallback server timeout")
+        .expect("fallback server task");
+
+    assert_eq!(
+        outcome.status, "ok",
+        "fallback outcome: {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.iterations, 1);
+    assert_eq!(requests.lock().expect("fallback requests").len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_nonstream_response_advances_to_a_meaningful_candidate() {
+    let workspace = TestWorkspace::new("empty-nonstream-fallback");
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (200, scripted_nonstream_response("")),
+        (200, scripted_nonstream_response("meaningful fallback")),
+    ])
+    .await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let combo = vec![
+        ("scripted".to_string(), "empty-model".to_string()),
+        ("scripted".to_string(), "valid-model".to_string()),
+    ];
+    let request = ChatRequest {
+        model: "empty-model".into(),
+        system: "system".into(),
+        messages: vec![Message::user_text("validate responses")],
+        tools: Vec::new(),
+        max_tokens: 64,
+        stream: false,
+    };
+
+    let (_, response) = chat_with_fallback_combo(&cfg, &combo, "main", request)
+        .await
+        .expect("meaningful fallback response");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("nonstream server timeout")
+        .expect("nonstream server task");
+
+    assert!(response.content.iter().any(
+        |block| matches!(block, ContentBlock::Text { text } if text == "meaningful fallback")
+    ));
+    assert_eq!(requests.lock().expect("nonstream requests").len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_combo_wrapper_caps_wire_attempts_at_three() {
+    let workspace = TestWorkspace::new("public-combo-attempt-cap");
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (500, "{}".into()),
+        (500, "{}".into()),
+        (500, "{}".into()),
+    ])
+    .await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let combo = (0..4)
+        .map(|index| ("scripted".to_string(), format!("model-{index}")))
+        .collect::<Vec<_>>();
+    let request = ChatRequest {
+        model: "model-0".into(),
+        system: "system".into(),
+        messages: vec![Message::user_text("test the public wrapper")],
+        tools: Vec::new(),
+        max_tokens: 64,
+        stream: true,
+    };
+
+    let error = stream_with_fallback_combo(&cfg, &combo, "main", request, |_| {})
+        .await
+        .expect_err("fourth wire attempt must be rejected");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("public cap server timeout")
+        .expect("public cap server task");
+
+    assert!(error.to_string().contains("HTTP 시도 예산 3회 소진"));
+    assert_eq!(requests.lock().expect("public cap requests").len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_attempt_exhaustion_stops_fallback_with_limit_status() {
+    let workspace = TestWorkspace::new("shared-attempt-limit-status");
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (500, "{}".into()),
+        (500, "{}".into()),
+        (500, "{}".into()),
+    ])
+    .await;
+    let mut cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let alternate = cfg
+        .file
+        .providers
+        .get("scripted")
+        .expect("scripted provider")
+        .clone();
+    cfg.file.providers.insert("alternate".into(), alternate);
+    cfg.file.harness.fallback = vec!["alternate".into()];
+    let binding = scripted_binding(TaskClass::Simple, &[], 1, false, 8_000);
+    let run = RunContext::for_config(
+        RunId::new("shared-attempt-limit-status"),
+        Arc::new(cfg.clone()),
+    );
+
+    let outcome = run_pipeline_with_context(
+        &cfg,
+        &binding,
+        "exhaust the shared attempt budget",
+        true,
+        None,
+        None,
+        None,
+        None,
+        run,
+    )
+    .await
+    .expect("attempt-limited pipeline");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("attempt limit server timeout")
+        .expect("attempt limit server task");
+
+    assert_eq!(outcome.status, "limit");
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("HTTP 시도 예산 3회 소진")),
+        "attempt-limit outcome: {:?}",
+        outcome.error
+    );
+    assert_eq!(requests.lock().expect("attempt limit requests").len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_run_fallback_call_caps_wire_attempts_below_the_shared_budget() {
+    let workspace = TestWorkspace::new("in-run-call-attempt-cap");
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (500, "{}".into()),
+        (500, "{}".into()),
+        (500, "{}".into()),
+    ])
+    .await;
+    let mut cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let alternate = cfg
+        .file
+        .providers
+        .get("scripted")
+        .expect("scripted provider")
+        .clone();
+    cfg.file.providers.insert("alternate".into(), alternate);
+    cfg.file.harness.fallback = vec!["alternate".into()];
+    let binding = scripted_binding(TaskClass::Simple, &[], 7, false, 8_000);
+    let run = RunContext::for_config(RunId::new("in-run-call-attempt-cap"), Arc::new(cfg.clone()));
+
+    let outcome = run_pipeline_with_context(
+        &cfg,
+        &binding,
+        "cap one fallback invocation below the run-tree budget",
+        true,
+        None,
+        None,
+        None,
+        None,
+        run,
+    )
+    .await
+    .expect("locally attempt-limited pipeline");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("local attempt cap server timeout")
+        .expect("local attempt cap server task");
+
+    assert_eq!(outcome.status, "limit");
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("HTTP 시도 예산 3회 소진")),
+        "local attempt-limit outcome: {:?}",
+        outcome.error
+    );
+    assert_eq!(requests.lock().expect("local cap requests").len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_response_after_display_never_calls_secondary() {
+    let workspace = TestWorkspace::new("displayed-invalid-response");
+    let (base_url, requests, server) =
+        start_scripted_response_sequence(vec![(200, scripted_text_response(" "))]).await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let combo = vec![
+        ("scripted".to_string(), "invalid-model".to_string()),
+        ("scripted".to_string(), "secondary-model".to_string()),
+    ];
+    let request = ChatRequest {
+        model: "invalid-model".into(),
+        system: "system".into(),
+        messages: vec![Message::user_text("do not mix displayed responses")],
+        tools: Vec::new(),
+        max_tokens: 64,
+        stream: true,
+    };
+
+    let error = stream_with_fallback_combo(&cfg, &combo, "main", request, |_| {})
+        .await
+        .expect_err("displayed invalid response must abort");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("displayed invalid server timeout")
+        .expect("displayed invalid server task");
+
+    assert!(error.to_string().contains("empty response"));
+    let captured = requests.lock().expect("displayed invalid requests");
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].contains("invalid-model"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_stream_retries_primary_once_then_succeeds_on_secondary() {
+    let workspace = TestWorkspace::new("empty-stream-retry");
+    let empty = scripted_text_response("");
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (200, empty.clone()),
+        (200, empty),
+        (200, scripted_text_response("secondary success")),
+    ])
+    .await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let combo = vec![
+        ("scripted".to_string(), "empty-model".to_string()),
+        ("scripted".to_string(), "secondary-model".to_string()),
+        ("scripted".to_string(), "tertiary-model".to_string()),
+    ];
+    let request = ChatRequest {
+        model: "empty-model".into(),
+        system: "system".into(),
+        messages: vec![Message::user_text("retry empty response")],
+        tools: Vec::new(),
+        max_tokens: 64,
+        stream: true,
+    };
+
+    let (_, response) = stream_with_fallback_combo(&cfg, &combo, "main", request, |_| {})
+        .await
+        .expect("secondary must fit inside the three-attempt cap");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("empty retry server timeout")
+        .expect("empty retry server task");
+
+    assert!(
+        response.content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text == "secondary success")
+        )
+    );
+    let captured = requests.lock().expect("empty retry requests");
+    assert_eq!(captured.len(), 3);
+    assert!(captured[0].contains("empty-model"));
+    assert!(captured[1].contains("empty-model"));
+    assert!(captured[2].contains("secondary-model"));
+    assert!(
+        captured
+            .iter()
+            .all(|request| !request.contains("tertiary-model"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_stream_retries_primary_once_then_succeeds_on_secondary() {
+    let workspace = TestWorkspace::new("malformed-stream-retry");
+    let malformed = "data: {not-json}\n\n".to_string();
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (200, malformed.clone()),
+        (200, malformed),
+        (200, scripted_text_response("secondary success")),
+    ])
+    .await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let combo = vec![
+        ("scripted".to_string(), "malformed-model".to_string()),
+        ("scripted".to_string(), "secondary-model".to_string()),
+    ];
+    let request = ChatRequest {
+        model: "malformed-model".into(),
+        system: "system".into(),
+        messages: vec![Message::user_text("retry malformed response")],
+        tools: Vec::new(),
+        max_tokens: 64,
+        stream: true,
+    };
+
+    let (_, response) = stream_with_fallback_combo(&cfg, &combo, "main", request, |_| {})
+        .await
+        .expect("secondary must recover malformed primary");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("malformed retry server timeout")
+        .expect("malformed retry server task");
+
+    assert!(
+        response.content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text == "secondary success")
+        )
+    );
+    let captured = requests.lock().expect("malformed retry requests");
+    assert_eq!(captured.len(), 3);
+    assert!(captured[0].contains("malformed-model"));
+    assert!(captured[1].contains("malformed-model"));
+    assert!(captured[2].contains("secondary-model"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_size_limit_skips_retry_and_advances_candidate() {
+    let workspace = TestWorkspace::new("stream-limit-next-candidate");
+    let oversized = format!("data: {}", "x".repeat(1024 * 1024 + 1));
+    let (base_url, requests, server) = start_scripted_response_sequence(vec![
+        (200, oversized),
+        (200, scripted_text_response("secondary success")),
+    ])
+    .await;
+    let cfg = scripted_config(workspace.path(), base_url, 8_000);
+    let combo = vec![
+        ("scripted".to_string(), "oversized-model".to_string()),
+        ("scripted".to_string(), "secondary-model".to_string()),
+    ];
+    let request = ChatRequest {
+        model: "oversized-model".into(),
+        system: "system".into(),
+        messages: vec![Message::user_text("skip deterministic size failure")],
+        tools: Vec::new(),
+        max_tokens: 64,
+        stream: true,
+    };
+
+    let (_, response) = stream_with_fallback_combo(&cfg, &combo, "main", request, |_| {})
+        .await
+        .expect("secondary candidate must succeed");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("stream limit server timeout")
+        .expect("stream limit server task");
+
+    assert!(
+        response.content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text == "secondary success")
+        )
+    );
+    let captured = requests.lock().expect("stream limit requests");
+    assert_eq!(captured.len(), 2);
+    assert!(captured[0].contains("oversized-model"));
+    assert!(captured[1].contains("secondary-model"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

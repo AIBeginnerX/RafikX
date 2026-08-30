@@ -23,6 +23,11 @@ struct ModelIterationBudget {
     used: AtomicU32,
 }
 
+struct ProviderAttemptBudget {
+    limit: AtomicU32,
+    used: AtomicU32,
+}
+
 #[derive(Default)]
 pub struct RunMetrics {
     context_window: AtomicU32,
@@ -67,6 +72,7 @@ pub struct RunContext {
     lifecycle: Arc<LifecycleRuntime>,
     approval_all: Arc<AtomicBool>,
     model_iterations: Arc<ModelIterationBudget>,
+    provider_attempts: Arc<ProviderAttemptBudget>,
     unresolved_child_tasks: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
@@ -118,6 +124,7 @@ impl RunContext {
             lifecycle,
             approval_all: Arc::clone(&self.approval_all),
             model_iterations: Arc::clone(&self.model_iterations),
+            provider_attempts: Arc::clone(&self.provider_attempts),
             unresolved_child_tasks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -260,6 +267,48 @@ impl RunContext {
         self.model_iterations.limit.load(Ordering::Acquire)
     }
 
+    pub(crate) fn ensure_provider_attempt_limit(&self, limit: u32) -> u32 {
+        let limit = limit.max(1);
+        let _ = self.provider_attempts.limit.compare_exchange(
+            0,
+            limit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.provider_attempts.limit.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn claim_provider_attempt(&self) -> bool {
+        let limit = self.provider_attempts.limit.load(Ordering::Acquire);
+        if limit == 0 {
+            return false;
+        }
+        let mut used = self.provider_attempts.used.load(Ordering::Acquire);
+        loop {
+            if used >= limit {
+                return false;
+            }
+            match self.provider_attempts.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_attempts_used(&self) -> u32 {
+        self.provider_attempts.used.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn provider_attempt_limit(&self) -> u32 {
+        self.provider_attempts.limit.load(Ordering::Acquire)
+    }
+
     pub(crate) fn mark_unresolved_child_task(&self, key: String, failure: String) {
         self.unresolved_child_tasks
             .lock()
@@ -319,6 +368,10 @@ impl RunContext {
             lifecycle,
             approval_all: Arc::new(AtomicBool::new(false)),
             model_iterations: Arc::new(ModelIterationBudget {
+                limit: AtomicU32::new(0),
+                used: AtomicU32::new(0),
+            }),
+            provider_attempts: Arc::new(ProviderAttemptBudget {
                 limit: AtomicU32::new(0),
                 used: AtomicU32::new(0),
             }),
@@ -388,5 +441,40 @@ mod tests {
         independent.ensure_model_iteration_limit(2);
         assert!(independent.claim_model_iteration());
         assert_eq!(independent.model_iterations_used(), 1);
+    }
+
+    #[test]
+    fn provider_attempt_budget_is_shared_by_concurrent_children() {
+        let root =
+            RunContext::isolated(crate::run::RunId::new("attempt-root"), std::env::temp_dir());
+        assert_eq!(root.ensure_provider_attempt_limit(7), 7);
+        let child = root.child(
+            crate::run::RunId::new("attempt-child"),
+            crate::run::AgentId::new("child"),
+        );
+        let sibling = root.child(
+            crate::run::RunId::new("attempt-sibling"),
+            crate::run::AgentId::new("sibling"),
+        );
+        let workers = (0..24)
+            .map(|index| {
+                let run = if index % 2 == 0 {
+                    child.clone()
+                } else {
+                    sibling.clone()
+                };
+                std::thread::spawn(move || run.claim_provider_attempt())
+            })
+            .collect::<Vec<_>>();
+        let claimed = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().expect("attempt budget worker")))
+            .sum::<usize>();
+
+        assert_eq!(claimed, 7);
+        assert_eq!(root.provider_attempts_used(), 7);
+        assert_eq!(child.provider_attempt_limit(), 7);
+        assert_eq!(root.model_iterations_used(), 0);
+        assert!(!sibling.claim_provider_attempt());
     }
 }
