@@ -1,3 +1,3 @@
-완료: v1.1.9 CLI 교정 후보 — 보이는 조상까지 확인하는 Canvas 의미+픽셀 증거, Path2D 변환·실제 OffscreenCanvas·ImageBitmap crop/resize/transfer와 소스 상한, 검증 명령의 제한 출력·시간초과 전체 트리 정리, Linux pidfd·macOS pid-version audit token 세대 고정 종료를 구현. 전체 556개·최소 기능 499개 테스트와 엄격 Node·Chrome 게임 복구 E2E 39.62초, 위조 Canvas 거부 및 분리·재부모화 후손 종료를 통과.
+완료: v1.1.9 CLI 후보 — 검증 증거 사전 정제·실패 사유 보존, 3초 상한의 세대 고정 Unix 정리, 인증·일회성 브라우저 영수증, Canvas 가림 판정, Windows Chrome/Edge 탐색, gofmt/shfmt 차이 검출을 구현. 전체 568개·최소 기능 511개 테스트, 프로세스 3종 12회 반복, 실제 Chrome 49개와 게임 복구 E2E 29.15초를 통과.
 다음: 새 정확 커밋 SHA를 5개 독립 gpt-5.6-sol CLI 검증에 통과시킨 뒤 그 SHA를 push하고 3개 OS·Rust 1.96 CI 성공 후 v1.1.9 annotated tag·GitHub Release를 게시하며 설치된 터미널의 `rafikx update`까지 검증한다. Tauri 데스크탑과 디지털 애니메이션 시작 화면은 별도 후속 Phase로 보류한다.
-이슈: 환경 의존 LSP 실동작 3개와 릴리스용 브라우저 게임 E2E 1개는 기본 실행에서 ignore이며 후자는 명시 실행으로 통과. Unix 추적은 악성 후손 격리용 보안 샌드박스가 아니고 구형 Linux의 pidfd 미지원 환경에서는 안전하게 실패하며, 기존 compiler·Clippy 경고와 전역 rustfmt 부채 외 신규 오류 없음.
+이슈: 환경 의존 LSP 실동작 3개와 릴리스용 브라우저 게임 E2E 1개는 기본 실행에서 ignore이며 후자는 명시 실행으로 통과. Unix 추적은 환경과 상속 scope FD를 함께 지우고 daemonize하는 적대 프로세스를 가두는 샌드박스가 아니며, 기존 compiler·Clippy 경고와 전역 rustfmt 부채 외 신규 오류 없음.

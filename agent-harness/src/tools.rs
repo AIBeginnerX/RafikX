@@ -1417,7 +1417,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_completion_cleans_reparented_environment_cleared_descendants() {
+    async fn bash_completion_cleans_reparented_descendants_with_retained_scope_fd() {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file());
@@ -1461,7 +1461,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_timeout_kills_reparented_environment_cleared_descendants() {
+    async fn bash_timeout_kills_reparented_descendants_with_retained_scope_fd() {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file());

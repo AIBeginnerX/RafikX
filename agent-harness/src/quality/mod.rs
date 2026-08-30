@@ -292,6 +292,22 @@ async fn run_argv_step(
     .await
 }
 
+fn successful_stdout_is_failure(program: &str, args: &[String], stdout: &[u8]) -> bool {
+    if stdout.is_empty() {
+        return false;
+    }
+    let executable = Path::new(program)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match executable.as_str() {
+        "gofmt" => args.iter().any(|arg| arg == "-l" || arg == "-d"),
+        "shfmt" => args.iter().any(|arg| arg == "-d"),
+        _ => false,
+    }
+}
+
 async fn run_argv_step_with_timeout(
     stage: &'static str,
     display: String,
@@ -310,7 +326,9 @@ async fn run_argv_step_with_timeout(
         },
         Ok(output) => {
             let code = output.status.code();
-            let failed = !output.status.success() || output.overflow;
+            let format_diff = output.status.success()
+                && successful_stdout_is_failure(&program, &args, &output.stdout);
+            let failed = !output.status.success() || output.overflow || format_diff;
             let tail = {
                 let text = format!(
                     "{}{}",
@@ -327,6 +345,12 @@ async fn run_argv_step_with_timeout(
                     "출력이 수집 상한을 초과했습니다".into()
                 } else {
                     format!("출력이 수집 상한을 초과했습니다\n{tail}")
+                })
+            } else if format_diff {
+                Some(if tail.is_empty() {
+                    "포맷 차이가 출력되었습니다".into()
+                } else {
+                    tail
                 })
             } else {
                 failed.then_some(tail)
@@ -1630,7 +1654,7 @@ pub(crate) fn redact_local_output(text: &str, workspace: &Path) -> String {
         .join(" ")
 }
 
-pub(crate) fn redact_tool_output(text: &str, workspace: &Path) -> String {
+pub(crate) fn redact_unbounded_output(text: &str, workspace: &Path) -> String {
     let normalized = normalize_redaction_input(text, workspace);
     let mut output = String::with_capacity(normalized.len());
     let mut redact_next = false;
@@ -1651,6 +1675,11 @@ pub(crate) fn redact_tool_output(text: &str, workspace: &Path) -> String {
     if let Some(start) = token_start {
         output.push_str(&redact_output_token(&normalized[start..], &mut redact_next));
     }
+    output
+}
+
+pub(crate) fn redact_tool_output(text: &str, workspace: &Path) -> String {
+    let output = redact_unbounded_output(text, workspace);
     let mut bounded = output.chars().take(40_000).collect::<String>();
     if output.chars().count() > 40_000 {
         bounded.push_str("\n…[truncated]");
@@ -1877,6 +1906,35 @@ mod tests {
             assert!(is_node_syntax_source(file), "not detected: {file}");
         }
         assert!(!is_node_syntax_source("component.jsx"));
+    }
+
+    #[test]
+    fn diff_printing_formatters_fail_on_successful_stdout() {
+        assert!(successful_stdout_is_failure(
+            "gofmt",
+            &["-l".into(), ".".into()],
+            b"main.go\n"
+        ));
+        assert!(successful_stdout_is_failure(
+            "/usr/local/bin/gofmt",
+            &["-d".into(), "main.go".into()],
+            b"diff main.go\n"
+        ));
+        assert!(successful_stdout_is_failure(
+            "shfmt.exe",
+            &["-d".into(), ".".into()],
+            b"diff script.sh\n"
+        ));
+        assert!(!successful_stdout_is_failure(
+            "gofmt",
+            &["-l".into(), ".".into()],
+            b""
+        ));
+        assert!(!successful_stdout_is_failure(
+            "cargo",
+            &["test".into()],
+            b"test output\n"
+        ));
     }
 
     #[cfg(unix)]

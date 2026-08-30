@@ -14,6 +14,7 @@ use crate::verify::task::VerifierVerdict;
 /// 판정 근거는 이 함수가 반환하는 exit code 뿐이다 (레드팀 시나리오 2).
 async fn run_cmd(cmd: &str, timeout_secs: u64, workspace: &std::path::Path) -> Evidence {
     let started = Instant::now();
+    let evidence_cmd = crate::quality::redact_bounded_error(cmd, workspace);
     #[cfg(windows)]
     let (program, args) = (
         "cmd",
@@ -36,12 +37,12 @@ async fn run_cmd(cmd: &str, timeout_secs: u64, workspace: &std::path::Path) -> E
     let duration_ms = started.elapsed().as_millis();
     match output {
         Err(error) => Evidence {
-            cmd: cmd.to_string(),
+            cmd: evidence_cmd,
             exit_code: None,
             expect_exit: 0,
             passed: false,
             duration_ms,
-            output_tail: error,
+            output_tail: crate::quality::redact_bounded_error(&error, workspace),
             diff_stat: None,
             guard: None,
             tests_passed: None,
@@ -49,10 +50,13 @@ async fn run_cmd(cmd: &str, timeout_secs: u64, workspace: &std::path::Path) -> E
         },
         Ok(out) => {
             let exit_code = (!out.overflow).then(|| out.status.code()).flatten();
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+            let combined = crate::quality::redact_unbounded_output(
+                &format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                workspace,
             );
             let mut tail: String = {
                 let lines: Vec<&str> = combined.lines().collect();
@@ -63,7 +67,7 @@ async fn run_cmd(cmd: &str, timeout_secs: u64, workspace: &std::path::Path) -> E
                 tail = format!("출력 상한 초과 — 검증을 신뢰할 수 없습니다\n{tail}");
             }
             Evidence {
-                cmd: cmd.to_string(),
+                cmd: evidence_cmd,
                 exit_code,
                 expect_exit: 0,
                 passed: exit_code == Some(0),
@@ -202,10 +206,34 @@ pub async fn run_task_verification(
     }
     let results = CmdResults::new(evidences);
 
+    if !results.all_passed {
+        let failed: Vec<String> = results
+            .results
+            .iter()
+            .filter(|e| !e.passed)
+            .map(|e| {
+                let detail = e.output_tail.lines().next().unwrap_or_default();
+                let detail = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                };
+                format!(
+                    "{} → exit {:?} (기대 {}){}",
+                    e.cmd, e.exit_code, e.expect_exit, detail
+                )
+            })
+            .collect();
+        return TaskOutcome::Rework(format!("검증 실패: {}", failed.join("; ")));
+    }
+
     // 2) diff 수집 — "수정 없는 완료" 차단의 근거.
     let diff = match collect_diff(workspace).await {
         Ok(diff) => diff,
-        Err(error) => return TaskOutcome::Rework(format!("diff 수집 실패: {error}")),
+        Err(error) => {
+            let error = crate::quality::redact_bounded_error(&error, workspace);
+            return TaskOutcome::Rework(format!("diff 수집 실패: {error}"));
+        }
     };
     let diff_empty = diff
         .stat
@@ -221,20 +249,6 @@ pub async fn run_task_verification(
     ));
 
     // 4) 판정 — 시스템 규칙만 적용한다.
-    if !results.all_passed {
-        let failed: Vec<String> = results
-            .results
-            .iter()
-            .filter(|e| !e.passed)
-            .map(|e| {
-                format!(
-                    "{} → exit {:?} (기대 {})",
-                    e.cmd, e.exit_code, e.expect_exit
-                )
-            })
-            .collect();
-        return TaskOutcome::Rework(format!("검증 실패: {}", failed.join("; ")));
-    }
     if task.require_diff && diff_empty {
         return TaskOutcome::Rework(
             "변경된 파일이 없다 — 수정 없이 완료될 수 없다 (diff 부재)".into(),
@@ -366,6 +380,36 @@ mod tests {
         assert!(evidence.output_tail.contains("출력 상한 초과"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_rework_preserves_timeout_reason() {
+        let mut task = task_with(&["sleep 30"], false);
+        task.verification[0].timeout_secs = 1;
+        let outcome = run_task_verification(&task, std::env::temp_dir().as_path()).await;
+        let state = task.apply(outcome);
+
+        assert_eq!(*state, TaskState::Rework);
+        assert!(task.evidence.last().unwrap().output_tail.contains("시간 초과"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_rework_preserves_output_overflow_reason() {
+        let mut task = task_with(&["yes rafikx | head -c 300000"], false);
+        task.verification[0].timeout_secs = 5;
+        let outcome = run_task_verification(&task, std::env::temp_dir().as_path()).await;
+        let state = task.apply(outcome);
+
+        assert_eq!(*state, TaskState::Rework);
+        assert!(
+            task.evidence
+                .last()
+                .unwrap()
+                .output_tail
+                .contains("출력 상한 초과")
+        );
+    }
+
     #[tokio::test]
     async fn verification_command_runs_in_the_task_workspace() {
         let dir =
@@ -380,6 +424,26 @@ mod tests {
         let evidence = run_cmd(command, 5, &dir).await;
 
         assert!(evidence.passed, "{}", evidence.output_tail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verification_evidence_redacts_command_and_output_secrets() {
+        let dir =
+            std::env::temp_dir().join(format!("rk-verify-redaction-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let evidence = run_cmd(
+            "API_TOKEN=INLINE-VERIFY-SECRET-123456 printf 'Authorization: Bearer OUTPUT-VERIFY-SECRET-123456\\n'",
+            5,
+            &dir,
+        )
+        .await;
+
+        let rendered = format!("{}\n{}", evidence.cmd, evidence.output_tail);
+        assert!(!rendered.contains("INLINE-VERIFY-SECRET-123456"));
+        assert!(!rendered.contains("OUTPUT-VERIFY-SECRET-123456"));
+        assert!(rendered.contains("[redacted]"), "{rendered}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

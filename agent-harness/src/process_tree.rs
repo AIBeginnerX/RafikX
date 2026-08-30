@@ -34,6 +34,8 @@ static PROCESS_SCOPE_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 const PROCESS_SCOPE_ENV: &str = "RAFIKX_PROCESS_SCOPE";
 #[cfg(unix)]
 const MAX_SCOPE_SCAN_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(unix)]
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(target_os = "linux")]
 const PROCESS_STOP_SIGNAL: i32 = 19;
@@ -44,7 +46,6 @@ const PROCESS_KILL_SIGNAL: i32 = 9;
 
 #[cfg(unix)]
 trait GenerationBoundProcess {
-    fn pid(&self) -> u32;
     fn signal(&self, signal: i32) -> Result<(), String>;
 }
 
@@ -85,10 +86,6 @@ impl ProcessIdentity {
 
 #[cfg(target_os = "linux")]
 impl GenerationBoundProcess for ProcessIdentity {
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
     fn signal(&self, signal: i32) -> Result<(), String> {
         // SAFETY: The pidfd is live and owned by `self`; null siginfo with zero flags requests the
         // ordinary signal operation for exactly the process generation captured by this fd.
@@ -127,6 +124,8 @@ struct AuditToken {
 struct ProcessIdentity {
     pid: u32,
     audit_token: AuditToken,
+    unique_id: u64,
+    parent_unique_id: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -153,6 +152,15 @@ unsafe extern "C" {
         size: i32,
     ) -> i32;
     fn proc_signal_with_audittoken(token: *mut AuditToken, signal: i32) -> i32;
+    fn proc_listpidspath(
+        process_type: u32,
+        type_info: u32,
+        path: *const std::os::raw::c_char,
+        path_flags: u32,
+        buffer: *mut std::ffi::c_void,
+        buffer_size: i32,
+    ) -> i32;
+    fn proc_listallpids(buffer: *mut std::ffi::c_void, buffer_size: i32) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -185,16 +193,14 @@ impl ProcessIdentity {
         Ok(Some(Self {
             pid,
             audit_token: token,
+            unique_id: identity.unique_id,
+            parent_unique_id: identity.parent_unique_id,
         }))
     }
 }
 
 #[cfg(target_os = "macos")]
 impl GenerationBoundProcess for ProcessIdentity {
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
     fn signal(&self, signal: i32) -> Result<(), String> {
         let mut token = self.audit_token;
         // SAFETY: `token` contains the captured pid-version and remains writable for libproc.
@@ -230,10 +236,6 @@ impl ProcessIdentity {
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 impl GenerationBoundProcess for ProcessIdentity {
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
     fn signal(&self, _signal: i32) -> Result<(), String> {
         Err(format!(
             "PID {}: 세대가 확인되지 않은 프로세스에는 신호를 보내지 않습니다",
@@ -248,6 +250,8 @@ pub(crate) struct ProcessScope {
     marker: String,
     #[cfg(unix)]
     marker_path: PathBuf,
+    #[cfg(target_os = "macos")]
+    root_unique_id: Option<u64>,
     #[cfg(target_os = "linux")]
     marker_device: u64,
     #[cfg(target_os = "linux")]
@@ -259,11 +263,11 @@ pub(crate) struct ProcessScope {
 }
 
 #[cfg(unix)]
-// SAFETY: `fcntl` is declared with the POSIX ABI and the only call below passes an owned,
-// open descriptor plus the integer-only F_SETFD command. The call runs before exec and does
-// not retain pointers or Rust references.
+// SAFETY: `fcntl` and `kill` use the POSIX ABI. Calls below pass only owned descriptors or
+// integer process-group/signal values, check errno, and retain no pointers or Rust references.
 unsafe extern "C" {
     fn fcntl(fd: std::os::raw::c_int, command: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    fn kill(pid: std::os::raw::c_int, signal: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
 #[cfg(unix)]
@@ -314,12 +318,21 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
         }
         match command.spawn() {
             Ok(child) => {
+                #[cfg(target_os = "macos")]
+                let root_unique_id = child.id().and_then(|pid| {
+                    ProcessIdentity::capture(pid)
+                        .ok()
+                        .flatten()
+                        .map(|identity| identity.unique_id)
+                });
                 drop(marker_file);
                 Ok((
                     child,
                     ProcessScope {
                         marker,
                         marker_path,
+                        #[cfg(target_os = "macos")]
+                        root_unique_id,
                         #[cfg(target_os = "linux")]
                         marker_device: marker_metadata.dev(),
                         #[cfg(target_os = "linux")]
@@ -584,25 +597,31 @@ impl Drop for ProcessScope {
     }
 }
 
-async fn run_killer(program: &str, args: &[String]) -> Result<(), String> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let status = tokio::time::timeout(Duration::from_secs(2), command.status())
-        .await
-        .map_err(|_| format!("{program} 시간 초과"))?
-        .map_err(|error| format!("{program} 실행 실패: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "{program} 실패 (exit {})",
-            status.code().unwrap_or(-1)
-        ));
+#[cfg(unix)]
+fn signal_process_group(root: u32, signal: i32) -> Result<(), String> {
+    let group = i32::try_from(root).map_err(|_| format!("프로세스 그룹 ID 범위 초과: {root}"))?;
+    // SAFETY: The caller owns the unreaped group leader while this negative PGID is used.
+    if unsafe { kill(-group, signal) } == 0 {
+        return Ok(());
     }
-    Ok(())
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(3) {
+        Ok(())
+    } else {
+        Err(format!("프로세스 그룹 {root} 신호 {signal} 실패: {error}"))
+    }
+}
+
+#[cfg(unix)]
+fn active_root(child: &mut Child, cleanup_errors: &mut Vec<String>) -> Option<u32> {
+    match child.try_wait() {
+        Ok(Some(_)) => None,
+        Ok(None) => child.id(),
+        Err(error) => {
+            cleanup_errors.push(format!("루트 프로세스 상태 확인 실패: {error}"));
+            child.id()
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -747,14 +766,16 @@ async fn scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
-    let device = scope.marker_device;
-    let inode = scope.marker_inode;
+fn file_scoped_pids(device: u64, inode: u64, budget: Duration) -> Result<Vec<u32>, String> {
+    let deadline = std::time::Instant::now() + budget;
     let entries =
         std::fs::read_dir("/proc").map_err(|error| format!("/proc 조회 실패: {error}"))?;
     let mut matches = std::collections::BTreeSet::new();
     let mut scanned = 0usize;
     for entry in entries.flatten() {
+        if std::time::Instant::now() >= deadline {
+            return Err("프로세스 scope 파일 조회 시간 상한을 초과했습니다".into());
+        }
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -769,6 +790,9 @@ fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
             continue;
         };
         for descriptor in descriptors.flatten() {
+            if std::time::Instant::now() >= deadline {
+                return Err("프로세스 scope 파일 조회 시간 상한을 초과했습니다".into());
+            }
             scanned = scanned.saturating_add(1);
             if scanned > 1_000_000 {
                 return Err("프로세스 scope 파일 조회 상한을 초과했습니다".into());
@@ -785,7 +809,94 @@ fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
     Ok(matches.into_iter().collect())
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+async fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const MAX_MATCHING_PIDS: usize = 4096;
+    let path = std::ffi::CString::new(scope.marker_path.as_os_str().as_bytes())
+        .map_err(|_| "프로세스 scope 경로에 NUL 문자가 있습니다".to_string())?;
+    let mut pids = vec![0i32; MAX_MATCHING_PIDS];
+    // SAFETY: `path` is NUL-terminated and `pids` is a writable, correctly sized int buffer.
+    let bytes = unsafe {
+        proc_listpidspath(
+            1,
+            0,
+            path.as_ptr(),
+            0,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(pids.as_slice()) as i32,
+        )
+    };
+    if bytes == -1 {
+        return Err(format!(
+            "프로세스 scope 파일 조회 실패: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let count = (bytes as usize) / std::mem::size_of::<i32>();
+    if count >= pids.len() {
+        return Err("프로세스 scope PID 조회 상한을 초과했습니다".into());
+    }
+    pids.truncate(count);
+    Ok(pids
+        .into_iter()
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0 && *pid != std::process::id())
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn lineage_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
+    const MAX_LIVE_PIDS: usize = 4096;
+    let Some(root_unique_id) = scope.root_unique_id else {
+        return Ok(Vec::new());
+    };
+    let mut pids = vec![0i32; MAX_LIVE_PIDS];
+    // SAFETY: `pids` is a writable int buffer whose byte size is passed exactly.
+    let count = unsafe {
+        proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(pids.as_slice()) as i32,
+        )
+    };
+    if count == -1 {
+        return Err(format!(
+            "프로세스 고유 계보 조회 실패: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let count = count as usize;
+    if count >= pids.len() {
+        return Err("프로세스 고유 계보 PID 상한을 초과했습니다".into());
+    }
+    pids.truncate(count);
+    let identities = pids
+        .into_iter()
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0 && *pid != std::process::id())
+        .filter_map(|pid| ProcessIdentity::capture(pid).ok().flatten())
+        .collect::<Vec<_>>();
+    let mut lineage = std::collections::BTreeSet::from([root_unique_id]);
+    let mut matches = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for identity in &identities {
+            if lineage.contains(&identity.parent_unique_id)
+                && lineage.insert(identity.unique_id)
+            {
+                matches.insert(identity.pid);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(matches.into_iter().collect())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 async fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -821,7 +932,15 @@ async fn inherited_scope_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> 
     if scope.force_discovery_failure {
         return Err("강제된 프로세스 scope 조회 실패".into());
     }
-    file_scoped_pids(scope)
+    let device = scope.marker_device;
+    let inode = scope.marker_inode;
+    let scan = tokio::task::spawn_blocking(move || {
+        file_scoped_pids(device, inode, Duration::from_secs(1))
+    });
+    tokio::time::timeout(Duration::from_secs(2), scan)
+        .await
+        .map_err(|_| "프로세스 scope 파일 조회 시간 초과".to_string())?
+        .map_err(|error| format!("프로세스 scope 파일 조회 작업 실패: {error}"))?
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -862,6 +981,11 @@ async fn discover_scope_pids(
         Ok(pids) => discovered.extend(pids),
         Err(error) => cleanup_errors.push(error),
     }
+    #[cfg(target_os = "macos")]
+    match lineage_scoped_pids(scope) {
+        Ok(pids) => discovered.extend(pids),
+        Err(error) => cleanup_errors.push(error),
+    }
     if let Some(pid) = root {
         match descendant_pids(pid).await {
             Ok(pids) => discovered.extend(pids),
@@ -881,23 +1005,20 @@ async fn capture_scoped_identities(
     cleanup_errors: &mut Vec<String>,
 ) -> (Vec<ProcessIdentity>, Vec<u32>) {
     let candidates = discover_scope_pids(scope, root, cleanup_errors).await;
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
     let mut captured = Vec::new();
-    let mut capture_failures = Vec::new();
-    for pid in candidates {
+    for &pid in &candidates {
         match ProcessIdentity::capture(pid) {
             Ok(Some(identity)) => captured.push(identity),
             Ok(None) => {}
-            Err(error) => capture_failures.push((pid, error)),
+            Err(error) => {
+                cleanup_errors.push(error);
+            }
         }
     }
-    let revalidated = discover_scope_pids(scope, root, cleanup_errors).await;
-    captured.retain(|identity| revalidated.binary_search(&identity.pid()).is_ok());
-    for (pid, error) in capture_failures {
-        if revalidated.binary_search(&pid).is_ok() {
-            cleanup_errors.push(error);
-        }
-    }
-    (captured, revalidated)
+    (captured, candidates)
 }
 
 #[cfg(unix)]
@@ -913,75 +1034,94 @@ fn signal_captured_processes<T: GenerationBoundProcess>(
     }
 }
 
+#[cfg(unix)]
+async fn terminate_unix_inner(child: &mut Child, scope: &ProcessScope) -> Vec<String> {
+    let mut cleanup_errors = Vec::new();
+    let mut root = active_root(child, &mut cleanup_errors);
+    if let Some(pid) = root
+        && let Err(error) = signal_process_group(pid, PROCESS_STOP_SIGNAL)
+    {
+        if active_root(child, &mut cleanup_errors).is_none() {
+            root = None;
+        } else {
+            cleanup_errors.push(error);
+        }
+    }
+
+    let (first, first_visible) =
+        capture_scoped_identities(scope, root, &mut cleanup_errors).await;
+    if root.is_none() && first_visible.is_empty() {
+        return cleanup_errors;
+    }
+
+    let mut captured = first;
+    signal_captured_processes(&captured, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
+    let mut visible = !first_visible.is_empty();
+    for _ in 0..2 {
+        if !visible {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (round, revalidated) =
+            capture_scoped_identities(scope, root, &mut cleanup_errors).await;
+        visible = !revalidated.is_empty();
+        signal_captured_processes(&round, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
+        captured.extend(round);
+    }
+    signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
+    if let Some(pid) = root
+        && let Err(error) = signal_process_group(pid, PROCESS_KILL_SIGNAL)
+        && active_root(child, &mut cleanup_errors).is_some()
+    {
+        cleanup_errors.push(error);
+    }
+
+    if child.id().is_some() {
+        if let Err(error) = child.start_kill() {
+            cleanup_errors.push(format!("루트 프로세스 종료 요청 실패: {error}"));
+        }
+        match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => cleanup_errors.push(format!("루트 프로세스 대기 실패: {error}")),
+            Err(_) => cleanup_errors.push("루트 프로세스 종료 확인 시간 초과".into()),
+        }
+    }
+
+    for _ in 0..2 {
+        let (remaining, revalidated) =
+            capture_scoped_identities(scope, None, &mut cleanup_errors).await;
+        if revalidated.is_empty() {
+            break;
+        }
+        signal_captured_processes(&remaining, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
+        signal_captured_processes(&remaining, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let verdict_scope = discover_scope_pids(scope, None, &mut cleanup_errors).await;
+    cleanup_errors.extend(
+        verdict_scope
+            .into_iter()
+            .map(|pid| format!("PID {pid}가 프로세스 scope에 남아 있습니다")),
+    );
+    cleanup_errors
+}
+
 pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result<(), String> {
     let mut cleanup_errors = Vec::new();
     #[cfg(unix)]
     {
-        let root = child.id();
-        let program = if std::path::Path::new("/bin/kill").is_file() {
-            "/bin/kill"
-        } else {
-            "/usr/bin/kill"
-        };
-        if let Some(pid) = root {
-            let group = format!("-{pid}");
-            let _ = run_killer(
-                program,
-                &["-STOP".to_string(), "--".to_string(), group.clone()],
-            )
-            .await;
-        }
-        let mut captured = Vec::new();
-        for _ in 0..3 {
-            let (round, _) = capture_scoped_identities(scope, root, &mut cleanup_errors).await;
-            signal_captured_processes(&round, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
-            captured.extend(round);
-            tokio::task::yield_now().await;
-        }
-        signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
-        if let Some(pid) = root {
-            let group = format!("-{pid}");
-            let _ = run_killer(program, &["-KILL".to_string(), "--".to_string(), group]).await;
-        }
-        for _ in 0..2 {
-            let (remaining, revalidated) =
-                capture_scoped_identities(scope, root, &mut cleanup_errors).await;
-            signal_captured_processes(&remaining, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
-            signal_captured_processes(&remaining, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
-            if revalidated.is_empty() {
-                break;
-            }
-        }
-        if child.id().is_some() {
-            let _ = child.kill().await;
-            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => cleanup_errors.push(format!("루트 프로세스 대기 실패: {error}")),
-                Err(_) => cleanup_errors.push("루트 프로세스 종료 확인 시간 초과".into()),
-            }
-        }
-        let mut settled_rounds = 0;
-        for _ in 0..8 {
-            let (remaining, revalidated) =
-                capture_scoped_identities(scope, None, &mut cleanup_errors).await;
-            signal_captured_processes(&remaining, PROCESS_STOP_SIGNAL, &mut cleanup_errors);
-            signal_captured_processes(&remaining, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
-            if revalidated.is_empty() {
-                settled_rounds += 1;
-                if settled_rounds == 2 {
-                    break;
+        match tokio::time::timeout(PROCESS_CLEANUP_TIMEOUT, terminate_unix_inner(child, scope)).await
+        {
+            Ok(errors) => cleanup_errors.extend(errors),
+            Err(_) => {
+                cleanup_errors.push("프로세스 scope 정리 전체 시간 초과".into());
+                if let Some(pid) = active_root(child, &mut cleanup_errors) {
+                    let _ = signal_process_group(pid, PROCESS_KILL_SIGNAL);
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
                 }
-            } else {
-                settled_rounds = 0;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let verdict_scope = discover_scope_pids(scope, None, &mut cleanup_errors).await;
-        cleanup_errors.extend(
-            verdict_scope
-                .into_iter()
-                .map(|pid| format!("PID {pid}가 프로세스 scope에 남아 있습니다")),
-        );
     }
     #[cfg(windows)]
     {
@@ -1020,17 +1160,12 @@ mod tests {
     use super::*;
 
     struct FakeIdentity<'a> {
-        pid: u32,
         generation: u64,
         current_generation: &'a std::cell::Cell<u64>,
         signaled_generations: &'a std::cell::RefCell<Vec<u64>>,
     }
 
     impl GenerationBoundProcess for FakeIdentity<'_> {
-        fn pid(&self) -> u32 {
-            self.pid
-        }
-
         fn signal(&self, _signal: i32) -> Result<(), String> {
             if self.current_generation.get() == self.generation {
                 self.signaled_generations.borrow_mut().push(self.generation);
@@ -1044,7 +1179,6 @@ mod tests {
         let current_generation = std::cell::Cell::new(1);
         let signaled_generations = std::cell::RefCell::new(Vec::new());
         let original = FakeIdentity {
-            pid: 42,
             generation: 1,
             current_generation: &current_generation,
             signaled_generations: &signaled_generations,
@@ -1057,7 +1191,6 @@ mod tests {
         assert!(errors.is_empty());
         assert!(signaled_generations.borrow().is_empty());
         let replacement = FakeIdentity {
-            pid: 42,
             generation: 2,
             current_generation: &current_generation,
             signaled_generations: &signaled_generations,
@@ -1077,6 +1210,34 @@ mod tests {
             b"123 command RAFIKX_PROCESS_SCOPE=42-000000000000000000010 OTHER=value\n",
             needle
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_proc_scope_budget_fails_immediately() {
+        let started = std::time::Instant::now();
+        let error = file_scoped_pids(0, 0, Duration::ZERO).expect_err("expired budget must fail");
+
+        assert!(error.contains("시간 상한"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn completed_command_cleanup_stays_within_global_budget() {
+        let mut command = Command::new("true");
+        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn completed command");
+        child.wait().await.expect("wait completed command");
+        let started = std::time::Instant::now();
+
+        terminate(&mut child, &scope)
+            .await
+            .expect("clean completed command");
+
+        assert!(
+            started.elapsed() < PROCESS_CLEANUP_TIMEOUT + Duration::from_secs(1),
+            "cleanup exceeded its global budget: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1202,7 +1363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inherited_scope_survives_environment_clearing_and_reparenting() {
+    async fn retained_scope_fd_survives_environment_clearing_and_reparenting() {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file());

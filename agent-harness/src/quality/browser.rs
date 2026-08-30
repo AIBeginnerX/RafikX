@@ -14,10 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const ERROR_MARKER: &str = "__RAFIKX_BROWSER_ERROR__";
-const READY_MARKER: &str = "__RAFIKX_BROWSER_READY__";
 const GAME_CONTRACT_META: &str = "rafikx-browser-game-contract";
-const GAME_SEQUENCE_MARKER: &str = "__RAFIKX_GAME_SEQUENCE_READY__";
 const PROBE_PATH: &str = "/__rafikx_probe.js";
+const PROBE_RESULT_PATH: &str = "/__rafikx_probe_result/";
+const PROBE_TOKEN_PLACEHOLDER: &str = "__RAFIKX_PROBE_TOKEN__";
 const MAX_STAGED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STAGED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STAGED_ENTRIES: usize = 25_000;
@@ -33,7 +33,22 @@ const MAX_REFERENCE_GRAPH_ENTRIES: usize = 512;
 const MAX_REFERENCE_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; sandbox allow-same-origin allow-scripts; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\nReferrer-Policy: no-referrer\r\n";
 const PROBE_SCRIPT: &str = r#"(() => {
-  const emit = (kind, value) => console.log('__RAFIKX_BROWSER_ERROR__' + kind + ': ' + String(value));
+  const nativeLog = console.log.bind(console);
+  const nativeFetch = globalThis.fetch.bind(globalThis);
+  const nativeAllSettled = Promise.allSettled.bind(Promise);
+  const pendingErrors = [];
+  const report = async (kind, value = '') => {
+    const detail = value ? '/' + encodeURIComponent(String(value).slice(0, 300)) : '';
+    const response = await nativeFetch('/__rafikx_probe_result/__RAFIKX_PROBE_TOKEN__/' + kind + detail, {
+      method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error'
+    });
+    if (!response.ok) throw new Error(`probe receipt failed: ${response.status}`);
+  };
+  const emit = (kind, value) => {
+    const detail = kind + ': ' + String(value);
+    nativeLog('__RAFIKX_BROWSER_ERROR__' + detail);
+    pendingErrors.push(report('error', detail));
+  };
   const originalError = console.error.bind(console);
   console.error = (...args) => {
     emit('console', args.map(value => String(value)).join(' '));
@@ -575,7 +590,7 @@ const PROBE_SCRIPT: &str = r#"(() => {
       resetCanvasFrame(tracker);
       const started = performance.now();
       let remaining = MAX_CANVAS_SAMPLES;
-      const observe = () => {
+  const observe = () => {
         if (!tracker.observing || remaining <= 0 || performance.now() - started > 300) return;
         sampleCanvasFrame(tracker);
         remaining -= 1;
@@ -583,6 +598,36 @@ const PROBE_SCRIPT: &str = r#"(() => {
       };
       requestAnimationFrame(observe);
     }
+  };
+  const visiblyPainted = element => {
+    const rect = element.getBoundingClientRect();
+    const left = Math.max(0, rect.left + 1);
+    const right = Math.min(innerWidth - 1, rect.right - 1);
+    const top = Math.max(0, rect.top + 1);
+    const bottom = Math.min(innerHeight - 1, rect.bottom - 1);
+    if (!(right >= left && bottom >= top)) return false;
+    const points = [
+      [(left + right) / 2, (top + bottom) / 2],
+      [left, top], [right, top], [left, bottom], [right, bottom],
+      [(left * 3 + right) / 4, (top * 3 + bottom) / 4],
+      [(left + right * 3) / 4, (top * 3 + bottom) / 4],
+      [(left * 3 + right) / 4, (top + bottom * 3) / 4],
+      [(left + right * 3) / 4, (top + bottom * 3) / 4],
+    ];
+    return points.some(([x, y]) => {
+      let current = element;
+      let root = current.getRootNode();
+      while (typeof ShadowRoot !== 'undefined' && root instanceof ShadowRoot) {
+        const localTop = typeof root.elementFromPoint === 'function'
+          ? root.elementFromPoint(x, y)
+          : current;
+        if (localTop !== current && !current.contains(localTop)) return false;
+        current = root.host;
+        root = current.getRootNode();
+      }
+      const documentTop = document.elementFromPoint(x, y);
+      return documentTop === current || current.contains(documentTop);
+    });
   };
   const visiblyRendered = element => {
     let current = element;
@@ -606,7 +651,8 @@ const PROBE_SCRIPT: &str = r#"(() => {
       && rect.bottom > 0
       && rect.right > 0
       && rect.top < innerHeight
-      && rect.left < innerWidth;
+      && rect.left < innerWidth
+      && visiblyPainted(element);
   };
   const gameSurface = api => {
     if (typeof api.surface !== 'function') throw new Error('window.__rafikxGameTest.surface is missing');
@@ -762,7 +808,7 @@ const PROBE_SCRIPT: &str = r#"(() => {
     expectState(api, 'ready');
     if (Number(api.restarts()) !== restarts + 1) throw new Error('restart counter did not advance');
     expectSurfaceChange(lostSurface, surfaceFingerprint(surface), 'lost→ready');
-    console.log('__RAFIKX_GAME_SEQUENCE_READY__');
+    await report('game');
   };
   window.addEventListener('load', () => setTimeout(async () => {
     try {
@@ -770,7 +816,12 @@ const PROBE_SCRIPT: &str = r#"(() => {
     } catch (error) {
       emit('game', error?.message || error);
     } finally {
-      console.log('__RAFIKX_BROWSER_READY__');
+      try {
+        await nativeAllSettled(pendingErrors);
+        await report('ready');
+      } catch (error) {
+        emit('probe', error?.message || error);
+      }
     }
   }, 0), { once: true });
 })();"#;
@@ -803,8 +854,7 @@ pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
         ]
         .iter()
         .any(|signal| lower.contains(signal));
-    explicit_surface
-        && [
+    let strong_game_signal = [
             "id=\"game\"",
             "id='game'",
             "id=\"board\"",
@@ -819,24 +869,18 @@ pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
             "pacman",
             "flappy",
             "bird.js",
-            "score",
-            "lives",
-            "restart",
             "playable",
-            "controls",
-            "pause",
             "start game",
             "press space",
             "game over",
-            "level",
             "게임",
             "마리오",
-            "점수",
-            "목숨",
-            "재시작",
         ]
         .iter()
-        .any(|signal| lower.contains(signal))
+        .any(|signal| lower.contains(signal));
+    let lifecycle_pair = (lower.contains("lives") || lower.contains("목숨"))
+        && (lower.contains("restart") || lower.contains("재시작"));
+    explicit_surface && (strong_game_signal || lifecycle_pair)
 }
 
 /// 콘솔 로그(stderr)에서 런타임 오류를 추출한다 — 순수 함수(테스트 가능).
@@ -892,17 +936,59 @@ pub fn parse_console_errors(stderr: &str) -> Vec<String> {
 
 /// 설치된 브라우저 바이너리를 찾는다 — 없으면 None.
 pub fn detect_browser() -> Option<&'static str> {
-    const CANDIDATES: &[&str] = &[
+    static DETECTED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DETECTED.get_or_init(find_browser).as_deref()
+}
+
+fn find_browser() -> Option<String> {
+    #[cfg(windows)]
+    let environment_roots = ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "ProgramW6432"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    #[cfg(not(windows))]
+    let environment_roots = Vec::new();
+    let candidates = browser_candidates(environment_roots);
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    const PATH_NAMES: &[&str] = &[
+        "google-chrome",
+        "chromium-browser",
+        "chromium",
+        "chrome.exe",
+        "msedge.exe",
+        "chromium.exe",
+    ];
+    let paths = std::env::var_os("PATH")?;
+    PATH_NAMES.iter().find_map(|name| {
+        std::env::split_paths(&paths)
+            .any(|directory| directory.join(name).is_file())
+            .then(|| (*name).to_string())
+    })
+}
+
+fn browser_candidates(environment_roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut candidates = vec![
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
         "/usr/bin/google-chrome",
         "/usr/bin/chromium-browser",
         "/usr/bin/chromium",
-    ];
-    CANDIDATES
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .copied()
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
+    for root in environment_roots {
+        candidates.push(root.join("Google/Chrome/Application/chrome.exe"));
+        candidates.push(root.join("Microsoft/Edge/Application/msedge.exe"));
+    }
+    candidates
 }
 
 fn network_isolation_flags(address: std::net::SocketAddr) -> [String; 4] {
@@ -917,12 +1003,19 @@ fn network_isolation_flags(address: std::net::SocketAddr) -> [String; 4] {
     ]
 }
 
+#[derive(Clone, Copy)]
+struct ProbeCompletion {
+    ready: bool,
+    game_sequence: bool,
+}
+
 fn evaluate_browser_output(
     success: bool,
     code: Option<i32>,
     stderr: &str,
     stderr_overflow: bool,
     server_errors: &[String],
+    probe: ProbeCompletion,
     game_contract_required: bool,
 ) -> anyhow::Result<Vec<String>> {
     let mut errors = parse_console_errors(stderr);
@@ -944,10 +1037,10 @@ fn evaluate_browser_output(
             code.map_or_else(|| "signal".into(), |code| code.to_string())
         );
     }
-    if !stderr.contains(READY_MARKER) {
+    if !probe.ready {
         anyhow::bail!("브라우저 준비 프로브가 실행되지 않았습니다");
     }
-    if game_contract_required && !stderr.contains(GAME_SEQUENCE_MARKER) {
+    if game_contract_required && !probe.game_sequence {
         let detail = errors
             .first()
             .map(|error| format!(": {error}"))
@@ -959,11 +1052,12 @@ fn evaluate_browser_output(
 
 fn inject_probe(html: &str) -> String {
     let tag = format!(r#"<script src="{PROBE_PATH}"></script>"#);
-    let lower = html.to_ascii_lowercase();
-    if let Some(head) = lower.find("<head")
-        && let Some(close) = html[head..].find('>')
+    let leading = html.len().saturating_sub(html.trim_start().len());
+    let lower = html[leading..].to_ascii_lowercase();
+    if lower.starts_with("<!doctype")
+        && let Some(close) = html[leading..].find('>')
     {
-        let at = head + close + 1;
+        let at = leading + close + 1;
         let mut injected = String::with_capacity(html.len() + tag.len());
         injected.push_str(&html[..at]);
         injected.push_str(&tag);
@@ -2023,6 +2117,20 @@ struct SmokeResources {
     run_dir: PathBuf,
 }
 
+#[derive(Clone)]
+struct ProbeServerState {
+    token: Arc<str>,
+    script_served: Arc<AtomicBool>,
+    ready: tokio::sync::watch::Sender<bool>,
+    game: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
+}
+
+struct ProbeReceipt {
+    ready: tokio::sync::watch::Receiver<bool>,
+    game: Arc<AtomicBool>,
+}
+
 impl SmokeResources {
     fn new(run_dir: PathBuf) -> Self {
         Self {
@@ -2079,26 +2187,89 @@ async fn serve_request(
     root: PathBuf,
     entry: PathBuf,
     errors: Arc<Mutex<Vec<String>>>,
+    probe: ProbeServerState,
 ) -> std::io::Result<()> {
     let mut request = vec![0u8; 16 * 1024];
     let read = stream.read(&mut request).await?;
     let request = String::from_utf8_lossy(&request[..read]);
-    let Some(raw_path) = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .map(|path| path.split('?').next().unwrap_or(path))
+    let Some((method, raw_path)) = request.lines().next().and_then(|line| {
+        let mut fields = line.split_whitespace();
+        Some((fields.next()?, fields.next()?.split('?').next().unwrap_or("")))
+    })
     else {
         return write_response(&mut stream, "400 Bad Request", "text/plain", b"bad request").await;
     };
     if raw_path == PROBE_PATH {
+        if probe.script_served.swap(true, Ordering::AcqRel) {
+            return write_response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain",
+                b"probe already served",
+            )
+            .await;
+        }
+        let script = PROBE_SCRIPT.replace(PROBE_TOKEN_PLACEHOLDER, &probe.token);
         return write_response(
             &mut stream,
             "200 OK",
             "text/javascript; charset=utf-8",
-            PROBE_SCRIPT.as_bytes(),
+            script.as_bytes(),
         )
         .await;
+    }
+    if let Some(receipt) = raw_path.strip_prefix(PROBE_RESULT_PATH) {
+        let mut parts = receipt.split('/');
+        let token = parts.next().unwrap_or_default();
+        let kind = parts.next().unwrap_or_default();
+        let detail = parts.next();
+        let valid = method == "POST"
+            && token == probe.token.as_ref()
+            && parts.next().is_none()
+            && matches!(kind, "ready" | "game" | "error")
+            && (kind == "error") == detail.is_some();
+        if !valid {
+            return write_response(&mut stream, "403 Forbidden", "text/plain", b"forbidden")
+                .await;
+        }
+        match kind {
+            "game" => {
+                if probe.completed.load(Ordering::Acquire)
+                    || probe.game.swap(true, Ordering::AcqRel)
+                {
+                    return write_response(
+                        &mut stream,
+                        "409 Conflict",
+                        "text/plain",
+                        b"duplicate receipt",
+                    )
+                    .await;
+                }
+            }
+            "ready" => {
+                if probe.completed.swap(true, Ordering::AcqRel) {
+                    return write_response(
+                        &mut stream,
+                        "409 Conflict",
+                        "text/plain",
+                        b"duplicate receipt",
+                    )
+                    .await;
+                }
+                let _ = probe.ready.send(true);
+            }
+            "error" => {
+                if let Some(detail) = detail
+                    && let Some(detail) = percent_decode_path(detail)
+                    && let Ok(mut errors) = errors.lock()
+                    && errors.len() < MAX_BROWSER_ERRORS
+                {
+                    errors.push(detail.chars().take(300).collect());
+                }
+            }
+            _ => unreachable!(),
+        }
+        return write_response(&mut stream, "204 No Content", "text/plain", b"").await;
     }
     if raw_path == "/favicon.ico" {
         return write_response(&mut stream, "204 No Content", "image/x-icon", b"").await;
@@ -2144,6 +2315,7 @@ async fn start_server(
     tokio::task::JoinHandle<()>,
     Arc<Mutex<Vec<String>>>,
     PathBuf,
+    ProbeReceipt,
 )> {
     let root = workspace.canonicalize()?;
     let entry = entry_html.canonicalize()?;
@@ -2153,6 +2325,19 @@ async fn start_server(
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let address = listener.local_addr()?;
     let errors = Arc::new(Mutex::new(Vec::new()));
+    let (ready, ready_receipt) = tokio::sync::watch::channel(false);
+    let game = Arc::new(AtomicBool::new(false));
+    let probe = ProbeServerState {
+        token: Arc::from(crate::auth::random_hex(16)),
+        script_served: Arc::new(AtomicBool::new(false)),
+        ready,
+        game: game.clone(),
+        completed: Arc::new(AtomicBool::new(false)),
+    };
+    let receipt = ProbeReceipt {
+        ready: ready_receipt,
+        game,
+    };
     let server_errors = errors.clone();
     let server_root = root.clone();
     let server_entry = entry.clone();
@@ -2161,12 +2346,13 @@ async fn start_server(
             let root = server_root.clone();
             let entry = server_entry.clone();
             let errors = server_errors.clone();
+            let probe = probe.clone();
             tokio::spawn(async move {
-                let _ = serve_request(stream, root, entry, errors).await;
+                let _ = serve_request(stream, root, entry, errors, probe).await;
             });
         }
     });
-    Ok((address, task, errors, root))
+    Ok((address, task, errors, root, receipt))
 }
 
 /// 엔트리 HTML 을 실제 브라우저로 로드해 콘솔 오류를 수집한다.
@@ -2216,7 +2402,8 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     let stage_dir = run_dir.join("web");
     let profile_dir = run_dir.join("profile");
     let staged_entry = stage_web_root(workspace, entry_html, &stage_dir)?;
-    let (address, server, server_errors, root) = start_server(&stage_dir, &staged_entry).await?;
+    let (address, server, server_errors, root, mut probe_receipt) =
+        start_server(&stage_dir, &staged_entry).await?;
     resources.server = Some(server);
     let entry = staged_entry.canonicalize()?;
     let relative = entry.strip_prefix(&root)?;
@@ -2266,25 +2453,13 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     let reader_log = stderr_log.clone();
     let stderr_overflow = Arc::new(AtomicBool::new(false));
     let reader_overflow = stderr_overflow.clone();
-    let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
     let reader = tokio::spawn(async move {
         let mut stderr = stderr;
         let mut buffer = [0u8; 8 * 1024];
-        let mut marker_tail = Vec::new();
         while let Ok(read) = stderr.read(&mut buffer).await {
             if read == 0 {
                 break;
             }
-            let mut scan = marker_tail;
-            scan.extend_from_slice(&buffer[..read]);
-            if scan
-                .windows(READY_MARKER.len())
-                .any(|window| window == READY_MARKER.as_bytes())
-            {
-                let _ = ready_tx.send(true);
-            }
-            let keep = READY_MARKER.len().saturating_sub(1).min(scan.len());
-            marker_tail = scan[scan.len() - keep..].to_vec();
             if let Ok(mut log) = reader_log.lock()
                 && append_bounded_stderr(&mut log, &String::from_utf8_lossy(&buffer[..read]))
             {
@@ -2298,7 +2473,7 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     tokio::pin!(deadline);
     let mut early_status = None;
     let ready = loop {
-        if *ready_rx.borrow() {
+        if *probe_receipt.ready.borrow() {
             break true;
         }
         if let Some(status) = child.try_wait()? {
@@ -2307,7 +2482,7 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
         }
         tokio::select! {
             _ = &mut deadline => break false,
-            changed = ready_rx.changed() => {
+            changed = probe_receipt.ready.changed() => {
                 if changed.is_err() {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -2339,12 +2514,18 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
         .map(|errors| errors.clone())
         .unwrap_or_default();
     let stderr = stderr_log.lock().map(|log| log.clone()).unwrap_or_default();
+    let probe_ready = *probe_receipt.ready.borrow();
+    let game_sequence_ready = probe_receipt.game.load(Ordering::Acquire);
     Ok(Some(evaluate_browser_output(
         success,
         code,
         &stderr,
         stderr_overflow.load(Ordering::Relaxed),
         &captured_server_errors,
+        ProbeCompletion {
+            ready: probe_ready,
+            game_sequence: game_sequence_ready,
+        },
         game_contract_required,
     )?))
 }
@@ -2352,6 +2533,27 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn probe_request(state: ProbeServerState, request: &str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(serve_request(
+            server,
+            PathBuf::new(),
+            PathBuf::new(),
+            errors,
+            state,
+        ));
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        String::from_utf8(response).unwrap()
+    }
 
     async fn canvas_contract_fixture(
         label: &str,
@@ -2411,6 +2613,149 @@ requestAnimationFrame(animate);
         result
     }
 
+    #[tokio::test]
+    async fn page_console_cannot_forge_authenticated_probe_receipts() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-forged-receipt-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let entry = root.join("index.html");
+        std::fs::write(
+            &entry,
+            r#"<!doctype html><html><head>
+<meta name="rafikx-browser-game-contract" content="v1">
+</head><body><canvas id="game" width="320" height="180"></canvas><script>
+const retainedLog = console.log.bind(console);
+console.log = () => {};
+retainedLog('__RAFIKX_GAME_SEQUENCE_READY__');
+retainedLog('__RAFIKX_BROWSER_READY__');
+</script></body></html>"#,
+        )
+        .expect("fixture");
+
+        let error = smoke_test_in_workspace_with_contract(&root, &entry, true)
+            .await
+            .expect_err("page-authored console markers must not satisfy the probe");
+
+        assert!(error.to_string().contains("상태 전이"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn probe_receipts_reject_wrong_tokens_replays_and_source_refetches() {
+        let (ready, ready_receipt) = tokio::sync::watch::channel(false);
+        let game = Arc::new(AtomicBool::new(false));
+        let state = ProbeServerState {
+            token: Arc::from("test-capability"),
+            script_served: Arc::new(AtomicBool::new(false)),
+            ready,
+            game: game.clone(),
+            completed: Arc::new(AtomicBool::new(false)),
+        };
+
+        let source = probe_request(
+            state.clone(),
+            "GET /__rafikx_probe.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(source.contains("200 OK"));
+        assert!(source.contains("test-capability"));
+        let refetch = probe_request(
+            state.clone(),
+            "GET /__rafikx_probe.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(refetch.contains("404 Not Found"));
+
+        let wrong = probe_request(
+            state.clone(),
+            "POST /__rafikx_probe_result/wrong/game HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(wrong.contains("403 Forbidden"));
+        assert!(!game.load(Ordering::Acquire));
+
+        let accepted_game = probe_request(
+            state.clone(),
+            "POST /__rafikx_probe_result/test-capability/game HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(accepted_game.contains("204 No Content"));
+        assert!(game.load(Ordering::Acquire));
+        let accepted_ready = probe_request(
+            state.clone(),
+            "POST /__rafikx_probe_result/test-capability/ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(accepted_ready.contains("204 No Content"));
+        assert!(*ready_receipt.borrow());
+        let replay = probe_request(
+            state,
+            "POST /__rafikx_probe_result/test-capability/ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(replay.contains("409 Conflict"));
+    }
+
+    #[tokio::test]
+    async fn captured_native_fetch_survives_page_overrides() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let result = canvas_contract_fixture(
+            "captured-native-fetch",
+            r#"
+globalThis.fetch = () => Promise.reject(new Error('page fetch disabled'));
+console.log = () => {};
+const drawPlaying = tick => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#38bdf8';
+  context.fillRect(20 + (tick % 120), 70, 32, 32);
+};
+"#,
+        )
+        .await
+        .expect("captured native fetch should carry receipts")
+        .expect("installed browser");
+        assert!(result.is_empty(), "browser errors: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn suppressed_console_does_not_hide_runtime_error_receipts() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-suppressed-console-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let entry = root.join("index.html");
+        std::fs::write(
+            &entry,
+            r#"<!doctype html><html><body><script>
+console.log = () => {};
+console.error = () => {};
+throw new Error('OUT_OF_BAND_RUNTIME');
+</script></body></html>"#,
+        )
+        .expect("fixture");
+
+        let errors = smoke_test_in_workspace(&root, &entry)
+            .await
+            .expect("browser smoke")
+            .expect("installed browser");
+        assert!(
+            errors.iter().any(|error| error.contains("OUT_OF_BAND_RUNTIME")),
+            "{errors:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn parses_uncaught_reference_error() {
         let stderr = "[38240:20464795:0829/143631.043658:INFO:CONSOLE:230] \"Uncaught ReferenceError: camTarget is not defined\", source: file:///tmp/game.js (230)";
@@ -2431,8 +2776,19 @@ requestAnimationFrame(animate);
 
     #[test]
     fn nonzero_browser_exit_is_a_gate_failure() {
-        let error = evaluate_browser_output(false, Some(9), "chrome crashed", false, &[], false)
-            .expect_err("nonzero browser exit must fail");
+        let error = evaluate_browser_output(
+            false,
+            Some(9),
+            "chrome crashed",
+            false,
+            &[],
+            ProbeCompletion {
+                ready: false,
+                game_sequence: false,
+            },
+            false,
+        )
+        .expect_err("nonzero browser exit must fail");
         assert!(error.to_string().contains('9'));
     }
 
@@ -2448,25 +2804,69 @@ requestAnimationFrame(animate);
 
     #[test]
     fn successful_process_without_ready_probe_is_not_a_pass() {
-        let error = evaluate_browser_output(true, Some(0), "", false, &[], false)
-            .expect_err("missing probe must fail");
+        let error = evaluate_browser_output(
+            true,
+            Some(0),
+            "",
+            false,
+            &[],
+            ProbeCompletion {
+                ready: false,
+                game_sequence: false,
+            },
+            false,
+        )
+        .expect_err("missing probe must fail");
         assert!(error.to_string().contains("프로브"));
     }
 
     #[test]
     fn browser_stderr_overflow_is_a_gate_failure() {
-        let error = evaluate_browser_output(true, Some(0), READY_MARKER, true, &[], false)
-            .expect_err("stderr overflow must fail");
+        let error = evaluate_browser_output(
+            true,
+            Some(0),
+            "",
+            true,
+            &[],
+            ProbeCompletion {
+                ready: true,
+                game_sequence: false,
+            },
+            false,
+        )
+        .expect_err("stderr overflow must fail");
         assert!(error.to_string().contains("상한"));
     }
 
     #[test]
     fn opted_in_game_requires_the_full_state_sequence() {
-        let error = evaluate_browser_output(true, Some(0), READY_MARKER, false, &[], true)
-            .expect_err("missing game sequence");
+        let error = evaluate_browser_output(
+            true,
+            Some(0),
+            "",
+            false,
+            &[],
+            ProbeCompletion {
+                ready: true,
+                game_sequence: false,
+            },
+            true,
+        )
+        .expect_err("missing game sequence");
         assert!(error.to_string().contains("상태 전이"));
-        let output = format!("{GAME_SEQUENCE_MARKER}\n{READY_MARKER}");
-        assert!(evaluate_browser_output(true, Some(0), &output, false, &[], true).is_ok());
+        assert!(evaluate_browser_output(
+            true,
+            Some(0),
+            "",
+            false,
+            &[],
+            ProbeCompletion {
+                ready: true,
+                game_sequence: true,
+            },
+            true,
+        )
+        .is_ok());
         assert!(entry_requires_game_contract(
             r#"<meta name="rafikx-browser-game-contract" content="v1">"#
         ));
@@ -2488,6 +2888,12 @@ requestAnimationFrame(animate);
         ));
         assert!(!entry_looks_like_browser_game(
             r#"<canvas id="chart"></canvas><script src="chart.js"></script>"#
+        ));
+        assert!(!entry_looks_like_browser_game(
+            r#"<canvas id="chart"></canvas><section>Score controls pause level</section>"#
+        ));
+        assert!(!entry_looks_like_browser_game(
+            r#"<svg id="dashboard"></svg><section>Level controls pause restart 재시작</section>"#
         ));
     }
 
@@ -2511,6 +2917,7 @@ requestAnimationFrame(animate);
 
     #[test]
     fn detects_browser_or_returns_none() {
+        let _: fn() -> Option<&'static str> = detect_browser;
         // macOS 기본 경로에 Chrome 이 있는 환경에서는 Some, 없으면 None — 둘 다 유효.
         let found = detect_browser();
         if std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
@@ -2518,6 +2925,21 @@ requestAnimationFrame(animate);
         {
             assert!(found.is_some());
         }
+    }
+
+    #[test]
+    fn windows_browser_candidates_cover_user_and_machine_roots() {
+        let candidates = browser_candidates([
+            PathBuf::from(r"C:\Users\tester\AppData\Local"),
+            PathBuf::from(r"D:\Programs"),
+        ]);
+
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Users\tester\AppData\Local/Google/Chrome/Application/chrome.exe"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"D:\Programs/Microsoft/Edge/Application/msedge.exe"
+        )));
     }
 
     #[test]
@@ -3324,6 +3746,58 @@ const drawPlaying = tick => {
         .await
         .expect_err("Canvas under a transparent ancestor must fail closed");
         assert!(error.to_string().contains("visibly rendered"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fully_occluded_canvas_cannot_satisfy_the_game_contract() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let error = canvas_contract_fixture(
+            "occluded-canvas",
+            r#"
+const cover = document.createElement('div');
+Object.assign(cover.style, {
+  position: 'fixed', inset: '0', zIndex: '9999', background: '#020617'
+});
+document.body.append(cover);
+const drawPlaying = tick => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#38bdf8';
+  context.fillRect(20 + (tick % 120), 70, 32, 32);
+};
+"#,
+        )
+        .await
+        .expect_err("Canvas behind an opaque sibling must fail closed");
+        assert!(error.to_string().contains("visibly rendered"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn partially_occluded_canvas_can_still_prove_gameplay() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let result = canvas_contract_fixture(
+            "partially-occluded-canvas",
+            r#"
+const cover = document.createElement('div');
+Object.assign(cover.style, {
+  position: 'fixed', left: '0', top: '0', width: '120px', height: '220px',
+  zIndex: '9999', background: '#020617'
+});
+document.body.append(cover);
+const drawPlaying = tick => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#38bdf8';
+  context.fillRect(20 + (tick % 120), 70, 32, 32);
+};
+"#,
+        )
+        .await
+        .expect("an exposed canvas sample should pass")
+        .expect("installed browser");
+        assert!(result.is_empty(), "browser errors: {result:?}");
     }
 
     #[tokio::test]

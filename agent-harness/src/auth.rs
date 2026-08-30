@@ -1479,7 +1479,7 @@ fn random_bytes(n: usize) -> Vec<u8> {
     out
 }
 
-fn random_hex(n: usize) -> String {
+pub(crate) fn random_hex(n: usize) -> String {
     random_bytes(n).iter().map(|b| format!("{b:02x}")).collect()
 }
 
