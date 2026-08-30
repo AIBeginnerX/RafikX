@@ -1181,5 +1181,5 @@ async fn browser_game_agent_repair_e2e() {
         &["index.html".into(), "style.css".into(), "game.js".into()],
     )
     .await;
-    assert!(report.passed, "final browser gate: {:?}", report.findings);
+    assert!(report.passed, "final browser gate: {report:#?}");
 }

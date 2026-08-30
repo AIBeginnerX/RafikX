@@ -3,6 +3,7 @@ use crate::config::ProviderConfig;
 use crate::provider::{ContentBlock, Message, Role, ToolSpec};
 
 const KEEP_TAIL: usize = 8;
+const TOOL_RESULT_OMIT_NOTICE: &str = "\n[도구 결과 일부 생략]\n";
 pub const AUTO_COMPACT_PERCENT: u32 = 80;
 
 pub const fn needs_auto_compaction(used: u32, window: u32) -> bool {
@@ -65,9 +66,11 @@ fn drop_oldest_unit(msgs: &mut Vec<Message>) -> bool {
     if msgs.len() <= 1 {
         return false;
     }
-    if is_tool_use(&msgs[0]) && msgs.len() > 2 && is_tool_result(&msgs[1]) {
-        msgs.remove(0);
-        msgs.remove(0);
+    if is_tool_use(&msgs[0]) && is_tool_result(&msgs[1]) {
+        if msgs.len() == 2 {
+            return false;
+        }
+        msgs.drain(0..2);
         return true;
     }
     msgs.remove(0);
@@ -106,6 +109,49 @@ fn truncate_oldest_text(msgs: &mut [Message], budget: usize) {
             }
         }
     }
+}
+
+fn truncate_tool_result(content: &mut String, max_tokens: usize) -> bool {
+    if estimate_tokens(content) <= max_tokens {
+        return false;
+    }
+
+    let marker_tokens = estimate_tokens(TOOL_RESULT_OMIT_NOTICE);
+    if max_tokens < marker_tokens {
+        return false;
+    }
+
+    let keep_chars = max_tokens
+        .saturating_mul(4)
+        .saturating_sub(TOOL_RESULT_OMIT_NOTICE.chars().count());
+    let content_chars = content.chars().count();
+    let head_chars = keep_chars.div_ceil(2).min(content_chars);
+    let tail_chars = keep_chars
+        .saturating_sub(head_chars)
+        .min(content_chars.saturating_sub(head_chars));
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content
+        .chars()
+        .skip(content_chars.saturating_sub(tail_chars))
+        .collect();
+    *content = format!("{head}{TOOL_RESULT_OMIT_NOTICE}{tail}");
+    true
+}
+
+fn truncate_newest_tool_result(msgs: &mut [Message], budget: usize) -> bool {
+    let total = msgs.iter().map(message_tokens).sum::<usize>();
+    for message in msgs.iter_mut().rev() {
+        for block in message.content.iter_mut().rev() {
+            let ContentBlock::ToolResult { content, .. } = block else {
+                continue;
+            };
+            let available = budget.saturating_sub(total.saturating_sub(estimate_tokens(content)));
+            if truncate_tool_result(content, available) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 출력 토큰을 남기고, 시스템·도구·최근 대화를 우선 유지한다.
@@ -151,12 +197,22 @@ pub fn pack_messages(
     }
     let mut guard = 0;
     while total(&msgs) > budget && guard < 8 {
+        let before = total(&msgs);
         truncate_oldest_text(&mut msgs, budget);
+        if total(&msgs) > budget {
+            truncate_newest_tool_result(&mut msgs, budget);
+        }
         agent::sanitize_tool_pairs(&mut msgs);
         if total(&msgs) > budget && msgs.len() > 1 {
-            drop_oldest_unit(&mut msgs);
-            insert_notice(&mut msgs);
+            if drop_oldest_unit(&mut msgs) {
+                insert_notice(&mut msgs);
+            } else {
+                break;
+            }
         } else {
+            break;
+        }
+        if total(&msgs) >= before {
             break;
         }
         guard += 1;
@@ -374,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn packer_preserves_recent_inspection_when_output_limit_exceeds_context() {
+    fn packer_bounds_oversized_latest_inspection_without_splitting_pair() {
         let msgs = vec![
             Message::user_text("현재 파일을 직접 검사하고 판정하라"),
             Message {
@@ -389,7 +445,10 @@ mod tests {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "inspect-1".into(),
-                    content: "const frame = () => requestAnimationFrame(frame);\n".repeat(200),
+                    content: format!(
+                        "HEAD-INSPECTION\n{}\nTAIL-INSPECTION",
+                        "x".repeat(256 * 1024)
+                    ),
                     is_error: false,
                 }],
             },
@@ -397,10 +456,29 @@ mod tests {
 
         let packed = pack_messages(&msgs, "review", &[], 32_000, 32_768, 200_000);
 
+        let pair_index = packed
+            .iter()
+            .position(is_tool_use)
+            .expect("the verdict-producing request must retain its tool use");
         assert!(
-            packed.iter().any(is_tool_use) && packed.iter().any(is_tool_result),
-            "the verdict-producing request must retain its recent inspection evidence"
+            packed.get(pair_index + 1).is_some_and(is_tool_result),
+            "the newest inspection pair must stay atomic"
         );
+        let content = packed
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("the verdict-producing request must retain its tool result");
+        assert!(content.contains("HEAD-INSPECTION"));
+        assert!(content.contains(TOOL_RESULT_OMIT_NOTICE.trim()));
+        assert!(content.contains("TAIL-INSPECTION"));
+
+        let reserved = estimate_tokens("review") + effective_output_limit(32_000, 32_768) as usize;
+        let used = packed.iter().map(message_tokens).sum::<usize>();
+        assert!(used + reserved <= 32_000, "used={used} reserved={reserved}");
     }
 
     #[test]

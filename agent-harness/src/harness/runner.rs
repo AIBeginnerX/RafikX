@@ -2305,6 +2305,19 @@ fn reviewer_has_successful_inspection(run_context: &RunContext, since: usize) ->
         })
 }
 
+fn reviewer_verdict_from_child(
+    status: &str,
+    inspected: bool,
+    response: &str,
+    committee: bool,
+) -> ReviewVerdict {
+    if status == "ok" && inspected {
+        parse_review_gate_verdict(response, committee)
+    } else {
+        ReviewVerdict::Indeterminate
+    }
+}
+
 fn record_reviewer_workspace_delta(
     snapshot: crate::tools::workspace_delta::WorkspaceSnapshot,
     run_context: &RunContext,
@@ -2404,7 +2417,6 @@ async fn run_review_gate(
         };
         // 안쪽 루프는 "판정 불능 → 결론만 재질의" 1회를 흡수한다.
         let mut resume: Option<Vec<Message>> = None;
-        let mut reviewer_inspected = false;
         let action = loop {
             let review_iterations = remaining_iteration_budget(
                 turn_iteration_limit,
@@ -2453,7 +2465,7 @@ async fn run_review_gate(
                 reviewer_run.clone(),
             )
             .await;
-            reviewer_inspected |=
+            let reviewer_inspected =
                 reviewer_has_successful_inspection(&reviewer_run, lifecycle_marker);
             match &review_result {
                 Ok(review) => {
@@ -2513,15 +2525,12 @@ async fn run_review_gate(
             outcome.input_tokens = outcome.input_tokens.saturating_add(review.input_tokens);
             outcome.output_tokens = outcome.output_tokens.saturating_add(review.output_tokens);
 
-            // 리뷰어가 정상 종료하지 못했으면 그 출력은 결론이 아니다 — 판정 불능으로 본다.
-            let verdict = if review.status == "ok" && reviewer_inspected {
-                parse_review_gate_verdict(
-                    &agent::last_assistant_text(&review.messages),
-                    persona.is_none(),
-                )
-            } else {
-                ReviewVerdict::Indeterminate
-            };
+            let verdict = reviewer_verdict_from_child(
+                &review.status,
+                reviewer_inspected,
+                &agent::last_assistant_text(&review.messages),
+                persona.is_none(),
+            );
             match gate_action(verdict, attempt, requeried) {
                 GateAction::Requery => {
                     requeried = true;
@@ -3499,6 +3508,57 @@ mod tests {
             })
             .expect("record successful inspection");
         assert!(reviewer_has_successful_inspection(&reviewer, marker));
+    }
+
+    #[test]
+    fn reviewer_requery_requires_inspection_from_the_verdict_producing_child() {
+        let parent = RunContext::isolated(
+            crate::run::RunId::new("review-requery-parent"),
+            std::env::temp_dir(),
+        );
+        let first = parent.child(
+            crate::run::RunId::new("review-requery-first"),
+            crate::run::AgentId::new("reviewer-first"),
+        );
+        let second = parent.child(
+            crate::run::RunId::new("review-requery-second"),
+            crate::run::AgentId::new("reviewer-second"),
+        );
+        for run in [&first, &second] {
+            run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted {
+                model: Some("test".into()),
+            })
+            .expect("start child run");
+        }
+        let first_marker = first.lifecycle_events().len();
+        first
+            .transition_lifecycle(crate::lifecycle::LifecycleEventData::ToolFinished {
+                name: "read_file".into(),
+                ok: true,
+            })
+            .expect("record first child inspection");
+
+        let first_verdict = reviewer_verdict_from_child(
+            "ok",
+            reviewer_has_successful_inspection(&first, first_marker),
+            "검사를 마쳤지만 결론은 아직 쓰지 않았다.",
+            false,
+        );
+        assert_eq!(first_verdict, ReviewVerdict::Indeterminate);
+        assert_eq!(gate_action(first_verdict, 0, false), GateAction::Requery);
+
+        let second_marker = second.lifecycle_events().len();
+        let second_verdict = reviewer_verdict_from_child(
+            "ok",
+            reviewer_has_successful_inspection(&second, second_marker),
+            "[판정] pass",
+            false,
+        );
+        assert_eq!(second_verdict, ReviewVerdict::Indeterminate);
+        assert_eq!(
+            gate_action(second_verdict, 0, true),
+            GateAction::Report("판정 불능 — 검증자가 판정하지 못했다".into())
+        );
     }
 
     #[test]

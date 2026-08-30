@@ -37,6 +37,3 @@ jobs:
           cargo run --manifest-path agent-harness/Cargo.toml --locked -- --help
           cargo run --manifest-path agent-harness/Cargo.toml --locked -- update --help
           cargo run --manifest-path agent-harness/Cargo.toml --locked -- quality-gate --help
-      - name: check desktop (Windows)
-        if: runner.os == 'Windows'
-        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml

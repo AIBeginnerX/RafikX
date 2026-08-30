@@ -24,6 +24,7 @@ const MAX_STAGED_ENTRIES: usize = 25_000;
 const MAX_STAGING_DURATION: Duration = Duration::from_secs(3);
 const MAX_BROWSER_STDERR_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ERRORS: usize = 64;
+const MAX_BROWSER_ERROR_DETAIL_CHARS: usize = 300;
 const MAX_DISCOVERY_ENTRIES: usize = 25_000;
 const MAX_BROWSER_ENTRIES: usize = 8;
 const MAX_DISCOVERY_DURATION: Duration = Duration::from_secs(3);
@@ -926,7 +927,10 @@ pub fn parse_console_errors(stderr: &str) -> Vec<String> {
         } else {
             line
         };
-        let reason: String = detail.chars().take(300).collect();
+        let reason: String = detail
+            .chars()
+            .take(MAX_BROWSER_ERROR_DETAIL_CHARS)
+            .collect();
         if !out.contains(&reason) {
             out.push(reason);
         }
@@ -2165,11 +2169,16 @@ fn accept_probe_receipt(
             let Some(detail) = decoded_error else {
                 return ProbeReceiptDecision::Conflict;
             };
-            if sequence.errors.insert(detail.clone()) {
-                ProbeReceiptDecision::Accepted(Some(detail))
-            } else {
-                ProbeReceiptDecision::Conflict
+            let detail: String = detail
+                .chars()
+                .take(MAX_BROWSER_ERROR_DETAIL_CHARS)
+                .collect();
+            if sequence.errors.len() >= MAX_BROWSER_ERRORS
+                || !sequence.errors.insert(detail.clone())
+            {
+                return ProbeReceiptDecision::Conflict;
             }
+            ProbeReceiptDecision::Accepted(Some(detail))
         }
         _ => ProbeReceiptDecision::Conflict,
     }
@@ -2305,7 +2314,7 @@ async fn serve_request(
             && let Ok(mut errors) = errors.lock()
             && errors.len() < MAX_BROWSER_ERRORS
         {
-            errors.push(detail.chars().take(300).collect());
+            errors.push(detail);
         }
         return write_response(&mut stream, "204 No Content", "text/plain", b"").await;
     }
@@ -2764,6 +2773,64 @@ retainedLog('__RAFIKX_BROWSER_READY__');
         )
         .await;
         assert!(replay.contains("409 Conflict"));
+    }
+
+    #[tokio::test]
+    async fn probe_receipts_cap_normalized_pre_ready_error_state() {
+        let (ready, _) = tokio::sync::watch::channel(false);
+        let sequence = Arc::new(Mutex::new(ProbeSequence::default()));
+        let state = ProbeServerState {
+            token: Arc::from("test-capability"),
+            script_served: Arc::new(AtomicBool::new(false)),
+            ready,
+            sequence: sequence.clone(),
+        };
+
+        for index in 0..MAX_BROWSER_ERRORS - 1 {
+            let response = probe_request(
+                state.clone(),
+                &format!(
+                    "POST /__rafikx_probe_result/test-capability/error/error-{index} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                response.contains("204 No Content"),
+                "error-{index}: {response}"
+            );
+        }
+
+        let oversized = format!("oversized-{}", "x".repeat(400));
+        let normalized: String = oversized
+            .chars()
+            .take(MAX_BROWSER_ERROR_DETAIL_CHARS)
+            .collect();
+        let accepted_oversized = probe_request(
+            state.clone(),
+            &format!(
+                "POST /__rafikx_probe_result/test-capability/error/{oversized} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(accepted_oversized.contains("204 No Content"));
+
+        let rejected_overflow = probe_request(
+            state,
+            "POST /__rafikx_probe_result/test-capability/error/overflow HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(rejected_overflow.contains("409 Conflict"));
+
+        let sequence = sequence.lock().unwrap();
+        assert_eq!(sequence.errors.len(), MAX_BROWSER_ERRORS);
+        assert!(sequence.errors.contains(&normalized));
+        assert!(!sequence.errors.contains(&oversized));
+        assert!(
+            sequence
+                .errors
+                .iter()
+                .all(|detail| detail.chars().count() <= MAX_BROWSER_ERROR_DETAIL_CHARS)
+        );
     }
 
     #[tokio::test]

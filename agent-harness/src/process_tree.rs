@@ -31,13 +31,15 @@ static PROCESS_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(unix)]
 static PROCESS_SCOPE_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(unix)]
-static PROCESS_CLEANUP_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static PROCESS_CLEANUP_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 #[cfg(unix)]
 const PROCESS_SCOPE_ENV: &str = "RAFIKX_PROCESS_SCOPE";
 #[cfg(unix)]
 const MAX_SCOPE_SCAN_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
-const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(unix)]
+const PROCESS_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(target_os = "linux")]
 const PROCESS_STOP_SIGNAL: i32 = 19;
@@ -1007,26 +1009,67 @@ async fn discover_scope_pids(
 }
 
 #[cfg(unix)]
-async fn capture_scoped_identities(
-    scope: &ProcessScope,
+fn capture_candidate_identities(
+    candidates: Vec<u32>,
     root: Option<u32>,
+    captured: &mut Vec<ProcessIdentity>,
+    visible: &mut Vec<u32>,
     cleanup_errors: &mut Vec<String>,
-) -> (Vec<ProcessIdentity>, Vec<u32>) {
-    let candidates = discover_scope_pids(scope, root, cleanup_errors).await;
-    if candidates.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-    let mut captured = Vec::new();
-    for &pid in &candidates {
+) {
+    for pid in candidates {
+        if Some(pid) == root || pid == std::process::id() {
+            continue;
+        }
+        if visible.contains(&pid) {
+            continue;
+        }
+        visible.push(pid);
         match ProcessIdentity::capture(pid) {
             Ok(Some(identity)) => captured.push(identity),
             Ok(None) => {}
-            Err(error) => {
-                cleanup_errors.push(error);
-            }
+            Err(error) => cleanup_errors.push(error),
         }
     }
-    (captured, candidates)
+}
+
+#[cfg(unix)]
+async fn capture_scoped_identities(
+    scope: &ProcessScope,
+    root: Option<u32>,
+    captured: &mut Vec<ProcessIdentity>,
+    cleanup_errors: &mut Vec<String>,
+) -> Vec<u32> {
+    let mut visible = Vec::new();
+    match scoped_pids(scope).await {
+        Ok(pids) => {
+            capture_candidate_identities(pids, root, captured, &mut visible, cleanup_errors)
+        }
+        Err(error) => cleanup_errors.push(error),
+    }
+    match inherited_scope_pids(scope).await {
+        Ok(pids) => {
+            capture_candidate_identities(pids, root, captured, &mut visible, cleanup_errors)
+        }
+        Err(error) => cleanup_errors.push(error),
+    }
+    #[cfg(target_os = "macos")]
+    match lineage_scoped_pids(scope) {
+        Ok(pids) => {
+            capture_candidate_identities(pids, root, captured, &mut visible, cleanup_errors)
+        }
+        Err(error) => cleanup_errors.push(error),
+    }
+    if let Some(pid) = root {
+        match descendant_pids(pid).await {
+            Ok(pids) => {
+                capture_candidate_identities(pids, root, captured, &mut visible, cleanup_errors)
+            }
+            Err(error) => cleanup_errors.push(error),
+        }
+    }
+    visible.sort_unstable();
+    visible.dedup();
+    visible
 }
 
 #[cfg(unix)]
@@ -1040,6 +1083,31 @@ fn signal_captured_processes<T: GenerationBoundProcess>(
             cleanup_errors.push(error);
         }
     }
+}
+
+#[cfg(unix)]
+async fn quiesce_before_cleanup(
+    child: &mut Child,
+    scope: &ProcessScope,
+    captured: &mut Vec<ProcessIdentity>,
+    cleanup_errors: &mut Vec<String>,
+) {
+    let root = active_root(child, cleanup_errors);
+    if let Some(pid) = root
+        && let Err(error) = signal_process_group(pid, PROCESS_STOP_SIGNAL)
+        && active_root(child, cleanup_errors).is_some()
+    {
+        cleanup_errors.push(error);
+    }
+    let start = captured.len();
+    let mut visible = Vec::new();
+    match inherited_scope_pids(scope).await {
+        Ok(pids) => {
+            capture_candidate_identities(pids, root, captured, &mut visible, cleanup_errors)
+        }
+        Err(error) => cleanup_errors.push(error),
+    }
+    signal_captured_processes(&captured[start..], PROCESS_STOP_SIGNAL, cleanup_errors);
 }
 
 #[cfg(unix)]
@@ -1060,23 +1128,31 @@ async fn terminate_unix_inner(
         }
     }
 
-    let (first, first_visible) = capture_scoped_identities(scope, root, cleanup_errors).await;
+    let first_start = captured.len();
+    let first_visible = capture_scoped_identities(scope, root, captured, cleanup_errors).await;
     if root.is_none() && first_visible.is_empty() {
         return;
     }
 
-    signal_captured_processes(&first, PROCESS_STOP_SIGNAL, cleanup_errors);
-    captured.extend(first);
+    signal_captured_processes(
+        &captured[first_start..],
+        PROCESS_STOP_SIGNAL,
+        cleanup_errors,
+    );
     #[cfg(test)]
     if scope.force_cleanup_timeout {
         tokio::time::sleep(PROCESS_CLEANUP_TIMEOUT + Duration::from_millis(100)).await;
     }
     if !first_visible.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let (round, revalidated) = capture_scoped_identities(scope, root, cleanup_errors).await;
+        let round_start = captured.len();
+        let revalidated = capture_scoped_identities(scope, root, captured, cleanup_errors).await;
         if !revalidated.is_empty() {
-            signal_captured_processes(&round, PROCESS_STOP_SIGNAL, cleanup_errors);
-            captured.extend(round);
+            signal_captured_processes(
+                &captured[round_start..],
+                PROCESS_STOP_SIGNAL,
+                cleanup_errors,
+            );
         }
     }
     signal_captured_processes(captured, PROCESS_KILL_SIGNAL, cleanup_errors);
@@ -1098,11 +1174,19 @@ async fn terminate_unix_inner(
         }
     }
 
-    let (remaining, revalidated) = capture_scoped_identities(scope, None, cleanup_errors).await;
+    let remaining_start = captured.len();
+    let revalidated = capture_scoped_identities(scope, None, captured, cleanup_errors).await;
     if !revalidated.is_empty() {
-        signal_captured_processes(&remaining, PROCESS_STOP_SIGNAL, cleanup_errors);
-        signal_captured_processes(&remaining, PROCESS_KILL_SIGNAL, cleanup_errors);
-        captured.extend(remaining);
+        signal_captured_processes(
+            &captured[remaining_start..],
+            PROCESS_STOP_SIGNAL,
+            cleanup_errors,
+        );
+        signal_captured_processes(
+            &captured[remaining_start..],
+            PROCESS_KILL_SIGNAL,
+            cleanup_errors,
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let verdict_scope = discover_scope_pids(scope, None, cleanup_errors).await;
@@ -1117,11 +1201,12 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
     let mut cleanup_errors = Vec::new();
     #[cfg(unix)]
     {
+        let mut captured = Vec::new();
+        quiesce_before_cleanup(child, scope, &mut captured, &mut cleanup_errors).await;
         let _permit = PROCESS_CLEANUP_PERMITS
             .acquire()
             .await
             .map_err(|_| "프로세스 정리 동시성 제어가 닫혔습니다".to_string())?;
-        let mut captured = Vec::new();
         match tokio::time::timeout(
             PROCESS_CLEANUP_TIMEOUT,
             terminate_unix_inner(child, scope, &mut captured, &mut cleanup_errors),
@@ -1138,17 +1223,24 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
                     let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
                 }
                 match tokio::time::timeout(
-                    Duration::from_millis(500),
-                    capture_scoped_identities(scope, None, &mut cleanup_errors),
+                    PROCESS_FALLBACK_TIMEOUT,
+                    capture_scoped_identities(scope, None, &mut captured, &mut cleanup_errors),
                 )
                 .await
                 {
-                    Ok((remaining, _)) => signal_captured_processes(
-                        &remaining,
+                    Ok(_) => signal_captured_processes(
+                        &captured,
                         PROCESS_KILL_SIGNAL,
                         &mut cleanup_errors,
                     ),
-                    Err(_) => cleanup_errors.push("프로세스 scope fallback 조회 시간 초과".into()),
+                    Err(_) => {
+                        cleanup_errors.push("프로세스 scope fallback 조회 시간 초과".into());
+                        signal_captured_processes(
+                            &captured,
+                            PROCESS_KILL_SIGNAL,
+                            &mut cleanup_errors,
+                        );
+                    }
                 }
             }
         }
@@ -1227,6 +1319,41 @@ mod tests {
         };
         signal_captured_processes(&[replacement], PROCESS_KILL_SIGNAL, &mut errors);
         assert_eq!(*signaled_generations.borrow(), [2]);
+    }
+
+    #[tokio::test]
+    async fn captured_candidate_survives_cancellation_before_later_discovery() {
+        let mut command = Command::new("sleep");
+        command.arg("5");
+        let mut child = command.spawn().expect("spawn cancellation fixture");
+        let pid = child.id().expect("fixture process id");
+        let mut captured = Vec::new();
+        let mut visible = Vec::new();
+        let mut errors = Vec::new();
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), async {
+            capture_candidate_identities(
+                vec![pid, pid],
+                None,
+                &mut captured,
+                &mut visible,
+                &mut errors,
+            );
+            std::future::pending::<()>().await;
+        })
+        .await;
+
+        assert!(cancelled.is_err(), "later discovery must be cancelled");
+        assert_eq!(visible, [pid]);
+        assert!(errors.is_empty(), "{}", errors.join("; "));
+        assert_eq!(
+            captured.len(),
+            1,
+            "captured identity was lost on cancellation"
+        );
+        signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut errors);
+        child.wait().await.expect("reap cancellation fixture");
+        assert!(errors.is_empty(), "{}", errors.join("; "));
     }
 
     #[test]

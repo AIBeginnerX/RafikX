@@ -12,41 +12,105 @@ const root = path.resolve(here, "../..");
 const binary = path.join(root, "agent-harness/target/debug/rafikx");
 const xtermScript = path.join(here, "node_modules/@xterm/xterm/lib/xterm.js");
 const xtermStyle = path.join(here, "node_modules/@xterm/xterm/css/xterm.css");
-const output = process.env.RAFIKX_QA_OUTPUT || path.join(here, "artifacts");
+const output = path.resolve(process.env.RAFIKX_QA_OUTPUT || path.join(here, "artifacts"));
 const tuiHome = path.join(root, ".omo/qa/tui-home");
 const configPath = path.join(tuiHome, "config.toml");
 const runStamp = `${Date.now()}-${process.pid}`;
 const qaWorkspace = path.join(tuiHome, "workspaces", runStamp);
 const runtimeConfigPath = path.join(tuiHome, `config-${runStamp}.toml`);
+const stagingOutput = path.join(output, `.tui-pty-${runStamp}`);
+const promotionLockPath = path.join(output, ".tui-pty.promote.lock");
 let scenario = 0;
+let server;
+let browser;
+let promotionLock;
+const surfaces = new Set();
 
-await fs.mkdir(output, { recursive: true });
-await fs.mkdir(qaWorkspace, { recursive: true });
-const configTemplate = await fs.readFile(configPath, "utf8");
-let runtimeConfig = configTemplate.replace(
-  /^workspace\s*=.*$/m,
-  `workspace = ${JSON.stringify(qaWorkspace)}`,
-);
-assert.notEqual(runtimeConfig, configTemplate, "QA config workspace was not replaced");
-const workspaceConfig = runtimeConfig;
-runtimeConfig = runtimeConfig.replace(
-  /(\[subagents\.coder\][\s\S]*?\nverify\s*=\s*)true/,
-  "$1false",
-);
-assert.notEqual(runtimeConfig, workspaceConfig, "QA coder verification was not disabled");
-const coderConfig = runtimeConfig;
-runtimeConfig = runtimeConfig.replace(
-  "[harness]\n",
-  "[harness]\nstrict_gate = false\nreview_committee = false\n",
-);
-assert.notEqual(runtimeConfig, coderConfig, "QA strict review gate was not disabled");
-await fs.writeFile(runtimeConfigPath, runtimeConfig);
+async function closeServer() {
+  if (!server?.listening) return;
+  server.closeAllConnections?.();
+  await new Promise((resolve) => server.close(resolve));
+}
 
-const build = spawnSync("cargo", ["build", "--all-features", "--manifest-path", "agent-harness/Cargo.toml"], {
-  cwd: root,
-  encoding: "utf8",
-});
-assert.equal(build.status, 0, build.stderr || build.stdout);
+async function acquirePromotionLock() {
+  const started = Date.now();
+  while (true) {
+    try {
+      promotionLock = await fs.open(promotionLockPath, "wx");
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST" || Date.now() - started > 30_000) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
+async function promoteArtifacts() {
+  const stagedFiles = await fs.readdir(stagingOutput);
+  assert.ok(stagedFiles.length > 0, "TUI QA produced no artifacts");
+  await acquirePromotionLock();
+  const backups = [];
+  const promoted = [];
+  const temporary = [];
+  try {
+    for (const name of stagedFiles) {
+      const destination = path.join(output, name);
+      const backup = path.join(output, `.${name}.${runStamp}.bak`);
+      try {
+        await fs.rename(destination, backup);
+        backups.push({ backup, destination });
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    }
+    for (const name of stagedFiles) {
+      const temporaryPath = path.join(output, `.${name}.${runStamp}.tmp`);
+      temporary.push(temporaryPath);
+      await fs.copyFile(path.join(stagingOutput, name), temporaryPath);
+      await fs.rename(temporaryPath, path.join(output, name));
+      promoted.push(path.join(output, name));
+    }
+    for (const { backup } of backups) await fs.rm(backup, { force: true });
+    backups.length = 0;
+  } catch (error) {
+    for (const destination of promoted) await fs.rm(destination, { force: true }).catch(() => {});
+    for (const { backup, destination } of backups.reverse()) {
+      await fs.rename(backup, destination).catch(() => {});
+    }
+    throw error;
+  } finally {
+    for (const temporaryPath of temporary) await fs.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
+try {
+  await fs.mkdir(output, { recursive: true });
+  await fs.mkdir(qaWorkspace, { recursive: true });
+  await fs.mkdir(stagingOutput, { recursive: true });
+  const configTemplate = await fs.readFile(configPath, "utf8");
+  let runtimeConfig = configTemplate.replace(
+    /^workspace\s*=.*$/m,
+    `workspace = ${JSON.stringify(qaWorkspace)}`,
+  );
+  assert.notEqual(runtimeConfig, configTemplate, "QA config workspace was not replaced");
+  const workspaceConfig = runtimeConfig;
+  runtimeConfig = runtimeConfig.replace(
+    /(\[subagents\.coder\][\s\S]*?\nverify\s*=\s*)true/,
+    "$1false",
+  );
+  assert.notEqual(runtimeConfig, workspaceConfig, "QA coder verification was not disabled");
+  const coderConfig = runtimeConfig;
+  runtimeConfig = runtimeConfig.replace(
+    "[harness]\n",
+    "[harness]\nstrict_gate = false\nreview_committee = false\n",
+  );
+  assert.notEqual(runtimeConfig, coderConfig, "QA strict review gate was not disabled");
+
+  const build = spawnSync("cargo", ["build", "--all-features", "--manifest-path", "agent-harness/Cargo.toml"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  assert.equal(build.status, 0, build.stderr || build.stdout);
 
 function streamResponse(response, body) {
   response.writeHead(200, {
@@ -83,7 +147,7 @@ function streamResponse(response, body) {
   }
 }
 
-const server = http.createServer((request, response) => {
+server = http.createServer((request, response) => {
   if (!request.url?.endsWith("/chat/completions")) {
     response.writeHead(404).end();
     return;
@@ -100,16 +164,27 @@ const server = http.createServer((request, response) => {
 });
 await new Promise((resolve, reject) => {
   server.once("error", reject);
-  server.listen(11434, "127.0.0.1", resolve);
+  server.listen(0, "127.0.0.1", resolve);
 });
+const address = server.address();
+assert.ok(address && typeof address !== "string", "mock server did not expose a TCP address");
+runtimeConfig = runtimeConfig.replace(
+  /(\[providers\.local\][\s\S]*?base_url\s*=\s*)"[^"]*"/,
+  `$1${JSON.stringify(`http://127.0.0.1:${address.port}/v1`)}`,
+);
+assert.match(runtimeConfig, new RegExp(`base_url = "http://127\\.0\\.0\\.1:${address.port}/v1"`));
+await fs.writeFile(runtimeConfigPath, runtimeConfig);
 
-const browser = await chromium.launch({ headless: true });
+browser = await chromium.launch({ headless: true });
 
 async function terminalSurface(cols, rows, reducedMotion = false) {
   scenario += 1;
   const cellWidth = 9;
   const cellHeight = 20;
   const context = await browser.newContext({ viewport: { width: cols * cellWidth + 32, height: rows * cellHeight + 32 } });
+  let childProcess;
+  let surface;
+  try {
   const page = await context.newPage();
   await page.setContent('<main id="terminal"></main>');
   await page.addStyleTag({ path: xtermStyle });
@@ -129,7 +204,7 @@ async function terminalSurface(cols, rows, reducedMotion = false) {
   }, { cols, rows });
   let raw = "";
   let closed = false;
-  const process = pty.spawn(binary, ["--config", runtimeConfigPath, "--provider", "local", "--model", "qwen3:8b"], {
+  childProcess = pty.spawn(binary, ["--config", runtimeConfigPath, "--provider", "local", "--model", "qwen3:8b"], {
     cols,
     rows,
     cwd: root,
@@ -140,7 +215,7 @@ async function terminalSurface(cols, rows, reducedMotion = false) {
       RAFIKX_REDUCE_MOTION: reducedMotion ? "1" : "0",
     },
   });
-  process.onData((data) => {
+  childProcess.onData((data) => {
     raw += data;
     if (!closed) page.evaluate((chunk) => window.term.write(chunk), data).catch(() => {});
   });
@@ -162,20 +237,31 @@ async function terminalSurface(cols, rows, reducedMotion = false) {
   }
   async function screenshot(name) {
     const stem = name.replace(/\.png$/, "");
-    await page.screenshot({ path: path.join(output, name), fullPage: true });
-    await fs.writeFile(path.join(output, `${stem}.txt`), `${await screenText()}\n`);
-    await fs.writeFile(path.join(output, `${stem}.ansi.txt`), raw);
+    await page.screenshot({ path: path.join(stagingOutput, name), fullPage: true });
+    await fs.writeFile(path.join(stagingOutput, `${stem}.txt`), `${await screenText()}\n`);
+    await fs.writeFile(path.join(stagingOutput, `${stem}.ansi.txt`), raw);
     await fs.writeFile(
-      path.join(output, `${stem}.metadata.json`),
+      path.join(stagingOutput, `${stem}.metadata.json`),
       `${JSON.stringify({ cols, rows, reducedMotion }, null, 2)}\n`,
     );
   }
   async function close() {
     closed = true;
-    try { process.kill(); } catch (_) {}
-    await context.close();
+    try { childProcess?.kill(); } catch (_) {}
+    try {
+      await context.close();
+    } finally {
+      surfaces.delete(surface);
+    }
   }
-  return { close, page, process, raw: () => raw, screenText, screenshot, waitFor };
+  surface = { close, page, process: childProcess, raw: () => raw, screenText, screenshot, waitFor };
+  surfaces.add(surface);
+  return surface;
+  } catch (error) {
+    try { childProcess?.kill(); } catch (_) {}
+    await context.close().catch(() => {});
+    throw error;
+  }
 }
 
 function processEnv() {
@@ -230,6 +316,15 @@ await approval.waitFor("Run summary · ✓ ok", 8000);
 await approval.screenshot("tui-succeeded-100x30.png");
 await approval.close();
 
-await browser.close();
-await new Promise((resolve) => server.close(resolve));
+await promoteArtifacts();
 process.stdout.write("TUI PTY/xterm QA passed\n");
+} finally {
+  for (const surface of surfaces) await surface.close().catch(() => {});
+  await browser?.close().catch(() => {});
+  await closeServer().catch(() => {});
+  await promotionLock?.close().catch(() => {});
+  if (promotionLock) await fs.rm(promotionLockPath, { force: true }).catch(() => {});
+  await fs.rm(runtimeConfigPath, { force: true }).catch(() => {});
+  await fs.rm(qaWorkspace, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(stagingOutput, { recursive: true, force: true }).catch(() => {});
+}
