@@ -1293,19 +1293,19 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
 
     match wait {
         Err(_) => {
-            crate::process_tree::terminate(&mut child, &process_scope)
+            crate::process_tree::terminate(child, process_scope)
                 .await
                 .map_err(|error| anyhow!("명령 시간 초과 후 프로세스 정리 실패: {error}"))?;
             Err(anyhow!("명령이 {timeout_secs}초를 넘겨 중단되었습니다"))
         }
         Ok(Err(e)) => {
-            crate::process_tree::terminate(&mut child, &process_scope)
+            crate::process_tree::terminate(child, process_scope)
                 .await
                 .map_err(|error| anyhow!("명령 대기 실패 후 프로세스 정리 실패: {error}"))?;
             Err(anyhow!("명령 실행 오류: {e}"))
         }
         Ok(Ok((status, out_buf, err_buf))) => {
-            crate::process_tree::terminate(&mut child, &process_scope)
+            crate::process_tree::terminate(child, process_scope)
                 .await
                 .map_err(|error| anyhow!("명령 종료 후 프로세스 정리 실패: {error}"))?;
             let mut combined = String::new();

@@ -93,7 +93,7 @@ fn insert_notice(msgs: &mut Vec<Message>) {
     msgs.insert(0, Message::user_text("[이전 대화 일부 생략]"));
 }
 
-fn truncate_oldest_text(msgs: &mut [Message], budget: usize) {
+fn truncate_oldest_text(msgs: &mut [Message], budget: usize) -> bool {
     for m in msgs.iter_mut() {
         if is_tool_use(m) || is_tool_result(m) {
             continue;
@@ -104,11 +104,19 @@ fn truncate_oldest_text(msgs: &mut [Message], budget: usize) {
             {
                 let keep = (budget / 8).max(24);
                 let cut: String = text.chars().take(keep * 4).collect();
-                *text = format!("{cut}\n[이전 대화 일부 생략]");
-                return;
+                let truncated = format!("{cut}\n[이전 대화 일부 생략]");
+                if estimate_tokens(&truncated) < estimate_tokens(text) {
+                    *text = truncated;
+                    return true;
+                }
             }
         }
     }
+    false
+}
+
+fn minimum_truncated_tool_result_tokens() -> usize {
+    estimate_tokens(&format!("h{TOOL_RESULT_OMIT_NOTICE}t"))
 }
 
 fn truncate_tool_result(content: &mut String, max_tokens: usize) -> bool {
@@ -116,8 +124,7 @@ fn truncate_tool_result(content: &mut String, max_tokens: usize) -> bool {
         return false;
     }
 
-    let marker_tokens = estimate_tokens(TOOL_RESULT_OMIT_NOTICE);
-    if max_tokens < marker_tokens {
+    if max_tokens < minimum_truncated_tool_result_tokens() {
         return false;
     }
 
@@ -134,21 +141,110 @@ fn truncate_tool_result(content: &mut String, max_tokens: usize) -> bool {
         .chars()
         .skip(content_chars.saturating_sub(tail_chars))
         .collect();
-    *content = format!("{head}{TOOL_RESULT_OMIT_NOTICE}{tail}");
+    let truncated = format!("{head}{TOOL_RESULT_OMIT_NOTICE}{tail}");
+    if estimate_tokens(&truncated) >= estimate_tokens(content) {
+        return false;
+    }
+    *content = truncated;
     true
+}
+
+/// `available` is shared by every result in one provider user-result message.
+/// Small results keep their full contents; the remaining capacity is water-filled
+/// across larger siblings so no result is starved by an earlier truncation.
+fn allocate_tool_result_limits(result_tokens: &[usize], available: usize) -> Option<Vec<usize>> {
+    let minimum = minimum_truncated_tool_result_tokens();
+    let mut limits: Vec<usize> = result_tokens
+        .iter()
+        .map(|tokens| (*tokens).min(minimum))
+        .collect();
+    let baseline = limits.iter().sum::<usize>();
+    if available < baseline {
+        return None;
+    }
+
+    let mut remaining = available - baseline;
+    while remaining > 0 {
+        let active: Vec<usize> = limits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, limit)| (*limit < result_tokens[index]).then_some(index))
+            .collect();
+        if active.is_empty() {
+            break;
+        }
+
+        let share = remaining.div_ceil(active.len());
+        let mut granted = 0;
+        for index in active {
+            let grant = share
+                .min(result_tokens[index].saturating_sub(limits[index]))
+                .min(remaining.saturating_sub(granted));
+            limits[index] += grant;
+            granted += grant;
+        }
+        if granted == 0 {
+            break;
+        }
+        remaining -= granted;
+    }
+    Some(limits)
+}
+
+fn truncate_tool_results_in_message(message: &mut Message, available: usize) -> bool {
+    let result_tokens: Vec<usize> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(estimate_tokens(content)),
+            _ => None,
+        })
+        .collect();
+    let Some(limits) = allocate_tool_result_limits(&result_tokens, available) else {
+        // The pair's fixed structure alone exceeds the budget. Emptying every
+        // result is the deterministic fixed point that still preserves IDs,
+        // order, errors, and the assistant/result adjacency contract.
+        let mut changed = false;
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && !content.is_empty()
+            {
+                content.clear();
+                changed = true;
+            }
+        }
+        return changed;
+    };
+
+    let mut changed = false;
+    let mut index = 0;
+    for block in &mut message.content {
+        if let ContentBlock::ToolResult { content, .. } = block {
+            changed |= truncate_tool_result(content, limits[index]);
+            index += 1;
+        }
+    }
+    changed
 }
 
 fn truncate_newest_tool_result(msgs: &mut [Message], budget: usize) -> bool {
     let total = msgs.iter().map(message_tokens).sum::<usize>();
     for message in msgs.iter_mut().rev() {
-        for block in message.content.iter_mut().rev() {
-            let ContentBlock::ToolResult { content, .. } = block else {
-                continue;
-            };
-            let available = budget.saturating_sub(total.saturating_sub(estimate_tokens(content)));
-            if truncate_tool_result(content, available) {
-                return true;
-            }
+        let result_tokens = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(estimate_tokens(content)),
+                _ => None,
+            })
+            .sum::<usize>();
+        if result_tokens == 0 {
+            continue;
+        }
+        let fixed_tokens = total.saturating_sub(result_tokens);
+        let available = budget.saturating_sub(fixed_tokens);
+        if truncate_tool_results_in_message(message, available) {
+            return true;
         }
     }
     false
@@ -195,27 +291,24 @@ pub fn pack_messages(
     if omitted {
         insert_notice(&mut msgs);
     }
-    let mut guard = 0;
-    while total(&msgs) > budget && guard < 8 {
+    while total(&msgs) > budget {
         let before = total(&msgs);
-        truncate_oldest_text(&mut msgs, budget);
-        if total(&msgs) > budget {
-            truncate_newest_tool_result(&mut msgs, budget);
-        }
+        let shrunk = truncate_oldest_text(&mut msgs, budget)
+            || truncate_newest_tool_result(&mut msgs, budget);
         agent::sanitize_tool_pairs(&mut msgs);
-        if total(&msgs) > budget && msgs.len() > 1 {
+        if shrunk && total(&msgs) < before {
+            continue;
+        }
+        if msgs.len() > 1 {
             if drop_oldest_unit(&mut msgs) {
                 insert_notice(&mut msgs);
-            } else {
-                break;
             }
-        } else {
-            break;
+            agent::sanitize_tool_pairs(&mut msgs);
+            if total(&msgs) < before {
+                continue;
+            }
         }
-        if total(&msgs) >= before {
-            break;
-        }
-        guard += 1;
+        break;
     }
     agent::sanitize_tool_pairs(&mut msgs);
     msgs
@@ -479,6 +572,163 @@ mod tests {
         let reserved = estimate_tokens("review") + effective_output_limit(32_000, 32_768) as usize;
         let used = packed.iter().map(message_tokens).sum::<usize>();
         assert!(used + reserved <= 32_000, "used={used} reserved={reserved}");
+    }
+
+    #[test]
+    fn packer_allocates_one_budget_across_sibling_tool_results() {
+        let small = "small sibling remains complete";
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "small".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "small.txt"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "first".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "first.txt"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "second".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "second.txt"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "small".into(),
+                        content: small.into(),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "first".into(),
+                        content: format!("FIRST-HEAD\n{}\nFIRST-TAIL", "a".repeat(256 * 1024)),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "second".into(),
+                        content: format!("SECOND-HEAD\n{}\nSECOND-TAIL", "b".repeat(256 * 1024)),
+                        is_error: true,
+                    },
+                ],
+            },
+        ];
+
+        let packed = pack_messages(&msgs, "review", &[], 32_000, 32_768, 200_000);
+        let pair_index = packed
+            .iter()
+            .position(is_tool_use)
+            .expect("the latest tool use must be retained");
+        assert!(
+            packed.get(pair_index + 1).is_some_and(is_tool_result),
+            "the latest tool use and all sibling results must remain adjacent"
+        );
+
+        let results: Vec<(&str, &str, bool)> = packed[pair_index + 1]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], ("small", small, false));
+        assert_eq!(results[1].0, "first");
+        assert!(!results[1].2);
+        assert!(results[1].1.contains("FIRST-HEAD"));
+        assert!(results[1].1.contains(TOOL_RESULT_OMIT_NOTICE.trim()));
+        assert!(results[1].1.contains("FIRST-TAIL"));
+        assert_eq!(results[2].0, "second");
+        assert!(results[2].2);
+        assert!(results[2].1.contains("SECOND-HEAD"));
+        assert!(results[2].1.contains(TOOL_RESULT_OMIT_NOTICE.trim()));
+        assert!(results[2].1.contains("SECOND-TAIL"));
+
+        let reserved = estimate_tokens("review") + effective_output_limit(32_000, 32_768) as usize;
+        let used = packed.iter().map(message_tokens).sum::<usize>();
+        assert!(used + reserved <= 32_000, "used={used} reserved={reserved}");
+    }
+
+    #[test]
+    fn packer_reaches_a_fixed_point_when_tool_pair_structure_exceeds_budget() {
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "oversized-input".into(),
+                    name: "read_file".into(),
+                    input: json!({"payload": "x".repeat(4_096)}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "oversized-input".into(),
+                        content: "first result".repeat(128),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "oversized-input".into(),
+                        content: "second result".repeat(128),
+                        is_error: true,
+                    },
+                ],
+            },
+        ];
+
+        let packed = pack_messages(&msgs, "", &[], 256, 0, 4_096);
+        assert!(packed.first().is_some_and(is_tool_use));
+        assert!(packed.get(1).is_some_and(is_tool_result));
+        let results: Vec<(&str, bool)> = packed[1]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if content.is_empty() => Some((tool_use_id.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![("oversized-input", false), ("oversized-input", true)]
+        );
+
+        let repacked = pack_messages(&packed, "", &[], 256, 0, 4_096);
+        let repacked_results: Vec<&str> = repacked[1]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(repacked_results, vec!["", ""]);
+    }
+
+    #[test]
+    fn truncate_oldest_text_skips_a_candidate_that_would_not_shrink() {
+        let original = "x".repeat(132);
+        let mut msgs = vec![Message::user_text(original.clone())];
+        assert!(!truncate_oldest_text(&mut msgs, 10_000));
+        let ContentBlock::Text { text } = &msgs[0].content[0] else {
+            panic!("test setup must contain text");
+        };
+        assert_eq!(text, &original);
     }
 
     #[test]

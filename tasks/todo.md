@@ -27,4 +27,10 @@
       전용 Phase에서 경고·포맷 차이를 기준선부터 정리
 - [ ] (보류) 환경 의존 LSP 실동작 테스트 3개 — rust-analyzer·typescript-language-server
       설치가 허용된 검증 환경에서 ignore 해제 후 교차 플랫폼 실행
+- [ ] (보류) PTY 증거 promotion lock의 강제 종료 복구 — owner PID·process start identity를
+      기록하고 실제 소유자가 없을 때만 회수하는 교차 플랫폼 계약을 별도 Phase로 설계
+- [ ] (보류) 터미널 시각 QA 확장 — NO_COLOR, OPAL/SYNTH/CLAUDE 테마, emoji/ZWJ
+      grapheme 폭과 steady EXECUTE 상태를 실제 PTY 증거로 추가
+- [ ] (보류) 최초 설치 스크립트도 mutable master 대신 검증된 안정 태그·커밋을 고정하도록
+      updater와 같은 불변 설치 계약으로 통합
 - [ ] (보류) 데스크탑 index.html:602 stale allowlist 버그 (dk/pi 미표시)

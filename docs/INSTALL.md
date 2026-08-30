@@ -58,7 +58,7 @@ irm https://raw.githubusercontent.com/내계정/rafikx/master/install.ps1 | iex
 | OS | Windows 10+, macOS 12+, 최근 Linux |
 | 디스크 | 소스+컴파일 중 약 2GB, 설치 후 실행 파일은 수 MB |
 | 네트워크 | 설치 시 crates.io, 사용 시 선택한 AI API |
-| Rust | rustc 1.85 이상 (에디션 2024). 스크립트가 설치해 줍니다 |
+| Rust | rustc 1.96 이상 (에디션 2024). 스크립트가 설치해 줍니다 |
 | Git | 한 줄 설치에 필요 |
 | Windows 추가 | Visual Studio Build Tools C++ (rustup이 안내할 수 있음) |
 | macOS 추가 | Xcode Command Line Tools: `xcode-select --install` |
@@ -138,7 +138,7 @@ rafikx
 
 터미널 없이 같은 RafikX를 쓰려면 Tauri 창을 빌드합니다. 에이전트 루프·도구·승인·`~/.rafikx` 설정은 CLI와 하나입니다.
 
-필요: Rust 1.85+, Windows는 WebView2 (Windows 10에 보통 포함), macOS는 Xcode CLT, Linux는 WebKitGTK 4.1 개발 패키지.
+필요: Rust는 위 공통 요구사항을 따릅니다. Windows는 WebView2 (Windows 10에 보통 포함), macOS는 Xcode CLT, Linux는 WebKitGTK 4.1 개발 패키지가 필요합니다.
 
 아이콘은 저장소 스크립트가 만듭니다. `tauri-cli` 2 가 없으면 스크립트가 `cargo install` 합니다.
 
@@ -197,7 +197,7 @@ Windows에서는 호스트가 지원하는 번들만 실제로 만들어집니�
 ## 확인
 
 ```text
-rafikx --version    →  rafikx 1.0.0
+rafikx --version    →  RafikX 1.1.9
 rafikx              →  대화 화면 (TTY). 처음이면 짧은 연결 마법사
 rafikx login        →  Zen / Go / Claude 등 연결
 rafikx settings     →  설정

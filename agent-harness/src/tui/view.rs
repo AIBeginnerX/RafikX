@@ -211,11 +211,7 @@ fn draw_file_tree(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         }
         let indent = "  ".repeat(row.depth);
         let marker = if row.is_dir {
-            if row.expanded {
-                "▾ "
-            } else {
-                "▸ "
-            }
+            if row.expanded { "▾ " } else { "▸ " }
         } else {
             "  "
         };
@@ -238,10 +234,7 @@ fn draw_file_tree(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
             Style::default().fg(th.mute),
         )));
     }
-    f.render_widget(
-        Paragraph::new(lines).scroll((0, 0)),
-        inner,
-    );
+    f.render_widget(Paragraph::new(lines).scroll((0, 0)), inner);
 
     let (preview_title, preview_lines) = match &tree.preview {
         Some(p) => (
@@ -253,10 +246,7 @@ fn draw_file_tree(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     let preview_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(th.mute))
-        .title(Span::styled(
-            preview_title,
-            Style::default().fg(th.mute),
-        ));
+        .title(Span::styled(preview_title, Style::default().fg(th.mute)));
     let preview_inner = preview_block.inner(halves[1]);
     f.render_widget(preview_block, halves[1]);
     if preview_lines.is_empty() {
@@ -516,13 +506,38 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         }
     }
     if area.width >= 96 {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(&app.cwd, Style::default().fg(th.secondary)));
+        append_workspace_path(
+            &mut spans,
+            &app.cwd,
+            area.width.into(),
+            Style::default().fg(th.secondary),
+        );
     }
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(th.bg)),
         area,
     );
+}
+
+fn append_workspace_path(
+    spans: &mut Vec<Span<'static>>,
+    path: &str,
+    terminal_width: usize,
+    style: Style,
+) {
+    const WORKSPACE_GAP: &str = "   ";
+    let preceding_width = spans.iter().fold(0usize, |width, span| {
+        width.saturating_add(super::md::display_width(&span.content))
+    });
+    let workspace_width = terminal_width
+        .saturating_sub(preceding_width)
+        .saturating_sub(super::md::display_width(WORKSPACE_GAP));
+    let workspace = super::start::compact_workspace(path, workspace_width);
+    if workspace.is_empty() {
+        return;
+    }
+    spans.push(Span::raw(WORKSPACE_GAP));
+    spans.push(Span::styled(workspace, style));
 }
 
 /// 대화 영역을 테두리로 감싼 뒤 내부에 트랜스크립트를 그린다.
@@ -1959,6 +1974,26 @@ mod tests {
     }
 
     #[test]
+    fn header_workspace_uses_unicode_width_and_keeps_the_path_tail() {
+        let mut spans = vec![Span::raw(" RAFIKX "), Span::raw(" 준비 ")];
+        let path = "/Users/노아/프로젝트/RafikX-작업";
+        let terminal_width = 30;
+
+        append_workspace_path(&mut spans, path, terminal_width, Style::default());
+
+        let shown = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let shown_width = spans
+            .iter()
+            .map(|span| super::super::md::display_width(&span.content))
+            .sum::<usize>();
+        assert!(shown.ends_with("…/RafikX-작업"));
+        assert_eq!(shown_width, terminal_width);
+    }
+
+    #[test]
     fn work_phase_assistant_renders_dim_italic_and_final_normal() {
         let th = pal_of(&palette::RAFIKX);
         let e = crate::tui::Entry {
@@ -2223,7 +2258,10 @@ mod preview_style_tests {
         let th = pal_of(&palette::RAFIKX);
         assert_eq!(preview_line_style("+added line", &th).fg, Some(th.success));
         assert_eq!(preview_line_style("-removed line", &th).fg, Some(th.err));
-        assert_eq!(preview_line_style("@@ -1,3 +1,4 @@", &th).fg, Some(th.secondary));
+        assert_eq!(
+            preview_line_style("@@ -1,3 +1,4 @@", &th).fg,
+            Some(th.secondary)
+        );
         assert_eq!(preview_line_style("--- diff ---", &th).fg, Some(th.mute));
         assert_eq!(preview_line_style("--- patch ---", &th).fg, Some(th.mute));
         assert_eq!(preview_line_style(" context line", &th).fg, Some(th.text));

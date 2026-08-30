@@ -136,19 +136,19 @@ pub(crate) async fn run_bounded_command(
     let status = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            let cleanup = crate::process_tree::terminate(&mut child, &process_scope).await;
+            let cleanup = crate::process_tree::terminate(child, process_scope).await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             cleanup.map_err(|cleanup| format!("실행 대기 실패 후 정리 실패: {cleanup}"))?;
             return Err(format!("실행 대기 실패: {error}"));
         }
         Err(_) => {
-            let cleanup = crate::process_tree::terminate(&mut child, &process_scope).await;
+            let cleanup = crate::process_tree::terminate(child, process_scope).await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             cleanup.map_err(|cleanup| format!("시간 초과 후 프로세스 정리 실패: {cleanup}"))?;
             return Err(format!("시간 초과 ({}초)", deadline.as_secs()));
         }
     };
-    crate::process_tree::terminate(&mut child, &process_scope)
+    crate::process_tree::terminate(child, process_scope)
         .await
         .map_err(|cleanup| format!("명령 종료 후 프로세스 정리 실패: {cleanup}"))?;
     let (stdout, stderr, overflow) = await_bounded_readers(stdout_reader, stderr_reader).await?;

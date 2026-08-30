@@ -16,10 +16,11 @@ const output = path.resolve(process.env.RAFIKX_QA_OUTPUT || path.join(here, "art
 const tuiHome = path.join(root, ".omo/qa/tui-home");
 const configPath = path.join(tuiHome, "config.toml");
 const runStamp = `${Date.now()}-${process.pid}`;
-const qaWorkspace = path.join(tuiHome, "workspaces", runStamp);
+const qaWorkspace = path.join(tuiHome, "workspaces", `한국어-workspace-${runStamp}`);
 const runtimeConfigPath = path.join(tuiHome, `config-${runStamp}.toml`);
 const stagingOutput = path.join(output, `.tui-pty-${runStamp}`);
 const promotionLockPath = path.join(output, ".tui-pty.promote.lock");
+const failedTask = "RAFIKX_PTY_HTTP500_9th_state_검증";
 let scenario = 0;
 let server;
 let browser;
@@ -113,6 +114,13 @@ try {
   assert.equal(build.status, 0, build.stderr || build.stdout);
 
 function streamResponse(response, body) {
+  const hasToolResult = body.messages?.some((message) => message.role === "tool");
+  const prompt = [...(body.messages || [])].reverse().find((message) => message.role === "user")?.content || "";
+  if (prompt === failedTask) {
+    response.writeHead(500, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "RAFIKX PTY forced HTTP 500" } }));
+    return;
+  }
   response.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -123,8 +131,6 @@ function streamResponse(response, body) {
     send({ choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 72, completion_tokens: 18 } });
     response.end("data: [DONE]\n\n");
   };
-  const hasToolResult = body.messages?.some((message) => message.role === "tool");
-  const prompt = [...(body.messages || [])].reverse().find((message) => message.role === "user")?.content || "";
   if (hasToolResult) {
     setTimeout(() => send({ choices: [{ delta: { content: "승인된 명령을 실행하고 결과를 검증했습니다." }, finish_reason: null }] }), 300);
     setTimeout(finish, 600);
@@ -298,6 +304,8 @@ running.process.write("프로젝트 구조를 분석해줘\r");
 await running.waitFor("프로젝트 구조를 분석해줘");
 await running.page.waitForTimeout(350);
 assert.match(await running.screenText(), /C.*P.*E.*V/);
+await running.waitFor("맥락과 실행 경계를 확인합니다.");
+assert.match(running.raw(), /38;2;129;126;119/);
 await running.screenshot("tui-running-100x30.png");
 running.process.write("\u001b");
 await running.waitFor("실행 취소를 요청했습니다");
@@ -315,6 +323,18 @@ await approval.waitFor("승인된 명령을 실행하고 결과를 검증했습�
 await approval.waitFor("Run summary · ✓ ok", 8000);
 await approval.screenshot("tui-succeeded-100x30.png");
 await approval.close();
+
+const failed = await terminalSurface(100, 30);
+await failed.waitFor("RAFIKX");
+failed.process.write(`/agent ${failedTask}\r`);
+await failed.waitFor("OpenAI 호환 API 오류 HTTP 500", 8000);
+await failed.waitFor("Failed", 8000);
+const failedText = await failed.screenText();
+assert.match(failedText.split("\n")[0], /…\/한국어-workspace-/);
+assert.match(failedText, /OpenAI 호환 API 오류 HTTP 500/);
+assert.match(failedText, /BUILD\s+! Failed/);
+await failed.screenshot("tui-failed-100x30.png");
+await failed.close();
 
 await promoteArtifacts();
 process.stdout.write("TUI PTY/xterm QA passed\n");

@@ -102,6 +102,7 @@ The signal path alone may use `filter: drop-shadow(...)` to read as emitted ligh
 
 - Header, composer, approval choices, and footer remain fixed.
 - Transcript owns scroll. The start screen uses that same region and never creates a second scrollbar.
+- At 96 columns and above, the workspace uses only the header width left after brand, harness, and lifecycle signals; Unicode display-width compaction preserves a visible `…/<last-directory>` tail instead of relying on terminal clipping.
 - Below 72 columns, the signal path stacks as two rows and optional explanation copy elides before model/workspace.
 - Below 18 rows, the start screen keeps brand, signal path, selected model, workspace, and input; supporting copy disappears.
 
@@ -184,6 +185,7 @@ Constraints:
 - Focus-visible treatment uses `line-strong` plus a 2px outline/offset; focus is never removed.
 - Color is never the sole carrier. Nodes include a glyph and label; outcomes include text.
 - Contrast targets WCAG AA for body text and controls.
+- The default TUI progress/thinking text is `#817e77` on `#11100e` (about `4.69:1`), above the AA body-text threshold while remaining subordinate to muted metadata and body copy.
 - Keyboard order follows visual order. Escape cancels the current run only when no modal owns Escape.
 - Dynamic lifecycle announcements are polite except approval and failure, which are assertive.
 - CJK content wraps by display width; code/path tokens use `overflow-wrap:anywhere` on the desktop.

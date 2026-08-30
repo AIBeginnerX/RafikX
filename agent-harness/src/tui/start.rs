@@ -38,7 +38,12 @@ fn draw_split(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     let (banner, bottom) = if banner_h >= 10 {
         (
             Rect::new(area.x, area.y, area.width, banner_h),
-            Rect::new(area.x, area.y + banner_h, area.width, area.height - banner_h),
+            Rect::new(
+                area.x,
+                area.y + banner_h,
+                area.width,
+                area.height - banner_h,
+            ),
         )
     } else {
         (area, Rect::new(area.x, area.y, area.width, 0))
@@ -85,7 +90,10 @@ fn draw_split(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
 /// 아래-왼쪽에서 위-오른쪽으로 뻗는다. 행마다 폭은 글리프별로 균일.
 const GLYPHS: &[(char, [&str; 7])] = &[
     ('{', [" ██", " █ ", " █ ", "██ ", " █ ", " █ ", " ██"]),
-    ('/', ["   █", "  █ ", "  █ ", " █  ", " █  ", "█   ", "█   "]),
+    (
+        '/',
+        ["   █", "  █ ", "  █ ", " █  ", " █  ", "█   ", "█   "],
+    ),
     ('}', ["██ ", " █ ", " █ ", " ██", " █ ", " █ ", "██ "]),
 ];
 
@@ -103,7 +111,11 @@ const WORDMARK: &str = "RAFIKX";
 const WORDMARK_GAP: usize = 2;
 const WORDMARK_W: usize = 6 + WORDMARK_GAP * 5;
 /// 락업 폭 — 마크와 워드마크 중 넓은 쪽 (중앙 정렬 기준).
-const LOCKUP_W: usize = if MARK_W > WORDMARK_W { MARK_W } else { WORDMARK_W };
+const LOCKUP_W: usize = if MARK_W > WORDMARK_W {
+    MARK_W
+} else {
+    WORDMARK_W
+};
 
 /// 부팅 연출 — 글자가 아래에서부터 한 행씩 켜진다 (reduced_motion 이면 즉시 전체).
 fn visible_rows(app: &App) -> usize {
@@ -120,8 +132,7 @@ fn visible_rows_for(tick: u16, settled: bool) -> usize {
 /// 반짝임 — (틱, 행, 열) 해시의 일부 칸만 밝게. 규칙적이지 않아 스치는 느낌이 난다.
 fn spark(tick: u16, row: usize, col: usize) -> bool {
     let t = (tick as usize).wrapping_mul(11);
-    let h = (t ^ row.wrapping_mul(31) ^ col.wrapping_mul(137))
-        .wrapping_mul(2_654_435_761);
+    let h = (t ^ row.wrapping_mul(31) ^ col.wrapping_mul(137)).wrapping_mul(2_654_435_761);
     (h >> 13) % 19 == 0
 }
 
@@ -195,8 +206,7 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
                             Style::default()
                                 .fg(palette.text)
                                 .add_modifier(Modifier::BOLD)
-                        } else if !reduced_motion(app) && spark(app.motion_tick, row_index, col)
-                        {
+                        } else if !reduced_motion(app) && spark(app.motion_tick, row_index, col) {
                             // 반짝임은 마크를 파지 않고 색만 밝힌다 — 항상 완전.
                             Style::default()
                                 .fg(palette.text)
@@ -364,7 +374,7 @@ fn truncate_display(text: &str, width: usize) -> String {
     shown
 }
 
-fn compact_workspace(path: &str, width: usize) -> String {
+pub(super) fn compact_workspace(path: &str, width: usize) -> String {
     if display_width(path) <= width {
         return path.to_string();
     }
@@ -609,16 +619,16 @@ fn active_stage(app: &App) -> Option<usize> {
         Some(LifecycleState::Planning) => Some(1),
         Some(
             LifecycleState::Running
-                | LifecycleState::WaitingApproval
-                | LifecycleState::Delegating
-                | LifecycleState::CancelRequested,
+            | LifecycleState::WaitingApproval
+            | LifecycleState::Delegating
+            | LifecycleState::CancelRequested,
         ) => Some(2),
         Some(
             LifecycleState::Answering
-                | LifecycleState::Succeeded
-                | LifecycleState::Limited
-                | LifecycleState::Failed
-                | LifecycleState::Cancelled,
+            | LifecycleState::Succeeded
+            | LifecycleState::Limited
+            | LifecycleState::Failed
+            | LifecycleState::Cancelled,
         ) => Some(3),
         None => None,
     }
@@ -734,6 +744,10 @@ mod tests {
         let workspace = compact_workspace("/Users/noah/projects/RafikX", 14);
         assert_eq!(workspace, "…/RafikX");
         assert!(display_width(&workspace) <= 14);
+
+        let mixed_workspace = compact_workspace("/Users/노아/프로젝트/RafikX-작업", 13);
+        assert_eq!(mixed_workspace, "…/RafikX-작업");
+        assert_eq!(display_width(&mixed_workspace), 13);
 
         let tip = compact_tip("긴 한국어 도움말은 문장 중간에서 잘리면 안 됩니다", 30);
         assert_eq!(tip, "팁 더 보기  ·  /tips");

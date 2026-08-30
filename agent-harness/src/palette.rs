@@ -40,7 +40,7 @@ pub const RAFIKX: Theme = Theme {
     kw: (226, 189, 115),
     panel: (24, 23, 19),
     border: (58, 57, 53),
-    thinking: (119, 116, 110),
+    thinking: (129, 126, 119),
 };
 
 /// opencode 느낌의 따뜻한 앰버 테마.
@@ -134,5 +134,43 @@ mod tests {
         assert_eq!(t.secondary, (106, 155, 204)); // #6a9bcc
         assert_eq!(t.text, (250, 249, 245)); // #faf9f5
         assert_eq!(t.mute, (176, 174, 165)); // #b0aea5
+    }
+
+    fn relative_luminance((red, green, blue): (u8, u8, u8)) -> f64 {
+        fn linear(channel: u8) -> f64 {
+            let srgb = f64::from(channel) / 255.0;
+            if srgb <= 0.04045 {
+                srgb / 12.92
+            } else {
+                ((srgb + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+
+    fn contrast_ratio(foreground: (u8, u8, u8), background: (u8, u8, u8)) -> f64 {
+        let (lighter, darker) = (
+            relative_luminance(foreground),
+            relative_luminance(background),
+        );
+        (lighter.max(darker) + 0.05) / (lighter.min(darker) + 0.05)
+    }
+
+    #[test]
+    fn rafikx_thinking_is_wcag_aa_but_subordinate_to_mute_text() {
+        let theme = &RAFIKX;
+        let thinking_contrast = contrast_ratio(theme.thinking, theme.bg);
+        let mute_contrast = contrast_ratio(theme.mute, theme.bg);
+
+        assert_eq!(theme.thinking, (129, 126, 119));
+        assert!(
+            thinking_contrast >= 4.5,
+            "thinking contrast: {thinking_contrast:.2}"
+        );
+        assert!(
+            thinking_contrast < mute_contrast,
+            "thinking must remain subordinate to mute text"
+        );
     }
 }

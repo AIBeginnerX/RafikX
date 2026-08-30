@@ -31,7 +31,7 @@ static PROCESS_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(unix)]
 static PROCESS_SCOPE_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(unix)]
-static PROCESS_CLEANUP_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static PROCESS_DISCOVERY_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 #[cfg(unix)]
 const PROCESS_SCOPE_ENV: &str = "RAFIKX_PROCESS_SCOPE";
 #[cfg(unix)]
@@ -266,6 +266,16 @@ pub(crate) struct ProcessScope {
     force_discovery_failure: bool,
     #[cfg(test)]
     force_cleanup_timeout: bool,
+    #[cfg(all(test, unix))]
+    cleanup_probe: Option<std::sync::Arc<CleanupProbe>>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Debug, Default)]
+struct CleanupProbe {
+    worker_started: tokio::sync::Notify,
+    scope_discovery_started: tokio::sync::Notify,
+    scope_discovery_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(unix)]
@@ -347,6 +357,8 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
                         force_discovery_failure: false,
                         #[cfg(test)]
                         force_cleanup_timeout: false,
+                        #[cfg(all(test, unix))]
+                        cleanup_probe: None,
                     },
                 ))
             }
@@ -374,6 +386,8 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
                 force_discovery_failure: false,
                 #[cfg(test)]
                 force_cleanup_timeout: false,
+                #[cfg(all(test, unix))]
+                cleanup_probe: None,
             },
         ))
     }
@@ -387,6 +401,8 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
                     force_discovery_failure: false,
                     #[cfg(test)]
                     force_cleanup_timeout: false,
+                    #[cfg(all(test, unix))]
+                    cleanup_probe: None,
                 },
             )
         })
@@ -980,6 +996,17 @@ async fn discover_scope_pids(
     root: Option<u32>,
     cleanup_errors: &mut Vec<String>,
 ) -> Vec<u32> {
+    let Ok(_permit) = PROCESS_DISCOVERY_PERMITS.acquire().await else {
+        cleanup_errors.push("프로세스 조회 동시성 제어가 닫혔습니다".into());
+        return Vec::new();
+    };
+    #[cfg(test)]
+    if let Some(probe) = &scope.cleanup_probe {
+        probe
+            .scope_discovery_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        probe.scope_discovery_started.notify_one();
+    }
     let mut discovered = match scoped_pids(scope).await {
         Ok(pids) => pids,
         Err(error) => {
@@ -1039,6 +1066,17 @@ async fn capture_scoped_identities(
     captured: &mut Vec<ProcessIdentity>,
     cleanup_errors: &mut Vec<String>,
 ) -> Vec<u32> {
+    let Ok(_permit) = PROCESS_DISCOVERY_PERMITS.acquire().await else {
+        cleanup_errors.push("프로세스 조회 동시성 제어가 닫혔습니다".into());
+        return Vec::new();
+    };
+    #[cfg(test)]
+    if let Some(probe) = &scope.cleanup_probe {
+        probe
+            .scope_discovery_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        probe.scope_discovery_started.notify_one();
+    }
     let mut visible = Vec::new();
     match scoped_pids(scope).await {
         Ok(pids) => {
@@ -1086,12 +1124,7 @@ fn signal_captured_processes<T: GenerationBoundProcess>(
 }
 
 #[cfg(unix)]
-async fn quiesce_before_cleanup(
-    child: &mut Child,
-    scope: &ProcessScope,
-    captured: &mut Vec<ProcessIdentity>,
-    cleanup_errors: &mut Vec<String>,
-) {
+fn quiesce_root_before_cleanup(child: &mut Child, cleanup_errors: &mut Vec<String>) {
     let root = active_root(child, cleanup_errors);
     if let Some(pid) = root
         && let Err(error) = signal_process_group(pid, PROCESS_STOP_SIGNAL)
@@ -1099,15 +1132,6 @@ async fn quiesce_before_cleanup(
     {
         cleanup_errors.push(error);
     }
-    let start = captured.len();
-    let mut visible = Vec::new();
-    match inherited_scope_pids(scope).await {
-        Ok(pids) => {
-            capture_candidate_identities(pids, root, captured, &mut visible, cleanup_errors)
-        }
-        Err(error) => cleanup_errors.push(error),
-    }
-    signal_captured_processes(&captured[start..], PROCESS_STOP_SIGNAL, cleanup_errors);
 }
 
 #[cfg(unix)]
@@ -1197,19 +1221,19 @@ async fn terminate_unix_inner(
     );
 }
 
-pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result<(), String> {
+async fn terminate_owned(mut child: Child, scope: ProcessScope) -> Result<(), String> {
     let mut cleanup_errors = Vec::new();
     #[cfg(unix)]
     {
+        #[cfg(test)]
+        if let Some(probe) = &scope.cleanup_probe {
+            probe.worker_started.notify_one();
+        }
+        quiesce_root_before_cleanup(&mut child, &mut cleanup_errors);
         let mut captured = Vec::new();
-        quiesce_before_cleanup(child, scope, &mut captured, &mut cleanup_errors).await;
-        let _permit = PROCESS_CLEANUP_PERMITS
-            .acquire()
-            .await
-            .map_err(|_| "프로세스 정리 동시성 제어가 닫혔습니다".to_string())?;
         match tokio::time::timeout(
             PROCESS_CLEANUP_TIMEOUT,
-            terminate_unix_inner(child, scope, &mut captured, &mut cleanup_errors),
+            terminate_unix_inner(&mut child, &scope, &mut captured, &mut cleanup_errors),
         )
         .await
         {
@@ -1217,14 +1241,14 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
             Err(_) => {
                 cleanup_errors.push("프로세스 scope 정리 전체 시간 초과".into());
                 signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
-                if let Some(pid) = active_root(child, &mut cleanup_errors) {
+                if let Some(pid) = active_root(&mut child, &mut cleanup_errors) {
                     let _ = signal_process_group(pid, PROCESS_KILL_SIGNAL);
                     let _ = child.start_kill();
                     let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
                 }
                 match tokio::time::timeout(
                     PROCESS_FALLBACK_TIMEOUT,
-                    capture_scoped_identities(scope, None, &mut captured, &mut cleanup_errors),
+                    capture_scoped_identities(&scope, None, &mut captured, &mut cleanup_errors),
                 )
                 .await
                 {
@@ -1275,6 +1299,12 @@ pub(crate) async fn terminate(child: &mut Child, scope: &ProcessScope) -> Result
     } else {
         Err(cleanup_errors.join("; "))
     }
+}
+
+pub(crate) async fn terminate(child: Child, scope: ProcessScope) -> Result<(), String> {
+    tokio::spawn(terminate_owned(child, scope))
+        .await
+        .map_err(|error| format!("프로세스 정리 작업 대기 실패: {error}"))?
 }
 
 #[cfg(all(test, unix))]
@@ -1356,6 +1386,149 @@ mod tests {
         assert!(errors.is_empty(), "{}", errors.join("; "));
     }
 
+    #[tokio::test]
+    async fn scope_discovery_waits_for_the_discovery_permit() {
+        // Given: a cleanup worker queued behind the sole discovery permit.
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn queued cleanup fixture");
+        let probe = std::sync::Arc::new(CleanupProbe::default());
+        scope.cleanup_probe = Some(probe.clone());
+        let permit = PROCESS_DISCOVERY_PERMITS
+            .acquire_many(2)
+            .await
+            .expect("hold discovery permit");
+        let cleanup = tokio::spawn(terminate(child, scope));
+        tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
+            .await
+            .expect("cleanup worker started");
+
+        // When: the worker reaches the occupied permit.
+        tokio::task::yield_now().await;
+
+        // Then: no scoped or inherited discovery has begun; releasing the permit starts it.
+        assert_eq!(
+            probe
+                .scope_discovery_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        drop(permit);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            probe.scope_discovery_started.notified(),
+        )
+        .await
+        .expect("scope discovery started after permit release");
+        tokio::time::timeout(Duration::from_secs(12), cleanup)
+            .await
+            .expect("queued cleanup completed")
+            .expect("cleanup caller joined")
+            .expect("queued cleanup succeeded");
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_while_queued_does_not_strand_descendants() {
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file());
+        let Some(python) = python else { return };
+
+        // Given: an environment-cleared, session-detached descendant and a busy discovery permit.
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-process-queued-cancel-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("test directory");
+        let ready = root.join("ready");
+        let script = "import os,sys,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n open(sys.argv[1], 'w').write(str(os.getpid()))\n time.sleep(60)\nos._exit(0)";
+        let mut command = Command::new("env");
+        command.args([
+            "-u",
+            PROCESS_SCOPE_ENV,
+            python,
+            "-c",
+            script,
+            ready.to_str().expect("ready path"),
+        ]);
+        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn cancellation fixture");
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&ready)
+                    && let Ok(pid) = pid.parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached daemon ready");
+        let scope_marker = scope.marker_path.clone();
+        let probe = std::sync::Arc::new(CleanupProbe::default());
+        scope.cleanup_probe = Some(probe.clone());
+        let permit = PROCESS_DISCOVERY_PERMITS
+            .acquire_many(2)
+            .await
+            .expect("hold discovery permit");
+        let caller = tokio::spawn(terminate(child, scope));
+        tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
+            .await
+            .expect("cleanup worker started");
+
+        // When: the awaiting caller is cancelled while the owned worker is queued.
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller must be cancelled")
+                .is_cancelled(),
+            "cleanup caller did not observe cancellation"
+        );
+
+        // Then: the detached worker retains the scope and completes descendant cleanup.
+        assert!(
+            scope_marker.exists(),
+            "queued worker dropped its process scope"
+        );
+        drop(permit);
+        let gone = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = std::process::Command::new("ps")
+                    .args(["-p", &daemon_pid.to_string(), "-o", "stat="])
+                    .output()
+                    .expect("inspect queued-cancellation daemon");
+                let state = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success()
+                    || state.trim().is_empty()
+                    || state.trim().starts_with('Z')
+                {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !gone {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &daemon_pid.to_string()])
+                .status();
+        }
+        assert!(
+            gone,
+            "caller cancellation stranded detached PID {daemon_pid}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while scope_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cleanup worker released process scope");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn process_scope_matching_requires_a_complete_environment_token() {
         let needle = b"RAFIKX_PROCESS_SCOPE=42-00000000000000000001";
@@ -1386,7 +1559,7 @@ mod tests {
         child.wait().await.expect("wait completed command");
         let started = std::time::Instant::now();
 
-        terminate(&mut child, &scope)
+        terminate(child, scope)
             .await
             .expect("clean completed command");
 
@@ -1401,7 +1574,7 @@ mod tests {
     async fn parent_closes_the_scope_marker_after_spawn() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 5"]);
-        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn scoped child");
+        let (child, scope) = spawn_scoped(&mut command).expect("spawn scoped child");
 
         #[cfg(target_os = "linux")]
         {
@@ -1420,9 +1593,7 @@ mod tests {
                 .into_iter()
                 .find(|path| std::path::Path::new(path).is_file())
             else {
-                terminate(&mut child, &scope)
-                    .await
-                    .expect("terminate child");
+                terminate(child, scope).await.expect("terminate child");
                 return;
             };
             let status = std::process::Command::new(program)
@@ -1436,9 +1607,7 @@ mod tests {
             );
         }
 
-        terminate(&mut child, &scope)
-            .await
-            .expect("terminate child");
+        terminate(child, scope).await.expect("terminate child");
     }
 
     #[tokio::test]
@@ -1454,9 +1623,9 @@ mod tests {
             "rafikx-process-tree",
             marker.to_str().expect("marker path"),
         ]);
-        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn process tree");
+        let (child, scope) = spawn_scoped(&mut command).expect("spawn process tree");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        terminate(&mut child, &scope).await.expect("terminate tree");
+        terminate(child, scope).await.expect("terminate tree");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(root);
@@ -1482,7 +1651,7 @@ mod tests {
             python,
             ready.to_str().expect("ready path"),
         ]);
-        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn detached process");
+        let (child, scope) = spawn_scoped(&mut command).expect("spawn detached process");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -1495,7 +1664,7 @@ mod tests {
         })
         .await
         .expect("detached daemon ready");
-        terminate(&mut child, &scope)
+        terminate(child, scope)
             .await
             .expect("terminate detached tree");
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1586,7 +1755,7 @@ mod tests {
             script,
             ready.to_str().expect("ready path"),
         ]);
-        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn clearenv process");
+        let (child, scope) = spawn_scoped(&mut command).expect("spawn clearenv process");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -1606,7 +1775,7 @@ mod tests {
             inherited.contains(&daemon_pid),
             "daemon PID {daemon_pid} did not retain the scope descriptor: {inherited:?}"
         );
-        terminate(&mut child, &scope)
+        terminate(child, scope)
             .await
             .expect("terminate clearenv tree");
         let gone = tokio::time::timeout(Duration::from_secs(3), async {
@@ -1658,7 +1827,7 @@ mod tests {
             script,
             ready.to_str().expect("ready path"),
         ]);
-        let (mut child, mut scope) = spawn_scoped(&mut command).expect("spawn timeout fixture");
+        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn timeout fixture");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -1672,7 +1841,7 @@ mod tests {
         .await
         .expect("detached daemon ready");
         scope.force_cleanup_timeout = true;
-        let error = terminate(&mut child, &scope)
+        let error = terminate(child, scope)
             .await
             .expect_err("forced cleanup timeout must fail closed");
         assert!(error.contains("전체 시간 초과"), "{error}");
@@ -1719,10 +1888,10 @@ mod tests {
             "rafikx-process-discovery-failure",
             marker.to_str().expect("marker path"),
         ]);
-        let (mut child, mut scope) = spawn_scoped(&mut command).expect("spawn process tree");
+        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn process tree");
         scope.force_discovery_failure = true;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let error = terminate(&mut child, &scope)
+        let error = terminate(child, scope)
             .await
             .expect_err("discovery failure must be reported");
         assert!(error.contains("강제된"));
@@ -1757,9 +1926,9 @@ mod windows_tests {
                 nested.replace('"', "`\"")
             ),
         ]);
-        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn Windows process tree");
+        let (child, scope) = spawn_scoped(&mut command).expect("spawn Windows process tree");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        terminate(&mut child, &scope).await.expect("terminate job");
+        terminate(child, scope).await.expect("terminate job");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(root);

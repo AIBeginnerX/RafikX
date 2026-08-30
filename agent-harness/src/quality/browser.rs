@@ -856,29 +856,29 @@ pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
         .iter()
         .any(|signal| lower.contains(signal));
     let strong_game_signal = [
-            "id=\"game\"",
-            "id='game'",
-            "id=\"board\"",
-            "id='board'",
-            "game.js",
-            "mario",
-            "platformer",
-            "snake",
-            "tetris",
-            "pong",
-            "breakout",
-            "pacman",
-            "flappy",
-            "bird.js",
-            "playable",
-            "start game",
-            "press space",
-            "game over",
-            "게임",
-            "마리오",
-        ]
-        .iter()
-        .any(|signal| lower.contains(signal));
+        "id=\"game\"",
+        "id='game'",
+        "id=\"board\"",
+        "id='board'",
+        "game.js",
+        "mario",
+        "platformer",
+        "snake",
+        "tetris",
+        "pong",
+        "breakout",
+        "pacman",
+        "flappy",
+        "bird.js",
+        "playable",
+        "start game",
+        "press space",
+        "game over",
+        "게임",
+        "마리오",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal));
     let lifecycle_pair = (lower.contains("lives") || lower.contains("목숨"))
         && (lower.contains("restart") || lower.contains("재시작"));
     explicit_surface && (strong_game_signal || lifecycle_pair)
@@ -946,11 +946,16 @@ pub fn detect_browser() -> Option<&'static str> {
 
 fn find_browser() -> Option<String> {
     #[cfg(windows)]
-    let environment_roots = ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "ProgramW6432"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
+    let environment_roots = [
+        "LOCALAPPDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "ProgramW6432",
+    ]
+    .into_iter()
+    .filter_map(std::env::var_os)
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
     #[cfg(not(windows))]
     let environment_roots = Vec::new();
     let candidates = browser_candidates(environment_roots);
@@ -2247,9 +2252,11 @@ async fn serve_request(
     let request = String::from_utf8_lossy(&request[..read]);
     let Some((method, raw_path)) = request.lines().next().and_then(|line| {
         let mut fields = line.split_whitespace();
-        Some((fields.next()?, fields.next()?.split('?').next().unwrap_or("")))
-    })
-    else {
+        Some((
+            fields.next()?,
+            fields.next()?.split('?').next().unwrap_or(""),
+        ))
+    }) else {
         return write_response(&mut stream, "400 Bad Request", "text/plain", b"bad request").await;
     };
     if raw_path == PROBE_PATH {
@@ -2282,8 +2289,7 @@ async fn serve_request(
             && matches!(kind, "ready" | "game" | "error")
             && (kind == "error") == detail.is_some();
         if !valid {
-            return write_response(&mut stream, "403 Forbidden", "text/plain", b"forbidden")
-                .await;
+            return write_response(&mut stream, "403 Forbidden", "text/plain", b"forbidden").await;
         }
         let decoded_error = detail.and_then(percent_decode_path);
         if kind == "error" && decoded_error.is_none() {
@@ -2490,7 +2496,7 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     let (mut child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
         .map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?;
     let Some(stderr) = child.stderr.take() else {
-        crate::process_tree::terminate(&mut child, &process_scope)
+        crate::process_tree::terminate(child, process_scope)
             .await
             .map_err(anyhow::Error::msg)?;
         anyhow::bail!("브라우저 stderr를 열 수 없습니다");
@@ -2545,13 +2551,13 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     } else if let Some(status) = early_status {
         (status.success(), status.code())
     } else {
-        crate::process_tree::terminate(&mut child, &process_scope)
+        crate::process_tree::terminate(child, process_scope)
             .await
             .map_err(anyhow::Error::msg)?;
         let _ = await_stderr_reader(&mut resources).await;
         anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
     };
-    crate::process_tree::terminate(&mut child, &process_scope)
+    crate::process_tree::terminate(child, process_scope)
         .await
         .map_err(anyhow::Error::msg)?;
     await_stderr_reader(&mut resources).await?;
@@ -2882,7 +2888,9 @@ throw new Error('OUT_OF_BAND_RUNTIME');
             .expect("browser smoke")
             .expect("installed browser");
         assert!(
-            errors.iter().any(|error| error.contains("OUT_OF_BAND_RUNTIME")),
+            errors
+                .iter()
+                .any(|error| error.contains("OUT_OF_BAND_RUNTIME")),
             "{errors:?}"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -2986,19 +2994,21 @@ throw new Error('OUT_OF_BAND_RUNTIME');
         )
         .expect_err("missing game sequence");
         assert!(error.to_string().contains("상태 전이"));
-        assert!(evaluate_browser_output(
-            true,
-            Some(0),
-            "",
-            false,
-            &[],
-            ProbeCompletion {
-                ready: true,
-                game_sequence: true,
-            },
-            true,
-        )
-        .is_ok());
+        assert!(
+            evaluate_browser_output(
+                true,
+                Some(0),
+                "",
+                false,
+                &[],
+                ProbeCompletion {
+                    ready: true,
+                    game_sequence: true,
+                },
+                true,
+            )
+            .is_ok()
+        );
         assert!(entry_requires_game_contract(
             r#"<meta name="rafikx-browser-game-contract" content="v1">"#
         ));
