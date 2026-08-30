@@ -1535,17 +1535,67 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_cancellation_interrupts_command_before_timeout() {
+    async fn bash_cancellation_quiesces_root_before_cleanup_completes() {
+        fn pid_exists(pid: u32) -> std::io::Result<bool> {
+            use std::os::raw::c_int;
+
+            const EPERM: c_int = 1;
+            const ESRCH: c_int = 3;
+
+            unsafe extern "C" {
+                fn kill(pid: c_int, signal: c_int) -> c_int;
+            }
+
+            let pid = c_int::try_from(pid).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "shell PID is out of range",
+                )
+            })?;
+            // SAFETY: Category 8 — FFI boundary. `pid` was range-checked for `c_int`,
+            // and POSIX signal 0 only probes process existence without delivering a signal.
+            if unsafe { kill(pid, 0) } == 0 {
+                return Ok(true);
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(ESRCH) => Ok(false),
+                Some(EPERM) => Ok(true),
+                _ => Err(error),
+            }
+        }
+
+        async fn is_stopped_zombie_or_gone(pid: u32) -> std::io::Result<bool> {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .kill_on_drop(true)
+                .output()
+                .await?;
+            if !output.status.success() {
+                return pid_exists(pid).map(|exists| !exists);
+            }
+            let state = output
+                .stdout
+                .iter()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace());
+            if matches!(state, Some(b'Z' | b'T')) {
+                return Ok(true);
+            }
+            pid_exists(pid).map(|exists| !exists)
+        }
+
         let root =
             std::env::temp_dir().join(format!("rafikx-bash-cancel-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&root).expect("workspace");
         let ready = root.join("READY");
+        let shell_pid = root.join("SHELL_PID");
         let run = RunContext::isolated(crate::run::RunId::new("bash-cancel-test"), root.clone());
         let mut ctx = ToolCtx::new(root.clone());
         ctx.run = Some(run.clone());
         let execution = tokio::spawn(async move {
             Bash.run(
-                json!({"command": "touch READY; sleep 60", "timeout_secs": 60}),
+                json!({"command": "printf '%s\\n' \"$$\" > SHELL_PID; touch READY; sleep 60 & wait", "timeout_secs": 5}),
                 &ctx,
             )
         });
@@ -1557,10 +1607,27 @@ mod tests {
         .await
         .expect("bash command started");
 
+        let pid = std::fs::read_to_string(&shell_pid)
+            .expect("shell pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric shell pid");
         assert!(run.cancel("test cancellation"));
-        let result = tokio::time::timeout(Duration::from_secs(3), execution)
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if is_stopped_zombie_or_gone(pid)
+                    .await
+                    .expect("probe cancelled shell PID")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled shell quiesced promptly");
+        let result = execution
             .await
-            .expect("cancelled bash returned promptly")
             .expect("bash task joined")
             .expect_err("cancelled bash must fail");
         assert!(result.to_string().contains("취소되었습니다"), "{result}");
