@@ -1410,6 +1410,54 @@ async fn run_bash(request: BashRequest) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn pid_exists(pid: u32) -> std::io::Result<bool> {
+        use std::os::raw::c_int;
+
+        const EPERM: c_int = 1;
+        const ESRCH: c_int = 3;
+
+        unsafe extern "C" {
+            fn kill(pid: c_int, signal: c_int) -> c_int;
+        }
+
+        let pid = c_int::try_from(pid).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "PID is out of range")
+        })?;
+        // SAFETY: Category 8 — FFI boundary. `pid` was range-checked for `c_int`,
+        // and POSIX signal 0 only probes process existence without delivering a signal.
+        if unsafe { kill(pid, 0) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(ESRCH) => Ok(false),
+            Some(EPERM) => Ok(true),
+            _ => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn pid_is_gone_or_in_state(pid: u32, accepted_states: &[u8]) -> std::io::Result<bool> {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return pid_exists(pid).map(|exists| !exists);
+        }
+        let state = output
+            .stdout
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace());
+        if state.is_some_and(|state| accepted_states.contains(&state)) {
+            return Ok(true);
+        }
+        pid_exists(pid).map(|exists| !exists)
+    }
+
     #[test]
     fn bash_output_truncation_keeps_a_utf8_boundary() {
         let invalid = vec![0xff; MAX_BASH_OUTPUT / 3 + 1];
@@ -1493,19 +1541,37 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("rafikx-bash-tree-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&root).expect("workspace");
+        let ready = root.join("READY");
+        let daemon_pid = root.join("DAEMON_PID");
         let result = run_bash(BashRequest {
             command: format!(
-                "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\nos._exit(0)'"
+                "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n open(\"DAEMON_PID\", \"w\").write(str(os.getpid()))\n open(\"READY\", \"w\").write(\"ready\")\n time.sleep(60)\n os._exit(0)\ndeadline=time.monotonic()+3\nwhile not os.path.exists(\"READY\"):\n if time.monotonic() >= deadline: os._exit(2)\n time.sleep(0.01)\nos._exit(0)'"
             ),
             workspace: root.clone(),
-            timeout_secs: 1,
+            timeout_secs: 5,
             run: None,
-            spawn_probe: None,
+            spawn_probe: Some(crate::process_tree::CleanupProbe::with_discovery_capacity(1)),
         })
         .await;
         assert!(result.is_ok(), "{result:?}");
-        tokio::time::sleep(Duration::from_millis(2200)).await;
-        assert!(!root.join("DESCENDANT_SURVIVED").exists());
+        assert!(ready.is_file(), "daemon never reported readiness");
+        let daemon_pid = std::fs::read_to_string(&daemon_pid)
+            .expect("daemon PID receipt")
+            .parse::<u32>()
+            .expect("numeric daemon PID");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if pid_is_gone_or_in_state(daemon_pid, &[b'Z'])
+                    .await
+                    .expect("inspect daemon PID")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retained-marker daemon survived run_bash cleanup");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1526,7 +1592,9 @@ mod tests {
             workspace: root.clone(),
             timeout_secs: 3,
             run: None,
-            spawn_probe: None,
+            spawn_probe: Some(crate::process_tree::CleanupProbe::with_discovery_capacity(
+                1,
+            )),
         })
         .await
         .expect("verbose finite command");
@@ -1547,19 +1615,54 @@ mod tests {
             crate::db::Db::new_id()
         ));
         std::fs::create_dir_all(&root).expect("workspace");
-        let result = run_bash(BashRequest {
-            command: format!(
-                "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\n os._exit(0)\ntime.sleep(5)'"
-            ),
-            workspace: root.clone(),
-            timeout_secs: 1,
-            run: None,
-            spawn_probe: None,
+        let ready = root.join("READY");
+        let daemon_pid = root.join("DAEMON_PID");
+        let execution = tokio::spawn({
+            let workspace = root.clone();
+            async move {
+                run_bash(BashRequest {
+                    command: format!(
+                        "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n open(\"DAEMON_PID\", \"w\").write(str(os.getpid()))\n open(\"READY\", \"w\").write(\"ready\")\n time.sleep(60)\n os._exit(0)\ntime.sleep(60)'"
+                    ),
+                    workspace,
+                    timeout_secs: 5,
+                    run: None,
+                    spawn_probe: Some(
+                        crate::process_tree::CleanupProbe::with_discovery_capacity(1),
+                    ),
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         })
-        .await;
-        assert!(result.is_err());
-        tokio::time::sleep(Duration::from_millis(2200)).await;
-        assert!(!root.join("DESCENDANT_SURVIVED").exists());
+        .await
+        .expect("timeout daemon never reported readiness");
+        let daemon_pid = std::fs::read_to_string(&daemon_pid)
+            .expect("timeout daemon PID receipt")
+            .parse::<u32>()
+            .expect("numeric timeout daemon PID");
+        let error = execution
+            .await
+            .expect("timeout bash task joined")
+            .expect_err("long-running Bash command must time out");
+        assert!(error.to_string().contains("5초를 넘겨"), "{error}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if pid_is_gone_or_in_state(daemon_pid, &[b'Z'])
+                    .await
+                    .expect("inspect timeout daemon PID")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retained-marker timeout daemon survived run_bash cleanup");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1662,55 +1765,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bash_cancellation_quiesces_root_before_cleanup_completes() {
-        fn pid_exists(pid: u32) -> std::io::Result<bool> {
-            use std::os::raw::c_int;
-
-            const EPERM: c_int = 1;
-            const ESRCH: c_int = 3;
-
-            unsafe extern "C" {
-                fn kill(pid: c_int, signal: c_int) -> c_int;
-            }
-
-            let pid = c_int::try_from(pid).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "shell PID is out of range",
-                )
-            })?;
-            // SAFETY: Category 8 — FFI boundary. `pid` was range-checked for `c_int`,
-            // and POSIX signal 0 only probes process existence without delivering a signal.
-            if unsafe { kill(pid, 0) } == 0 {
-                return Ok(true);
-            }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(ESRCH) => Ok(false),
-                Some(EPERM) => Ok(true),
-                _ => Err(error),
-            }
-        }
-
-        async fn is_stopped_zombie_or_gone(pid: u32) -> std::io::Result<bool> {
-            let output = Command::new("ps")
-                .args(["-o", "stat=", "-p", &pid.to_string()])
-                .kill_on_drop(true)
-                .output()
-                .await?;
-            if !output.status.success() {
-                return pid_exists(pid).map(|exists| !exists);
-            }
-            let state = output
-                .stdout
-                .iter()
-                .copied()
-                .find(|byte| !byte.is_ascii_whitespace());
-            if matches!(state, Some(b'Z' | b'T')) {
-                return Ok(true);
-            }
-            pid_exists(pid).map(|exists| !exists)
-        }
-
         let root =
             std::env::temp_dir().join(format!("rafikx-bash-cancel-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&root).expect("workspace");
@@ -1750,7 +1804,7 @@ mod tests {
         assert!(run.cancel("test cancellation"));
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if is_stopped_zombie_or_gone(pid)
+                if pid_is_gone_or_in_state(pid, &[b'Z', b'T'])
                     .await
                     .expect("probe cancelled shell PID")
                 {
