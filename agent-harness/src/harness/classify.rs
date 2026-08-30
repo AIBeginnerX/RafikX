@@ -178,25 +178,27 @@ pub(crate) fn browser_game_intent(text: &str) -> bool {
         ]
         .iter()
         .any(|signal| lower.contains(signal));
-    let game_signal = contains_english_term(&lower, "game")
-        || [
-            "snake",
-            "tetris",
-            "pong",
-            "breakout",
-            "pacman",
-            "platformer",
-            "super mario",
-            "게임",
-            "테트리스",
-            "핑퐁",
-            "벽돌깨기",
-            "플랫포머",
-            "슈퍼마리오",
-            "슈퍼 마리오",
-        ]
-        .iter()
-        .any(|signal| lower.contains(signal));
+    let named_browser_game = [
+        "snake",
+        "tetris",
+        "pong",
+        "breakout",
+        "pacman",
+        "flappy bird",
+        "platformer",
+        "super mario",
+        "테트리스",
+        "핑퐁",
+        "벽돌깨기",
+        "플랫포머",
+        "플래피 버드",
+        "슈퍼마리오",
+        "슈퍼 마리오",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal));
+    let game_signal =
+        contains_english_term(&lower, "game") || lower.contains("게임") || named_browser_game;
     let browser_signal = contains_english_term(&lower, "js")
         || contains_english_term(&lower, "css")
         || [
@@ -215,7 +217,32 @@ pub(crate) fn browser_game_intent(text: &str) -> bool {
         ]
         .iter()
         .any(|signal| lower.contains(signal));
-    game_signal && browser_signal && !reporting_only
+    let native_game_target = [
+        "pygame",
+        "unity",
+        "godot",
+        "unreal",
+        "sdl",
+        "swiftui",
+        "android",
+        "ios game",
+        "rust game",
+        "game in rust",
+        "python game",
+        "game in python",
+        "c++ game",
+        "game in c++",
+        "java game",
+        "game in java",
+        "유니티",
+        "고도 엔진",
+        "파이게임",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal));
+    game_signal
+        && (browser_signal || (named_browser_game && !native_game_target))
+        && !reporting_only
 }
 
 pub fn classify_rules(text: &str, obsidian: bool) -> TaskClass {
@@ -613,6 +640,8 @@ mod intent_gate_tests {
             "Build an HTML5 Snake game with a score chart",
             "Build a browser game and dashboard for game analytics",
             "Build an HTML dashboard for game analytics with a playable mode.",
+            "Build a playable Flappy Bird clone in HTML",
+            "슈퍼마리오 게임을 만들어줘",
             "브라우저 게임과 점수 대시보드를 만들어줘",
             "HTML 게임 만들어줘",
             "캔버스 테트리스 구현",
@@ -624,6 +653,8 @@ mod intent_gate_tests {
             "build an HTML dashboard for game scores",
             "render a canvas chart for game analytics",
             "게임 통계 웹 대시보드를 만들어줘",
+            "Build a playable HTML dashboard",
+            "Build a Snake game in Rust",
         ] {
             assert!(!browser_game_intent(task), "task: {task}");
         }

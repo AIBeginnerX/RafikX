@@ -108,23 +108,41 @@ fn game_e2e_repaired_source() -> &'static str {
     r#"const canvas = document.querySelector('#game');
 const context = canvas.getContext('2d');
 const status = document.querySelector('#status');
-const game = { mode: 'ready', restarts: 0 };
+const game = { mode: 'ready', restarts: 0, x: 72, direction: 1, score: 0 };
 function render() {
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.fillStyle = game.mode === 'lost' ? '#dc2626' : '#4f46e5';
-  context.fillRect(48, 280, 28, 28);
-  status.textContent = game.mode.toUpperCase();
+  for (let segment = 0; segment < 3; segment += 1) {
+    context.fillRect(game.x - segment * 22 * game.direction, 168, 20, 20);
+  }
+  context.fillStyle = '#f59e0b';
+  context.fillRect(520, 168, 18, 18);
+  status.textContent = `${game.mode.toUpperCase()} · SCORE ${game.score}`;
 }
 function restart() {
   game.mode = 'ready';
   game.restarts += 1;
+  game.x = 72;
+  game.direction = 1;
+  game.score = 0;
   render();
+}
+function frame() {
+  if (game.mode === 'playing') {
+    game.x += game.direction * 3;
+    if (game.x > 620) { game.x = 24; game.score += 1; }
+    if (game.x < 20) { game.x = 616; game.score += 1; }
+  }
+  render();
+  requestAnimationFrame(frame);
 }
 document.addEventListener('keydown', event => {
   if (event.code === 'Space' && game.mode === 'ready') game.mode = 'playing';
   else if (event.code === 'KeyP' && game.mode === 'playing') game.mode = 'paused';
   else if (event.code === 'KeyP' && game.mode === 'paused') game.mode = 'playing';
   else if (event.code === 'KeyR' && game.mode === 'lost') restart();
+  else if (event.code === 'ArrowRight' || event.code === 'KeyD') game.direction = 1;
+  else if (event.code === 'ArrowLeft' || event.code === 'KeyA') game.direction = -1;
   render();
 });
 window.__rafikxGameTest = {
@@ -133,7 +151,7 @@ window.__rafikxGameTest = {
   forceLoss: () => { game.mode = 'lost'; render(); },
   surface: () => document.querySelector('main')
 };
-render();"#
+frame();"#
 }
 
 fn scripted_tool_response(calls: Vec<(&str, &str, serde_json::Value)>) -> String {

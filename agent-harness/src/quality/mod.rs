@@ -205,6 +205,33 @@ fn is_node_syntax_source(file: &str) -> bool {
     )
 }
 
+fn is_typescript_syntax_source(file: &str) -> bool {
+    matches!(
+        Path::new(file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "ts" | "tsx" | "jsx"
+    )
+}
+
+fn typescript_validator(workspace: &Path) -> Option<String> {
+    let local = workspace.join("node_modules/.bin/tsc");
+    if local.is_file() {
+        return Some("./node_modules/.bin/tsc".into());
+    }
+    #[cfg(windows)]
+    {
+        let local = workspace.join("node_modules/.bin/tsc.cmd");
+        if local.is_file() {
+            return Some("./node_modules/.bin/tsc.cmd".into());
+        }
+    }
+    profile::tool_available("tsc").then(|| "tsc".into())
+}
+
 fn command_argv(
     cmd: &str,
     workspace: &Path,
@@ -486,8 +513,11 @@ fn package_free_javascript_fallback(
         })
 }
 
-fn browser_game_contract_target(_html: &str, required: bool, _entry_count: usize) -> bool {
+fn browser_game_contract_target(html: &str, required: bool, entry_count: usize) -> bool {
     required
+        && (entry_count <= 1
+            || browser::entry_requires_game_contract(html)
+            || browser::entry_looks_like_browser_game(html))
 }
 
 fn has_adjacent_safety_justification(lines: &[&str], line: usize) -> bool {
@@ -496,7 +526,14 @@ fn has_adjacent_safety_justification(lines: &[&str], line: usize) -> bool {
         .rev()
         .take_while(|candidate| candidate.trim_start().starts_with("//"))
         .take(4)
-        .any(|candidate| candidate.contains("SAFETY:"))
+        .any(|candidate| {
+            candidate
+                .trim_start()
+                .strip_prefix("//")
+                .map(str::trim_start)
+                .and_then(|comment| comment.strip_prefix("SAFETY:"))
+                .is_some_and(|justification| !justification.trim().is_empty())
+        })
 }
 
 fn code_contains_pattern(line: &str, pattern: &str) -> bool {
@@ -604,13 +641,20 @@ fn rust_line_facts(line: &str, state: &mut RustScanState) -> (i32, i32, bool, St
             cursor += 2;
             continue;
         }
-        if bytes[cursor] == b'r' {
-            let mut quote = cursor + 1;
+        let raw_prefix = if bytes[cursor] == b'r' {
+            Some(1)
+        } else if bytes[cursor..].starts_with(b"br") || bytes[cursor..].starts_with(b"cr") {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(prefix_len) = raw_prefix {
+            let mut quote = cursor + prefix_len;
             while bytes.get(quote) == Some(&b'#') {
                 quote += 1;
             }
             if bytes.get(quote) == Some(&b'"') {
-                state.raw_hashes = Some(quote - cursor - 1);
+                state.raw_hashes = Some(quote - cursor - prefix_len);
                 cursor = quote + 1;
                 continue;
             }
@@ -809,6 +853,61 @@ async fn run_quality_gate_with_contract(
                     note: Some(error),
                 }),
             }
+        }
+    }
+
+    let typescript = typescript_validator(workspace);
+    for file in changed
+        .iter()
+        .filter(|file| is_typescript_syntax_source(file))
+    {
+        match validated_changed_arg(workspace, file) {
+            Ok(Some(file)) => {
+                if let Some(program) = &typescript {
+                    let is_jsx = Path::new(&file)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsx"));
+                    let mut args = vec![
+                        "--pretty".into(),
+                        "false".into(),
+                        "--noEmit".into(),
+                        "--skipLibCheck".into(),
+                        "--jsx".into(),
+                        "preserve".into(),
+                    ];
+                    if is_jsx {
+                        args.extend(["--allowJs".into(), "--checkJs".into(), "false".into()]);
+                    }
+                    args.push(file.clone());
+                    steps.push(
+                        run_argv_step(
+                            "S3-syntax",
+                            format!("tsc --noEmit {file:?}"),
+                            program.clone(),
+                            args,
+                            workspace,
+                        )
+                        .await,
+                    );
+                } else {
+                    steps.push(GateStep {
+                        stage: "S3-syntax",
+                        command: format!("tsc --noEmit {file:?}"),
+                        passed: false,
+                        exit_code: None,
+                        note: Some("필수 TypeScript/JSX 구문 검사기 tsc 미설치".into()),
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(error) => steps.push(GateStep {
+                stage: "S3-syntax",
+                command: format!("tsc --noEmit {file:?}"),
+                passed: false,
+                exit_code: None,
+                note: Some(error),
+            }),
         }
     }
 
@@ -1231,6 +1330,17 @@ fn looks_like_aws_access_key(token: &str) -> bool {
             .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
 }
 
+fn looks_like_standalone_secret(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("xoxb-")
+        || looks_like_telegram_bot_token(token)
+        || looks_like_aws_access_key(token)
+        || looks_like_high_entropy_secret(token)
+}
+
 fn looks_like_sensitive_key(key: &str) -> bool {
     let key = key
         .trim_matches(|character: char| {
@@ -1363,7 +1473,7 @@ fn redact_url(token: &str) -> Option<String> {
     let safe_path = token[authority_end..suffix_start]
         .split('/')
         .map(|segment| {
-            if looks_like_telegram_bot_token(segment) || looks_like_aws_access_key(segment) {
+            if looks_like_standalone_secret(segment) {
                 changed = true;
                 "[redacted]"
             } else {
@@ -1476,7 +1586,6 @@ fn normalize_redaction_input(text: &str, workspace: &Path) -> String {
 }
 
 fn redact_output_token(token: &str, redact_next: &mut bool) -> String {
-    let lower = token.to_ascii_lowercase();
     if *redact_next {
         return match credential_token(token) {
             Some(CredentialToken::Scheme) => token.to_string(),
@@ -1505,14 +1614,7 @@ fn redact_output_token(token: &str, redact_next: &mut bool) -> String {
         *redact_next = at + 1 == token.len();
         return format!("{}[redacted]", &token[..=at]);
     }
-    if lower.starts_with("sk-")
-        || lower.starts_with("ghp_")
-        || lower.starts_with("github_pat_")
-        || lower.starts_with("xoxb-")
-        || looks_like_telegram_bot_token(token)
-        || looks_like_aws_access_key(token)
-        || looks_like_high_entropy_secret(token)
-    {
+    if looks_like_standalone_secret(token) {
         return "[redacted]".to_string();
     }
     token.to_string()
@@ -1688,6 +1790,45 @@ mod tests {
         )
         .await;
         for file in ["broken.py", "broken.go"] {
+            let syntax = report
+                .steps
+                .iter()
+                .find(|step| step.stage == "S3-syntax" && step.command.contains(file))
+                .unwrap_or_else(|| panic!("missing syntax step for {file}"));
+            assert!(!syntax.passed, "invalid {file} unexpectedly passed");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mixed_rust_typescript_and_jsx_changes_run_each_syntax_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-mixed-typescript-syntax-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("temp workspace");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"mixed_typescript_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(root.join("src/lib.rs"), "pub fn ready() -> bool { true }\n")
+            .expect("Rust fixture");
+        std::fs::write(root.join("broken.ts"), "const broken: = 1;\n").expect("TypeScript fixture");
+        std::fs::write(root.join("broken.tsx"), "const view = <div>;\n").expect("TSX fixture");
+        std::fs::write(root.join("broken.jsx"), "const view = <div>;\n").expect("JSX fixture");
+
+        let report = run_quality_gate(
+            &root,
+            &[
+                "src/lib.rs".into(),
+                "broken.ts".into(),
+                "broken.tsx".into(),
+                "broken.jsx".into(),
+            ],
+        )
+        .await;
+        for file in ["broken.ts", "broken.tsx", "broken.jsx"] {
             let syntax = report
                 .steps
                 .iter()
@@ -1917,11 +2058,27 @@ mod tests {
         let telegram =
             "https://api.telegram.org/bot123456789:AAabcdefghijklmnopqrstuvwx/sendMessage";
         let aws = "https://example.test/build/AKIA1234567890ABCDEF/artifact";
-        let redacted =
-            redact_tool_output(&format!("{telegram}\n{aws}"), Path::new("/tmp/workspace"));
+        let openai =
+            "https://example.test/build/sk-proj-1234567890abcdefghijklmnopqrstuvwxyz/artifact";
+        let github = "https://example.test/build/ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890/artifact";
+        let github_pat =
+            "https://example.test/build/github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890/artifact";
+        let slack =
+            "https://example.test/build/xoxb-1234567890-abcdefghijklmnopqrstuvwxyz/artifact";
+        let generic =
+            "https://example.test/build/abcdefghijklmnopqrstuvwxyz1234567890ABCDEF/artifact";
+        let redacted = redact_tool_output(
+            &format!("{telegram}\n{aws}\n{openai}\n{github}\n{github_pat}\n{slack}\n{generic}"),
+            Path::new("/tmp/workspace"),
+        );
         assert!(!redacted.contains("AAabcdefghijklmnopqrstuvwx"));
         assert!(!redacted.contains("AKIA1234567890ABCDEF"));
-        assert_eq!(redacted.matches("[redacted]").count(), 2);
+        assert!(!redacted.contains("sk-proj-"));
+        assert!(!redacted.contains("ghp_"));
+        assert!(!redacted.contains("github_pat_"));
+        assert!(!redacted.contains("xoxb-"));
+        assert!(!redacted.contains("abcdefghijklmnopqrstuvwxyz1234567890ABCDEF"));
+        assert_eq!(redacted.matches("[redacted]").count(), 7);
         assert!(redacted.contains("/sendMessage"));
         assert!(redacted.contains("/artifact"));
     }
@@ -1961,8 +2118,12 @@ mod tests {
     fn unsafe_idiom_requires_an_adjacent_safety_justification() {
         let justified = ["// SAFETY: checked ABI", "unsafe { call(); }"];
         let unproved = ["// ordinary note", "unsafe { call(); }"];
+        let empty = ["// SAFETY:", "unsafe { call(); }"];
+        let disguised = ["// UNSAFETY: trust me", "unsafe { call(); }"];
         assert!(has_adjacent_safety_justification(&justified, 1));
         assert!(!has_adjacent_safety_justification(&unproved, 1));
+        assert!(!has_adjacent_safety_justification(&empty, 1));
+        assert!(!has_adjacent_safety_justification(&disguised, 1));
         assert!(code_contains_pattern(
             "let value = unsafe { call() };",
             "unsafe "
@@ -1973,10 +2134,11 @@ mod tests {
             "let text = \"unsafe { not code }\";",
             "/* unsafe { not code } */ fn safe() {}",
             "let raw = r#\"unsafe { not code }\"#;",
+            "const PAD: &[u8] = br#\"\\\"#; unsafe { after_raw_bytes(); }",
         ];
         assert_eq!(
             rust_unsafe_line_mask(&unsafe_lines),
-            [true, false, false, false]
+            [true, false, false, false, true]
         );
         let lines = [
             "fn before() {}",
@@ -2041,13 +2203,57 @@ mod tests {
     }
 
     #[test]
-    fn browser_game_task_targets_every_entry_in_multi_entry_workspaces() {
+    fn browser_game_task_targets_only_game_entries_in_multi_entry_workspaces() {
         let decoy = r#"<canvas id="game"></canvas><script src="game.js"></script>"#;
         let actual = r#"<canvas id="board"></canvas><script src="snake-engine.js"></script>"#;
         let dashboard = r#"<main id="dashboard"></main><script src="charts.js"></script>"#;
         assert!(browser_game_contract_target(decoy, true, 3));
         assert!(browser_game_contract_target(actual, true, 3));
-        assert!(browser_game_contract_target(dashboard, true, 3));
+        assert!(!browser_game_contract_target(dashboard, true, 3));
         assert!(!browser_game_contract_target(actual, false, 3));
+        assert!(browser_game_contract_target(dashboard, true, 1));
+    }
+
+    #[test]
+    fn shared_css_does_not_force_game_contract_onto_unrelated_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-shared-game-css-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(root.join("site.css"), "body { margin: 0; }\n").expect("shared CSS");
+        std::fs::write(root.join("game.js"), "requestAnimationFrame(() => {});\n")
+            .expect("game source");
+        std::fs::write(
+            root.join("game.html"),
+            r#"<meta name="rafikx-browser-game-contract" content="v1"><link rel="stylesheet" href="site.css"><canvas id="game"></canvas><script src="game.js"></script>"#,
+        )
+        .expect("game entry");
+        std::fs::write(
+            root.join("about.html"),
+            r#"<link rel="stylesheet" href="site.css"><main>About</main>"#,
+        )
+        .expect("about entry");
+
+        let entries = browser::discover_entries_for_task(
+            &root,
+            &["game.html".into(), "game.js".into(), "site.css".into()],
+            true,
+        )
+        .expect("entry discovery");
+        assert_eq!(entries.len(), 2);
+        let targeted = entries
+            .iter()
+            .map(|entry| {
+                let html = std::fs::read_to_string(entry).expect("entry source");
+                (
+                    entry.file_name().and_then(|name| name.to_str()).unwrap(),
+                    browser_game_contract_target(&html, true, entries.len()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(targeted.get("game.html"), Some(&true));
+        assert_eq!(targeted.get("about.html"), Some(&false));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

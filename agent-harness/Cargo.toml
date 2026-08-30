@@ -2,6 +2,7 @@
 name = "rafikx"
 version = "1.1.9"
 edition = "2024"
+rust-version = "1.88"
 description = "A personal AI coding-agent runtime for the terminal, desktop, and Telegram"
 license = "MIT"
 repository = "https://github.com/AIBeginnerX/RafikX"

@@ -47,13 +47,19 @@ const PROBE_SCRIPT: &str = r#"(() => {
     }
   }, true);
   window.addEventListener('unhandledrejection', event => emit('promise', event.reason || 'unhandled rejection'));
-  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const frames = count => new Promise(resolve => {
+    const next = () => count-- <= 0 ? resolve() : requestAnimationFrame(next);
+    requestAnimationFrame(next);
+  });
+  const frame = () => frames(2);
+  const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
   const gameState = api => String(api.state()).toLowerCase();
   const expectState = (api, expected) => {
     const actual = gameState(api);
     if (actual !== expected) throw new Error(`expected ${expected}, got ${actual}`);
   };
   const press = code => document.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
+  const release = code => document.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true }));
   const hash = value => {
     let result = 2166136261;
     const stride = Math.max(1, Math.floor(value.length / 50000));
@@ -63,28 +69,80 @@ const PROBE_SCRIPT: &str = r#"(() => {
     }
     return String(result >>> 0);
   };
+  const visiblyRendered = element => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && Number(style.opacity) !== 0
+      && rect.width * rect.height >= 1
+      && rect.bottom > 0
+      && rect.right > 0
+      && rect.top < innerHeight
+      && rect.left < innerWidth;
+  };
   const gameSurface = api => {
     if (typeof api.surface !== 'function') throw new Error('window.__rafikxGameTest.surface is missing');
     const candidate = api.surface();
-    const surface = typeof candidate === 'string' ? document.querySelector(candidate) : candidate;
-    if (!(surface instanceof Element)) throw new Error('game surface is not an Element or selector');
-    const style = getComputedStyle(surface);
-    const rect = surface.getBoundingClientRect();
-    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || rect.width * rect.height < 256) {
+    const root = typeof candidate === 'string' ? document.querySelector(candidate) : candidate;
+    if (!(root instanceof Element)) throw new Error('game surface is not an Element or selector');
+    const rootRect = root.getBoundingClientRect();
+    if (!visiblyRendered(root) || rootRect.width * rootRect.height < 256) {
       throw new Error('game surface is not visibly rendered');
     }
-    return surface;
+    const selector = 'canvas,svg,[role="application"],#game,#arena,#board,#screen';
+    const primaries = [];
+    if (root.matches(selector)) primaries.push(root);
+    for (const element of root.querySelectorAll(selector)) {
+      if (!primaries.includes(element)) primaries.push(element);
+    }
+    const visiblePrimaries = primaries.filter(element => {
+      const rect = element.getBoundingClientRect();
+      return visiblyRendered(element) && rect.width * rect.height >= 256;
+    });
+    if (visiblePrimaries.length === 0) throw new Error('visible gameplay surface is missing');
+    return { root, primaries: visiblePrimaries };
   };
-  const surfaceFingerprint = surface => {
-    const clone = surface.cloneNode(true);
-    clone.querySelectorAll?.('script,style,noscript').forEach(node => node.remove());
-    const parts = [clone.outerHTML || clone.textContent || ''];
-    const canvases = surface.matches('canvas') ? [surface] : Array.from(surface.querySelectorAll('canvas'));
-    for (const canvas of canvases) {
-      try { parts.push(canvas.toDataURL()); } catch (error) { parts.push(String(error)); }
+  const renderedFingerprint = root => {
+    const elements = [root, ...root.querySelectorAll('*')].slice(0, 512);
+    const parts = [`innerText:${String(root.innerText || '').trim()}`];
+    for (const element of elements) {
+      if (!visiblyRendered(element)) continue;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      const directText = Array.from(element.childNodes)
+        .filter(node => node.nodeType === Node.TEXT_NODE)
+        .map(node => String(node.textContent || '').trim())
+        .filter(Boolean)
+        .join(' ');
+      const before = getComputedStyle(element, '::before').content;
+      const after = getComputedStyle(element, '::after').content;
+      parts.push([
+        element.tagName,
+        Math.round(rect.x * 10), Math.round(rect.y * 10),
+        Math.round(rect.width * 10), Math.round(rect.height * 10),
+        style.display, style.visibility, style.opacity, style.color,
+        style.backgroundColor, style.backgroundImage, style.borderColor,
+        style.transform, style.fill, style.stroke, style.font,
+        before, after, directText,
+      ].join('|'));
+      if (element instanceof HTMLCanvasElement) {
+        try { parts.push(`canvas:${hash(element.toDataURL())}`); } catch (error) { parts.push(`canvas-error:${String(error)}`); }
+      } else if (element instanceof HTMLImageElement) {
+        parts.push(`image:${element.currentSrc || element.src}`);
+      } else if (typeof SVGGraphicsElement !== 'undefined' && element instanceof SVGGraphicsElement) {
+        try {
+          const box = element.getBBox();
+          parts.push(`svg:${box.x}:${box.y}:${box.width}:${box.height}`);
+        } catch (_) {}
+      }
     }
     return hash(parts.join('\n'));
   };
+  const surfaceFingerprint = surface => renderedFingerprint(surface.root);
+  const gameplayFingerprint = surface => hash(
+    surface.primaries.map(element => renderedFingerprint(element)).join('\n')
+  );
   const expectSurfaceChange = (before, after, transition) => {
     if (before === after) throw new Error(`game surface did not change for ${transition}`);
   };
@@ -106,16 +164,26 @@ const PROBE_SCRIPT: &str = r#"(() => {
     await frame();
     expectState(api, 'playing');
     const playingSurface = surfaceFingerprint(surface);
+    const playingGameplay = gameplayFingerprint(surface);
     expectSurfaceChange(readySurface, playingSurface, 'ready→playing');
     press('KeyR');
     await frame();
     expectState(api, 'playing');
     if (Number(api.restarts()) !== initialRestarts) throw new Error('KeyR restarted from playing');
+    press('ArrowRight');
+    press('KeyD');
+    await delay(160);
+    await frames(4);
+    release('ArrowRight');
+    release('KeyD');
+    expectState(api, 'playing');
+    expectSurfaceChange(playingGameplay, gameplayFingerprint(surface), 'playing gameplay progress');
+    const progressedSurface = surfaceFingerprint(surface);
     press('KeyP');
     await frame();
     expectState(api, 'paused');
     const pausedSurface = surfaceFingerprint(surface);
-    expectSurfaceChange(playingSurface, pausedSurface, 'playing→paused');
+    expectSurfaceChange(progressedSurface, pausedSurface, 'playing→paused');
     press('KeyR');
     await frame();
     expectState(api, 'paused');
@@ -170,6 +238,8 @@ pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
             "id='arena'",
             "id=\"board\"",
             "id='board'",
+            "id=\"screen\"",
+            "id='screen'",
             "role=\"application\"",
             "role='application'",
         ]
@@ -189,6 +259,8 @@ pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
             "pong",
             "breakout",
             "pacman",
+            "flappy",
+            "bird.js",
             "score",
             "lives",
             "restart",
@@ -196,6 +268,7 @@ pub(crate) fn entry_looks_like_browser_game(html: &str) -> bool {
             "controls",
             "pause",
             "start game",
+            "press space",
             "game over",
             "level",
             "게임",
@@ -1777,6 +1850,9 @@ mod tests {
         assert!(entry_looks_like_browser_game(
             r#"<svg id="arena"></svg><button>Start game</button>"#
         ));
+        assert!(entry_looks_like_browser_game(
+            r#"<canvas id="screen"></canvas><p>Press Space</p><script src="bird.js"></script>"#
+        ));
         assert!(!entry_looks_like_browser_game(
             r#"<canvas id="chart"></canvas><script src="chart.js"></script>"#
         ));
@@ -2268,11 +2344,15 @@ document.addEventListener('keydown', event => {
   else if (event.code === 'KeyP' && fake.state === 'playing') fake.state = 'paused';
   else if (event.code === 'KeyP' && fake.state === 'paused') fake.state = 'playing';
   else if (event.code === 'KeyR' && fake.state === 'lost') { fake.state = 'ready'; fake.restarts += 1; }
+  document.querySelector('#game').dataset.state = fake.state;
 });
 window.__rafikxGameTest = {
   state: () => fake.state,
   restarts: () => fake.restarts,
-  forceLoss: () => { fake.state = 'lost'; },
+  forceLoss: () => {
+    fake.state = 'lost';
+    document.querySelector('#game').dataset.state = fake.state;
+  },
   surface: () => document.querySelector('#game')
 };
 </script></body></html>"#,
@@ -2284,6 +2364,48 @@ window.__rafikxGameTest = {
             .expect_err("detached state must fail");
         assert!(
             error.to_string().contains("surface did not change"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn status_only_state_machine_cannot_validate_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-status-only-contract-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(
+            root.join("index.html"),
+            r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"></head><body><main><canvas id="game" width="320" height="180"></canvas><p id="status">READY</p></main><script>
+const fake = { state: 'ready', restarts: 0 };
+const render = () => { document.querySelector('#status').textContent = fake.state.toUpperCase(); };
+document.addEventListener('keydown', event => {
+  if (event.code === 'Space' && fake.state === 'ready') fake.state = 'playing';
+  else if (event.code === 'KeyP' && fake.state === 'playing') fake.state = 'paused';
+  else if (event.code === 'KeyP' && fake.state === 'paused') fake.state = 'playing';
+  else if (event.code === 'KeyR' && fake.state === 'lost') { fake.state = 'ready'; fake.restarts += 1; }
+  render();
+});
+window.__rafikxGameTest = {
+  state: () => fake.state,
+  restarts: () => fake.restarts,
+  forceLoss: () => { fake.state = 'lost'; render(); },
+  surface: () => document.querySelector('main')
+};
+</script></body></html>"#,
+        )
+        .expect("status-only fixture");
+
+        let error = smoke_test_in_workspace_with_contract(&root, &root.join("index.html"), true)
+            .await
+            .expect_err("status-only state must fail");
+        assert!(
+            error.to_string().contains("playing gameplay progress"),
             "{error}"
         );
         let _ = std::fs::remove_dir_all(root);
