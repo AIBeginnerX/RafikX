@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::ExitStatus;
 use std::process::Stdio;
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
@@ -296,6 +296,10 @@ pub(crate) struct ProcessScope {
     marker_device: u64,
     #[cfg(target_os = "linux")]
     marker_inode: u64,
+    #[cfg(unix)]
+    discovery_reservation: Arc<tokio::sync::OwnedSemaphorePermit>,
+    #[cfg(unix)]
+    discovery_operation: Arc<tokio::sync::Mutex<()>>,
     #[cfg(windows)]
     job: WindowsJob,
     #[cfg(test)]
@@ -361,14 +365,38 @@ impl Drop for ScopedProcess {
 
 #[cfg(all(test, unix))]
 #[derive(Debug, Default)]
-struct CleanupProbe {
+pub(crate) struct CleanupProbe {
+    spawn_reservation_waiting: tokio::sync::Notify,
     worker_started: tokio::sync::Notify,
     cleanup_admission_acquired: tokio::sync::Notify,
     cleanup_admission_calls: std::sync::atomic::AtomicUsize,
     scope_discovery_started: tokio::sync::Notify,
     scope_discovery_calls: std::sync::atomic::AtomicUsize,
+    scope_quiesced: tokio::sync::Notify,
     cleanup_admission_permits: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     discovery_permits: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+}
+
+#[cfg(all(test, unix))]
+impl CleanupProbe {
+    pub(crate) fn with_discovery_capacity(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            discovery_permits: Some(Arc::new(tokio::sync::Semaphore::new(capacity))),
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn discovery_permits(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(
+            self.discovery_permits
+                .as_ref()
+                .expect("test discovery permits must be configured"),
+        )
+    }
+
+    pub(crate) async fn wait_for_spawn_reservation(&self) {
+        self.spawn_reservation_waiting.notified().await;
+    }
 }
 
 #[cfg(unix)]
@@ -396,10 +424,53 @@ fn create_scope_file(marker: &str) -> std::io::Result<(File, PathBuf)> {
     Ok((file, path))
 }
 
-pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, ProcessScope)> {
+pub(crate) async fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, ProcessScope)> {
+    spawn_scoped_inner(
+        command,
+        #[cfg(all(test, unix))]
+        None,
+    )
+    .await
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn spawn_scoped_with_probe(
+    command: &mut Command,
+    probe: Arc<CleanupProbe>,
+) -> std::io::Result<(Child, ProcessScope)> {
+    spawn_scoped_inner(command, Some(probe)).await
+}
+
+async fn spawn_scoped_inner(
+    command: &mut Command,
+    #[cfg(all(test, unix))] probe: Option<Arc<CleanupProbe>>,
+) -> std::io::Result<(Child, ProcessScope)> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.spawn_reservation_waiting.notify_one();
+        }
+        let discovery_permits = {
+            #[cfg(test)]
+            if let Some(permits) = probe
+                .as_ref()
+                .and_then(|probe| probe.discovery_permits.as_ref())
+            {
+                Arc::clone(permits)
+            } else {
+                Arc::clone(&PROCESS_DISCOVERY_PERMITS)
+            }
+            #[cfg(not(test))]
+            Arc::clone(&PROCESS_DISCOVERY_PERMITS)
+        };
+        let discovery_reservation = Arc::new(
+            discovery_permits
+                .acquire_owned()
+                .await
+                .map_err(|_| std::io::Error::other("process discovery reservation is closed"))?,
+        );
         let _spawn_guard = PROCESS_SCOPE_SPAWN_LOCK
             .lock()
             .map_err(|_| std::io::Error::other("process scope spawn lock poisoned"))?;
@@ -446,12 +517,14 @@ pub(crate) fn spawn_scoped(command: &mut Command) -> std::io::Result<(Child, Pro
                         marker_device: marker_metadata.dev(),
                         #[cfg(target_os = "linux")]
                         marker_inode: marker_metadata.ino(),
+                        discovery_reservation,
+                        discovery_operation: Arc::new(tokio::sync::Mutex::new(())),
                         #[cfg(test)]
                         force_discovery_failure: false,
                         #[cfg(test)]
                         force_cleanup_timeout: false,
                         #[cfg(all(test, unix))]
-                        cleanup_probe: None,
+                        cleanup_probe: probe,
                     },
                 ))
             }
@@ -1046,22 +1119,74 @@ async fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
 }
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
-fn spawn_marker_fd_scan<T, F, P>(permit: P, scan: F) -> tokio::task::JoinHandle<T>
+struct MarkerScanSpawnError<P> {
+    ownership: Option<P>,
+    error: std::io::Error,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn take_marker_scan_ownership<P>(ownership: &Mutex<Option<P>>) -> Option<P> {
+    match ownership.lock() {
+        Ok(mut ownership) => ownership.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn spawn_marker_fd_scan<T, F, P>(
+    ownership: P,
+    scan: F,
+) -> Result<tokio::sync::oneshot::Receiver<(P, T)>, MarkerScanSpawnError<P>>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
     P: Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        scan()
-    })
+    spawn_marker_fd_scan_inner(ownership, scan, false)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn spawn_marker_fd_scan_inner<T, F, P>(
+    ownership: P,
+    scan: F,
+    force_start_failure: bool,
+) -> Result<tokio::sync::oneshot::Receiver<(P, T)>, MarkerScanSpawnError<P>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    P: Send + 'static,
+{
+    if force_start_failure {
+        return Err(MarkerScanSpawnError {
+            ownership: Some(ownership),
+            error: std::io::Error::other("forced marker scan thread start failure"),
+        });
+    }
+    let ownership = Arc::new(Mutex::new(Some(ownership)));
+    let thread_ownership = Arc::clone(&ownership);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    match std::thread::Builder::new()
+        .name("rafikx-marker-scan".into())
+        .spawn(move || {
+            let Some(ownership) = take_marker_scan_ownership(&thread_ownership) else {
+                return;
+            };
+            let result = scan();
+            let _ = sender.send((ownership, result));
+        }) {
+        Ok(_thread) => Ok(receiver),
+        Err(error) => Err(MarkerScanSpawnError {
+            ownership: take_marker_scan_ownership(&ownership),
+            error,
+        }),
+    }
 }
 
 #[cfg(target_os = "linux")]
 async fn inherited_scope_pids(
     scope: &ProcessScope,
-    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    operation: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    reservation: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Vec<u32>, String> {
     #[cfg(test)]
     if scope.force_discovery_failure {
@@ -1069,26 +1194,24 @@ async fn inherited_scope_pids(
     }
     let device = scope.marker_device;
     let inode = scope.marker_inode;
-    let scan = spawn_marker_fd_scan(permit, move || {
+    let ownership = (Arc::clone(&operation), reservation);
+    let scan = match spawn_marker_fd_scan(ownership, move || {
         file_scoped_pids(device, inode, Duration::from_secs(1))
-    });
-    tokio::time::timeout(Duration::from_secs(2), scan)
-        .await
-        .map_err(|_| "프로세스 scope 파일 조회 시간 초과".to_string())?
-        .map_err(|error| format!("프로세스 scope 파일 조회 작업 실패: {error}"))?
-}
-
-#[cfg(unix)]
-fn process_discovery_permits(_scope: &ProcessScope) -> std::sync::Arc<tokio::sync::Semaphore> {
-    #[cfg(test)]
-    if let Some(permits) = _scope
-        .cleanup_probe
-        .as_ref()
-        .and_then(|probe| probe.discovery_permits.as_ref())
-    {
-        return std::sync::Arc::clone(permits);
+    }) {
+        Ok(scan) => scan,
+        Err(error) => {
+            drop(error.ownership);
+            return Err(format!(
+                "프로세스 scope 파일 조회 스레드 시작 실패: {}",
+                error.error
+            ));
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(2), scan).await {
+        Ok(Ok(((_operation, _reservation), result))) => result,
+        Ok(Err(_)) => Err("프로세스 scope 파일 조회 작업이 중단되었습니다".into()),
+        Err(_) => Err("프로세스 scope 파일 조회 시간 초과".to_string()),
     }
-    std::sync::Arc::clone(&PROCESS_DISCOVERY_PERMITS)
 }
 
 #[cfg(unix)]
@@ -1116,6 +1239,13 @@ async fn inherited_scope_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> 
 }
 
 #[cfg(unix)]
+fn try_discovery_operation(
+    operation: &Arc<tokio::sync::Mutex<()>>,
+) -> Option<Arc<tokio::sync::OwnedMutexGuard<()>>> {
+    Arc::clone(operation).try_lock_owned().ok().map(Arc::new)
+}
+
+#[cfg(unix)]
 fn contains_scope_marker(line: &[u8], needle: &[u8]) -> bool {
     line.windows(needle.len())
         .enumerate()
@@ -1133,14 +1263,7 @@ async fn discover_scope_pids(
     root: Option<u32>,
     cleanup_errors: &mut Vec<String>,
 ) -> Vec<u32> {
-    let Ok(permit) = process_discovery_permits(scope).acquire_owned().await else {
-        cleanup_errors.push("프로세스 조회 동시성 제어가 닫혔습니다".into());
-        return Vec::new();
-    };
-    #[cfg(target_os = "linux")]
-    let permit = Arc::new(permit);
-    #[cfg(not(target_os = "linux"))]
-    let _permit = permit;
+    let operation = try_discovery_operation(&scope.discovery_operation);
     #[cfg(test)]
     if let Some(probe) = &scope.cleanup_probe {
         probe
@@ -1155,14 +1278,24 @@ async fn discover_scope_pids(
             Vec::new()
         }
     };
-    #[cfg(target_os = "linux")]
-    let inherited = inherited_scope_pids(scope, Arc::clone(&permit)).await;
-    #[cfg(not(target_os = "linux"))]
-    let inherited = inherited_scope_pids(scope).await;
-    match inherited {
-        Ok(pids) => discovered.extend(pids),
-        Err(error) => cleanup_errors.push(error),
+    if let Some(operation) = operation.as_ref() {
+        #[cfg(not(target_os = "linux"))]
+        let _operation = operation;
+        #[cfg(target_os = "linux")]
+        let inherited = inherited_scope_pids(
+            scope,
+            Arc::clone(operation),
+            Arc::clone(&scope.discovery_reservation),
+        )
+        .await;
+        #[cfg(not(target_os = "linux"))]
+        let inherited = inherited_scope_pids(scope).await;
+        match inherited {
+            Ok(pids) => discovered.extend(pids),
+            Err(error) => cleanup_errors.push(error),
+        }
     }
+    let _operation = operation;
     #[cfg(target_os = "macos")]
     match lineage_scoped_pids(scope) {
         Ok(pids) => discovered.extend(pids),
@@ -1216,14 +1349,7 @@ async fn capture_scoped_identities(
     captured: &mut Vec<ProcessIdentity>,
     cleanup_errors: &mut Vec<String>,
 ) -> Vec<u32> {
-    let Ok(permit) = process_discovery_permits(scope).acquire_owned().await else {
-        cleanup_errors.push("프로세스 조회 동시성 제어가 닫혔습니다".into());
-        return Vec::new();
-    };
-    #[cfg(target_os = "linux")]
-    let permit = Arc::new(permit);
-    #[cfg(not(target_os = "linux"))]
-    let _permit = permit;
+    let operation = try_discovery_operation(&scope.discovery_operation);
     #[cfg(test)]
     if let Some(probe) = &scope.cleanup_probe {
         probe
@@ -1232,20 +1358,30 @@ async fn capture_scoped_identities(
         probe.scope_discovery_started.notify_one();
     }
     let mut visible = Vec::new();
-    #[cfg(target_os = "linux")]
-    let inherited = inherited_scope_pids(scope, Arc::clone(&permit)).await;
-    #[cfg(not(target_os = "linux"))]
-    let inherited = inherited_scope_pids(scope).await;
-    match inherited {
-        Ok(pids) => capture_and_quiesce_candidate_identities(
-            pids,
-            root,
-            captured,
-            &mut visible,
-            cleanup_errors,
-        ),
-        Err(error) => cleanup_errors.push(error),
+    if let Some(operation) = operation.as_ref() {
+        #[cfg(not(target_os = "linux"))]
+        let _operation = operation;
+        #[cfg(target_os = "linux")]
+        let inherited = inherited_scope_pids(
+            scope,
+            Arc::clone(operation),
+            Arc::clone(&scope.discovery_reservation),
+        )
+        .await;
+        #[cfg(not(target_os = "linux"))]
+        let inherited = inherited_scope_pids(scope).await;
+        match inherited {
+            Ok(pids) => capture_and_quiesce_candidate_identities(
+                pids,
+                root,
+                captured,
+                &mut visible,
+                cleanup_errors,
+            ),
+            Err(error) => cleanup_errors.push(error),
+        }
     }
+    let _operation = operation;
     match scoped_pids(scope).await {
         Ok(pids) => capture_and_quiesce_candidate_identities(
             pids,
@@ -1366,6 +1502,7 @@ async fn terminate_owned(mut child: Child, scope: ProcessScope) -> Result<(), St
     let mut cleanup_errors = Vec::new();
     #[cfg(unix)]
     {
+        let _discovery_reservation = Arc::clone(&scope.discovery_reservation);
         #[cfg(test)]
         if let Some(probe) = &scope.cleanup_probe {
             probe.worker_started.notify_one();
@@ -1375,6 +1512,10 @@ async fn terminate_owned(mut child: Child, scope: ProcessScope) -> Result<(), St
         let root = active_root(&mut child, &mut cleanup_errors);
         let first_visible =
             capture_scoped_identities(&scope, root, &mut captured, &mut cleanup_errors).await;
+        #[cfg(test)]
+        if let Some(probe) = &scope.cleanup_probe {
+            probe.scope_quiesced.notify_one();
+        }
         let _cleanup_admission = match process_cleanup_admission_permits(&scope)
             .acquire_owned()
             .await
@@ -1618,22 +1759,26 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn marker_fd_scan_keeps_discovery_permit_after_owner_cancellation() {
-        static TEST_DISCOVERY_PERMITS: tokio::sync::Semaphore =
-            tokio::sync::Semaphore::const_new(2);
-        let mut permits = TEST_DISCOVERY_PERMITS
-            .acquire_many(2)
+        let discovery_permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut permits = Arc::clone(&discovery_permits)
+            .acquire_many_owned(2)
             .await
             .expect("reserve both discovery permits");
         let scan_permit = permits.split(1).expect("split marker scan permit");
+        let operation = Arc::new(tokio::sync::Mutex::new(()));
+        let operation_guard = Arc::clone(&operation).lock_owned().await;
         let (scan_started, started) = tokio::sync::oneshot::channel();
         let (release_scan, release) = std::sync::mpsc::sync_channel(0);
         let (scan_sender, scan_receiver) = tokio::sync::oneshot::channel();
         let owner = tokio::spawn(async move {
-            let permit = Arc::new(scan_permit);
-            let scan = spawn_marker_fd_scan(Arc::clone(&permit), move || {
+            let ownership = (operation_guard, Arc::new(scan_permit));
+            let scan = match spawn_marker_fd_scan(ownership, move || {
                 scan_started.send(()).expect("report scan start");
                 release.recv().expect("release marker scan");
-            });
+            }) {
+                Ok(scan) => scan,
+                Err(_) => panic!("marker scan thread must start"),
+            };
             scan_sender.send(scan).expect("return scan handle");
             std::future::pending::<()>().await;
         });
@@ -1650,79 +1795,246 @@ mod tests {
         );
 
         assert!(
-            TEST_DISCOVERY_PERMITS.try_acquire().is_err(),
+            discovery_permits.try_acquire().is_err(),
             "reserved permits must exclude unrelated discovery"
         );
+        assert!(
+            operation.try_lock().is_err(),
+            "blocking marker scan returned its operation guard"
+        );
         drop(permits);
-        let available = TEST_DISCOVERY_PERMITS
+        let available = discovery_permits
             .try_acquire()
             .expect("the unrelated permit must become available");
         assert!(
-            TEST_DISCOVERY_PERMITS.try_acquire().is_err(),
+            discovery_permits.try_acquire().is_err(),
             "blocking marker scan returned its permit before completing"
         );
         drop(available);
 
         release_scan.send(()).expect("release marker scan");
         scan.await.expect("marker scan completed");
-        let all_permits = TEST_DISCOVERY_PERMITS
+        let all_permits = discovery_permits
             .try_acquire_many(2)
             .expect("marker scan released its permit after completion");
         drop(all_permits);
+        assert!(operation.try_lock().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_marker_scan_does_not_block_current_or_later_fallbacks() {
+        let probe = CleanupProbe::with_discovery_capacity(1);
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        let (child, scope) = spawn_scoped_with_probe(&mut command, probe)
+            .await
+            .expect("spawn fallback fixture");
+        let root = child.id().expect("fallback fixture root");
+        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = descendant_pids(root)
+                    .await
+                    .expect("discover fallback fixture descendant")
+                    .into_iter()
+                    .next()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fallback fixture descendant appeared");
+
+        let operation = try_discovery_operation(&scope.discovery_operation)
+            .expect("reserve marker scan operation");
+        let (scan_started, started) = tokio::sync::oneshot::channel();
+        let (release_scan, release) = std::sync::mpsc::sync_channel(0);
+        let scan = spawn_marker_fd_scan(
+            (
+                Arc::clone(&operation),
+                Arc::clone(&scope.discovery_reservation),
+            ),
+            move || {
+                scan_started.send(()).expect("report marker scan start");
+                release.recv().expect("release timed-out marker scan");
+            },
+        )
+        .unwrap_or_else(|_| panic!("marker scan thread must start"));
+        started.await.expect("marker scan started");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), scan)
+                .await
+                .is_err(),
+            "marker scan receiver must time out"
+        );
+        drop(operation);
+
+        let mut captured = Vec::new();
+        let mut cleanup_errors = Vec::new();
+        let visible = tokio::time::timeout(
+            Duration::from_secs(1),
+            capture_scoped_identities(&scope, Some(root), &mut captured, &mut cleanup_errors),
+        )
+        .await
+        .expect("current-round fallbacks stayed bounded");
+        assert!(visible.contains(&descendant));
+        assert!(captured.iter().any(|identity| identity.pid == descendant));
+        assert!(cleanup_errors.is_empty(), "{}", cleanup_errors.join("; "));
+
+        assert!(
+            try_discovery_operation(&scope.discovery_operation).is_none(),
+            "timed-out marker scan released the operation early"
+        );
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            discover_scope_pids(&scope, Some(root), &mut cleanup_errors),
+        )
+        .await
+        .expect("later-round fallbacks did not await the marker scan");
+        assert!(later.contains(&descendant));
+        assert!(cleanup_errors.is_empty(), "{}", cleanup_errors.join("; "));
+
+        signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
+        assert!(cleanup_errors.is_empty(), "{}", cleanup_errors.join("; "));
+        let candidate = captured
+            .iter()
+            .find(|identity| identity.pid == descendant)
+            .expect("captured fallback candidate");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if candidate
+                    .captured_generation_is_gone()
+                    .expect("revalidate killed fallback candidate")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fallback candidate was killed while marker scan remained blocked");
+        assert!(
+            try_discovery_operation(&scope.discovery_operation).is_none(),
+            "candidate signaling released the marker scan operation"
+        );
+
+        release_scan.send(()).expect("release marker scan");
+        let released = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&scope.discovery_operation).lock_owned(),
+        )
+        .await
+        .expect("marker scan released its operation after returning");
+        drop(released);
+        terminate(child, scope)
+            .await
+            .expect("cleanup fallback fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marker_fd_scan_start_failure_returns_ownership() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&permits)
+            .acquire_owned()
+            .await
+            .expect("reserve discovery capacity");
+        let operation = Arc::new(tokio::sync::Mutex::new(()));
+        let operation_guard = Arc::clone(&operation).lock_owned().await;
+
+        let error =
+            match spawn_marker_fd_scan_inner((operation_guard, Arc::new(permit)), || (), true) {
+                Ok(_) => panic!("forced marker scan start failure must fail"),
+                Err(error) => error,
+            };
+        assert!(error.ownership.is_some(), "thread start lost ownership");
+        assert_eq!(error.error.kind(), std::io::ErrorKind::Other);
+        assert!(permits.try_acquire().is_err());
+        assert!(operation.try_lock().is_err());
+
+        drop(error);
+        assert!(permits.try_acquire().is_ok());
+        assert!(operation.try_lock().is_ok());
     }
 
     #[tokio::test]
-    async fn scope_discovery_waits_for_the_discovery_permit() {
-        // Given: a cleanup worker queued behind the sole discovery permit.
-        let mut command = Command::new("sleep");
-        command.arg("30");
-        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn queued cleanup fixture");
-        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let probe = std::sync::Arc::new(CleanupProbe {
-            cleanup_admission_permits: Some(cleanup_admission_permits),
-            discovery_permits: Some(discovery_permits.clone()),
-            ..CleanupProbe::default()
+    async fn spawn_waits_for_discovery_reservation_before_side_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-process-pre-spawn-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("test directory");
+        let side_effect = root.join("SPAWNED");
+        let probe = CleanupProbe::with_discovery_capacity(1);
+        let held = probe
+            .discovery_permits()
+            .acquire_owned()
+            .await
+            .expect("hold spawn reservation");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf spawned > \"$1\"; sleep 30",
+            "rafikx-pre-spawn",
+            side_effect.to_str().expect("side effect path"),
+        ]);
+        let spawn = tokio::spawn({
+            let probe = Arc::clone(&probe);
+            async move { spawn_scoped_with_probe(&mut command, probe).await }
         });
-        scope.cleanup_probe = Some(probe.clone());
-        let permit = discovery_permits
-            .acquire_many(2)
+        tokio::time::timeout(Duration::from_secs(1), probe.wait_for_spawn_reservation())
             .await
-            .expect("hold discovery permit");
-        let cleanup = tokio::spawn(terminate(child, scope));
-        tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
+            .expect("spawn reached reservation");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!side_effect.exists());
+
+        drop(held);
+        let (child, scope) = tokio::time::timeout(Duration::from_secs(2), spawn)
             .await
-            .expect("cleanup worker started");
-
-        // When: the worker reaches the occupied permit.
-        tokio::task::yield_now().await;
-
-        // Then: no scoped or inherited discovery has begun; releasing the permit starts it.
-        assert_eq!(
-            probe
-                .scope_discovery_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
-        drop(permit);
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            probe.scope_discovery_started.notified(),
-        )
+            .expect("spawn acquired reservation")
+            .expect("spawn task joined")
+            .expect("spawn succeeded");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !side_effect.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
-        .expect("scope discovery started after permit release");
-        tokio::time::timeout(Duration::from_secs(12), cleanup)
+        .expect("spawn side effect observed");
+        terminate(child, scope)
             .await
-            .expect("queued cleanup completed")
-            .expect("cleanup caller joined")
-            .expect("queued cleanup succeeded");
+            .expect("cleanup spawned fixture");
+        assert!(side_effect.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn closed_reservation_and_spawn_failure_release_capacity() {
+        let closed_probe = CleanupProbe::with_discovery_capacity(1);
+        closed_probe.discovery_permits().close();
+        let mut closed_command = Command::new("sh");
+        closed_command.args(["-c", "exit 0"]);
+        let closed = spawn_scoped_with_probe(&mut closed_command, closed_probe)
+            .await
+            .expect_err("closed reservation must reject spawn");
+        assert_eq!(closed.kind(), std::io::ErrorKind::Other);
+
+        let failed_probe = CleanupProbe::with_discovery_capacity(1);
+        let permits = failed_probe.discovery_permits();
+        let mut missing = Command::new("/rafikx/does-not-exist");
+        spawn_scoped_with_probe(&mut missing, failed_probe)
+            .await
+            .expect_err("missing executable must fail");
+        assert_eq!(permits.available_permits(), 1);
     }
 
     #[tokio::test]
     async fn cleanup_admission_queues_sessions_after_discovery() {
         // Given: cleanup admission is saturated while physical discovery remains available.
         let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
         let held_admission = cleanup_admission_permits
             .clone()
             .acquire_many_owned(2)
@@ -1733,14 +2045,14 @@ mod tests {
         for _ in 0..3 {
             let mut command = Command::new("sleep");
             command.arg("30");
-            let (child, mut scope) =
-                spawn_scoped(&mut command).expect("spawn saturated cleanup fixture");
             let probe = std::sync::Arc::new(CleanupProbe {
                 cleanup_admission_permits: Some(cleanup_admission_permits.clone()),
                 discovery_permits: Some(discovery_permits.clone()),
                 ..CleanupProbe::default()
             });
-            scope.cleanup_probe = Some(probe.clone());
+            let (child, scope) = spawn_scoped_with_probe(&mut command, probe.clone())
+                .await
+                .expect("spawn saturated cleanup fixture");
             let cleanup = tokio::spawn(terminate(child, scope));
             tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
                 .await
@@ -1811,15 +2123,6 @@ mod tests {
             ready.to_str().expect("ready path"),
             survived.to_str().expect("survived path"),
         ]);
-        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn admission fixture");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("detached daemon ready");
-
         let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
         let held_admission = cleanup_admission_permits
             .clone()
@@ -1828,14 +2131,34 @@ mod tests {
             .expect("hold cleanup admission");
         let probe = std::sync::Arc::new(CleanupProbe {
             cleanup_admission_permits: Some(cleanup_admission_permits),
-            discovery_permits: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(2))),
+            discovery_permits: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
             ..CleanupProbe::default()
         });
-        scope.cleanup_probe = Some(probe.clone());
+        let (child, scope) = spawn_scoped_with_probe(&mut command, probe.clone())
+            .await
+            .expect("spawn admission fixture");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached daemon ready");
+
         let cleanup = tokio::spawn(terminate(child, scope));
         tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
             .await
             .expect("cleanup worker started");
+        tokio::time::timeout(Duration::from_secs(2), probe.scope_quiesced.notified())
+            .await
+            .expect("retained-marker descendants quiesced before admission");
+        assert_eq!(
+            probe
+                .cleanup_admission_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "cleanup admission preceded retained-marker quiescence"
+        );
 
         tokio::time::sleep(Duration::from_millis(1300)).await;
         let side_effect_happened = survived.exists();
@@ -1860,14 +2183,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_budget_starts_after_admitted_identity_capture() {
+    async fn cleanup_uses_its_reserved_capacity_for_every_discovery_round() {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file());
         let Some(python) = python else { return };
 
-        // Given: a detached, environment-cleared descendant retains the scope descriptor while
-        // both discovery permits remain occupied longer than the old cleanup deadline.
+        // Given: this scope owns one permit while unrelated work occupies every other permit.
         let root = std::env::temp_dir().join(format!(
             "rafikx-process-admission-budget-{}",
             crate::db::Db::new_id()
@@ -1884,7 +2206,14 @@ mod tests {
             script,
             ready.to_str().expect("ready path"),
         ]);
-        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn admission fixture");
+        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+        let probe = std::sync::Arc::new(CleanupProbe {
+            discovery_permits: Some(discovery_permits.clone()),
+            ..CleanupProbe::default()
+        });
+        let (child, scope) = spawn_scoped_with_probe(&mut command, probe.clone())
+            .await
+            .expect("spawn admission fixture");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -1897,39 +2226,22 @@ mod tests {
         })
         .await
         .expect("detached daemon ready");
-        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let probe = std::sync::Arc::new(CleanupProbe {
-            cleanup_admission_permits: Some(cleanup_admission_permits),
-            discovery_permits: Some(discovery_permits.clone()),
-            ..CleanupProbe::default()
-        });
-        scope.cleanup_probe = Some(probe.clone());
         let permits = discovery_permits
             .acquire_many(2)
             .await
-            .expect("hold both discovery permits");
+            .expect("hold unrelated discovery capacity");
         let cleanup = tokio::spawn(terminate(child, scope));
         tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
             .await
             .expect("cleanup worker started");
 
-        // When: admission remains blocked past the old global deadline, then becomes available.
-        tokio::time::sleep(PROCESS_CLEANUP_TIMEOUT + Duration::from_millis(100)).await;
-        assert_eq!(
-            probe
-                .scope_discovery_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "identity capture started without an available discovery permit"
-        );
-        drop(permits);
+        // When: cleanup performs initial, revalidation, and final discovery.
         let cleanup_result = tokio::time::timeout(Duration::from_secs(12), cleanup)
             .await
             .expect("admitted cleanup completed")
             .expect("cleanup caller joined");
 
-        // Then: admission time is not charged to cleanup and the exact retained-marker daemon dies.
+        // Then: no round reacquires global capacity and the exact retained-marker daemon dies.
         let gone = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let output = std::process::Command::new("ps")
@@ -1966,6 +2278,7 @@ mod tests {
             "cleanup repeated a redundant full discovery round"
         );
         assert!(gone, "admitted cleanup stranded detached PID {daemon_pid}");
+        drop(permits);
     }
 
     #[tokio::test]
@@ -1975,7 +2288,7 @@ mod tests {
             .find(|path| std::path::Path::new(path).is_file());
         let Some(python) = python else { return };
 
-        // Given: an environment-cleared, session-detached descendant and a busy discovery permit.
+        // Given: an environment-cleared descendant whose cleanup is queued for admission.
         let root = std::env::temp_dir().join(format!(
             "rafikx-process-queued-cancel-{}",
             crate::db::Db::new_id()
@@ -1992,7 +2305,20 @@ mod tests {
             script,
             ready.to_str().expect("ready path"),
         ]);
-        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn cancellation fixture");
+        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held_admission = cleanup_admission_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold cleanup admission");
+        let probe = std::sync::Arc::new(CleanupProbe {
+            cleanup_admission_permits: Some(cleanup_admission_permits),
+            discovery_permits: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
+            ..CleanupProbe::default()
+        });
+        let (child, scope) = spawn_scoped_with_probe(&mut command, probe.clone())
+            .await
+            .expect("spawn cancellation fixture");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -2006,22 +2332,13 @@ mod tests {
         .await
         .expect("detached daemon ready");
         let scope_marker = scope.marker_path.clone();
-        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let probe = std::sync::Arc::new(CleanupProbe {
-            cleanup_admission_permits: Some(cleanup_admission_permits),
-            discovery_permits: Some(discovery_permits.clone()),
-            ..CleanupProbe::default()
-        });
-        scope.cleanup_probe = Some(probe.clone());
-        let permit = discovery_permits
-            .acquire_many(2)
-            .await
-            .expect("hold discovery permit");
         let caller = tokio::spawn(terminate(child, scope));
         tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
             .await
             .expect("cleanup worker started");
+        tokio::time::timeout(Duration::from_secs(2), probe.scope_quiesced.notified())
+            .await
+            .expect("cleanup quiesced before admission");
 
         // When: the awaiting caller is cancelled while the owned worker is queued.
         caller.abort();
@@ -2038,7 +2355,7 @@ mod tests {
             scope_marker.exists(),
             "queued worker dropped its process scope"
         );
-        drop(permit);
+        drop(held_admission);
         let gone = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let output = std::process::Command::new("ps")
@@ -2077,6 +2394,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capacity_one_cleanup_finishes_before_the_next_spawn() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-process-capacity-one-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("test directory");
+        let spawned = root.join("B_SPAWNED");
+        let discovery_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let cleanup_admission_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held_admission = Arc::clone(&cleanup_admission_permits)
+            .acquire_owned()
+            .await
+            .expect("hold cleanup admission");
+        let probe_a = Arc::new(CleanupProbe {
+            cleanup_admission_permits: Some(cleanup_admission_permits),
+            discovery_permits: Some(Arc::clone(&discovery_permits)),
+            ..CleanupProbe::default()
+        });
+        let mut command_a = Command::new("sleep");
+        command_a.arg("30");
+        let (child_a, scope_a) = spawn_scoped_with_probe(&mut command_a, Arc::clone(&probe_a))
+            .await
+            .expect("spawn scope A");
+        let cleanup_a = tokio::spawn(terminate(child_a, scope_a));
+        tokio::time::timeout(Duration::from_secs(2), probe_a.scope_quiesced.notified())
+            .await
+            .expect("scope A quiesced");
+
+        let probe_b = Arc::new(CleanupProbe {
+            discovery_permits: Some(discovery_permits),
+            ..CleanupProbe::default()
+        });
+        let mut command_b = Command::new("sh");
+        command_b.args([
+            "-c",
+            "printf spawned > \"$1\"; sleep 30",
+            "rafikx-capacity-one",
+            spawned.to_str().expect("spawn marker path"),
+        ]);
+        let spawn_b = tokio::spawn({
+            let probe_b = Arc::clone(&probe_b);
+            async move { spawn_scoped_with_probe(&mut command_b, probe_b).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), probe_b.wait_for_spawn_reservation())
+            .await
+            .expect("scope B queued for reservation");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!spawned.exists(), "scope B spawned before A cleanup");
+
+        drop(held_admission);
+        cleanup_a
+            .await
+            .expect("scope A cleanup joined")
+            .expect("scope A cleanup succeeded");
+        let (child_b, scope_b) = tokio::time::timeout(Duration::from_secs(2), spawn_b)
+            .await
+            .expect("scope B acquired released reservation")
+            .expect("scope B task joined")
+            .expect("scope B spawned");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !spawned.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scope B side effect observed");
+        terminate(child_b, scope_b).await.expect("cleanup scope B");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn scoped_process_drop_cleans_detached_retained_marker_descendant() {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
@@ -2100,7 +2488,9 @@ mod tests {
             ready.to_str().expect("ready path"),
             survived.to_str().expect("survived path"),
         ]);
-        let (child, scope) = spawn_scoped(&mut command).expect("spawn owner-drop fixture");
+        let (child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn owner-drop fixture");
         let owner = tokio::spawn(async move {
             let _process = ScopedProcess::new(child, scope);
             std::future::pending::<()>().await;
@@ -2160,7 +2550,9 @@ mod tests {
     #[tokio::test]
     async fn completed_command_cleanup_stays_within_global_budget() {
         let mut command = Command::new("true");
-        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn completed command");
+        let (mut child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn completed command");
         child.wait().await.expect("wait completed command");
         let started = std::time::Instant::now();
 
@@ -2179,7 +2571,9 @@ mod tests {
     async fn parent_closes_the_scope_marker_after_spawn() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 5"]);
-        let (child, scope) = spawn_scoped(&mut command).expect("spawn scoped child");
+        let (child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn scoped child");
 
         #[cfg(target_os = "linux")]
         {
@@ -2228,7 +2622,9 @@ mod tests {
             "rafikx-process-tree",
             marker.to_str().expect("marker path"),
         ]);
-        let (child, scope) = spawn_scoped(&mut command).expect("spawn process tree");
+        let (child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn process tree");
         tokio::time::sleep(Duration::from_millis(50)).await;
         terminate(child, scope).await.expect("terminate tree");
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -2256,7 +2652,9 @@ mod tests {
             python,
             ready.to_str().expect("ready path"),
         ]);
-        let (child, scope) = spawn_scoped(&mut command).expect("spawn detached process");
+        let (child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn detached process");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -2308,7 +2706,9 @@ mod tests {
         let script = "import os,sys,time\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n os.closerange(3, 1024)\n open(sys.argv[1], 'w').write(str(os.getpid()))\n time.sleep(60)\nos._exit(0)";
         let mut command = Command::new(python);
         command.args(["-c", script, ready.to_str().expect("ready path")]);
-        let (mut child, scope) = spawn_scoped(&mut command).expect("spawn env-only process");
+        let (mut child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn env-only process");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -2360,7 +2760,9 @@ mod tests {
             script,
             ready.to_str().expect("ready path"),
         ]);
-        let (child, scope) = spawn_scoped(&mut command).expect("spawn clearenv process");
+        let (child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn clearenv process");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -2432,7 +2834,9 @@ mod tests {
             script,
             ready.to_str().expect("ready path"),
         ]);
-        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn timeout fixture");
+        let (child, mut scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn timeout fixture");
         let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
@@ -2493,7 +2897,9 @@ mod tests {
             "rafikx-process-discovery-failure",
             marker.to_str().expect("marker path"),
         ]);
-        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn process tree");
+        let (child, mut scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn process tree");
         scope.force_discovery_failure = true;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let error = terminate(child, scope)
@@ -2531,7 +2937,9 @@ mod windows_tests {
                 nested.replace('"', "`\"")
             ),
         ]);
-        let (child, scope) = spawn_scoped(&mut command).expect("spawn Windows process tree");
+        let (child, scope) = spawn_scoped(&mut command)
+            .await
+            .expect("spawn Windows process tree");
         tokio::time::sleep(Duration::from_millis(200)).await;
         terminate(child, scope).await.expect("terminate job");
         tokio::time::sleep(Duration::from_millis(1100)).await;

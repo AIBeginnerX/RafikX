@@ -2493,8 +2493,21 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let (child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
-        .map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?;
+    let readiness_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let spawn = async {
+        #[cfg(all(test, unix))]
+        return crate::process_tree::spawn_scoped_with_probe(
+            &mut command,
+            crate::process_tree::CleanupProbe::with_discovery_capacity(1),
+        )
+        .await;
+        #[allow(unreachable_code)]
+        crate::process_tree::spawn_scoped(&mut command).await
+    };
+    let (child, process_scope) = match tokio::time::timeout_at(readiness_deadline, spawn).await {
+        Ok(result) => result.map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?,
+        Err(_) => anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)"),
+    };
     let mut process = crate::process_tree::ScopedProcess::new(child, process_scope);
     let Some(stderr) = process
         .child_mut()
@@ -2525,7 +2538,7 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     });
     resources.reader = Some(reader);
 
-    let deadline = tokio::time::sleep(std::time::Duration::from_secs(15));
+    let deadline = tokio::time::sleep_until(readiness_deadline);
     tokio::pin!(deadline);
     let mut early_status = None;
     let ready = loop {

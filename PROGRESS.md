@@ -1,3 +1,3 @@
-완료: Bash 취소의 1초 내 루트 정지와 동기 프로세스 트리 회수를 분리해 검증하는 테스트 계약을 고정했다.
-검증: 취소 테스트 32개 동시 압력 실행과 라이브러리 688개가 통과했고, GPT-5.6 Sol 독립 재검토가 PASS했다.
-다음: retained-scope 자손 정리의 압력 회귀를 닫은 뒤 전체 CLI 릴리스 테스트·빌드·PTY QA를 완료한다. 데스크탑은 제외한다.
+완료: Unix scoped process가 실행 전에 정리 용량을 예약하고, 스캔 시간 초과 중에도 환경·자손 fallback을 계속하도록 프로세스 회수 경계를 고정했다.
+검증: process-tree 24개, Bash 9개, quality 23개, browser 50개와 전체 라이브러리 695개가 통과했고 GPT-5.6 Sol 아키텍처·보안·코드 재검토가 모두 PASS했다.
+다음: 깨끗한 CLI SHA에서 default·minimal·Clippy·release·ignored E2E·PTY QA 릴리스 매트릭스를 완료한다. 데스크탑은 제외한다.

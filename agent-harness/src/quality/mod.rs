@@ -113,6 +113,25 @@ pub(crate) async fn run_bounded_command(
     workspace: &Path,
     deadline: std::time::Duration,
 ) -> Result<BoundedCommandOutput, String> {
+    run_bounded_command_inner(
+        program,
+        args,
+        workspace,
+        deadline,
+        #[cfg(all(test, unix))]
+        None,
+    )
+    .await
+}
+
+async fn run_bounded_command_inner(
+    program: &str,
+    args: &[String],
+    workspace: &Path,
+    deadline: std::time::Duration,
+    #[cfg(all(test, unix))] spawn_probe: Option<std::sync::Arc<crate::process_tree::CleanupProbe>>,
+) -> Result<BoundedCommandOutput, String> {
+    let operation_deadline = tokio::time::Instant::now() + deadline;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -120,8 +139,17 @@ pub(crate) async fn run_bounded_command(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let (child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
-        .map_err(|error| format!("실행 실패: {error}"))?;
+    let spawn = async {
+        #[cfg(all(test, unix))]
+        if let Some(probe) = spawn_probe {
+            return crate::process_tree::spawn_scoped_with_probe(&mut command, probe).await;
+        }
+        crate::process_tree::spawn_scoped(&mut command).await
+    };
+    let (child, process_scope) = match tokio::time::timeout_at(operation_deadline, spawn).await {
+        Ok(result) => result.map_err(|error| format!("실행 실패: {error}"))?,
+        Err(_) => return Err(format!("시간 초과 ({}초)", deadline.as_secs())),
+    };
     let mut process = crate::process_tree::ScopedProcess::new(child, process_scope);
     let stdout = process
         .child_mut()?
@@ -136,21 +164,22 @@ pub(crate) async fn run_bounded_command(
     let stdout_reader = tokio::spawn(read_bounded_tail(stdout, MAX_QUALITY_STREAM_BYTES));
     let stderr_reader = tokio::spawn(read_bounded_tail(stderr, MAX_QUALITY_STREAM_BYTES));
 
-    let status = match tokio::time::timeout(deadline, process.child_mut()?.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            let cleanup = process.terminate().await;
-            let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
-            cleanup.map_err(|cleanup| format!("실행 대기 실패 후 정리 실패: {cleanup}"))?;
-            return Err(format!("실행 대기 실패: {error}"));
-        }
-        Err(_) => {
-            let cleanup = process.terminate().await;
-            let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
-            cleanup.map_err(|cleanup| format!("시간 초과 후 프로세스 정리 실패: {cleanup}"))?;
-            return Err(format!("시간 초과 ({}초)", deadline.as_secs()));
-        }
-    };
+    let status =
+        match tokio::time::timeout_at(operation_deadline, process.child_mut()?.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                let cleanup = process.terminate().await;
+                let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
+                cleanup.map_err(|cleanup| format!("실행 대기 실패 후 정리 실패: {cleanup}"))?;
+                return Err(format!("실행 대기 실패: {error}"));
+            }
+            Err(_) => {
+                let cleanup = process.terminate().await;
+                let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
+                cleanup.map_err(|cleanup| format!("시간 초과 후 프로세스 정리 실패: {cleanup}"))?;
+                return Err(format!("시간 초과 ({}초)", deadline.as_secs()));
+            }
+        };
     process
         .terminate()
         .await
@@ -1778,7 +1807,16 @@ mod tests {
         let execution = tokio::spawn({
             let root = root.clone();
             async move {
-                run_bounded_command("sh", &args, &root, std::time::Duration::from_secs(60)).await
+                run_bounded_command_inner(
+                    "sh",
+                    &args,
+                    &root,
+                    std::time::Duration::from_secs(60),
+                    Some(crate::process_tree::CleanupProbe::with_discovery_capacity(
+                        1,
+                    )),
+                )
+                .await
             }
         });
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -1799,6 +1837,55 @@ mod tests {
             !side_effect_happened,
             "aborted bounded command left a background process running"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_command_timeout_while_spawn_is_queued_has_no_side_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-quality-pre-spawn-timeout-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp workspace");
+        let side_effect = root.join("SPAWNED");
+        let probe = crate::process_tree::CleanupProbe::with_discovery_capacity(1);
+        let held = probe
+            .discovery_permits()
+            .acquire_owned()
+            .await
+            .expect("hold spawn reservation");
+        let args = vec!["-c".to_string(), "printf spawned > SPAWNED".to_string()];
+        let execution = tokio::spawn({
+            let root = root.clone();
+            let probe = std::sync::Arc::clone(&probe);
+            async move {
+                run_bounded_command_inner(
+                    "sh",
+                    &args,
+                    &root,
+                    std::time::Duration::from_millis(200),
+                    Some(probe),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            probe.wait_for_spawn_reservation(),
+        )
+        .await
+        .expect("quality command reached pre-spawn reservation");
+
+        let error = match execution.await.expect("quality command joined") {
+            Ok(_) => panic!("queued quality command must time out"),
+            Err(error) => error,
+        };
+        assert!(error.contains("시간 초과"), "{error}");
+        assert!(!side_effect.exists(), "timed out queued spawn executed");
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!side_effect.exists(), "dropped spawn future executed later");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

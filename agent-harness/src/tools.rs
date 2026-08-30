@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::db::Db;
 use crate::obsidian;
@@ -912,6 +911,8 @@ impl Tool for Bash {
                 workspace,
                 timeout_secs,
                 run: run.clone(),
+                #[cfg(all(test, unix))]
+                spawn_probe: None,
             }));
             let changes = match snapshot {
                 Some(snapshot) => snapshot
@@ -1260,6 +1261,8 @@ struct BashRequest {
     workspace: PathBuf,
     timeout_secs: u64,
     run: Option<RunContext>,
+    #[cfg(all(test, unix))]
+    spawn_probe: Option<std::sync::Arc<crate::process_tree::CleanupProbe>>,
 }
 
 async fn run_bash(request: BashRequest) -> Result<String> {
@@ -1268,7 +1271,10 @@ async fn run_bash(request: BashRequest) -> Result<String> {
         workspace,
         timeout_secs,
         run,
+        #[cfg(all(test, unix))]
+        spawn_probe,
     } = request;
+    let operation_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd");
@@ -1286,8 +1292,28 @@ async fn run_bash(request: BashRequest) -> Result<String> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .stdin(Stdio::null());
-    let (child, process_scope) = crate::process_tree::spawn_scoped(&mut cmd)
-        .map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?;
+    let spawn = async {
+        #[cfg(all(test, unix))]
+        if let Some(probe) = spawn_probe {
+            return crate::process_tree::spawn_scoped_with_probe(&mut cmd, probe).await;
+        }
+        crate::process_tree::spawn_scoped(&mut cmd).await
+    };
+    let spawned = if let Some(run) = &run {
+        tokio::select! {
+            biased;
+            reason = run.cancelled_reason() => {
+                return Err(anyhow!("명령이 취소되었습니다: {reason}"));
+            }
+            result = tokio::time::timeout_at(operation_deadline, spawn) => result,
+        }
+    } else {
+        tokio::time::timeout_at(operation_deadline, spawn).await
+    };
+    let (child, process_scope) = match spawned {
+        Ok(result) => result.map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?,
+        Err(_) => return Err(anyhow!("명령이 {timeout_secs}초를 넘겨 중단되었습니다")),
+    };
     let mut process = crate::process_tree::ScopedProcess::new(child, process_scope);
     let stdout = process
         .child_mut()
@@ -1314,11 +1340,12 @@ async fn run_bash(request: BashRequest) -> Result<String> {
         };
         if let Some(run) = &run {
             tokio::select! {
-                result = timeout(Duration::from_secs(timeout_secs), completion) => Ok(result),
+                biased;
                 reason = run.cancelled_reason() => Err(reason),
+                result = tokio::time::timeout_at(operation_deadline, completion) => Ok(result),
             }
         } else {
-            Ok(timeout(Duration::from_secs(timeout_secs), completion).await)
+            Ok(tokio::time::timeout_at(operation_deadline, completion).await)
         }
     };
 
@@ -1473,6 +1500,7 @@ mod tests {
             workspace: root.clone(),
             timeout_secs: 1,
             run: None,
+            spawn_probe: None,
         })
         .await;
         assert!(result.is_ok(), "{result:?}");
@@ -1498,6 +1526,7 @@ mod tests {
             workspace: root.clone(),
             timeout_secs: 3,
             run: None,
+            spawn_probe: None,
         })
         .await
         .expect("verbose finite command");
@@ -1525,11 +1554,108 @@ mod tests {
             workspace: root.clone(),
             timeout_secs: 1,
             run: None,
+            spawn_probe: None,
         })
         .await;
         assert!(result.is_err());
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!root.join("DESCENDANT_SURVIVED").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_cancellation_while_spawn_is_queued_has_no_side_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-bash-pre-spawn-cancel-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let side_effect = root.join("SPAWNED");
+        let probe = crate::process_tree::CleanupProbe::with_discovery_capacity(1);
+        let discovery_permits = probe.discovery_permits();
+        let held = discovery_permits
+            .acquire_owned()
+            .await
+            .expect("hold spawn reservation");
+        let run = RunContext::isolated(
+            crate::run::RunId::new("bash-pre-spawn-cancel"),
+            root.clone(),
+        );
+        let execution = tokio::spawn({
+            let run = run.clone();
+            let probe = std::sync::Arc::clone(&probe);
+            async move {
+                run_bash(BashRequest {
+                    command: "printf spawned > SPAWNED".into(),
+                    workspace: root,
+                    timeout_secs: 5,
+                    run: Some(run),
+                    spawn_probe: Some(probe),
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), probe.wait_for_spawn_reservation())
+            .await
+            .expect("bash reached pre-spawn reservation");
+
+        assert!(run.cancel("cancel queued spawn"));
+        let error = execution
+            .await
+            .expect("queued bash joined")
+            .expect_err("queued bash must be cancelled");
+        assert!(error.to_string().contains("취소되었습니다"), "{error}");
+        assert!(
+            !side_effect.exists(),
+            "cancelled queued spawn executed its command"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(side_effect.parent().expect("workspace parent"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_while_spawn_is_queued_has_no_side_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-bash-pre-spawn-timeout-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let side_effect = root.join("SPAWNED");
+        let probe = crate::process_tree::CleanupProbe::with_discovery_capacity(1);
+        let held = probe
+            .discovery_permits()
+            .acquire_owned()
+            .await
+            .expect("hold spawn reservation");
+        let execution = tokio::spawn({
+            let probe = std::sync::Arc::clone(&probe);
+            let root = root.clone();
+            async move {
+                run_bash(BashRequest {
+                    command: "printf spawned > SPAWNED".into(),
+                    workspace: root,
+                    timeout_secs: 1,
+                    run: None,
+                    spawn_probe: Some(probe),
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), probe.wait_for_spawn_reservation())
+            .await
+            .expect("bash reached pre-spawn reservation");
+
+        let error = execution
+            .await
+            .expect("queued bash joined")
+            .expect_err("queued bash must time out");
+        assert!(error.to_string().contains("1초를 넘겨"), "{error}");
+        assert!(!side_effect.exists(), "timed out queued spawn executed");
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!side_effect.exists(), "dropped spawn future executed later");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1591,13 +1717,22 @@ mod tests {
         let ready = root.join("READY");
         let shell_pid = root.join("SHELL_PID");
         let run = RunContext::isolated(crate::run::RunId::new("bash-cancel-test"), root.clone());
-        let mut ctx = ToolCtx::new(root.clone());
-        ctx.run = Some(run.clone());
-        let execution = tokio::spawn(async move {
-            Bash.run(
-                json!({"command": "printf '%s\\n' \"$$\" > SHELL_PID; touch READY; sleep 60 & wait", "timeout_secs": 5}),
-                &ctx,
-            )
+        let execution = tokio::spawn({
+            let run = run.clone();
+            let workspace = root.clone();
+            async move {
+                run_bash(BashRequest {
+                    command: "printf '%s\\n' \"$$\" > SHELL_PID; touch READY; sleep 60 & wait"
+                        .into(),
+                    workspace,
+                    timeout_secs: 5,
+                    run: Some(run),
+                    spawn_probe: Some(crate::process_tree::CleanupProbe::with_discovery_capacity(
+                        1,
+                    )),
+                })
+                .await
+            }
         });
         tokio::time::timeout(Duration::from_secs(3), async {
             while !ready.exists() {
