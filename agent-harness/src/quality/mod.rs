@@ -1600,11 +1600,44 @@ fn redact_spaced_assignments(text: &str) -> String {
     output
 }
 
+fn redaction_path_spellings(path: &Path) -> Vec<String> {
+    let mut spellings = vec![path.display().to_string()];
+    if let Ok(canonical) = path.canonicalize() {
+        spellings.push(canonical.display().to_string());
+    }
+    for spelling in spellings.clone() {
+        for (source_prefix, alias_prefix) in [
+            ("/private/tmp", "/tmp"),
+            ("/tmp", "/private/tmp"),
+            ("/private/var", "/var"),
+            ("/var", "/private/var"),
+        ] {
+            if let Some(rest) = spelling.strip_prefix(source_prefix)
+                && (rest.is_empty() || rest.starts_with('/'))
+            {
+                spellings.push(format!("{alias_prefix}{rest}"));
+            }
+        }
+    }
+    spellings.retain(|spelling| spelling.len() > 1);
+    spellings.sort();
+    spellings.dedup();
+    spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+    spellings
+}
+
+fn redact_path_spellings(mut text: String, path: &Path, replacement: &str) -> String {
+    for spelling in redaction_path_spellings(path) {
+        text = text.replace(&spelling, replacement);
+    }
+    text
+}
+
 fn normalize_redaction_input(text: &str, workspace: &Path) -> String {
     let cleaned = strip_ansi_sequences(text);
-    let mut normalized = cleaned.replace(&workspace.display().to_string(), "<workspace>");
+    let mut normalized = redact_path_spellings(cleaned, workspace, "<workspace>");
     if let Some(home) = std::env::var_os("HOME") {
-        normalized = normalized.replace(&Path::new(&home).display().to_string(), "<home>");
+        normalized = redact_path_spellings(normalized, Path::new(&home), "<home>");
     }
     redact_spaced_assignments(&normalized)
 }
@@ -2094,6 +2127,19 @@ mod tests {
         assert!(redacted.contains("<workspace>/src/main.rs"));
         assert!(!redacted.contains("TOOL-SECRET"));
         assert!(!redacted.contains("private-workspace"));
+    }
+
+    #[test]
+    fn local_path_redaction_covers_private_tmp_aliases() {
+        let canonical_workspace = Path::new("/private/tmp/rafikx-alias-workspace");
+        let alias_output = "/tmp/rafikx-alias-workspace/private/file";
+        let redacted = redact_tool_output(alias_output, canonical_workspace);
+        assert_eq!(redacted, "<workspace>/private/file");
+
+        let alias_workspace = Path::new("/tmp/rafikx-alias-workspace");
+        let canonical_output = "/private/tmp/rafikx-alias-workspace/private/file";
+        let redacted = redact_tool_output(canonical_output, alias_workspace);
+        assert_eq!(redacted, "<workspace>/private/file");
     }
 
     #[test]

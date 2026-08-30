@@ -9,6 +9,14 @@ pub const fn needs_auto_compaction(used: u32, window: u32) -> bool {
     window > 0 && used.saturating_mul(100) >= window.saturating_mul(AUTO_COMPACT_PERCENT)
 }
 
+pub fn effective_output_limit(context_window: u32, requested: u32) -> u32 {
+    if requested == 0 {
+        0
+    } else {
+        requested.min(context_window.max(256) / 2)
+    }
+}
+
 /// 대략적인 토큰 수 (문자/4). 정밀 토크나이저는 쓰지 않는다.
 pub fn estimate_tokens(s: &str) -> usize {
     s.chars().count().div_ceil(4)
@@ -113,8 +121,9 @@ pub fn pack_messages(
     let mut msgs = messages.to_vec();
     agent::sanitize_tool_pairs(&mut msgs);
 
-    let reserved = estimate_tokens(system) + tools_tokens(tools) + reserve_output as usize;
     let window = (context_window as usize).max(256);
+    let output_reserve = effective_output_limit(context_window, reserve_output) as usize;
+    let reserved = estimate_tokens(system) + tools_tokens(tools) + output_reserve;
     let mut budget = window.saturating_sub(reserved).max(256);
     let char_cap = (max_context_chars as usize).max(4096);
     // 문자 한도와 토큰 한도 중 더 작은 쪽 (토큰≈문자/4)
@@ -362,6 +371,36 @@ mod tests {
                 i += 1;
             }
         }
+    }
+
+    #[test]
+    fn packer_preserves_recent_inspection_when_output_limit_exceeds_context() {
+        let msgs = vec![
+            Message::user_text("현재 파일을 직접 검사하고 판정하라"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "inspect-1".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "game.js"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "inspect-1".into(),
+                    content: "const frame = () => requestAnimationFrame(frame);\n".repeat(200),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        let packed = pack_messages(&msgs, "review", &[], 32_000, 32_768, 200_000);
+
+        assert!(
+            packed.iter().any(is_tool_use) && packed.iter().any(is_tool_result),
+            "the verdict-producing request must retain its recent inspection evidence"
+        );
     }
 
     #[test]

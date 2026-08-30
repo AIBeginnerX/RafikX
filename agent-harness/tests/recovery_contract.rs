@@ -1171,6 +1171,11 @@ async fn browser_game_agent_repair_e2e() {
             }),
         "fresh reviewer did not inspect the repaired game"
     );
+    assert!(
+        captured[6].contains("rafikx-browser-game-contract")
+            && captured[6].contains("requestAnimationFrame(frame)"),
+        "the verdict request lost the reviewer's inspected file contents"
+    );
     let report = run_quality_gate(
         workspace.path(),
         &["index.html".into(), "style.css".into(), "game.js".into()],

@@ -778,12 +778,16 @@ async fn run_pipeline_inner(
             return Ok(shared_iteration_limit_outcome(&run_context));
         }
         let mut messages = resume.unwrap_or_else(|| vec![Message::user_text(task)]);
+        let output_token_limit = crate::packer::effective_output_limit(
+            binding.context_window,
+            cfg.file.general.max_tokens,
+        );
         messages = crate::packer::pack_messages(
             &messages,
             &system,
             &[],
             binding.context_window,
-            cfg.file.general.max_tokens,
+            output_token_limit,
             cfg.file.general.max_context_chars,
         );
         let req = ChatRequest {
@@ -791,7 +795,7 @@ async fn run_pipeline_inner(
             system,
             messages: messages.clone(),
             tools: vec![],
-            max_tokens: cfg.file.general.max_tokens,
+            max_tokens: output_token_limit,
             stream: true,
         };
         let on_main_event = |ev: StreamEvent| match ev {
@@ -1995,8 +1999,7 @@ pub(crate) const REVIEW_GATE_MAX_ITER: u32 = 8;
 const REVIEW_SUMMARY_CAP: usize = 2000;
 
 /// 판정 불능일 때 리뷰어에게 한 번만 되묻는 문장.
-const REVIEW_REQUERY: &str =
-    "[판정] pass 또는 fail 한 줄로만 결론을 내라. 이미 읽은 근거로 판정하라.";
+const REVIEW_REQUERY: &str = "직접 검사하지 않았다면 read_file 또는 grep으로 현재 코드를 먼저 확인하라. 그 뒤 [판정] pass 또는 fail 결론을 다시 남겨라.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewVerdict {
@@ -2286,6 +2289,22 @@ fn reviewer_registry(requested: &[String]) -> Result<ToolRegistry> {
     ToolRegistry::with_exact_names(&canonical)
 }
 
+fn reviewer_has_successful_inspection(run_context: &RunContext, since: usize) -> bool {
+    run_context
+        .lifecycle_events()
+        .iter()
+        .skip(since)
+        .any(|event| {
+            &event.run_id == run_context.run_id()
+                && event.agent_id.as_ref() == run_context.agent_id()
+                && matches!(
+                    &event.event,
+                    crate::lifecycle::LifecycleEventData::ToolFinished { name, ok: true }
+                        if matches!(name.as_str(), "read_file" | "grep")
+                )
+        })
+}
+
 fn record_reviewer_workspace_delta(
     snapshot: crate::tools::workspace_delta::WorkspaceSnapshot,
     run_context: &RunContext,
@@ -2385,6 +2404,7 @@ async fn run_review_gate(
         };
         // 안쪽 루프는 "판정 불능 → 결론만 재질의" 1회를 흡수한다.
         let mut resume: Option<Vec<Message>> = None;
+        let mut reviewer_inspected = false;
         let action = loop {
             let review_iterations = remaining_iteration_budget(
                 turn_iteration_limit,
@@ -2411,6 +2431,15 @@ async fn run_review_gate(
                     return outcome;
                 }
             };
+            let reviewer_nonce = crate::db::Db::new_id();
+            let reviewer_run = run_context.child(
+                crate::run::RunId::new(format!(
+                    "{}:reviewer-{reviewer_nonce}",
+                    run_context.run_id()
+                )),
+                crate::run::AgentId::new(format!("reviewer-{reviewer_nonce}")),
+            );
+            let lifecycle_marker = reviewer_run.lifecycle_events().len();
             let review_result = run_review_once(
                 cfg,
                 &reviewer,
@@ -2421,9 +2450,31 @@ async fn run_review_gate(
                 yes,
                 remote.clone(),
                 local_ask.clone(),
-                run_context.clone(),
+                reviewer_run.clone(),
             )
             .await;
+            reviewer_inspected |=
+                reviewer_has_successful_inspection(&reviewer_run, lifecycle_marker);
+            match &review_result {
+                Ok(review) => {
+                    let state = match review.status.as_str() {
+                        "ok" => TerminalState::Succeeded,
+                        "cancelled" => TerminalState::Cancelled,
+                        "limit" | "incomplete" => TerminalState::Limited,
+                        _ => TerminalState::Failed,
+                    };
+                    let error = review
+                        .error
+                        .as_deref()
+                        .map(|detail| crate::quality::redact_local_output(detail, &cfg.workspace));
+                    reviewer_run.finish_with_error(state, error);
+                }
+                Err(error) => {
+                    let detail =
+                        crate::quality::redact_local_output(&error.to_string(), &cfg.workspace);
+                    reviewer_run.finish_with_error(TerminalState::Failed, Some(detail));
+                }
+            }
             match record_reviewer_workspace_delta(reviewer_snapshot, &run_context) {
                 Ok(false) => {}
                 Ok(true) => {
@@ -2463,7 +2514,7 @@ async fn run_review_gate(
             outcome.output_tokens = outcome.output_tokens.saturating_add(review.output_tokens);
 
             // 리뷰어가 정상 종료하지 못했으면 그 출력은 결론이 아니다 — 판정 불능으로 본다.
-            let verdict = if review.status == "ok" {
+            let verdict = if review.status == "ok" && reviewer_inspected {
                 parse_review_gate_verdict(
                     &agent::last_assistant_text(&review.messages),
                     persona.is_none(),
@@ -3391,6 +3442,63 @@ mod tests {
         for name in ["read_file", "list_dir", "grep", "glob"] {
             assert!(exact.get(name).is_some());
         }
+    }
+
+    #[test]
+    fn reviewer_pass_requires_a_successful_direct_inspection_trace() {
+        let parent = RunContext::isolated(
+            crate::run::RunId::new("review-trace-parent"),
+            std::env::temp_dir(),
+        );
+        let reviewer = parent.child(
+            crate::run::RunId::new("review-trace-reviewer"),
+            crate::run::AgentId::new("reviewer"),
+        );
+        let unrelated = parent.child(
+            crate::run::RunId::new("review-trace-unrelated"),
+            crate::run::AgentId::new("unrelated"),
+        );
+        let same_run_id = parent.child(
+            crate::run::RunId::new("review-trace-reviewer"),
+            crate::run::AgentId::new("different-agent"),
+        );
+        for run in [&reviewer, &unrelated, &same_run_id] {
+            run.transition_lifecycle(crate::lifecycle::LifecycleEventData::RunStarted {
+                model: Some("test".into()),
+            })
+            .expect("start child run");
+        }
+        let marker = reviewer.lifecycle_events().len();
+
+        unrelated
+            .transition_lifecycle(crate::lifecycle::LifecycleEventData::ToolFinished {
+                name: "read_file".into(),
+                ok: true,
+            })
+            .expect("record unrelated inspection");
+        same_run_id
+            .transition_lifecycle(crate::lifecycle::LifecycleEventData::ToolFinished {
+                name: "grep".into(),
+                ok: true,
+            })
+            .expect("record wrong-agent inspection");
+        assert!(!reviewer_has_successful_inspection(&reviewer, marker));
+
+        reviewer
+            .transition_lifecycle(crate::lifecycle::LifecycleEventData::ToolFinished {
+                name: "read_file".into(),
+                ok: false,
+            })
+            .expect("record failed inspection");
+        assert!(!reviewer_has_successful_inspection(&reviewer, marker));
+
+        reviewer
+            .transition_lifecycle(crate::lifecycle::LifecycleEventData::ToolFinished {
+                name: "grep".into(),
+                ok: true,
+            })
+            .expect("record successful inspection");
+        assert!(reviewer_has_successful_inspection(&reviewer, marker));
     }
 
     #[test]

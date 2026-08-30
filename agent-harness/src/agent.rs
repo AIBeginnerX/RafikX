@@ -294,12 +294,14 @@ pub async fn run_agent_with_context(
         );
         worker_activity(&run_context, &format!("반복 {iterations}/{max_iter}"));
         let specs = registry.specs();
+        let output_token_limit =
+            crate::packer::effective_output_limit(context_window, cfg.file.general.max_tokens);
         messages = crate::packer::pack_messages(
             &messages,
             &system,
             &specs,
             context_window,
-            cfg.file.general.max_tokens,
+            output_token_limit,
             cfg.file.general.max_context_chars,
         );
         crate::graph::node_in(
@@ -315,7 +317,7 @@ pub async fn run_agent_with_context(
             system: system.clone(),
             messages: messages.clone(),
             tools: registry.specs(),
-            max_tokens: cfg.file.general.max_tokens,
+            max_tokens: output_token_limit,
             stream: true,
         };
 

@@ -3,6 +3,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::App;
 use super::view::Pal;
@@ -32,7 +33,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
 
 fn draw_split(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     // 하단 기존 내용(RECENT 제외)에 필요한 줄 수를 확보하고 나머지를 배너에 준다.
-    let bottom_rows = bottom_lines(app, palette, false).len() as u16 + 2;
+    let bottom_rows = bottom_lines(app, palette, false, area.width as usize).len() as u16 + 2;
     let banner_h = area.height.saturating_sub(bottom_rows).min(BANNER_LINES);
     let (banner, bottom) = if banner_h >= 10 {
         (
@@ -74,7 +75,7 @@ fn draw_split(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     }
 
     if bottom.height > 0 {
-        let lines = bottom_lines(app, palette, false);
+        let lines = bottom_lines(app, palette, false, area.width as usize);
         f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), bottom);
     }
 }
@@ -160,6 +161,15 @@ fn marquee_line(tick: u16, width: usize) -> String {
         .collect()
 }
 
+fn banner_status_line(tick: u16, is_booting: bool, width: usize) -> String {
+    if is_booting {
+        return marquee_line(tick, width);
+    }
+    let status = truncate_display("RUNTIME ONLINE", width);
+    let padding = width.saturating_sub(display_width(&status)) / 2;
+    format!("{}{status}", " ".repeat(padding))
+}
+
 fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
     let left_inner_w = area.width.saturating_sub(4) as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -226,7 +236,11 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
         lines.push(Line::default());
         lines.push(Line::from(ribbon));
         lines.push(Line::from(Span::styled(
-            marquee_line(app.motion_tick, left_inner_w.min(WORDMARK_W + 6)),
+            banner_status_line(
+                app.motion_tick,
+                booting(app),
+                left_inner_w.min(WORDMARK_W + 6),
+            ),
             Style::default().fg(palette.secondary),
         )));
     } else {
@@ -238,7 +252,7 @@ fn draw_banner(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
-            marquee_line(app.motion_tick, left_inner_w),
+            banner_status_line(app.motion_tick, booting(app), left_inner_w),
             Style::default().fg(palette.secondary),
         )));
     }
@@ -317,39 +331,75 @@ fn digest_features() -> [&'static str; 4] {
 }
 
 fn truncated_line(marker: &str, text: &str, width: usize, style: Style) -> Line<'static> {
-    let budget = width.saturating_sub(marker.chars().count());
-    let shown: String = if display_width(text) <= budget {
-        text.to_string()
-    } else {
-        let mut out = String::new();
-        let mut used = 0usize;
-        for ch in text.chars() {
-            let w = if ch.is_ascii() { 1 } else { 2 };
-            if used + w + 1 > budget {
-                break;
-            }
-            out.push(ch);
-            used += w;
-        }
-        out.push('…');
-        out
-    };
+    let budget = width.saturating_sub(display_width(marker));
+    let shown = truncate_display(text, budget);
     Line::from(vec![
         Span::styled(marker.to_string(), style),
         Span::styled(shown, style),
     ])
 }
 
-/// 대략적 표시 폭 — 한글 등 비 ASCII 는 2칸으로 계산 (잘림 방지용 추정).
 fn display_width(text: &str) -> usize {
-    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+    UnicodeWidthStr::width(text)
+}
+
+fn truncate_display(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut shown = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + char_width + 1 > width {
+            break;
+        }
+        shown.push(ch);
+        used += char_width;
+    }
+    shown.push('…');
+    shown
+}
+
+fn compact_workspace(path: &str, width: usize) -> String {
+    if display_width(path) <= width {
+        return path.to_string();
+    }
+    let tail = path
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(path);
+    let prefix = "…/";
+    if display_width(prefix) >= width {
+        return truncate_display(prefix, width);
+    }
+    format!(
+        "{prefix}{}",
+        truncate_display(tail, width - display_width(prefix))
+    )
+}
+
+fn compact_tip(tip: &str, width: usize) -> String {
+    let full = format!("{tip}  ·  /tips");
+    if display_width(&full) <= width {
+        return full;
+    }
+    truncate_display("팁 더 보기  ·  /tips", width)
 }
 
 // ---------------------------------------------------------------------------
 // 하단 — 기존에 표시되던 정보 (분할 모드에선 RECENT 를 오른쪽 패널이 대신한다).
 // ---------------------------------------------------------------------------
 
-fn bottom_lines(app: &App, palette: &Pal, include_recent: bool) -> Vec<Line<'static>> {
+fn bottom_lines(
+    app: &App,
+    palette: &Pal,
+    include_recent: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         if booting(app) {
@@ -366,8 +416,8 @@ fn bottom_lines(app: &App, palette: &Pal, include_recent: bool) -> Vec<Line<'sta
         Style::default().fg(palette.body),
     )));
     lines.push(Line::default());
-    lines.push(metadata_line("MODEL", &app.binding, palette));
-    lines.push(metadata_line("WORKSPACE", &app.cwd, palette));
+    lines.push(metadata_line("MODEL", &app.binding, palette, width));
+    lines.push(workspace_line(&app.cwd, palette, width));
     if include_recent && !app.recent_sessions.is_empty() {
         let joined = app
             .recent_sessions
@@ -375,11 +425,11 @@ fn bottom_lines(app: &App, palette: &Pal, include_recent: bool) -> Vec<Line<'sta
             .map(|s| s.title.as_str())
             .collect::<Vec<_>>()
             .join("  ›  ");
-        lines.push(metadata_line("RECENT", &joined, palette));
+        lines.push(metadata_line("RECENT", &joined, palette, width));
     }
     if let Some(tip) = &app.start_tip {
         // 세션당 1줄 — App 생성 시 고정된 팁 (F9). /tips off 로 영구 해제.
-        lines.push(metadata_line("TIP", &format!("{tip}  ·  /tips"), palette));
+        lines.push(tip_line(tip, palette, width));
     }
     lines.push(Line::from(Span::styled(
         if configured(app) {
@@ -429,8 +479,9 @@ fn draw_centered(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
         )));
     }
     lines.push(Line::default());
-    lines.push(metadata_line("MODEL", &app.binding, palette));
-    lines.push(metadata_line("WORKSPACE", &app.cwd, palette));
+    let width = area.width as usize;
+    lines.push(metadata_line("MODEL", &app.binding, palette, width));
+    lines.push(workspace_line(&app.cwd, palette, width));
     if area.height >= 16 && !app.recent_sessions.is_empty() {
         // 데스크탑 splash의 세션 히스토리에 대응하는 CLI 시작 화면 요소.
         let joined = app
@@ -439,10 +490,10 @@ fn draw_centered(f: &mut Frame, app: &App, area: Rect, palette: &Pal) {
             .map(|s| s.title.as_str())
             .collect::<Vec<_>>()
             .join("  ›  ");
-        lines.push(metadata_line("RECENT", &joined, palette));
+        lines.push(metadata_line("RECENT", &joined, palette, width));
     }
     if let Some(tip) = &app.start_tip {
-        lines.push(metadata_line("TIP", &format!("{tip}  ·  /tips"), palette));
+        lines.push(tip_line(tip, palette, width));
     }
     if area.height >= 14 {
         lines.push(Line::from(Span::styled(
@@ -508,14 +559,37 @@ fn signal_lines(app: &App, compact: bool, palette: &Pal) -> Vec<Line<'static>> {
     ]
 }
 
-fn metadata_line(label: &str, value: &str, palette: &Pal) -> Line<'static> {
+fn metadata_line(label: &str, value: &str, palette: &Pal, width: usize) -> Line<'static> {
+    const LABEL_WIDTH: usize = 10;
+    let value = truncate_display(value, width.saturating_sub(LABEL_WIDTH));
     Line::from(vec![
         Span::styled(
             format!("{label:<10}"),
             Style::default().fg(palette.secondary),
         ),
-        Span::styled(value.to_string(), Style::default().fg(palette.text)),
+        Span::styled(value, Style::default().fg(palette.text)),
     ])
+}
+
+fn workspace_line(path: &str, palette: &Pal, width: usize) -> Line<'static> {
+    const LABEL_WIDTH: usize = 10;
+    const SIDE_MARGIN: usize = 4;
+    metadata_line(
+        "WORKSPACE",
+        &compact_workspace(path, width.saturating_sub(LABEL_WIDTH + SIDE_MARGIN)),
+        palette,
+        width,
+    )
+}
+
+fn tip_line(tip: &str, palette: &Pal, width: usize) -> Line<'static> {
+    const LABEL_WIDTH: usize = 10;
+    metadata_line(
+        "TIP",
+        &compact_tip(tip, width.saturating_sub(LABEL_WIDTH)),
+        palette,
+        width,
+    )
 }
 
 fn booting(app: &App) -> bool {
@@ -643,6 +717,27 @@ mod tests {
         assert_eq!(marquee_line(0, 0), "");
         // 다중 바이트 문자가 깨지지 않는다 — 순환 문구의 '·' 가 그대로 나온다.
         assert!(marquee_line(0, 60).contains('·'), "UTF-8 보존");
+    }
+
+    #[test]
+    fn settled_banner_replaces_marquee_with_static_status() {
+        assert_ne!(
+            banner_status_line(0, true, 20),
+            banner_status_line(1, true, 20)
+        );
+        assert!(banner_status_line(40, false, 20).contains("RUNTIME ONLINE"));
+        assert_eq!(display_width(&banner_status_line(40, false, 8)), 8);
+    }
+
+    #[test]
+    fn compact_metadata_preserves_meaning_at_narrow_widths() {
+        let workspace = compact_workspace("/Users/noah/projects/RafikX", 14);
+        assert_eq!(workspace, "…/RafikX");
+        assert!(display_width(&workspace) <= 14);
+
+        let tip = compact_tip("긴 한국어 도움말은 문장 중간에서 잘리면 안 됩니다", 30);
+        assert_eq!(tip, "팁 더 보기  ·  /tips");
+        assert!(display_width(&tip) <= 30);
     }
 
     #[test]

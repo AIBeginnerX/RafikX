@@ -18,4 +18,8 @@
       (기존 동작, Self-Harness 의 flush_observations 와 같은 항목)
 - [ ] (보류) chat 단위테스트가 실제 config 를 대상으로 실행됨 — 병렬 실행 시
       engine 값 오염 가능 (기존 테스트 설계)
+- [ ] (보류) 저장소 전체 rustfmt·Clippy 기존 부채 정리 — 동작 변경과 분리한
+      전용 Phase에서 경고·포맷 차이를 기준선부터 정리
+- [ ] (보류) 환경 의존 LSP 실동작 테스트 3개 — rust-analyzer·typescript-language-server
+      설치가 허용된 검증 환경에서 ignore 해제 후 교차 플랫폼 실행
 - [ ] (보류) 데스크탑 index.html:602 stale allowlist 버그 (dk/pi 미표시)

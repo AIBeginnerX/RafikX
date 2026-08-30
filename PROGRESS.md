@@ -1,3 +1,3 @@
-완료: v1.1.9 CLI 후보 — 검증 증거 사전 정제·실패 사유 보존, 3초 상한의 세대 고정 Unix 정리, 인증·일회성 브라우저 영수증, Canvas 가림 판정, Windows Chrome/Edge 탐색, gofmt/shfmt 차이 검출을 구현. 전체 568개·최소 기능 511개 테스트, 프로세스 3종 12회 반복, 실제 Chrome 49개와 게임 복구 E2E 29.15초를 통과.
-다음: 새 정확 커밋 SHA를 5개 독립 gpt-5.6-sol CLI 검증에 통과시킨 뒤 그 SHA를 push하고 3개 OS·Rust 1.96 CI 성공 후 v1.1.9 annotated tag·GitHub Release를 게시하며 설치된 터미널의 `rafikx update`까지 검증한다. Tauri 데스크탑과 디지털 애니메이션 시작 화면은 별도 후속 Phase로 보류한다.
-이슈: 환경 의존 LSP 실동작 3개와 릴리스용 브라우저 게임 E2E 1개는 기본 실행에서 ignore이며 후자는 명시 실행으로 통과. Unix 추적은 환경과 상속 scope FD를 함께 지우고 daemonize하는 적대 프로세스를 가두는 샌드박스가 아니며, 기존 compiler·Clippy 경고와 전역 rustfmt 부채 외 신규 오류 없음.
+완료: v1.1.9 터미널 CLI 후보 — Unix 자손 정리 수렴·timeout 신원 보존, 검증자의 직접 열람 증거·고유 자식 문맥, 컨텍스트 기반 출력 예산, 일회성 브라우저 영수증, Unicode 폭 기반 시작 화면과 격리 PTY QA를 완성했다.
+검증: 기본 575개·최소 기능 516개 테스트, `cargo check` 양 구성, Clippy·release build, 게임 복구 E2E 29.35초, 실제 xterm.js 8개 화면의 폭 초과·테두리 오정렬 0건과 GPT-5.6 Sol 시각 검토 2/2를 통과했다. 환경 의존 LSP 3개는 ignore다.
+다음: 현재 후보의 정확 SHA를 GPT-5.6 Sol 코드·보안·아키텍처·계약·수동 QA 5/5에 통과시킨 뒤 master push → Rust 1.96·Ubuntu·Windows·macOS CI → v1.1.9 annotated tag·GitHub Release → 설치본 `rafikx update`를 완료한다. 데스크탑은 계속 제외한다.

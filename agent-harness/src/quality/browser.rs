@@ -2122,13 +2122,57 @@ struct ProbeServerState {
     token: Arc<str>,
     script_served: Arc<AtomicBool>,
     ready: tokio::sync::watch::Sender<bool>,
-    game: Arc<AtomicBool>,
-    completed: Arc<AtomicBool>,
+    sequence: Arc<Mutex<ProbeSequence>>,
+}
+
+#[derive(Default)]
+struct ProbeSequence {
+    game: bool,
+    completed: bool,
+    errors: std::collections::BTreeSet<String>,
 }
 
 struct ProbeReceipt {
     ready: tokio::sync::watch::Receiver<bool>,
-    game: Arc<AtomicBool>,
+    sequence: Arc<Mutex<ProbeSequence>>,
+}
+
+enum ProbeReceiptDecision {
+    Accepted(Option<String>),
+    Conflict,
+    Unavailable,
+}
+
+fn accept_probe_receipt(
+    probe: &ProbeServerState,
+    kind: &str,
+    decoded_error: Option<String>,
+) -> ProbeReceiptDecision {
+    let Ok(mut sequence) = probe.sequence.lock() else {
+        return ProbeReceiptDecision::Unavailable;
+    };
+    match kind {
+        "game" if !sequence.completed && !sequence.game => {
+            sequence.game = true;
+            ProbeReceiptDecision::Accepted(None)
+        }
+        "ready" if !sequence.completed => {
+            sequence.completed = true;
+            let _ = probe.ready.send(true);
+            ProbeReceiptDecision::Accepted(None)
+        }
+        "error" if !sequence.completed => {
+            let Some(detail) = decoded_error else {
+                return ProbeReceiptDecision::Conflict;
+            };
+            if sequence.errors.insert(detail.clone()) {
+                ProbeReceiptDecision::Accepted(Some(detail))
+            } else {
+                ProbeReceiptDecision::Conflict
+            }
+        }
+        _ => ProbeReceiptDecision::Conflict,
+    }
 }
 
 impl SmokeResources {
@@ -2232,42 +2276,36 @@ async fn serve_request(
             return write_response(&mut stream, "403 Forbidden", "text/plain", b"forbidden")
                 .await;
         }
-        match kind {
-            "game" => {
-                if probe.completed.load(Ordering::Acquire)
-                    || probe.game.swap(true, Ordering::AcqRel)
-                {
-                    return write_response(
-                        &mut stream,
-                        "409 Conflict",
-                        "text/plain",
-                        b"duplicate receipt",
-                    )
-                    .await;
-                }
+        let decoded_error = detail.and_then(percent_decode_path);
+        if kind == "error" && decoded_error.is_none() {
+            return write_response(&mut stream, "403 Forbidden", "text/plain", b"forbidden").await;
+        }
+        let accepted_error = match accept_probe_receipt(&probe, kind, decoded_error) {
+            ProbeReceiptDecision::Accepted(detail) => detail,
+            ProbeReceiptDecision::Conflict => {
+                return write_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "text/plain",
+                    b"duplicate or out-of-order receipt",
+                )
+                .await;
             }
-            "ready" => {
-                if probe.completed.swap(true, Ordering::AcqRel) {
-                    return write_response(
-                        &mut stream,
-                        "409 Conflict",
-                        "text/plain",
-                        b"duplicate receipt",
-                    )
-                    .await;
-                }
-                let _ = probe.ready.send(true);
+            ProbeReceiptDecision::Unavailable => {
+                return write_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "text/plain",
+                    b"probe state unavailable",
+                )
+                .await;
             }
-            "error" => {
-                if let Some(detail) = detail
-                    && let Some(detail) = percent_decode_path(detail)
-                    && let Ok(mut errors) = errors.lock()
-                    && errors.len() < MAX_BROWSER_ERRORS
-                {
-                    errors.push(detail.chars().take(300).collect());
-                }
-            }
-            _ => unreachable!(),
+        };
+        if let Some(detail) = accepted_error
+            && let Ok(mut errors) = errors.lock()
+            && errors.len() < MAX_BROWSER_ERRORS
+        {
+            errors.push(detail.chars().take(300).collect());
         }
         return write_response(&mut stream, "204 No Content", "text/plain", b"").await;
     }
@@ -2326,17 +2364,16 @@ async fn start_server(
     let address = listener.local_addr()?;
     let errors = Arc::new(Mutex::new(Vec::new()));
     let (ready, ready_receipt) = tokio::sync::watch::channel(false);
-    let game = Arc::new(AtomicBool::new(false));
+    let sequence = Arc::new(Mutex::new(ProbeSequence::default()));
     let probe = ProbeServerState {
         token: Arc::from(crate::auth::random_hex(16)),
         script_served: Arc::new(AtomicBool::new(false)),
         ready,
-        game: game.clone(),
-        completed: Arc::new(AtomicBool::new(false)),
+        sequence: sequence.clone(),
     };
     let receipt = ProbeReceipt {
         ready: ready_receipt,
-        game,
+        sequence,
     };
     let server_errors = errors.clone();
     let server_root = root.clone();
@@ -2515,7 +2552,11 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
         .unwrap_or_default();
     let stderr = stderr_log.lock().map(|log| log.clone()).unwrap_or_default();
     let probe_ready = *probe_receipt.ready.borrow();
-    let game_sequence_ready = probe_receipt.game.load(Ordering::Acquire);
+    let game_sequence_ready = probe_receipt
+        .sequence
+        .lock()
+        .map(|sequence| sequence.game)
+        .unwrap_or(false);
     Ok(Some(evaluate_browser_output(
         success,
         code,
@@ -2648,13 +2689,12 @@ retainedLog('__RAFIKX_BROWSER_READY__');
     #[tokio::test]
     async fn probe_receipts_reject_wrong_tokens_replays_and_source_refetches() {
         let (ready, ready_receipt) = tokio::sync::watch::channel(false);
-        let game = Arc::new(AtomicBool::new(false));
+        let sequence = Arc::new(Mutex::new(ProbeSequence::default()));
         let state = ProbeServerState {
             token: Arc::from("test-capability"),
             script_served: Arc::new(AtomicBool::new(false)),
             ready,
-            game: game.clone(),
-            completed: Arc::new(AtomicBool::new(false)),
+            sequence: sequence.clone(),
         };
 
         let source = probe_request(
@@ -2677,7 +2717,20 @@ retainedLog('__RAFIKX_BROWSER_READY__');
         )
         .await;
         assert!(wrong.contains("403 Forbidden"));
-        assert!(!game.load(Ordering::Acquire));
+        assert!(!sequence.lock().unwrap().game);
+
+        let accepted_error = probe_request(
+            state.clone(),
+            "POST /__rafikx_probe_result/test-capability/error/runtime%20failure HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(accepted_error.contains("204 No Content"));
+        let replayed_error = probe_request(
+            state.clone(),
+            "POST /__rafikx_probe_result/test-capability/error/runtime%20failure HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(replayed_error.contains("409 Conflict"));
 
         let accepted_game = probe_request(
             state.clone(),
@@ -2685,7 +2738,7 @@ retainedLog('__RAFIKX_BROWSER_READY__');
         )
         .await;
         assert!(accepted_game.contains("204 No Content"));
-        assert!(game.load(Ordering::Acquire));
+        assert!(sequence.lock().unwrap().game);
         let accepted_ready = probe_request(
             state.clone(),
             "POST /__rafikx_probe_result/test-capability/ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
@@ -2693,6 +2746,18 @@ retainedLog('__RAFIKX_BROWSER_READY__');
         .await;
         assert!(accepted_ready.contains("204 No Content"));
         assert!(*ready_receipt.borrow());
+        let late_game = probe_request(
+            state.clone(),
+            "POST /__rafikx_probe_result/test-capability/game HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(late_game.contains("409 Conflict"));
+        let late_error = probe_request(
+            state.clone(),
+            "POST /__rafikx_probe_result/test-capability/error/late HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(late_error.contains("409 Conflict"));
         let replay = probe_request(
             state,
             "POST /__rafikx_probe_result/test-capability/ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
