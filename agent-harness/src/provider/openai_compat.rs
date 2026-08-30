@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::{
     ChatRequest, ChatResponse, ContentBlock, LimitHint, Message, Role, StopReason, StreamEvent,
-    limit_hint, map_stop_reason, rate_limit_error,
+    limit_hint, map_stop_reason,
 };
 
 const CODEX_RESPONSES: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -686,11 +686,11 @@ fn map_openai_finish(raw: Option<&str>) -> StopReason {
     }
 }
 
-fn api_error(status: u16, body: &str, hint: &LimitHint, mode: &CompatMode) -> anyhow::Error {
+fn api_error(status: u16, _body: &str, hint: &LimitHint, mode: &CompatMode) -> anyhow::Error {
     if status == 429 {
-        return rate_limit_error(status, body, hint);
+        let wait = hint.retry_after_secs.unwrap_or(45);
+        return anyhow!("OpenAI 호환 API 요청 제한 (HTTP {status}) retry_after={wait}");
     }
-    let snippet: String = body.chars().take(400).collect();
     if status == 401 {
         return match mode {
             CompatMode::CodexResponses => anyhow!(
@@ -701,7 +701,7 @@ fn api_error(status: u16, body: &str, hint: &LimitHint, mode: &CompatMode) -> an
             }
         };
     }
-    anyhow!("OpenAI 호환 API 오류 HTTP {status}: {snippet}")
+    anyhow!("OpenAI 호환 API 오류 HTTP {status}")
 }
 
 fn session_id() -> String {
@@ -1274,5 +1274,38 @@ mod usage_tests {
         take_stream_usage(&event, &mut input, &mut output, &mut cached, &mut reported);
         assert_eq!((input, output, cached), (1200, 80, 900));
         assert!(reported);
+    }
+
+    #[test]
+    fn api_error_discards_untrusted_body_before_persistent_logging() {
+        let echoed_bearer = "unlabeled-echoed-bearer-7f8db8d8";
+        let body = format!("upstream detail: {echoed_bearer}");
+
+        for status in [429, 500] {
+            let error = api_error(
+                status,
+                &body,
+                &LimitHint {
+                    retry_after_secs: Some(12),
+                    ..LimitHint::default()
+                },
+                &CompatMode::ChatCompletions,
+            );
+            for persistent_log_message in [
+                format!("{error}"),
+                format!("{error:#}"),
+                format!("{error:?}"),
+            ] {
+                assert!(persistent_log_message.contains(&format!("HTTP {status}")));
+                assert!(
+                    !persistent_log_message.contains(echoed_bearer),
+                    "persistent log leaked untrusted provider body: {persistent_log_message}"
+                );
+                assert!(
+                    !persistent_log_message.contains("upstream detail"),
+                    "persistent log retained provider response body: {persistent_log_message}"
+                );
+            }
+        }
     }
 }
