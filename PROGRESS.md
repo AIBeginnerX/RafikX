@@ -1,3 +1,3 @@
-완료: v1.1.9 터미널 CLI의 프로세스 정리·요청 예산·도구 쌍·provider 오류 로그·lifecycle 준비 상태·PTY 정리 차단점을 단계별 커밋으로 닫고 릴리스 후보 문서를 현재 구현과 맞췄다.
-검증: 기본 605개·최소 기능 539개, process-tree 17개, TUI 62개, 게임 복구 E2E 29.03초, xterm.js 9개 화면 동시 2회, Clippy와 릴리스 `RafikX 1.1.9`가 통과했다. LSP 3개와 릴리스 E2E 1개는 기본 실행에서 ignore다.
-다음: 새 후보의 정확 SHA를 GPT-5.6 Sol 코드·보안·아키텍처·계약·수동 QA와 시각·CJK 전 레인에 통과시킨 뒤 push → CLI CI → v1.1.9 Release → 설치본 update를 완료한다. 데스크탑은 계속 제외한다.
+완료: `750a589` 정확 SHA의 7개 독립 검증 결과를 기록하고, 포화된 프로세스 정리가 8초 예산 안에서 재대기하지 않도록 정리 세션 허가와 물리 스캔 허가를 분리했으며 중복 pre-KILL 전체 스캔을 제거했다.
+검증: 새 포화 회귀를 포함한 process-tree 18개와 기본 병렬 library 573개, cargo check가 통과했고 취소된 Linux blocking scan은 기존 회귀에서 실제 스캔 permit을 완료까지 유지한다.
+다음: Anthropic·OpenAI 오류 본문과 PTY 환경 전달의 비밀·메모리 경계를 닫고, 0-message 요청과 ULW epoch·Ready·Answering 차단점을 별도 커밋으로 순차 해결한다. 데스크탑은 계속 제외한다.

@@ -36,6 +36,10 @@ static PROCESS_SCOPE_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 static PROCESS_DISCOVERY_PERMITS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)));
 #[cfg(unix)]
+static PROCESS_CLEANUP_ADMISSION_PERMITS: std::sync::LazyLock<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)));
+#[cfg(unix)]
 const PROCESS_SCOPE_ENV: &str = "RAFIKX_PROCESS_SCOPE";
 #[cfg(unix)]
 const MAX_SCOPE_SCAN_BYTES: usize = 64 * 1024 * 1024;
@@ -306,8 +310,11 @@ pub(crate) struct ProcessScope {
 #[derive(Debug, Default)]
 struct CleanupProbe {
     worker_started: tokio::sync::Notify,
+    cleanup_admission_acquired: tokio::sync::Notify,
+    cleanup_admission_calls: std::sync::atomic::AtomicUsize,
     scope_discovery_started: tokio::sync::Notify,
     scope_discovery_calls: std::sync::atomic::AtomicUsize,
+    cleanup_admission_permits: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     discovery_permits: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
@@ -1031,6 +1038,21 @@ fn process_discovery_permits(_scope: &ProcessScope) -> std::sync::Arc<tokio::syn
     std::sync::Arc::clone(&PROCESS_DISCOVERY_PERMITS)
 }
 
+#[cfg(unix)]
+fn process_cleanup_admission_permits(
+    _scope: &ProcessScope,
+) -> std::sync::Arc<tokio::sync::Semaphore> {
+    #[cfg(test)]
+    if let Some(permits) = _scope
+        .cleanup_probe
+        .as_ref()
+        .and_then(|probe| probe.cleanup_admission_permits.as_ref())
+    {
+        return std::sync::Arc::clone(permits);
+    }
+    std::sync::Arc::clone(&PROCESS_CLEANUP_ADMISSION_PERMITS)
+}
+
 #[cfg(all(unix, not(target_os = "linux")))]
 async fn inherited_scope_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
     #[cfg(test)]
@@ -1250,10 +1272,6 @@ async fn terminate_unix_inner(
     if scope.force_cleanup_timeout {
         tokio::time::sleep(PROCESS_CLEANUP_TIMEOUT + Duration::from_millis(100)).await;
     }
-    if !first_visible.is_empty() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        capture_scoped_identities(scope, root, captured, cleanup_errors).await;
-    }
     signal_captured_processes(captured, PROCESS_KILL_SIGNAL, cleanup_errors);
     if let Some(pid) = root
         && let Err(error) = signal_process_group(pid, PROCESS_KILL_SIGNAL)
@@ -1300,6 +1318,32 @@ async fn terminate_owned(mut child: Child, scope: ProcessScope) -> Result<(), St
             probe.worker_started.notify_one();
         }
         quiesce_root_before_cleanup(&mut child, &mut cleanup_errors);
+        let _cleanup_admission = match process_cleanup_admission_permits(&scope)
+            .acquire_owned()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                cleanup_errors.push("프로세스 정리 허가가 닫혔습니다".into());
+                if let Some(pid) = active_root(&mut child, &mut cleanup_errors) {
+                    if let Err(error) = signal_process_group(pid, PROCESS_KILL_SIGNAL) {
+                        cleanup_errors.push(error);
+                    }
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                }
+                cleanup_errors.sort();
+                cleanup_errors.dedup();
+                return Err(cleanup_errors.join("; "));
+            }
+        };
+        #[cfg(test)]
+        if let Some(probe) = &scope.cleanup_probe {
+            probe
+                .cleanup_admission_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            probe.cleanup_admission_acquired.notify_one();
+        }
         let mut captured = Vec::new();
         let root = active_root(&mut child, &mut cleanup_errors);
         let first_visible =
@@ -1579,9 +1623,15 @@ mod tests {
         let mut command = Command::new("sleep");
         command.arg("30");
         let (child, mut scope) = spawn_scoped(&mut command).expect("spawn queued cleanup fixture");
-        let probe = std::sync::Arc::new(CleanupProbe::default());
+        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let probe = std::sync::Arc::new(CleanupProbe {
+            cleanup_admission_permits: Some(cleanup_admission_permits),
+            discovery_permits: Some(discovery_permits.clone()),
+            ..CleanupProbe::default()
+        });
         scope.cleanup_probe = Some(probe.clone());
-        let permit = PROCESS_DISCOVERY_PERMITS
+        let permit = discovery_permits
             .acquire_many(2)
             .await
             .expect("hold discovery permit");
@@ -1612,6 +1662,76 @@ mod tests {
             .expect("queued cleanup completed")
             .expect("cleanup caller joined")
             .expect("queued cleanup succeeded");
+    }
+
+    #[tokio::test]
+    async fn cleanup_admission_limits_saturated_sessions_before_discovery() {
+        // Given: two admitted cleanup sessions blocked before discovery and a third queued session.
+        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let held_discovery = discovery_permits
+            .acquire_many(2)
+            .await
+            .expect("hold both discovery permits");
+        let mut cleanups = Vec::new();
+        let mut probes = Vec::new();
+        for index in 0..3 {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            let (child, mut scope) =
+                spawn_scoped(&mut command).expect("spawn saturated cleanup fixture");
+            let probe = std::sync::Arc::new(CleanupProbe {
+                cleanup_admission_permits: Some(cleanup_admission_permits.clone()),
+                discovery_permits: Some(discovery_permits.clone()),
+                ..CleanupProbe::default()
+            });
+            scope.cleanup_probe = Some(probe.clone());
+            let cleanup = tokio::spawn(terminate(child, scope));
+            tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
+                .await
+                .expect("cleanup worker started");
+            if index < 2 {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    probe.cleanup_admission_acquired.notified(),
+                )
+                .await
+                .expect("cleanup session admitted");
+            }
+            cleanups.push(cleanup);
+            probes.push(probe);
+        }
+
+        // Then: only two sessions own admission while all physical scans remain separately gated.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            probes[2]
+                .cleanup_admission_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "third cleanup entered before an admitted session completed"
+        );
+        assert_eq!(
+            discovery_permits.available_permits(),
+            0,
+            "cleanup admission bypassed physical discovery gating"
+        );
+
+        drop(held_discovery);
+        for cleanup in cleanups {
+            tokio::time::timeout(Duration::from_secs(20), cleanup)
+                .await
+                .expect("saturated cleanup completed")
+                .expect("cleanup caller joined")
+                .expect("saturated cleanup succeeded");
+        }
+        assert_eq!(
+            probes[2]
+                .cleanup_admission_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "queued cleanup never acquired admission"
+        );
     }
 
     #[tokio::test]
@@ -1652,8 +1772,10 @@ mod tests {
         })
         .await
         .expect("detached daemon ready");
+        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
         let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
         let probe = std::sync::Arc::new(CleanupProbe {
+            cleanup_admission_permits: Some(cleanup_admission_permits),
             discovery_permits: Some(discovery_permits.clone()),
             ..CleanupProbe::default()
         });
@@ -1711,6 +1833,13 @@ mod tests {
             cleanup_result.is_ok(),
             "cleanup deadline started before admission: {cleanup_result:?}"
         );
+        assert_eq!(
+            probe
+                .scope_discovery_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "cleanup repeated a redundant full discovery round"
+        );
         assert!(gone, "admitted cleanup stranded detached PID {daemon_pid}");
     }
 
@@ -1752,9 +1881,15 @@ mod tests {
         .await
         .expect("detached daemon ready");
         let scope_marker = scope.marker_path.clone();
-        let probe = std::sync::Arc::new(CleanupProbe::default());
+        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let probe = std::sync::Arc::new(CleanupProbe {
+            cleanup_admission_permits: Some(cleanup_admission_permits),
+            discovery_permits: Some(discovery_permits.clone()),
+            ..CleanupProbe::default()
+        });
         scope.cleanup_probe = Some(probe.clone());
-        let permit = PROCESS_DISCOVERY_PERMITS
+        let permit = discovery_permits
             .acquire_many(2)
             .await
             .expect("hold discovery permit");

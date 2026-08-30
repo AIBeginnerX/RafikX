@@ -17,7 +17,12 @@
 - [x] 후속 명령의 오래된 lifecycle 상태 제거와 booting·ready-unconfigured·ready-configured 표시 구분
 - [x] PTY 실행별 `RAFIKX_HOME` 정리와 준비 상태 실제 터미널 증거 추가
 - [x] 기본·최소 기능 전체 테스트, 브라우저 게임 복구 E2E, 릴리스 바이너리, 동시 PTY 검증
-- [ ] (진행) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
+- [x] `750a589` 정확 SHA의 GPT-5.6 Sol 코드·보안·아키텍처·계약·QA·시각·CJK 결과 기록
+- [x] 정리 세션 허가와 실제 프로세스 스캔 허가를 분리하고 중복 pre-KILL 전체 스캔 제거
+- [ ] (진행) Anthropic·OpenAI 오류 본문과 PTY 환경 전달의 비밀·메모리 경계 고정
+- [ ] (대기) 메시지 예산 0인 요청의 provider 호출 차단과 현재 사용자 작업 보존
+- [ ] (대기) ULW 연속 실행 epoch와 정적인 Ready·실제 Answering lifecycle 고정
+- [ ] (대기) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 
 ## 터미널 릴리스 이후
