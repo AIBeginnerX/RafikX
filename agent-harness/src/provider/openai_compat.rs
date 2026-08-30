@@ -7,7 +7,7 @@ use super::{
     StopReason, StreamEvent, limit_hint, map_stop_reason,
 };
 
-const CODEX_RESPONSES: &str = "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 enum CompatMode {
@@ -43,10 +43,20 @@ impl OpenAiCompatProvider {
 
     pub fn with_codex_oauth(token: String, account_id: String) -> Result<Self> {
         Self::create(
-            "https://chatgpt.com/backend-api/codex".into(),
+            CODEX_BASE.into(),
             Some(token),
             CompatMode::CodexResponses,
             account_id,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_codex_oauth_at(base_url: String) -> Result<Self> {
+        Self::create(
+            base_url,
+            Some("test-token".into()),
+            CompatMode::CodexResponses,
+            String::new(),
         )
     }
 
@@ -74,7 +84,7 @@ impl OpenAiCompatProvider {
 
     fn url(&self) -> String {
         match self.mode {
-            CompatMode::CodexResponses => CODEX_RESPONSES.to_string(),
+            CompatMode::CodexResponses => format!("{}/responses", self.base_url),
             CompatMode::ChatCompletions => format!("{}/chat/completions", self.base_url),
         }
     }
@@ -198,7 +208,10 @@ impl OpenAiCompatProvider {
                     if reasoning_started {
                         on_event(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
                     }
-                    return Ok(finish_stream(
+                    if finish.is_none() {
+                        anyhow::bail!("완료 신호에 응답 종결 사유가 없습니다");
+                    }
+                    let response = finish_stream(
                         full_text,
                         tool_acc,
                         finish.as_deref(),
@@ -208,7 +221,9 @@ impl OpenAiCompatProvider {
                         cache_reported,
                         hint.clone(),
                         stream_model.clone(),
-                    ));
+                    );
+                    require_stream_content(&response, "OpenAI 호환")?;
+                    return Ok(response);
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
@@ -315,7 +330,7 @@ impl OpenAiCompatProvider {
             on_event(SemanticStreamEvent::ReasoningText("\n[/모델 작업]\n"));
         }
 
-        Ok(finish_stream(
+        let response = finish_stream(
             full_text,
             tool_acc,
             finish.as_deref(),
@@ -325,7 +340,9 @@ impl OpenAiCompatProvider {
             cache_reported,
             hint,
             stream_model,
-        ))
+        );
+        require_stream_content(&response, "OpenAI 호환")?;
+        Ok(response)
     }
 
     async fn chat_codex_stream<F>(&self, req: &ChatRequest, mut on_event: F) -> Result<ChatResponse>
@@ -359,13 +376,9 @@ impl OpenAiCompatProvider {
         let mut cached_tokens = 0u32;
         let mut cache_reported = false;
         let mut finish = None::<String>;
-        let mut finished = false;
         let mut reasoning_started = false;
 
         while let Some(chunk) = stream.next().await {
-            if finished {
-                break;
-            }
             let chunk = chunk.context("Codex 응답 스트림이 중간에 끊겼습니다")?;
             buf.extend_from_slice(&chunk);
             while let Some(line) = drain_line(&mut buf) {
@@ -380,12 +393,32 @@ impl OpenAiCompatProvider {
                 let data = data.trim();
                 if data == "[DONE]" {
                     close_codex_reasoning(&mut reasoning_started, &mut on_event);
-                    finished = true;
-                    break;
+                    if finish.is_none() {
+                        anyhow::bail!("Codex 완료 신호에 응답 종결 사유가 없습니다");
+                    }
+                    let response = enforce_codex_output_limit(
+                        finish_stream(
+                            full_text,
+                            tools,
+                            finish.as_deref(),
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens,
+                            cache_reported,
+                            hint,
+                            stream_model,
+                        ),
+                        req.max_tokens,
+                    );
+                    require_stream_content(&response, "Codex")?;
+                    return Ok(response);
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                if let Some(status) = codex_terminal_failure(&v) {
+                    anyhow::bail!("Codex 응답이 완료되지 않았습니다 ({status})");
+                }
                 let output_limit_reached = apply_codex_event(
                     &v,
                     &mut full_text,
@@ -401,39 +434,51 @@ impl OpenAiCompatProvider {
                 );
                 if output_limit_reached {
                     tools.clear();
-                    finished = true;
-                    break;
+                    let response = enforce_codex_output_limit(
+                        finish_stream(
+                            full_text,
+                            tools,
+                            finish.as_deref(),
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens,
+                            cache_reported,
+                            hint,
+                            stream_model,
+                        ),
+                        req.max_tokens,
+                    );
+                    require_stream_content(&response, "Codex")?;
+                    return Ok(response);
                 }
                 if finish.is_some() {
-                    finished = true;
+                    let response = enforce_codex_output_limit(
+                        finish_stream(
+                            full_text,
+                            tools,
+                            finish.as_deref(),
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens,
+                            cache_reported,
+                            hint,
+                            stream_model,
+                        ),
+                        req.max_tokens,
+                    );
+                    require_stream_content(&response, "Codex")?;
+                    return Ok(response);
                 }
             }
         }
 
-        if !finished && full_text.is_empty() && tools.is_empty() {
+        if full_text.is_empty() && tools.is_empty() {
             anyhow::bail!("응답이 시작되기 전에 Codex 스트림이 종료되었습니다");
         }
-        if !finished {
-            anyhow::bail!(
-                "응답이 완료되기 전에 Codex 스트림이 종료되었습니다 ({}자 수신)",
-                full_text.chars().count()
-            );
-        }
-
-        Ok(enforce_codex_output_limit(
-            finish_stream(
-                full_text,
-                tools,
-                finish.as_deref(),
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                cache_reported,
-                hint,
-                stream_model,
-            ),
-            req.max_tokens,
-        ))
+        anyhow::bail!(
+            "응답이 완료되기 전에 Codex 스트림이 종료되었습니다 ({}자 수신)",
+            full_text.chars().count()
+        );
     }
 }
 
@@ -488,6 +533,13 @@ fn enforce_codex_output_limit(mut response: ChatResponse, max_tokens: u32) -> Ch
         .retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
     response.stop_reason = StopReason::MaxTokens;
     response
+}
+
+fn require_stream_content(response: &ChatResponse, provider: &str) -> Result<()> {
+    if response.content.is_empty() {
+        anyhow::bail!("{provider} 스트림이 빈 완료 응답을 보냈습니다");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // 스트림 종결 축이 인자별로 독립적이라 유지
@@ -702,7 +754,7 @@ fn parse_completion(text: &str) -> Result<ChatResponse> {
 
 fn map_openai_finish(raw: Option<&str>) -> StopReason {
     match raw {
-        Some("stop") => StopReason::EndTurn,
+        Some("stop") | Some("completed") => StopReason::EndTurn,
         Some("tool_calls") => StopReason::ToolUse,
         Some("length") => StopReason::MaxTokens,
         other => map_stop_reason(other),
@@ -835,6 +887,7 @@ fn build_codex_body(req: &ChatRequest, stream: bool) -> Value {
 
 fn parse_codex_response(text: &str) -> Result<ChatResponse> {
     let v: Value = serde_json::from_str(text).context("Codex 응답 JSON을 해석할 수 없습니다")?;
+    require_completed_codex_response(&v)?;
     let mut full_text = String::new();
     let mut tools = Vec::new();
     let mut input_tokens = 0u32;
@@ -846,10 +899,14 @@ fn parse_codex_response(text: &str) -> Result<ChatResponse> {
     take_usage(&v, &mut input_tokens, &mut output_tokens);
     let cached_tokens = crate::provider::cached_tokens_from(&v);
     let cache_reported = crate::provider::cached_tokens_entry(&v).is_some();
-    if let Some(status) = v.get("status").and_then(|x| x.as_str()) {
+    if let Some(status) = v
+        .get("status")
+        .or_else(|| v.pointer("/response/status"))
+        .and_then(Value::as_str)
+    {
         finish = Some(status.to_string());
     }
-    Ok(finish_stream(
+    let response = finish_stream(
         full_text,
         tools,
         finish.as_deref(),
@@ -858,8 +915,40 @@ fn parse_codex_response(text: &str) -> Result<ChatResponse> {
         cached_tokens,
         cache_reported,
         LimitHint::default(),
-        v.get("model").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-    ))
+        v.get("model")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    );
+    require_stream_content(&response, "Codex")?;
+    Ok(response)
+}
+
+fn require_completed_codex_response(v: &Value) -> Result<()> {
+    let status = v
+        .get("status")
+        .or_else(|| v.pointer("/response/status"))
+        .and_then(Value::as_str);
+    match status {
+        Some("completed") => Ok(()),
+        Some(status @ ("failed" | "incomplete" | "cancelled")) => {
+            anyhow::bail!("Codex 응답이 완료되지 않았습니다 ({status})")
+        }
+        Some(other) => anyhow::bail!("Codex 응답이 완료되지 않았습니다 ({other})"),
+        None => anyhow::bail!("Codex 응답에 종결 상태가 없습니다"),
+    }
+}
+
+fn codex_terminal_failure(v: &Value) -> Option<&str> {
+    let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
+    if kind.ends_with(".failed") || kind.ends_with(".incomplete") || kind.ends_with(".cancelled") {
+        return kind.rsplit('.').next();
+    }
+    let status = v.pointer("/response/status").and_then(Value::as_str)?;
+    match status {
+        "failed" | "incomplete" | "cancelled" => Some(status),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // codex 이벤트 필드가 그대로 인자로 대응된다
@@ -1045,6 +1134,40 @@ fn take_stream_usage(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn sse_provider(body: String, codex: bool) -> OpenAiCompatProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{body}"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let base_url = format!("http://{address}");
+        if codex {
+            OpenAiCompatProvider::with_codex_oauth_at(base_url).unwrap()
+        } else {
+            OpenAiCompatProvider::new(base_url, None).unwrap()
+        }
+    }
+
+    fn streaming_request() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".into(),
+            system: String::new(),
+            messages: vec![Message::user_text("test")],
+            tools: Vec::new(),
+            max_tokens: 1024,
+            stream: true,
+        }
+    }
 
     #[test]
     fn codex_stream_labels_reasoning_and_content_candidates_separately() {
@@ -1254,6 +1377,79 @@ mod usage_tests {
         let guarded = enforce_codex_output_limit(response, 32_768);
         assert_eq!(guarded.stop_reason, StopReason::MaxTokens);
         assert!(guarded.content.is_empty());
+    }
+
+    #[test]
+    fn codex_nonstream_requires_completed_status_and_content() {
+        for status in ["failed", "incomplete", "cancelled", "in_progress"] {
+            let err = parse_codex_response(&json!({"status": status}).to_string()).unwrap_err();
+            assert!(format!("{err:#}").contains("완료되지 않았습니다"));
+        }
+        let err = parse_codex_response(&json!({"status": "completed"}).to_string()).unwrap_err();
+        assert!(format!("{err:#}").contains("빈 완료 응답"));
+    }
+
+    #[test]
+    fn codex_terminal_failures_are_not_completed_events() {
+        for event in [
+            json!({"type": "response.failed"}),
+            json!({"type": "response.incomplete"}),
+            json!({"type": "response.cancelled"}),
+            json!({"type": "response.output_item.done", "response": {"status": "failed"}}),
+        ] {
+            assert!(codex_terminal_failure(&event).is_some());
+        }
+        assert!(codex_terminal_failure(&json!({"type": "response.completed"})).is_none());
+    }
+
+    #[test]
+    fn stream_completion_requires_content() {
+        let response = stream(Vec::new(), Some("stop"));
+        assert!(require_stream_content(&response, "OpenAI 호환").is_err());
+    }
+
+    #[tokio::test]
+    async fn done_only_chat_stream_is_rejected() {
+        let provider = sse_provider("data: [DONE]\n\n".into(), false).await;
+        let err = provider
+            .chat_semantic_stream(&streaming_request(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("종결 사유"));
+    }
+
+    #[tokio::test]
+    async fn malformed_only_chat_stream_is_rejected() {
+        let provider = sse_provider("data: not-json\n\ndata: [DONE]\n\n".into(), false).await;
+        let err = provider
+            .chat_semantic_stream(&streaming_request(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("종결 사유"));
+    }
+
+    #[tokio::test]
+    async fn codex_completed_event_returns_without_waiting_for_next_chunk() {
+        let provider = sse_provider(
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+            )
+            .into(),
+            true,
+        )
+        .await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            provider.chat_semantic_stream(&streaming_request(), |_| {}),
+        )
+        .await
+        .expect("completed event must finish without another network chunk")
+        .unwrap();
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "ready"
+        ));
     }
 
     #[test]

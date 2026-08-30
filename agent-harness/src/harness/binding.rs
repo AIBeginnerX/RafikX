@@ -1181,13 +1181,35 @@ pub async fn chat_with_fallback_combo(
     model_role: &str,
     req: ChatRequest,
 ) -> Result<(String, ChatResponse)> {
-    let mut order: Vec<String> = Vec::new();
-    for (p, _) in combo {
-        if !order.contains(p) {
-            order.push(p.clone());
-        }
+    chat_with_fallback_inner(cfg, &[], model_role, req, Some(combo)).await
+}
+
+#[derive(Clone, Copy)]
+struct FallbackCandidate<'a> {
+    provider: &'a str,
+    combo_model: Option<&'a str>,
+}
+
+fn fallback_candidates<'a>(
+    order: &'a [String],
+    combo: Option<&'a [(String, String)]>,
+) -> Vec<FallbackCandidate<'a>> {
+    match combo {
+        Some(chain) => chain
+            .iter()
+            .map(|(provider, model)| FallbackCandidate {
+                provider,
+                combo_model: Some(model),
+            })
+            .collect(),
+        None => order
+            .iter()
+            .map(|provider| FallbackCandidate {
+                provider,
+                combo_model: None,
+            })
+            .collect(),
     }
-    chat_with_fallback_inner(cfg, &order, model_role, req, Some(combo)).await
 }
 
 async fn chat_with_fallback_inner(
@@ -1198,29 +1220,33 @@ async fn chat_with_fallback_inner(
     combo: Option<&[(String, String)]>,
 ) -> Result<(String, ChatResponse)> {
     let original_model = req.model.clone();
-    let primary = order.first().map(|s| s.as_str());
+    let candidates = fallback_candidates(order, combo);
+    let primary = candidates.first().map(|candidate| candidate.provider);
     // 첫 번째(주 연결) 오류를 끝까지 보존한다 — 마지막 폴백의 오류가 원인을 가리지 않게.
     let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err = None;
-    for name in order {
-        let combo_model = combo
-            .and_then(|c| c.iter().find(|(p, _)| p == name))
-            .map(|(_, m)| m.clone());
-        let Some(model) = combo_model
-            .or_else(|| model_for_fallback(cfg, name, model_role, &original_model, primary))
-        else {
+    for candidate in candidates {
+        let Some(model) = candidate.combo_model.map(str::to_string).or_else(|| {
+            model_for_fallback(
+                cfg,
+                candidate.provider,
+                model_role,
+                &original_model,
+                primary,
+            )
+        }) else {
             continue;
         };
-        if let Some(c) = combo
-            && model != original_model
-            && let Some(pair) = c.iter().find(|(_, m)| *m == model)
-        {
+        if candidate.combo_model.is_some() && model != original_model {
             // 콤보 전환은 "다른 모델이 답한다"는 사실이라 사용자에게 보인다
             // (프로바이더 수준 폴백의 저소음 규칙과 구분, F8).
-            crate::ui::live_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
+            crate::ui::live_warn(&format!(
+                "폴 fallback: {}/{} 사용 중",
+                candidate.provider, model
+            ));
         }
         req.model = model;
-        match try_accounts(cfg, name, |client| {
+        match try_accounts(cfg, candidate.provider, |client| {
             let req = req.clone();
             async move { client.chat(&req).await }
         })
@@ -1228,11 +1254,15 @@ async fn chat_with_fallback_inner(
         {
             Ok(resp) => {
                 warn_model_mismatch(&req.model, &resp);
-                return Ok((name.clone(), resp));
+                return Ok((candidate.provider.to_string(), resp));
             }
             Err(e) => {
-                fallback_warn(&format!("{name} 호출 실패 ({}) → 다음 연결", short_err(&e)));
-                if Some(name.as_str()) == primary && primary_err.is_none() {
+                fallback_warn(&format!(
+                    "{} 호출 실패 ({}) → 다음 연결",
+                    candidate.provider,
+                    short_err(&e)
+                ));
+                if Some(candidate.provider) == primary && primary_err.is_none() {
                     primary_err = Some(e);
                 } else {
                     last_err = Some(e);
@@ -1253,6 +1283,35 @@ pub fn tool_args_label(name: &str, total_bytes: usize) -> String {
 fn short_err(e: &anyhow::Error) -> String {
     let s = format!("{e:#}");
     s.chars().take(120).collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreamFailureAction {
+    AbortAfterEmission,
+    RetrySameAccount,
+    NextAccount,
+    NextCandidate,
+}
+
+fn stream_failure_action(
+    error: &anyhow::Error,
+    emitted: usize,
+    attempt: u32,
+) -> StreamFailureAction {
+    if emitted > 0 {
+        return StreamFailureAction::AbortAfterEmission;
+    }
+    if is_rate_limited(error) || is_auth_failure(error) {
+        return StreamFailureAction::NextAccount;
+    }
+    if is_retryable(error) {
+        return if attempt < 2 {
+            StreamFailureAction::RetrySameAccount
+        } else {
+            StreamFailureAction::NextAccount
+        };
+    }
+    StreamFailureAction::NextCandidate
 }
 
 pub async fn stream_with_fallback<F>(
@@ -1297,14 +1356,8 @@ pub async fn stream_with_fallback_combo<F>(
 where
     F: FnMut(StreamEvent),
 {
-    let mut order: Vec<String> = Vec::new();
-    for (p, _) in combo {
-        if !order.contains(p) {
-            order.push(p.clone());
-        }
-    }
     let mut on_event = on_event;
-    stream_with_fallback_inner(cfg, &order, model_role, req, Some(combo), true, |event| {
+    stream_with_fallback_inner(cfg, &[], model_role, req, Some(combo), true, |event| {
         on_event(event.public())
     })
     .await
@@ -1320,13 +1373,7 @@ pub(crate) async fn stream_semantic_with_fallback_combo<F>(
 where
     F: FnMut(SemanticStreamEvent),
 {
-    let mut order: Vec<String> = Vec::new();
-    for (provider, _) in combo {
-        if !order.contains(provider) {
-            order.push(provider.clone());
-        }
-    }
-    stream_with_fallback_inner(cfg, &order, model_role, req, Some(combo), false, on_event).await
+    stream_with_fallback_inner(cfg, &[], model_role, req, Some(combo), false, on_event).await
 }
 
 async fn stream_with_fallback_inner<F>(
@@ -1343,42 +1390,45 @@ where
 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let original_model = req.model.clone();
-    let primary = order.first().map(|s| s.as_str());
+    let candidates = fallback_candidates(order, combo);
+    let primary = candidates.first().map(|candidate| candidate.provider);
     let mut primary_err: Option<anyhow::Error> = None;
     let mut last_err: Option<anyhow::Error> = None;
     let emitted = AtomicUsize::new(0);
 
-    for name in order {
-        let combo_model = combo
-            .and_then(|c| c.iter().find(|(p, _)| p == name))
-            .map(|(_, m)| m.clone());
-        let Some(model) = combo_model
-            .or_else(|| model_for_fallback(cfg, name, model_role, &original_model, primary))
-        else {
+    'candidates: for candidate in candidates {
+        let Some(model) = candidate.combo_model.map(str::to_string).or_else(|| {
+            model_for_fallback(
+                cfg,
+                candidate.provider,
+                model_role,
+                &original_model,
+                primary,
+            )
+        }) else {
             continue;
         };
-        if let Some(c) = combo
-            && model != original_model
-            && let Some(pair) = c.iter().find(|(_, m)| *m == model)
-        {
+        if candidate.combo_model.is_some() && model != original_model {
             // 콤보 전환은 "다른 모델이 답한다"는 사실이라 사용자에게 보인다
             // (프로바이더 수준 폴백의 저소음 규칙과 구분, F8).
-            crate::ui::live_warn(&format!("폴 fallback: {}/{} 사용 중", pair.0, pair.1));
+            crate::ui::live_warn(&format!(
+                "폴 fallback: {}/{} 사용 중",
+                candidate.provider, model
+            ));
         }
         req.model = model;
-        let ids = account_ids_for(name);
-        for (i, id) in ids.iter().enumerate() {
+        let ids = account_ids_for(candidate.provider);
+        for id in &ids {
             let wait = crate::usage::seconds_left(id);
             if wait > 20 {
                 // retry_after 존중 — 마지막 계정이어도 리밋 중이면 건너뛰고
                 // 다음 연결로 폴백한다 (429 재시도 폭풍 방지).
-                let _ = i;
                 continue;
             }
             if wait > 0 && wait <= 20 {
                 tokio::time::sleep(Duration::from_secs(wait as u64)).await;
             }
-            let Ok(client) = build_provider_account(cfg, name, id) else {
+            let Ok(client) = build_provider_account(cfg, candidate.provider, id) else {
                 continue;
             };
 
@@ -1400,46 +1450,49 @@ where
                 match client.chat_semantic_stream(&req, &mut track).await {
                     Ok(resp) => {
                         crate::usage::record_success(id, &resp);
+                        crate::usage::apply_hint(id, &resp.limit);
                         warn_model_mismatch(&req.model, &resp);
-                        return Ok((name.clone(), resp));
-                    }
-                    Err(e) if is_rate_limited(&e) => {
-                        crate::usage::mark_limited(
-                            id,
-                            crate::usage::parse_retry_after(&format!("{e:#}")),
-                        );
-                        crate::ui::warn("리밋 → 다음 계정으로 전환");
-                        last_err = Some(e);
-                        break;
+                        return Ok((candidate.provider.to_string(), resp));
                     }
                     Err(e) => {
-                        last_err = Some(e);
-                        if is_retryable(last_err.as_ref().unwrap()) && attempt < 2 {
-                            attempt += 1;
-                            if emitted.load(Ordering::Relaxed) > 0 {
-                                // 출력이 이미 나간 뒤의 절단 — 같은 연결로만 다시 시도하고,
-                                // 재출력이 중복으로 보이지 않게 경계 표시를 남긴다.
-                                on_event(SemanticStreamEvent::ReasoningText(
-                                    "\n[연결 끊김 — 같은 연결로 재시도]\n",
-                                ));
-                            }
-                            tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt)))
-                                .await;
-                            continue;
+                        let action = stream_failure_action(
+                            &e,
+                            emitted.load(Ordering::Relaxed),
+                            attempt,
+                        );
+                        if is_rate_limited(&e) {
+                            crate::usage::mark_limited(
+                                id,
+                                crate::usage::parse_retry_after(&format!("{e:#}")),
+                            );
+                            crate::ui::warn("리밋 → 다음 계정으로 전환");
                         }
-                        break;
+                        last_err = Some(e);
+                        match action {
+                            StreamFailureAction::AbortAfterEmission => {
+                                return Err(last_err.unwrap_or_else(|| {
+                                    anyhow!("응답 도중 스트림이 끊겼습니다")
+                                }));
+                            }
+                            StreamFailureAction::RetrySameAccount => {
+                                attempt += 1;
+                                tokio::time::sleep(Duration::from_millis(
+                                    800 * u64::from(attempt),
+                                ))
+                                .await;
+                            }
+                            StreamFailureAction::NextAccount => break,
+                            StreamFailureAction::NextCandidate => continue 'candidates,
+                        }
                     }
                 }
             }
-            if emitted.load(Ordering::Relaxed) > 0 {
-                return Err(last_err.unwrap_or_else(|| anyhow!("응답 도중 스트림이 끊겼습니다")));
-            }
-            break;
         }
-        if last_err.is_some() && Some(name.as_str()) == primary && primary_err.is_none() {
+        if last_err.is_some() && Some(candidate.provider) == primary && primary_err.is_none() {
             primary_err = last_err.take();
             fallback_warn(&format!(
-                "{name} 실패 ({}) → 다음 연결",
+                "{} 실패 ({}) → 다음 연결",
+                candidate.provider,
                 primary_err.as_ref().map(short_err).unwrap_or_default()
             ));
         }
@@ -1736,6 +1789,52 @@ mod combo_tests {
         assert!(cfg.file.combos.is_empty());
         // 콤보 미설정 시 model_override "combo:x" 만 오류 — 일반 경로는 무영향
         assert!(combo_chain_specs(&cfg, "x").is_err());
+    }
+
+    #[test]
+    fn combo_candidates_keep_same_provider_models_in_order() {
+        let combo = vec![
+            ("openai".to_string(), "gpt-5.6-sol".to_string()),
+            ("openai".to_string(), "gpt-5.6-codex".to_string()),
+            ("anthropic".to_string(), "claude-opus".to_string()),
+        ];
+        let candidates = fallback_candidates(&[], Some(&combo));
+        let actual: Vec<_> = candidates
+            .iter()
+            .map(|candidate| (candidate.provider, candidate.combo_model))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("openai", Some("gpt-5.6-sol")),
+                ("openai", Some("gpt-5.6-codex")),
+                ("anthropic", Some("claude-opus")),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_failures_rotate_accounts_before_candidates_without_output() {
+        assert_eq!(
+            stream_failure_action(&anyhow!("HTTP 429"), 0, 0),
+            StreamFailureAction::NextAccount
+        );
+        assert_eq!(
+            stream_failure_action(&anyhow!("HTTP 401"), 0, 0),
+            StreamFailureAction::NextAccount
+        );
+        assert_eq!(
+            stream_failure_action(&anyhow!("stream timed out"), 0, 2),
+            StreamFailureAction::NextAccount
+        );
+        assert_eq!(
+            stream_failure_action(&anyhow!("HTTP 400 model not found"), 0, 0),
+            StreamFailureAction::NextCandidate
+        );
+        assert_eq!(
+            stream_failure_action(&anyhow!("HTTP 500"), 1, 0),
+            StreamFailureAction::AbortAfterEmission
+        );
     }
 }
 

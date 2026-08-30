@@ -1,3 +1,3 @@
-완료: CLI의 네이티브 게임 대시보드·차트 요청을 브라우저 게임으로 오분류하지 않게 하고 개발 문서의 최소 Rust를 1.96으로 통일했다.
-검증: 분류 회귀 17개와 rustfmt·git diff 검사가 통과했고 Rust WASM 브라우저 게임·브라우저 게임 대시보드·슈퍼마리오 양성 경로를 보존했다.
-다음: 프로세스 정리·공급자 스트림·병렬 lifecycle·검증 후 최종 답변 경계를 수정하고 기본·최소 전체 검증을 다시 진행한다. 데스크탑은 제외한다.
+완료: CLI 공급자 fallback이 같은 provider의 다른 모델과 모든 계정을 순회하고 빈·손상·실패 스트림과 Codex terminal을 fail-closed로 처리하게 했다.
+검증: OpenAI 호환 스트림 20개·fallback combo 6개·Anthropic 스트림 6개와 cargo check·git diff 검사가 통과했다.
+다음: 프로세스 정리·동기 Bash 취소와 병렬 lifecycle·검증 후 최종 답변 경계를 마무리하고 기본·최소 전체 검증을 진행한다. 데스크탑은 제외한다.

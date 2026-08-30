@@ -285,6 +285,8 @@ impl AnthropicProvider {
         let mut stop_reason = StopReason::Other;
         let mut thinking_started = false;
         let mut content = AnthropicStreamAccumulator::default();
+        let mut saw_message_start = false;
+        let mut saw_terminal_delta = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("응답 스트림이 중간에 끊겼습니다")?;
@@ -300,6 +302,7 @@ impl AnthropicProvider {
                     };
                     match v.get("type").and_then(|t| t.as_str()) {
                         Some("message_start") => {
+                            saw_message_start = true;
                             if stream_model.is_empty()
                                 && let Some(m) =
                                     v.pointer("/message/model").and_then(|x| x.as_str())
@@ -353,9 +356,12 @@ impl AnthropicProvider {
                         }
                         Some("content_block_stop") => content.content_block_stop(&v),
                         Some("message_delta") => {
-                            stop_reason = map_stop_reason(
-                                v.pointer("/delta/stop_reason").and_then(|x| x.as_str()),
-                            );
+                            if let Some(raw_stop_reason) =
+                                v.pointer("/delta/stop_reason").and_then(|x| x.as_str())
+                            {
+                                stop_reason = map_stop_reason(Some(raw_stop_reason));
+                                saw_terminal_delta = true;
+                            }
                             if let Some(n) =
                                 v.pointer("/usage/output_tokens").and_then(|x| x.as_u64())
                             {
@@ -370,7 +376,7 @@ impl AnthropicProvider {
                                 cached_tokens = stopped_cache;
                                 cache_reported = true;
                             }
-                            return Ok(ChatResponse {
+                            let response = ChatResponse {
                                 model: stream_model.clone(),
                                 content: content.finish(stop_reason),
                                 stop_reason,
@@ -379,7 +385,13 @@ impl AnthropicProvider {
                                 cached_tokens,
                                 cache_reported,
                                 limit: hint.clone(),
-                            });
+                            };
+                            require_anthropic_stream_completion(
+                                saw_message_start,
+                                saw_terminal_delta,
+                                &response.content,
+                            )?;
+                            return Ok(response);
                         }
                         Some("error") => {
                             return Err(anyhow!("Anthropic API 스트림 오류"));
@@ -399,6 +411,20 @@ impl AnthropicProvider {
             full_text.chars().count()
         );
     }
+}
+
+fn require_anthropic_stream_completion(
+    saw_message_start: bool,
+    saw_terminal_delta: bool,
+    content: &[ContentBlock],
+) -> Result<()> {
+    if !saw_message_start || !saw_terminal_delta {
+        anyhow::bail!("Anthropic 스트림에 완결 이벤트가 없습니다");
+    }
+    if content.is_empty() {
+        anyhow::bail!("Anthropic 스트림이 빈 완료 응답을 보냈습니다");
+    }
+    Ok(())
 }
 
 fn build_body(req: &ChatRequest) -> Value {
@@ -578,6 +604,23 @@ fn api_error(status: u16, _body: &str, hint: &LimitHint) -> anyhow::Error {
 #[cfg(test)]
 mod streaming_usage_tests {
     use super::*;
+
+    #[test]
+    fn terminal_stream_requires_start_delta_and_content() {
+        assert!(require_anthropic_stream_completion(false, true, &[]).is_err());
+        assert!(require_anthropic_stream_completion(true, false, &[]).is_err());
+        assert!(require_anthropic_stream_completion(true, true, &[]).is_err());
+        assert!(
+            require_anthropic_stream_completion(
+                true,
+                true,
+                &[ContentBlock::Text {
+                    text: "done".into(),
+                }],
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn stream_accumulator_keeps_interleaved_blocks_in_index_order() {
