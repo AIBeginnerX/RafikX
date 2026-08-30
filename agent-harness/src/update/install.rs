@@ -5,37 +5,7 @@ use std::process::{Command, Output};
 #[cfg(windows)]
 use std::process::Stdio;
 
-use super::{GIT_UPD_TOKEN_ENV, GIT_UPD_USER_ENV, GIT_URL};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ValidatedTag<'a>(&'a str);
-
-impl<'a> ValidatedTag<'a> {
-    fn parse(raw: &'a str) -> anyhow::Result<Self> {
-        let Some(version) = raw.strip_prefix('v') else {
-            anyhow::bail!("릴리스 태그는 정확한 vX.Y.Z 형식이어야 합니다: {raw:?}");
-        };
-        let mut parts = version.split('.');
-        let (Some(major), Some(minor), Some(patch), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            anyhow::bail!("릴리스 태그는 정확한 vX.Y.Z 형식이어야 합니다: {raw:?}");
-        };
-        let valid_component = |part: &str| {
-            !part.is_empty()
-                && part.bytes().all(|byte| byte.is_ascii_digit())
-                && (part == "0" || !part.starts_with('0'))
-        };
-        if ![major, minor, patch].into_iter().all(valid_component) {
-            anyhow::bail!("릴리스 태그는 정확한 vX.Y.Z 형식이어야 합니다: {raw:?}");
-        }
-        Ok(Self(raw))
-    }
-
-    fn as_str(self) -> &'a str {
-        self.0
-    }
-}
+use super::{GIT_UPD_TOKEN_ENV, GIT_UPD_USER_ENV, GIT_URL, ValidatedTag};
 
 pub(super) fn perform_install(raw_tag: &str) -> anyhow::Result<()> {
     let tag = ValidatedTag::parse(raw_tag)?;

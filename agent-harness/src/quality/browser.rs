@@ -69,6 +69,165 @@ const PROBE_SCRIPT: &str = r#"(() => {
     }
     return String(result >>> 0);
   };
+  // Track rendered 2D primitives by frame; fillText/strokeText are intentionally not wrapped.
+  const canvasTrackers = new WeakMap();
+  const canvasArgument = value => {
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? String(Math.round(value * 1000) / 1000) : String(value);
+    }
+    if (value instanceof HTMLImageElement) return `image:${value.currentSrc || value.src}`;
+    if (value instanceof HTMLCanvasElement) return `canvas:${value.width}x${value.height}`;
+    if (typeof ImageBitmap !== 'undefined' && value instanceof ImageBitmap) {
+      return `bitmap:${value.width}x${value.height}`;
+    }
+    if (typeof ImageData !== 'undefined' && value instanceof ImageData) {
+      let sampled = '';
+      const stride = Math.max(1, Math.floor(value.data.length / 4096));
+      for (let index = 0; index < value.data.length; index += stride) {
+        sampled += String.fromCharCode(value.data[index]);
+      }
+      return `image-data:${value.width}x${value.height}:${hash(sampled)}`;
+    }
+    return String(value);
+  };
+  const canvasTracker = context => {
+    let tracker = canvasTrackers.get(context.canvas);
+    if (!tracker) {
+      tracker = {
+        operations: [], pathOperations: [], observed: new Set(), baseline: '', observing: false, skipCurrent: false,
+      };
+      canvasTrackers.set(context.canvas, tracker);
+    }
+    return tracker;
+  };
+  const canvasFrameFingerprint = tracker => hash(
+    [...new Set(tracker.operations)].sort().join('\n')
+  );
+  const finishCanvasFrame = tracker => {
+    const fingerprint = canvasFrameFingerprint(tracker);
+    if (tracker.observing) {
+      if (tracker.skipCurrent) tracker.skipCurrent = false;
+      else {
+        tracker.observed.add(fingerprint);
+        if (tracker.observed.size > 512) {
+          tracker.observed.delete(tracker.observed.values().next().value);
+        }
+      }
+    }
+    return fingerprint;
+  };
+  const canvasPathMethods = new Set([
+    'closePath', 'moveTo', 'lineTo', 'bezierCurveTo', 'quadraticCurveTo',
+    'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
+  ]);
+  const recordCanvasOperation = (context, method, args) => {
+    const tracker = canvasTracker(context);
+    if (method === 'clearRect') {
+      if (Number(args[0]) <= 0
+          && Number(args[1]) <= 0
+          && Number(args[2]) >= context.canvas.width
+          && Number(args[3]) >= context.canvas.height) {
+        finishCanvasFrame(tracker);
+        tracker.operations = [];
+        tracker.pathOperations = [];
+      }
+      return;
+    }
+    const transform = typeof context.getTransform === 'function' ? context.getTransform() : null;
+    const matrix = transform
+      ? `matrix:${transform.a}:${transform.b}:${transform.c}:${transform.d}:${transform.e}:${transform.f}`
+      : '';
+    if (method === 'beginPath') {
+      tracker.pathOperations = [];
+      return;
+    }
+    if (canvasPathMethods.has(method)) {
+      tracker.pathOperations.push([method, ...args.map(canvasArgument), matrix].join('|'));
+      if (tracker.pathOperations.length > 4096) {
+        tracker.pathOperations.splice(0, tracker.pathOperations.length - 4096);
+      }
+      return;
+    }
+    if (method !== 'putImageData' && Number(context.globalAlpha) <= 0) return;
+    const fillMethod = method === 'fill' || method === 'fillRect';
+    const strokeMethod = method === 'stroke' || method === 'strokeRect';
+    const paint = strokeMethod ? String(context.strokeStyle) : String(context.fillStyle);
+    if ((fillMethod || strokeMethod)
+        && ['transparent', 'rgba(0, 0, 0, 0)', 'rgba(0,0,0,0)'].includes(paint)) {
+      return;
+    }
+    if ((method === 'fill' || method === 'stroke')
+        && tracker.pathOperations.length === 0
+        && !(typeof Path2D !== 'undefined' && args[0] instanceof Path2D)) {
+      return;
+    }
+    const path = method === 'fill' || method === 'stroke'
+      ? `path:${hash(tracker.pathOperations.join('\n'))}`
+      : '';
+    tracker.operations.push([
+      method,
+      ...args.map(canvasArgument),
+      path,
+      `fill:${String(context.fillStyle)}`,
+      `stroke:${String(context.strokeStyle)}`,
+      `alpha:${context.globalAlpha}`,
+      `composite:${context.globalCompositeOperation}`,
+      `line:${context.lineWidth}:${context.lineCap}:${context.lineJoin}`,
+      `dash:${typeof context.getLineDash === 'function' ? context.getLineDash().join(',') : ''}`,
+      `shadow:${context.shadowColor}:${context.shadowBlur}:${context.shadowOffsetX}:${context.shadowOffsetY}`,
+      `filter:${context.filter || 'none'}`,
+      matrix,
+    ].join('|'));
+    if (tracker.operations.length > 4096) {
+      tracker.operations.splice(0, tracker.operations.length - 4096);
+    }
+  };
+  if (typeof CanvasRenderingContext2D !== 'undefined') {
+    const drawingMethods = [
+      'clearRect', 'fillRect', 'strokeRect', 'drawImage', 'putImageData',
+      'beginPath', 'closePath', 'moveTo', 'lineTo', 'bezierCurveTo',
+      'quadraticCurveTo', 'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
+      'fill', 'stroke',
+    ];
+    for (const method of drawingMethods) {
+      const original = CanvasRenderingContext2D.prototype[method];
+      if (typeof original !== 'function') continue;
+      CanvasRenderingContext2D.prototype[method] = function(...args) {
+        recordCanvasOperation(this, method, args);
+        return original.apply(this, args);
+      };
+    }
+  }
+  const canvasGameplayFingerprint = canvas => {
+    const tracker = canvasTrackers.get(canvas);
+    if (!tracker) {
+      try { return `canvas:${hash(canvas.toDataURL())}`; }
+      catch (error) { return `canvas-error:${String(error)}`; }
+    }
+    const current = canvasFrameFingerprint(tracker);
+    if (!tracker.observing) return `canvas2d:${current}`;
+    const variants = new Set(tracker.observed);
+    variants.add(current);
+    if (![...variants].some(fingerprint => fingerprint !== tracker.baseline)) {
+      return `canvas2d:${tracker.baseline}`;
+    }
+    return `canvas2d-motion:${hash([...variants].sort().join('\n'))}`;
+  };
+  const beginGameplayObservation = surface => {
+    const canvases = [];
+    for (const primary of surface.primaries) {
+      if (primary instanceof HTMLCanvasElement) canvases.push(primary);
+      for (const canvas of primary.querySelectorAll?.('canvas') || []) canvases.push(canvas);
+    }
+    for (const canvas of [...new Set(canvases)]) {
+      const tracker = canvasTrackers.get(canvas);
+      if (!tracker) continue;
+      tracker.baseline = canvasFrameFingerprint(tracker);
+      tracker.observed.clear();
+      tracker.observing = true;
+      tracker.skipCurrent = true;
+    }
+  };
   const visiblyRendered = element => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
@@ -152,7 +311,12 @@ const PROBE_SCRIPT: &str = r#"(() => {
       }
       parts.push(visual.join('|'));
       if (isCanvas) {
-        try { parts.push(`canvas:${hash(element.toDataURL())}`); } catch (error) { parts.push(`canvas-error:${String(error)}`); }
+        if (includeText) {
+          try { parts.push(`canvas:${hash(element.toDataURL())}`); }
+          catch (error) { parts.push(`canvas-error:${String(error)}`); }
+        } else {
+          parts.push(canvasGameplayFingerprint(element));
+        }
       } else if (isImage) {
         parts.push(`image:${element.currentSrc || element.src}`);
       } else if (isSvgShape) {
@@ -190,6 +354,7 @@ const PROBE_SCRIPT: &str = r#"(() => {
     expectState(api, 'playing');
     const playingSurface = surfaceFingerprint(surface);
     const playingGameplay = gameplayFingerprint(surface);
+    beginGameplayObservation(surface);
     expectSurfaceChange(readySurface, playingSurface, 'ready→playing');
     press('KeyR');
     await frame();
@@ -1389,7 +1554,24 @@ fn stage_web_root_with_limits(
                 relative.display()
             );
         }
-        if !is_web_asset(&source) {
+        let resolved_relative = resolved
+            .strip_prefix(&source_root)
+            .map_err(|_| anyhow::anyhow!("브라우저 자산이 프로젝트 밖을 가리킵니다"))?;
+        if has_hidden_component(resolved_relative) || has_sensitive_component(resolved_relative) {
+            anyhow::bail!(
+                "민감한 브라우저 자산 대상을 차단했습니다: {}",
+                relative.display()
+            );
+        }
+        if resolved_relative.components().any(
+            |component| matches!(component, Component::Normal(name) if is_discovery_excluded_name(name)),
+        ) {
+            anyhow::bail!(
+                "제외된 브라우저 자산 대상을 차단했습니다: {}",
+                relative.display()
+            );
+        }
+        if !is_web_asset(&source) || !is_web_asset(&resolved) {
             anyhow::bail!(
                 "허용되지 않은 브라우저 자산 형식입니다: {}",
                 relative.display()
@@ -2297,6 +2479,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sensitive_symlink_target_reference_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-sensitive-symlink-reference-{}",
+            crate::db::Db::new_id()
+        ));
+        let stage = root.join("stage");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join("index.html"),
+            "<script src=\"app.js\"></script>",
+        )
+        .expect("entry fixture");
+        std::fs::write(workspace.join("token.js"), "window.value = 'private';")
+            .expect("sensitive target fixture");
+        std::os::unix::fs::symlink(workspace.join("token.js"), workspace.join("app.js"))
+            .expect("symlink fixture");
+
+        let error = stage_web_root(&workspace, &workspace.join("index.html"), &stage)
+            .expect_err("sensitive symlink target must fail");
+        assert!(error.to_string().contains("민감한"), "{error}");
+        assert!(!stage.join("app.js").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn staging_preserves_project_relative_sibling_assets() {
         let root = std::env::temp_dir().join(format!(
@@ -2436,6 +2645,60 @@ window.__rafikxGameTest = {
         let error = smoke_test_in_workspace_with_contract(&root, &root.join("index.html"), true)
             .await
             .expect_err("status-only state must fail");
+        assert!(
+            error.to_string().contains("playing gameplay progress"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn canvas_status_counter_text_cannot_validate_gameplay_progress() {
+        if detect_browser().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-browser-canvas-status-only-contract-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(
+            root.join("index.html"),
+            r#"<!doctype html><html><head><meta name="rafikx-browser-game-contract" content="v1"></head><body><canvas id="game" width="320" height="180"></canvas><script>
+const canvas = document.querySelector('#game');
+const context = canvas.getContext('2d');
+const fake = { state: 'ready', restarts: 0, counter: 0 };
+const render = () => {
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.font = '24px sans-serif';
+  context.fillText(`${fake.state.toUpperCase()} ${fake.counter}`, 24, 90);
+};
+setInterval(() => {
+  if (fake.state === 'playing') { fake.counter += 1; render(); }
+}, 20);
+document.addEventListener('keydown', event => {
+  if (event.code === 'Space' && fake.state === 'ready') fake.state = 'playing';
+  else if (event.code === 'KeyP' && fake.state === 'playing') fake.state = 'paused';
+  else if (event.code === 'KeyP' && fake.state === 'paused') fake.state = 'playing';
+  else if (event.code === 'KeyR' && fake.state === 'lost') {
+    fake.state = 'ready'; fake.restarts += 1; fake.counter = 0;
+  }
+  render();
+});
+window.__rafikxGameTest = {
+  state: () => fake.state,
+  restarts: () => fake.restarts,
+  forceLoss: () => { fake.state = 'lost'; render(); },
+  surface: () => canvas
+};
+render();
+</script></body></html>"#,
+        )
+        .expect("canvas status-only fixture");
+
+        let error = smoke_test_in_workspace_with_contract(&root, &root.join("index.html"), true)
+            .await
+            .expect_err("canvas text-only state must fail");
         assert!(
             error.to_string().contains("playing gameplay progress"),
             "{error}"

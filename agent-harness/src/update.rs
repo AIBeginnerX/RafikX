@@ -8,6 +8,36 @@ mod install;
 pub const REPO_API: &str = "https://api.github.com/repos/AIBeginnerX/RafikX/releases/latest";
 const GIT_URL: &str = "https://github.com/AIBeginnerX/RafikX.git";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValidatedTag<'a>(&'a str);
+
+impl<'a> ValidatedTag<'a> {
+    fn parse(raw: &'a str) -> anyhow::Result<Self> {
+        let Some(version) = raw.strip_prefix('v') else {
+            anyhow::bail!("릴리스 태그는 정확한 vX.Y.Z 형식이어야 합니다: {raw:?}");
+        };
+        let mut parts = version.split('.');
+        let (Some(major), Some(minor), Some(patch), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            anyhow::bail!("릴리스 태그는 정확한 vX.Y.Z 형식이어야 합니다: {raw:?}");
+        };
+        let valid_component = |part: &str| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == "0" || !part.starts_with('0'))
+        };
+        if ![major, minor, patch].into_iter().all(valid_component) {
+            anyhow::bail!("릴리스 태그는 정확한 vX.Y.Z 형식이어야 합니다: {raw:?}");
+        }
+        Ok(Self(raw))
+    }
+
+    fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Release {
     pub tag: String,
@@ -109,12 +139,7 @@ pub fn latest_release() -> Result<Release> {
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let best = text
-        .lines()
-        .filter_map(|l| l.rsplit('/').next())
-        .filter_map(|t| t.parse::<SemverKey>().ok().map(|k| (t.to_string(), k)))
-        .max_by(|a, b| a.1.cmp(&b.1));
-    let Some((tag, _)) = best else {
+    let Some(tag) = latest_stable_tag_from_refs(&text) else {
         return Err(anyhow!("태그가 없습니다"));
     };
     Ok(Release {
@@ -126,6 +151,14 @@ pub fn latest_release() -> Result<Release> {
     })
 }
 
+fn latest_stable_tag_from_refs(text: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|l| l.rsplit('/').next())
+        .filter_map(|t| t.parse::<SemverKey>().ok().map(|k| (t.to_string(), k)))
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .map(|(tag, _)| tag)
+}
+
 /// vX.Y.Z 태그 정렬용 키.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct SemverKey(Vec<u64>);
@@ -133,18 +166,13 @@ struct SemverKey(Vec<u64>);
 impl std::str::FromStr for SemverKey {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
-        let nums: Vec<u64> = s
-            .trim_start_matches(|c: char| !c.is_ascii_digit())
+        let tag = ValidatedTag::parse(s)?;
+        let nums = tag
+            .as_str()
+            .trim_start_matches('v')
             .split('.')
-            .take(3)
-            .map(|p| {
-                p.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-            })
-            .filter(|p| !p.is_empty())
-            .map(|p| p.parse::<u64>())
-            .collect::<Result<_, _>>()?;
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(SemverKey(nums))
     }
 }
@@ -331,6 +359,19 @@ mod tests {
                 .iter()
                 .any(|argument| argument.contains("synthetic-credential"))
         );
+    }
+
+    #[test]
+    fn tag_fallback_ignores_annotated_peeled_and_non_stable_refs() {
+        let refs = concat!(
+            "111 refs/tags/v1.1.8\n",
+            "222 refs/tags/v1.1.8^{}\n",
+            "333 refs/tags/v1.1.9\n",
+            "444 refs/tags/v1.1.9^{}\n",
+            "555 refs/tags/v9.0.0-rc.1\n",
+            "666 refs/tags/release-10.0.0\n",
+        );
+        assert_eq!(latest_stable_tag_from_refs(refs), Some("v1.1.9".into()));
     }
 
     #[test]
