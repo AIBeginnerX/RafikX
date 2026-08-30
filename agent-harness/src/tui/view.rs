@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::md::MdKind;
 use super::{App, EntryKind};
+use crate::lifecycle::LifecycleState;
 use crate::palette::{self, Theme};
 
 const CONTINUATION_PREFIX: &str = "       ";
@@ -1403,8 +1404,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         used += super::md::display_width(yolo);
     }
 
+    let lifecycle_state = app.lifecycle_state.lock().ok().and_then(|state| *state);
+
     // 상태 — 승인 대기가 최우선, 그다음 실행 스피너, 마지막 idle 결과.
     if let Some(ap) = &app.approval {
+        let state = " Waiting approval";
+        used += super::md::display_width(state);
+        line_spans.push(Span::styled(
+            state,
+            Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+        ));
         for (i, (label, color)) in [("Yes", Color::Green), ("No", th.err), ("Always", th.warn)]
             .iter()
             .enumerate()
@@ -1429,22 +1438,33 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
         used += super::md::display_width(hint);
         line_spans.push(Span::styled(hint, Style::default().fg(th.mute)));
     } else if app.busy {
-        let state = format!(" {} {}", braille_spin(), active_status_label(&app.status));
+        let label = lifecycle_state
+            .map(lifecycle_state_label)
+            .unwrap_or_else(|| active_status_label(&app.status));
+        let state = format!(" {} {label}", braille_spin());
         used += super::md::display_width(&state);
         line_spans.push(Span::styled(
             state,
-            Style::default().fg(th.code).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(lifecycle_state
+                    .map(|state| lifecycle_status_color(state, th))
+                    .unwrap_or(th.code))
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
-        let state = format!(
-            " {} {}",
-            idle_status_mark(&app.status),
-            footer_state_label(&app.status)
-        );
+        let label = lifecycle_state
+            .map(lifecycle_state_label)
+            .unwrap_or_else(|| footer_state_label(&app.status));
+        let mark = lifecycle_state
+            .map(lifecycle_status_mark)
+            .unwrap_or_else(|| idle_status_mark(&app.status));
+        let state = format!(" {mark} {label}");
         used += super::md::display_width(&state);
         line_spans.push(Span::styled(
             state,
-            Style::default().fg(idle_status_color(&app.status, th)),
+            Style::default().fg(lifecycle_state
+                .map(|state| lifecycle_status_color(state, th))
+                .unwrap_or_else(|| idle_status_color(&app.status, th))),
         ));
     }
 
@@ -1548,21 +1568,77 @@ fn footer_state_label(status: &str) -> &'static str {
         || status.contains("오류")
     {
         "Failed"
-    } else if normalized.contains("stop")
+    } else if normalized.contains("limit") || status.contains("제한") {
+        "Limited"
+    } else if normalized.contains("cancel")
+        || normalized.contains("stop")
         || normalized.contains("interrupt")
+        || status.contains("취소")
         || status.contains("중단")
     {
-        "Stopped"
+        "Cancelled"
+    } else if normalized == "ok"
+        || normalized.contains("success")
+        || normalized.contains("succeed")
+        || status.contains("완료")
+    {
+        "Succeeded"
     } else {
         "Ready"
+    }
+}
+
+fn lifecycle_state_label(state: LifecycleState) -> &'static str {
+    match state {
+        LifecycleState::Queued => "Queued",
+        LifecycleState::Planning => "Planning",
+        LifecycleState::Running => "Running",
+        LifecycleState::WaitingApproval => "Waiting approval",
+        LifecycleState::Delegating => "Delegating",
+        LifecycleState::Answering => "Answering",
+        LifecycleState::Succeeded => "Succeeded",
+        LifecycleState::Limited => "Limited",
+        LifecycleState::Failed => "Failed",
+        LifecycleState::CancelRequested => "Cancelling",
+        LifecycleState::Cancelled => "Cancelled",
+    }
+}
+
+fn lifecycle_status_mark(state: LifecycleState) -> &'static str {
+    match state {
+        LifecycleState::Queued => "·",
+        LifecycleState::Planning
+        | LifecycleState::Running
+        | LifecycleState::Delegating
+        | LifecycleState::Answering => "●",
+        LifecycleState::WaitingApproval => "?",
+        LifecycleState::Succeeded => "✓",
+        LifecycleState::Limited | LifecycleState::Failed => "!",
+        LifecycleState::CancelRequested | LifecycleState::Cancelled => "■",
+    }
+}
+
+fn lifecycle_status_color(state: LifecycleState, th: &Pal) -> Color {
+    match state {
+        LifecycleState::Queued => th.mute,
+        LifecycleState::Planning
+        | LifecycleState::Running
+        | LifecycleState::Delegating
+        | LifecycleState::Answering => th.code,
+        LifecycleState::WaitingApproval | LifecycleState::Limited => th.warn,
+        LifecycleState::Succeeded => th.success,
+        LifecycleState::Failed | LifecycleState::CancelRequested | LifecycleState::Cancelled => {
+            th.err
+        }
     }
 }
 
 fn idle_status_mark(status: &str) -> &'static str {
     match footer_state_label(status) {
         "Failed" => "!",
-        "Stopped" => "■",
-        "Ready" => "✓",
+        "Limited" => "!",
+        "Cancelled" => "■",
+        "Ready" | "Succeeded" => "✓",
         _ => "?",
     }
 }
@@ -1570,8 +1646,9 @@ fn idle_status_mark(status: &str) -> &'static str {
 fn idle_status_color(status: &str, th: &Pal) -> Color {
     match footer_state_label(status) {
         "Failed" => th.err,
-        "Stopped" => th.warn,
-        "Ready" => th.success,
+        "Limited" => th.warn,
+        "Cancelled" => th.err,
+        "Ready" | "Succeeded" => th.success,
         _ => th.mute,
     }
 }
@@ -2220,7 +2297,9 @@ mod tests {
         assert_eq!(harness_header_label(true, "pi"), "Harness Manual · pi");
         assert_eq!(footer_state_label("준비"), "Ready");
         assert_eq!(footer_state_label("실패"), "Failed");
-        assert_eq!(footer_state_label("중단됨"), "Stopped");
+        assert_eq!(footer_state_label("제한됨"), "Limited");
+        assert_eq!(footer_state_label("중단됨"), "Cancelled");
+        assert_eq!(footer_state_label("ok"), "Succeeded");
         assert_eq!(idle_status_mark("준비"), "✓");
         assert_eq!(idle_status_mark("실패"), "!");
         assert_eq!(idle_status_mark("중단됨"), "■");
@@ -2229,6 +2308,27 @@ mod tests {
             "Auto-compacting"
         );
         assert_eq!(active_status_label("도구 실행 중"), "Working");
+    }
+
+    #[test]
+    fn lifecycle_footer_labels_name_every_state() {
+        let cases = [
+            (LifecycleState::Queued, "Queued"),
+            (LifecycleState::Planning, "Planning"),
+            (LifecycleState::Running, "Running"),
+            (LifecycleState::WaitingApproval, "Waiting approval"),
+            (LifecycleState::Delegating, "Delegating"),
+            (LifecycleState::CancelRequested, "Cancelling"),
+            (LifecycleState::Answering, "Answering"),
+            (LifecycleState::Succeeded, "Succeeded"),
+            (LifecycleState::Limited, "Limited"),
+            (LifecycleState::Failed, "Failed"),
+            (LifecycleState::Cancelled, "Cancelled"),
+        ];
+
+        for (state, label) in cases {
+            assert_eq!(lifecycle_state_label(state), label);
+        }
     }
 
     #[test]

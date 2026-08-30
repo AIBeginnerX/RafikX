@@ -250,6 +250,26 @@ fn truncate_newest_tool_result(msgs: &mut [Message], budget: usize) -> bool {
     false
 }
 
+fn drop_tool_pair_for_budget(msgs: &mut Vec<Message>, budget: usize) -> bool {
+    let pair_index = msgs
+        .windows(2)
+        .position(|pair| {
+            is_tool_use(&pair[0])
+                && is_tool_result(&pair[1])
+                && message_tokens(&pair[0]).saturating_add(message_tokens(&pair[1])) > budget
+        })
+        .or_else(|| {
+            msgs.windows(2)
+                .position(|pair| is_tool_use(&pair[0]) && is_tool_result(&pair[1]))
+        });
+    let Some(pair_index) = pair_index else {
+        return false;
+    };
+
+    msgs.drain(pair_index..pair_index + 2);
+    true
+}
+
 /// 출력 토큰을 남기고, 시스템·도구·최근 대화를 우선 유지한다.
 /// 도구 짝은 깨지 않는다. 잘리면 프롬프트에 한 줄 안내를 넣는다.
 pub fn pack_messages(
@@ -298,6 +318,12 @@ pub fn pack_messages(
         agent::sanitize_tool_pairs(&mut msgs);
         if shrunk && total(&msgs) < before {
             continue;
+        }
+        if drop_tool_pair_for_budget(&mut msgs, budget) {
+            insert_notice(&mut msgs);
+            if total(&msgs) < before {
+                continue;
+            }
         }
         if msgs.len() > 1 {
             if drop_oldest_unit(&mut msgs) {
@@ -661,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn packer_reaches_a_fixed_point_when_tool_pair_structure_exceeds_budget() {
+    fn packer_drops_a_tool_pair_when_its_fixed_structure_exceeds_budget() {
         let msgs = vec![
             Message {
                 role: Role::Assistant,
@@ -689,35 +715,144 @@ mod tests {
         ];
 
         let packed = pack_messages(&msgs, "", &[], 256, 0, 4_096);
-        assert!(packed.first().is_some_and(is_tool_use));
-        assert!(packed.get(1).is_some_and(is_tool_result));
-        let results: Vec<(&str, bool)> = packed[1]
-            .content
+        assert!(packed.iter().all(|message| !is_tool_use(message)));
+        assert!(packed.iter().all(|message| !is_tool_result(message)));
+        assert!(has_omit_notice(&packed));
+
+        let window = 256usize;
+        let reserved =
+            estimate_tokens("") + tools_tokens(&[]) + effective_output_limit(256, 0) as usize;
+        let mut budget = window.saturating_sub(reserved).max(256);
+        let char_as_tokens = 4_096usize / 4;
+        if char_as_tokens < budget {
+            budget = char_as_tokens.max(256);
+        }
+        let used = packed.iter().map(message_tokens).sum::<usize>();
+        assert!(used <= budget, "used={used} budget={budget}");
+
+        let repacked = pack_messages(&packed, "", &[], 256, 0, 4_096);
+        assert_eq!(
+            serde_json::to_value(&repacked).unwrap(),
+            serde_json::to_value(&packed).unwrap()
+        );
+    }
+
+    #[test]
+    fn dropping_an_oversized_pair_preserves_remaining_pair_metadata() {
+        let mut msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "first".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "first.rs"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "first".into(),
+                    content: "first result".into(),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "dropped".into(),
+                    name: "read_file".into(),
+                    input: json!({"payload": "x".repeat(4_096)}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "dropped".into(),
+                    content: "dropped result".repeat(128),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "last".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "last.rs"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "last".into(),
+                    content: "last result".into(),
+                    is_error: true,
+                }],
+            },
+        ];
+
+        assert!(drop_tool_pair_for_budget(&mut msgs, 256));
+        let uses: Vec<&str> = msgs
             .iter()
+            .filter(|message| is_tool_use(message))
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
+            })
+            .collect();
+        assert_eq!(uses, vec!["first", "last"]);
+        let results: Vec<(&str, bool)> = msgs
+            .iter()
+            .filter(|message| is_tool_result(message))
+            .flat_map(|message| message.content.iter())
             .filter_map(|block| match block {
                 ContentBlock::ToolResult {
                     tool_use_id,
-                    content,
                     is_error,
-                } if content.is_empty() => Some((tool_use_id.as_str(), *is_error)),
-                _ => None,
+                    ..
+                } => Some((tool_use_id.as_str(), *is_error)),
+                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
             })
             .collect();
-        assert_eq!(
-            results,
-            vec![("oversized-input", false), ("oversized-input", true)]
-        );
+        assert_eq!(results, vec![("first", false), ("last", true)]);
+    }
 
-        let repacked = pack_messages(&packed, "", &[], 256, 0, 4_096);
-        let repacked_results: Vec<&str> = repacked[1]
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(repacked_results, vec!["", ""]);
+    #[test]
+    fn packer_drops_a_fixed_pair_when_the_omission_notice_exceeds_the_budget() {
+        let tool_use = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "edge".into(),
+                name: "read_file".into(),
+                input: json!({"payload": "x".repeat(984)}),
+            }],
+        };
+        let tool_result = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "edge".into(),
+                content: String::new(),
+                is_error: false,
+            }],
+        };
+        let pair_tokens = message_tokens(&tool_use) + message_tokens(&tool_result);
+        let notice_tokens = message_tokens(&Message::user_text("[이전 대화 일부 생략]"));
+        assert!(pair_tokens <= 256, "pair_tokens={pair_tokens}");
+        assert!(
+            pair_tokens + notice_tokens > 256,
+            "pair_tokens={pair_tokens} notice_tokens={notice_tokens}"
+        );
+        let messages = vec![
+            Message::user_text("old context ".repeat(256)),
+            tool_use,
+            tool_result,
+        ];
+
+        let packed = pack_messages(&messages, "", &[], 256, 0, 4_096);
+
+        assert_eq!(packed.len(), 1);
+        assert!(has_omit_notice(&packed));
+        assert!(packed.iter().map(message_tokens).sum::<usize>() <= 256);
     }
 
     #[test]

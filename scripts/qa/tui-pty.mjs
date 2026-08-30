@@ -27,6 +27,12 @@ let browser;
 let promotionLock;
 const surfaces = new Set();
 
+function stripTerminalControls(value) {
+  return value
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
 async function closeServer() {
   if (!server?.listening) return;
   server.closeAllConnections?.();
@@ -305,22 +311,31 @@ await running.waitFor("프로젝트 구조를 분석해줘");
 await running.page.waitForTimeout(350);
 assert.match(await running.screenText(), /C.*P.*E.*V/);
 await running.waitFor("맥락과 실행 경계를 확인합니다.");
+await running.waitFor("Running");
+assert.match(await running.screenText(), /Running/);
 assert.match(running.raw(), /38;2;129;126;119/);
 await running.screenshot("tui-running-100x30.png");
 running.process.write("\u001b");
-await running.waitFor("실행 취소를 요청했습니다");
-assert.match(await running.screenText(), /●E/);
-await running.screenshot("tui-cancel-requested-100x30.png");
+await running.waitFor("Cancelled");
+assert.match(stripTerminalControls(running.raw()), /실행 취소를 요청했습니다/);
+assert.match(running.raw(), /Cancelling/);
+assert.match(await running.screenText(), /Cancelled/);
+assert.match(await running.screenText(), /●V/);
+await running.screenshot("tui-cancelled-100x30.png");
 await running.close();
 
 const approval = await terminalSurface(100, 30);
 await approval.waitFor("RAFIKX");
 approval.process.write("/agent 승인 명령을 실행해줘\r");
 await approval.waitFor("도구 실행 승인 필요", 8000);
+await approval.waitFor("Waiting approval", 8000);
+assert.match(await approval.screenText(), /Waiting approval/);
 await approval.screenshot("tui-approval-100x30.png");
 approval.process.write("y");
 await approval.waitFor("승인된 명령을 실행하고 결과를 검증했습니다", 8000);
 await approval.waitFor("Run summary · ✓ ok", 8000);
+await approval.waitFor("Succeeded", 8000);
+assert.match(await approval.screenText(), /Succeeded/);
 await approval.screenshot("tui-succeeded-100x30.png");
 await approval.close();
 
@@ -333,6 +348,7 @@ const failedText = await failed.screenText();
 assert.match(failedText.split("\n")[0], /…\/한국어-workspace-/);
 assert.match(failedText, /OpenAI 호환 API 오류 HTTP 500/);
 assert.match(failedText, /BUILD\s+! Failed/);
+assert.match(failedText, /Failed/);
 await failed.screenshot("tui-failed-100x30.png");
 await failed.close();
 

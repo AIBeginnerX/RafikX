@@ -13,6 +13,8 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::ExitStatus;
 use std::process::Stdio;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
 #[cfg(unix)]
@@ -129,6 +131,7 @@ struct ProcessIdentity {
     pid: u32,
     audit_token: AuditToken,
     unique_id: u64,
+    pid_version: u32,
     parent_unique_id: u64,
 }
 
@@ -171,6 +174,18 @@ unsafe extern "C" {
 impl ProcessIdentity {
     const PROC_PID_UNIQUE_IDENTIFIER_INFO: i32 = 17;
 
+    fn matches_current_generation(&self, current: Option<&Self>) -> bool {
+        current.is_some_and(|current| {
+            self.pid == current.pid
+                && self.unique_id == current.unique_id
+                && self.pid_version == current.pid_version
+        })
+    }
+
+    fn captured_generation_is_gone(&self) -> Result<bool, String> {
+        Ok(!self.matches_current_generation(Self::capture(self.pid)?.as_ref()))
+    }
+
     fn capture(pid: u32) -> Result<Option<Self>, String> {
         let mut identity = ProcUniqueIdentifierInfo::default();
         let expected = std::mem::size_of::<ProcUniqueIdentifierInfo>() as i32;
@@ -193,11 +208,13 @@ impl ProcessIdentity {
         }
         let mut token = AuditToken { value: [0; 8] };
         token.value[5] = pid;
-        token.value[7] = identity.pid_version as u32;
+        let pid_version = identity.pid_version as u32;
+        token.value[7] = pid_version;
         Ok(Some(Self {
             pid,
             audit_token: token,
             unique_id: identity.unique_id,
+            pid_version,
             parent_unique_id: identity.parent_unique_id,
         }))
     }
@@ -213,10 +230,24 @@ impl GenerationBoundProcess for ProcessIdentity {
             if error == 3 {
                 return Ok(());
             }
+            let signal_error = std::io::Error::from_raw_os_error(error);
+            if signal_error.kind() == std::io::ErrorKind::PermissionDenied {
+                // EPERM can race with target exit. Suppress it only when an immediate unique-id +
+                // pid-version lookup proves that the exact captured generation is already gone.
+                match self.captured_generation_is_gone() {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(revalidation_error) => {
+                        return Err(format!(
+                            "PID {} audit-token 신호 {signal} 실패: {signal_error}; 세대 재검증 실패: {revalidation_error}",
+                            self.pid
+                        ));
+                    }
+                }
+            }
             return Err(format!(
                 "PID {} audit-token 신호 {signal} 실패: {}",
-                self.pid,
-                std::io::Error::from_raw_os_error(error)
+                self.pid, signal_error
             ));
         }
         Ok(())
@@ -952,15 +983,33 @@ async fn file_scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
     Err(format!("프로세스 scope lsof 반복 실패: {last_failure}"))
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn spawn_marker_fd_scan<T, F>(
+    permit: Arc<tokio::sync::SemaphorePermit<'static>>,
+    scan: F,
+) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        scan()
+    })
+}
+
 #[cfg(target_os = "linux")]
-async fn inherited_scope_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
+async fn inherited_scope_pids(
+    scope: &ProcessScope,
+    permit: Arc<tokio::sync::SemaphorePermit<'static>>,
+) -> Result<Vec<u32>, String> {
     #[cfg(test)]
     if scope.force_discovery_failure {
         return Err("강제된 프로세스 scope 조회 실패".into());
     }
     let device = scope.marker_device;
     let inode = scope.marker_inode;
-    let scan = tokio::task::spawn_blocking(move || {
+    let scan = spawn_marker_fd_scan(permit, move || {
         file_scoped_pids(device, inode, Duration::from_secs(1))
     });
     tokio::time::timeout(Duration::from_secs(2), scan)
@@ -996,10 +1045,14 @@ async fn discover_scope_pids(
     root: Option<u32>,
     cleanup_errors: &mut Vec<String>,
 ) -> Vec<u32> {
-    let Ok(_permit) = PROCESS_DISCOVERY_PERMITS.acquire().await else {
+    let Ok(permit) = PROCESS_DISCOVERY_PERMITS.acquire().await else {
         cleanup_errors.push("프로세스 조회 동시성 제어가 닫혔습니다".into());
         return Vec::new();
     };
+    #[cfg(target_os = "linux")]
+    let permit = Arc::new(permit);
+    #[cfg(not(target_os = "linux"))]
+    let _permit = permit;
     #[cfg(test)]
     if let Some(probe) = &scope.cleanup_probe {
         probe
@@ -1014,7 +1067,11 @@ async fn discover_scope_pids(
             Vec::new()
         }
     };
-    match inherited_scope_pids(scope).await {
+    #[cfg(target_os = "linux")]
+    let inherited = inherited_scope_pids(scope, Arc::clone(&permit)).await;
+    #[cfg(not(target_os = "linux"))]
+    let inherited = inherited_scope_pids(scope).await;
+    match inherited {
         Ok(pids) => discovered.extend(pids),
         Err(error) => cleanup_errors.push(error),
     }
@@ -1066,10 +1123,14 @@ async fn capture_scoped_identities(
     captured: &mut Vec<ProcessIdentity>,
     cleanup_errors: &mut Vec<String>,
 ) -> Vec<u32> {
-    let Ok(_permit) = PROCESS_DISCOVERY_PERMITS.acquire().await else {
+    let Ok(permit) = PROCESS_DISCOVERY_PERMITS.acquire().await else {
         cleanup_errors.push("프로세스 조회 동시성 제어가 닫혔습니다".into());
         return Vec::new();
     };
+    #[cfg(target_os = "linux")]
+    let permit = Arc::new(permit);
+    #[cfg(not(target_os = "linux"))]
+    let _permit = permit;
     #[cfg(test)]
     if let Some(probe) = &scope.cleanup_probe {
         probe
@@ -1084,7 +1145,11 @@ async fn capture_scoped_identities(
         }
         Err(error) => cleanup_errors.push(error),
     }
-    match inherited_scope_pids(scope).await {
+    #[cfg(target_os = "linux")]
+    let inherited = inherited_scope_pids(scope, Arc::clone(&permit)).await;
+    #[cfg(not(target_os = "linux"))]
+    let inherited = inherited_scope_pids(scope).await;
+    match inherited {
         Ok(pids) => {
             capture_candidate_identities(pids, root, captured, &mut visible, cleanup_errors)
         }
@@ -1311,6 +1376,57 @@ pub(crate) async fn terminate(child: Child, scope: ProcessScope) -> Result<(), S
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn macos_identity(pid: u32, unique_id: u64, pid_version: u32) -> ProcessIdentity {
+        let mut audit_token = AuditToken { value: [0; 8] };
+        audit_token.value[5] = pid;
+        audit_token.value[7] = pid_version;
+        ProcessIdentity {
+            pid,
+            audit_token,
+            unique_id,
+            pid_version,
+            parent_unique_id: 0,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_requires_unique_id_and_pid_version_for_the_same_generation() {
+        let captured = macos_identity(42, 7, 3);
+
+        assert!(captured.matches_current_generation(Some(&macos_identity(42, 7, 3))));
+        assert!(!captured.matches_current_generation(Some(&macos_identity(42, 8, 3))));
+        assert!(!captured.matches_current_generation(Some(&macos_identity(42, 7, 4))));
+        assert!(!captured.matches_current_generation(Some(&macos_identity(43, 7, 3))));
+        assert!(!captured.matches_current_generation(None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_generation_revalidation_detects_a_reaped_process() {
+        let mut command = Command::new("sleep");
+        command.arg("5").kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn generation probe");
+        let pid = child.id().expect("generation probe pid");
+        let captured = ProcessIdentity::capture(pid)
+            .expect("capture live generation")
+            .expect("live generation exists");
+
+        assert!(
+            !captured
+                .captured_generation_is_gone()
+                .expect("revalidate live generation")
+        );
+        child.start_kill().expect("kill generation probe");
+        child.wait().await.expect("reap generation probe");
+        assert!(
+            captured
+                .captured_generation_is_gone()
+                .expect("revalidate reaped generation")
+        );
+    }
+
     struct FakeIdentity<'a> {
         generation: u64,
         current_generation: &'a std::cell::Cell<u64>,
@@ -1384,6 +1500,62 @@ mod tests {
         signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut errors);
         child.wait().await.expect("reap cancellation fixture");
         assert!(errors.is_empty(), "{}", errors.join("; "));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marker_fd_scan_keeps_discovery_permit_after_owner_cancellation() {
+        static TEST_DISCOVERY_PERMITS: tokio::sync::Semaphore =
+            tokio::sync::Semaphore::const_new(2);
+        let mut permits = TEST_DISCOVERY_PERMITS
+            .acquire_many(2)
+            .await
+            .expect("reserve both discovery permits");
+        let scan_permit = permits.split(1).expect("split marker scan permit");
+        let (scan_started, started) = tokio::sync::oneshot::channel();
+        let (release_scan, release) = std::sync::mpsc::sync_channel(0);
+        let (scan_sender, scan_receiver) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let permit = Arc::new(scan_permit);
+            let scan = spawn_marker_fd_scan(Arc::clone(&permit), move || {
+                scan_started.send(()).expect("report scan start");
+                release.recv().expect("release marker scan");
+            });
+            scan_sender.send(scan).expect("return scan handle");
+            std::future::pending::<()>().await;
+        });
+        let scan = scan_receiver.await.expect("receive scan handle");
+        started.await.expect("marker scan started");
+
+        owner.abort();
+        assert!(
+            owner
+                .await
+                .expect_err("owner must be cancelled")
+                .is_cancelled(),
+            "owner cancellation was not observed"
+        );
+
+        assert!(
+            TEST_DISCOVERY_PERMITS.try_acquire().is_err(),
+            "reserved permits must exclude unrelated discovery"
+        );
+        drop(permits);
+        let available = TEST_DISCOVERY_PERMITS
+            .try_acquire()
+            .expect("the unrelated permit must become available");
+        assert!(
+            TEST_DISCOVERY_PERMITS.try_acquire().is_err(),
+            "blocking marker scan returned its permit before completing"
+        );
+        drop(available);
+
+        release_scan.send(()).expect("release marker scan");
+        scan.await.expect("marker scan completed");
+        let all_permits = TEST_DISCOVERY_PERMITS
+            .try_acquire_many(2)
+            .expect("marker scan released its permit after completion");
+        drop(all_permits);
     }
 
     #[tokio::test]
