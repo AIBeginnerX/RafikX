@@ -306,6 +306,59 @@ pub(crate) struct ProcessScope {
     cleanup_probe: Option<std::sync::Arc<CleanupProbe>>,
 }
 
+pub(crate) struct ScopedProcess {
+    child: Option<Child>,
+    scope: Option<ProcessScope>,
+}
+
+impl ScopedProcess {
+    pub(crate) fn new(child: Child, scope: ProcessScope) -> Self {
+        Self {
+            child: Some(child),
+            scope: Some(scope),
+        }
+    }
+
+    pub(crate) fn child_mut(&mut self) -> Result<&mut Child, String> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| "프로세스 소유권이 이미 정리 작업으로 이동했습니다".to_string())
+    }
+
+    pub(crate) async fn terminate(mut self) -> Result<(), String> {
+        let child = self
+            .child
+            .take()
+            .ok_or_else(|| "프로세스 소유권이 이미 정리 작업으로 이동했습니다".to_string())?;
+        let scope = self
+            .scope
+            .take()
+            .ok_or_else(|| "프로세스 scope가 이미 정리 작업으로 이동했습니다".to_string())?;
+        terminate(child, scope).await
+    }
+}
+
+impl Drop for ScopedProcess {
+    fn drop(&mut self) {
+        let (Some(child), Some(scope)) = (self.child.take(), self.scope.take()) else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(terminate_owned(child, scope));
+            return;
+        }
+        std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let _ = runtime.block_on(terminate_owned(child, scope));
+        });
+    }
+}
+
 #[cfg(all(test, unix))]
 #[derive(Debug, Default)]
 struct CleanupProbe {
@@ -1318,6 +1371,10 @@ async fn terminate_owned(mut child: Child, scope: ProcessScope) -> Result<(), St
             probe.worker_started.notify_one();
         }
         quiesce_root_before_cleanup(&mut child, &mut cleanup_errors);
+        let mut captured = Vec::new();
+        let root = active_root(&mut child, &mut cleanup_errors);
+        let first_visible =
+            capture_scoped_identities(&scope, root, &mut captured, &mut cleanup_errors).await;
         let _cleanup_admission = match process_cleanup_admission_permits(&scope)
             .acquire_owned()
             .await
@@ -1325,6 +1382,7 @@ async fn terminate_owned(mut child: Child, scope: ProcessScope) -> Result<(), St
             Ok(permit) => permit,
             Err(_) => {
                 cleanup_errors.push("프로세스 정리 허가가 닫혔습니다".into());
+                signal_captured_processes(&captured, PROCESS_KILL_SIGNAL, &mut cleanup_errors);
                 if let Some(pid) = active_root(&mut child, &mut cleanup_errors) {
                     if let Err(error) = signal_process_group(pid, PROCESS_KILL_SIGNAL) {
                         cleanup_errors.push(error);
@@ -1344,10 +1402,6 @@ async fn terminate_owned(mut child: Child, scope: ProcessScope) -> Result<(), St
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             probe.cleanup_admission_acquired.notify_one();
         }
-        let mut captured = Vec::new();
-        let root = active_root(&mut child, &mut cleanup_errors);
-        let first_visible =
-            capture_scoped_identities(&scope, root, &mut captured, &mut cleanup_errors).await;
         match tokio::time::timeout(
             PROCESS_CLEANUP_TIMEOUT,
             terminate_unix_inner(
@@ -1665,17 +1719,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_admission_limits_saturated_sessions_before_discovery() {
-        // Given: two admitted cleanup sessions blocked before discovery and a third queued session.
+    async fn cleanup_admission_queues_sessions_after_discovery() {
+        // Given: cleanup admission is saturated while physical discovery remains available.
         let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
         let discovery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let held_discovery = discovery_permits
-            .acquire_many(2)
+        let held_admission = cleanup_admission_permits
+            .clone()
+            .acquire_many_owned(2)
             .await
-            .expect("hold both discovery permits");
+            .expect("hold both cleanup admission permits");
         let mut cleanups = Vec::new();
         let mut probes = Vec::new();
-        for index in 0..3 {
+        for _ in 0..3 {
             let mut command = Command::new("sleep");
             command.arg("30");
             let (child, mut scope) =
@@ -1690,34 +1745,29 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
                 .await
                 .expect("cleanup worker started");
-            if index < 2 {
-                tokio::time::timeout(
-                    Duration::from_secs(1),
-                    probe.cleanup_admission_acquired.notified(),
-                )
-                .await
-                .expect("cleanup session admitted");
-            }
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                probe.scope_discovery_started.notified(),
+            )
+            .await
+            .expect("scope discovery started before admission");
             cleanups.push(cleanup);
             probes.push(probe);
         }
 
-        // Then: only two sessions own admission while all physical scans remain separately gated.
+        // Then: every session quiesces its scope before any can enter saturated admission.
         tokio::task::yield_now().await;
-        assert_eq!(
-            probes[2]
-                .cleanup_admission_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "third cleanup entered before an admitted session completed"
-        );
-        assert_eq!(
-            discovery_permits.available_permits(),
-            0,
-            "cleanup admission bypassed physical discovery gating"
-        );
+        for probe in &probes {
+            assert_eq!(
+                probe
+                    .cleanup_admission_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "cleanup entered saturated admission before scope discovery"
+            );
+        }
 
-        drop(held_discovery);
+        drop(held_admission);
         for cleanup in cleanups {
             tokio::time::timeout(Duration::from_secs(20), cleanup)
                 .await
@@ -1725,12 +1775,87 @@ mod tests {
                 .expect("cleanup caller joined")
                 .expect("saturated cleanup succeeded");
         }
+        for probe in &probes {
+            assert_eq!(
+                probe
+                    .cleanup_admission_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "queued cleanup never acquired admission"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_cleanup_quiesces_retained_marker_before_admission() {
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file());
+        let Some(python) = python else { return };
+
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-process-pre-admission-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("test directory");
+        let ready = root.join("ready");
+        let survived = root.join("DESCENDANT_SURVIVED");
+        let script = "import os,sys,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n open(sys.argv[1], 'w').write(str(os.getpid()))\n time.sleep(1)\n open(sys.argv[2], 'w').write('survived')\n time.sleep(60)\nos._exit(0)";
+        let mut command = Command::new("env");
+        command.args([
+            "-u",
+            PROCESS_SCOPE_ENV,
+            python,
+            "-c",
+            script,
+            ready.to_str().expect("ready path"),
+            survived.to_str().expect("survived path"),
+        ]);
+        let (child, mut scope) = spawn_scoped(&mut command).expect("spawn admission fixture");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached daemon ready");
+
+        let cleanup_admission_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let held_admission = cleanup_admission_permits
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .expect("hold cleanup admission");
+        let probe = std::sync::Arc::new(CleanupProbe {
+            cleanup_admission_permits: Some(cleanup_admission_permits),
+            discovery_permits: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(2))),
+            ..CleanupProbe::default()
+        });
+        scope.cleanup_probe = Some(probe.clone());
+        let cleanup = tokio::spawn(terminate(child, scope));
+        tokio::time::timeout(Duration::from_secs(1), probe.worker_started.notified())
+            .await
+            .expect("cleanup worker started");
+
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        let side_effect_happened = survived.exists();
+        drop(held_admission);
+        tokio::time::timeout(Duration::from_secs(12), cleanup)
+            .await
+            .expect("queued cleanup completed")
+            .expect("cleanup caller joined")
+            .expect("queued cleanup succeeded");
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            !side_effect_happened,
+            "retained-marker descendant ran while cleanup waited for admission"
+        );
         assert_eq!(
-            probes[2]
+            probe
                 .cleanup_admission_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "queued cleanup never acquired admission"
+            1
         );
     }
 
@@ -1949,6 +2074,64 @@ mod tests {
         .await
         .expect("cleanup worker released process scope");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scoped_process_drop_cleans_detached_retained_marker_descendant() {
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file());
+        let Some(python) = python else { return };
+        let root = std::env::temp_dir().join(format!(
+            "rafikx-process-owner-drop-{}",
+            crate::db::Db::new_id()
+        ));
+        std::fs::create_dir_all(&root).expect("test directory");
+        let ready = root.join("ready");
+        let survived = root.join("DESCENDANT_SURVIVED");
+        let script = "import os,sys,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n open(sys.argv[1], 'w').write(str(os.getpid()))\n time.sleep(2)\n open(sys.argv[2], 'w').write('survived')\n time.sleep(60)\nos._exit(0)";
+        let mut command = Command::new("env");
+        command.args([
+            "-u",
+            PROCESS_SCOPE_ENV,
+            python,
+            "-c",
+            script,
+            ready.to_str().expect("ready path"),
+            survived.to_str().expect("survived path"),
+        ]);
+        let (child, scope) = spawn_scoped(&mut command).expect("spawn owner-drop fixture");
+        let owner = tokio::spawn(async move {
+            let _process = ScopedProcess::new(child, scope);
+            std::future::pending::<()>().await;
+        });
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&ready)
+                    && let Ok(pid) = pid.parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached daemon ready");
+
+        owner.abort();
+        assert!(owner.await.expect_err("owner cancelled").is_cancelled());
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        let side_effect_happened = survived.exists();
+        if side_effect_happened {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &daemon_pid.to_string()])
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            !side_effect_happened,
+            "dropping scoped ownership stranded detached PID {daemon_pid}"
+        );
     }
 
     #[test]

@@ -27,7 +27,8 @@
 - [x] 릴리스 문서·기본/최소 전체 테스트·브라우저 게임 E2E·실제 PTY 최종 갱신
 - [x] 네이티브 게임의 대시보드·차트·리포트 요청 오분류 수정과 Rust 1.96 문서 통일
 - [x] 동일 provider 모델·계정 fallback과 OpenAI·Anthropic·Codex stream terminal 무결성 고정
-- [ ] (진행) 프로세스 정리·동기 Bash 취소와 병렬 lifecycle·검증 후 최종 답변 차단점 수정
+- [x] admission 대기 전 프로세스 quiesce와 Bash·브라우저·품질 명령 취소·조기 오류 정리
+- [ ] (진행) 병렬 lifecycle·검증 후 최종 답변·TUI Esc 차단점 수정
 - [ ] (대기) 기본·최소 전체 테스트, 브라우저 게임 복구 E2E, 실제 PTY 재검증
 - [ ] (대기) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`

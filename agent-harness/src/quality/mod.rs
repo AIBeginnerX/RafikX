@@ -120,35 +120,39 @@ pub(crate) async fn run_bounded_command(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let (mut child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
+    let (child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
         .map_err(|error| format!("실행 실패: {error}"))?;
-    let stdout = child
+    let mut process = crate::process_tree::ScopedProcess::new(child, process_scope);
+    let stdout = process
+        .child_mut()?
         .stdout
         .take()
         .ok_or_else(|| "표준 출력 파이프를 열 수 없습니다".to_string())?;
-    let stderr = child
+    let stderr = process
+        .child_mut()?
         .stderr
         .take()
         .ok_or_else(|| "표준 오류 파이프를 열 수 없습니다".to_string())?;
     let stdout_reader = tokio::spawn(read_bounded_tail(stdout, MAX_QUALITY_STREAM_BYTES));
     let stderr_reader = tokio::spawn(read_bounded_tail(stderr, MAX_QUALITY_STREAM_BYTES));
 
-    let status = match tokio::time::timeout(deadline, child.wait()).await {
+    let status = match tokio::time::timeout(deadline, process.child_mut()?.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            let cleanup = crate::process_tree::terminate(child, process_scope).await;
+            let cleanup = process.terminate().await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             cleanup.map_err(|cleanup| format!("실행 대기 실패 후 정리 실패: {cleanup}"))?;
             return Err(format!("실행 대기 실패: {error}"));
         }
         Err(_) => {
-            let cleanup = crate::process_tree::terminate(child, process_scope).await;
+            let cleanup = process.terminate().await;
             let _ = await_bounded_readers(stdout_reader, stderr_reader).await;
             cleanup.map_err(|cleanup| format!("시간 초과 후 프로세스 정리 실패: {cleanup}"))?;
             return Err(format!("시간 초과 ({}초)", deadline.as_secs()));
         }
     };
-    crate::process_tree::terminate(child, process_scope)
+    process
+        .terminate()
         .await
         .map_err(|cleanup| format!("명령 종료 후 프로세스 정리 실패: {cleanup}"))?;
     let (stdout, stderr, overflow) = await_bounded_readers(stdout_reader, stderr_reader).await?;
@@ -1758,6 +1762,44 @@ pub(crate) fn repair_evidence(report: &QualityReport, workspace: &Path) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborted_bounded_command_cleans_background_processes() {
+        let root =
+            std::env::temp_dir().join(format!("rafikx-quality-abort-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&root).expect("temp workspace");
+        let ready = root.join("READY");
+        let survived = root.join("DESCENDANT_SURVIVED");
+        let args = vec![
+            "-c".to_string(),
+            "touch READY; (sleep 2; touch DESCENDANT_SURVIVED) & wait".to_string(),
+        ];
+        let execution = tokio::spawn({
+            let root = root.clone();
+            async move {
+                run_bounded_command("sh", &args, &root, std::time::Duration::from_secs(60)).await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("bounded command started");
+
+        execution.abort();
+        let joined = execution.await;
+        assert!(matches!(joined, Err(error) if error.is_cancelled()));
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        let side_effect_happened = survived.exists();
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            !side_effect_happened,
+            "aborted bounded command left a background process running"
+        );
+    }
 
     #[tokio::test]
     async fn changed_javascript_paths_are_argv_not_shell_source() {

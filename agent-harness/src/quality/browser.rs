@@ -2493,12 +2493,16 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let (mut child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
+    let (child, process_scope) = crate::process_tree::spawn_scoped(&mut command)
         .map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?;
-    let Some(stderr) = child.stderr.take() else {
-        crate::process_tree::terminate(child, process_scope)
-            .await
-            .map_err(anyhow::Error::msg)?;
+    let mut process = crate::process_tree::ScopedProcess::new(child, process_scope);
+    let Some(stderr) = process
+        .child_mut()
+        .map_err(anyhow::Error::msg)?
+        .stderr
+        .take()
+    else {
+        process.terminate().await.map_err(anyhow::Error::msg)?;
         anyhow::bail!("브라우저 stderr를 열 수 없습니다");
     };
     let stderr_log = Arc::new(Mutex::new(String::new()));
@@ -2528,7 +2532,11 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
         if *probe_receipt.ready.borrow() {
             break true;
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = process
+            .child_mut()
+            .map_err(anyhow::Error::msg)?
+            .try_wait()?
+        {
             early_status = Some(status);
             break false;
         }
@@ -2544,22 +2552,22 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     };
     let (success, code) = if ready {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        match child.try_wait()? {
+        match process
+            .child_mut()
+            .map_err(anyhow::Error::msg)?
+            .try_wait()?
+        {
             Some(status) => (status.success(), status.code()),
             None => (true, Some(0)),
         }
     } else if let Some(status) = early_status {
         (status.success(), status.code())
     } else {
-        crate::process_tree::terminate(child, process_scope)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        process.terminate().await.map_err(anyhow::Error::msg)?;
         let _ = await_stderr_reader(&mut resources).await;
         anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
     };
-    crate::process_tree::terminate(child, process_scope)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    process.terminate().await.map_err(anyhow::Error::msg)?;
     await_stderr_reader(&mut resources).await?;
     let captured_server_errors = server_errors
         .lock()

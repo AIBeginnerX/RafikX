@@ -905,11 +905,12 @@ impl Tool for Bash {
             } else {
                 None
             };
-            let result = tokio::runtime::Handle::current().block_on(run_bash(
+            let result = tokio::runtime::Handle::current().block_on(run_bash(BashRequest {
                 command,
                 workspace,
                 timeout_secs,
-            ));
+                run: run.clone(),
+            }));
             let changes = match snapshot {
                 Some(snapshot) => snapshot
                     .changed_baselines()
@@ -1252,7 +1253,20 @@ where
     Ok(retained)
 }
 
-async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Result<String> {
+struct BashRequest {
+    command: String,
+    workspace: PathBuf,
+    timeout_secs: u64,
+    run: Option<RunContext>,
+}
+
+async fn run_bash(request: BashRequest) -> Result<String> {
+    let BashRequest {
+        command,
+        workspace,
+        timeout_secs,
+        run,
+    } = request;
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd");
@@ -1270,42 +1284,67 @@ async fn run_bash(command: String, workspace: PathBuf, timeout_secs: u64) -> Res
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .stdin(Stdio::null());
-    let (mut child, process_scope) = crate::process_tree::spawn_scoped(&mut cmd)
+    let (child, process_scope) = crate::process_tree::spawn_scoped(&mut cmd)
         .map_err(|e| anyhow!("명령을 시작하지 못했습니다: {e}"))?;
-    let stdout = child
+    let mut process = crate::process_tree::ScopedProcess::new(child, process_scope);
+    let stdout = process
+        .child_mut()
+        .map_err(anyhow::Error::msg)?
         .stdout
         .take()
         .ok_or_else(|| anyhow!("명령 stdout 파이프를 열지 못했습니다"))?;
-    let stderr = child
+    let stderr = process
+        .child_mut()
+        .map_err(anyhow::Error::msg)?
         .stderr
         .take()
         .ok_or_else(|| anyhow!("명령 stderr 파이프를 열지 못했습니다"))?;
 
-    let wait = timeout(Duration::from_secs(timeout_secs), async {
-        let (status, out_buf, err_buf) = tokio::try_join!(
-            child.wait(),
-            read_bounded_prefix(stdout),
-            read_bounded_prefix(stderr),
-        )?;
-        Ok::<_, std::io::Error>((status, out_buf, err_buf))
-    })
-    .await;
+    let wait = {
+        let child = process.child_mut().map_err(anyhow::Error::msg)?;
+        let completion = async {
+            let (status, out_buf, err_buf) = tokio::try_join!(
+                child.wait(),
+                read_bounded_prefix(stdout),
+                read_bounded_prefix(stderr),
+            )?;
+            Ok::<_, std::io::Error>((status, out_buf, err_buf))
+        };
+        if let Some(run) = &run {
+            tokio::select! {
+                result = timeout(Duration::from_secs(timeout_secs), completion) => Ok(result),
+                reason = run.cancelled_reason() => Err(reason),
+            }
+        } else {
+            Ok(timeout(Duration::from_secs(timeout_secs), completion).await)
+        }
+    };
 
     match wait {
-        Err(_) => {
-            crate::process_tree::terminate(child, process_scope)
+        Err(reason) => {
+            process
+                .terminate()
+                .await
+                .map_err(|error| anyhow!("명령 취소 후 프로세스 정리 실패: {error}"))?;
+            Err(anyhow!("명령이 취소되었습니다: {reason}"))
+        }
+        Ok(Err(_)) => {
+            process
+                .terminate()
                 .await
                 .map_err(|error| anyhow!("명령 시간 초과 후 프로세스 정리 실패: {error}"))?;
             Err(anyhow!("명령이 {timeout_secs}초를 넘겨 중단되었습니다"))
         }
-        Ok(Err(e)) => {
-            crate::process_tree::terminate(child, process_scope)
+        Ok(Ok(Err(e))) => {
+            process
+                .terminate()
                 .await
                 .map_err(|error| anyhow!("명령 대기 실패 후 프로세스 정리 실패: {error}"))?;
             Err(anyhow!("명령 실행 오류: {e}"))
         }
-        Ok(Ok((status, out_buf, err_buf))) => {
-            crate::process_tree::terminate(child, process_scope)
+        Ok(Ok(Ok((status, out_buf, err_buf)))) => {
+            process
+                .terminate()
                 .await
                 .map_err(|error| anyhow!("명령 종료 후 프로세스 정리 실패: {error}"))?;
             let mut combined = String::new();
@@ -1425,13 +1464,14 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("rafikx-bash-tree-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&root).expect("workspace");
-        let result = run_bash(
-            format!(
+        let result = run_bash(BashRequest {
+            command: format!(
                 "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\nos._exit(0)'"
             ),
-            root.clone(),
-            1,
-        )
+            workspace: root.clone(),
+            timeout_secs: 1,
+            run: None,
+        })
         .await;
         assert!(result.is_ok(), "{result:?}");
         tokio::time::sleep(Duration::from_millis(2200)).await;
@@ -1451,9 +1491,14 @@ mod tests {
             "printf 'stderr-0123456789-0123456789-0123456789-0123456789\\n' >&2; ",
             "i=$((i + 1)); done",
         );
-        let output = run_bash(command.into(), root.clone(), 3)
-            .await
-            .expect("verbose finite command");
+        let output = run_bash(BashRequest {
+            command: command.into(),
+            workspace: root.clone(),
+            timeout_secs: 3,
+            run: None,
+        })
+        .await
+        .expect("verbose finite command");
         assert!(output.contains("출력이 20KB에서 잘렸습니다"));
         assert!(output.len() < MAX_BASH_OUTPUT + 100);
         let _ = std::fs::remove_dir_all(root);
@@ -1471,17 +1516,52 @@ mod tests {
             crate::db::Db::new_id()
         ));
         std::fs::create_dir_all(&root).expect("workspace");
-        let result = run_bash(
-            format!(
+        let result = run_bash(BashRequest {
+            command: format!(
                 "env -u RAFIKX_PROCESS_SCOPE \"{python}\" -c 'import os,time\nos.environ.clear()\nchild=os.fork()\nif child == 0:\n os.setsid()\n if os.fork() > 0: os._exit(0)\n for fd in (0,1,2):\n  try: os.close(fd)\n  except OSError: pass\n time.sleep(2)\n open(\"DESCENDANT_SURVIVED\", \"w\").write(\"survived\")\n os._exit(0)\ntime.sleep(5)'"
             ),
-            root.clone(),
-            1,
-        )
+            workspace: root.clone(),
+            timeout_secs: 1,
+            run: None,
+        })
         .await;
         assert!(result.is_err());
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!root.join("DESCENDANT_SURVIVED").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bash_cancellation_interrupts_command_before_timeout() {
+        let root =
+            std::env::temp_dir().join(format!("rafikx-bash-cancel-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let ready = root.join("READY");
+        let run = RunContext::isolated(crate::run::RunId::new("bash-cancel-test"), root.clone());
+        let mut ctx = ToolCtx::new(root.clone());
+        ctx.run = Some(run.clone());
+        let execution = tokio::spawn(async move {
+            Bash.run(
+                json!({"command": "touch READY; sleep 60", "timeout_secs": 60}),
+                &ctx,
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("bash command started");
+
+        assert!(run.cancel("test cancellation"));
+        let result = tokio::time::timeout(Duration::from_secs(3), execution)
+            .await
+            .expect("cancelled bash returned promptly")
+            .expect("bash task joined")
+            .expect_err("cancelled bash must fail");
+        assert!(result.to_string().contains("취소되었습니다"), "{result}");
         let _ = std::fs::remove_dir_all(root);
     }
 
