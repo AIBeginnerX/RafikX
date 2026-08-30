@@ -1454,17 +1454,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Pal) {
     } else {
         let label = lifecycle_state
             .map(lifecycle_state_label)
-            .unwrap_or_else(|| footer_state_label(&app.status));
+            .unwrap_or_else(|| idle_lifecycle_label(app));
         let mark = lifecycle_state
             .map(lifecycle_status_mark)
-            .unwrap_or_else(|| idle_status_mark(&app.status));
+            .unwrap_or_else(|| idle_status_mark(label));
         let state = format!(" {mark} {label}");
         used += super::md::display_width(&state);
         line_spans.push(Span::styled(
             state,
             Style::default().fg(lifecycle_state
                 .map(|state| lifecycle_status_color(state, th))
-                .unwrap_or_else(|| idle_status_color(&app.status, th))),
+                .unwrap_or_else(|| idle_status_color(label, th))),
         ));
     }
 
@@ -1588,6 +1588,36 @@ fn footer_state_label(status: &str) -> &'static str {
     }
 }
 
+fn idle_lifecycle_label(app: &App) -> &'static str {
+    idle_lifecycle_label_for(
+        &app.status,
+        app.show_start
+            && app.motion_tick < 16
+            && !super::start::terminal_reduced_motion(&app.session),
+        !crate::auth::usable_names(&app.session.cfg).is_empty(),
+    )
+}
+
+fn idle_lifecycle_label_for(status: &str, booting: bool, configured: bool) -> &'static str {
+    if booting {
+        return start_lifecycle_label(true, configured);
+    }
+    match footer_state_label(status) {
+        "Ready" => start_lifecycle_label(false, configured),
+        state => state,
+    }
+}
+
+fn start_lifecycle_label(booting: bool, configured: bool) -> &'static str {
+    if booting {
+        "Booting"
+    } else if configured {
+        "Ready-configured"
+    } else {
+        "Ready-unconfigured"
+    }
+}
+
 fn lifecycle_state_label(state: LifecycleState) -> &'static str {
     match state {
         LifecycleState::Queued => "Queued",
@@ -1634,22 +1664,31 @@ fn lifecycle_status_color(state: LifecycleState, th: &Pal) -> Color {
 }
 
 fn idle_status_mark(status: &str) -> &'static str {
-    match footer_state_label(status) {
-        "Failed" => "!",
-        "Limited" => "!",
-        "Cancelled" => "■",
-        "Ready" | "Succeeded" => "✓",
-        _ => "?",
+    match status {
+        "Booting" => "·",
+        "Ready-configured" | "Ready-unconfigured" => "✓",
+        _ => match footer_state_label(status) {
+            "Failed" => "!",
+            "Limited" => "!",
+            "Cancelled" => "■",
+            "Ready" | "Succeeded" => "✓",
+            _ => "?",
+        },
     }
 }
 
 fn idle_status_color(status: &str, th: &Pal) -> Color {
-    match footer_state_label(status) {
-        "Failed" => th.err,
-        "Limited" => th.warn,
-        "Cancelled" => th.err,
-        "Ready" | "Succeeded" => th.success,
-        _ => th.mute,
+    match status {
+        "Booting" => th.code,
+        "Ready-configured" => th.success,
+        "Ready-unconfigured" => th.warn,
+        _ => match footer_state_label(status) {
+            "Failed" => th.err,
+            "Limited" => th.warn,
+            "Cancelled" => th.err,
+            "Ready" | "Succeeded" => th.success,
+            _ => th.mute,
+        },
     }
 }
 
@@ -2308,6 +2347,33 @@ mod tests {
             "Auto-compacting"
         );
         assert_eq!(active_status_label("도구 실행 중"), "Working");
+    }
+
+    #[test]
+    fn start_footer_names_booting_and_both_ready_configurations() {
+        assert_eq!(start_lifecycle_label(true, false), "Booting");
+        assert_eq!(start_lifecycle_label(false, false), "Ready-unconfigured");
+        assert_eq!(start_lifecycle_label(false, true), "Ready-configured");
+        assert_eq!(idle_status_mark("Booting"), "·");
+        assert_eq!(idle_status_mark("Ready-unconfigured"), "✓");
+        assert_eq!(idle_status_mark("Ready-configured"), "✓");
+    }
+
+    #[test]
+    fn hidden_start_footer_keeps_configured_readiness_without_changing_terminal_states() {
+        assert_eq!(
+            idle_lifecycle_label_for("준비", false, false),
+            "Ready-unconfigured"
+        );
+        assert_eq!(
+            idle_lifecycle_label_for("준비", false, true),
+            "Ready-configured"
+        );
+        assert_eq!(
+            idle_lifecycle_label_for("ok", false, true),
+            "Succeeded"
+        );
+        assert_eq!(idle_lifecycle_label_for("실패", false, true), "Failed");
     }
 
     #[test]

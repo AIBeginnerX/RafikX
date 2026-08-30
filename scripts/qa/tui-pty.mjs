@@ -16,8 +16,10 @@ const output = path.resolve(process.env.RAFIKX_QA_OUTPUT || path.join(here, "art
 const tuiHome = path.join(root, ".omo/qa/tui-home");
 const configPath = path.join(tuiHome, "config.toml");
 const runStamp = `${Date.now()}-${process.pid}`;
+const runHome = path.join(tuiHome, "runs", runStamp);
 const qaWorkspace = path.join(tuiHome, "workspaces", `한국어-workspace-${runStamp}`);
 const runtimeConfigPath = path.join(tuiHome, `config-${runStamp}.toml`);
+const unconfiguredConfigPath = path.join(tuiHome, `config-unconfigured-${runStamp}.toml`);
 const stagingOutput = path.join(output, `.tui-pty-${runStamp}`);
 const promotionLockPath = path.join(output, ".tui-pty.promote.lock");
 const failedTask = "RAFIKX_PTY_HTTP500_9th_state_검증";
@@ -31,6 +33,51 @@ function stripTerminalControls(value) {
   return value
     .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
     .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function disableProviders(configText) {
+  const lines = configText.split("\n");
+  const disabled = [];
+  let providerBlock = false;
+  let enabledSeen = false;
+  for (const line of lines) {
+    const section = line.match(/^\[([^\]]+)\]\s*$/)?.[1];
+    if (section) {
+      if (providerBlock && !enabledSeen) disabled.push("enabled = false");
+      providerBlock = section.startsWith("providers.");
+      enabledSeen = false;
+      disabled.push(line);
+      continue;
+    }
+    if (providerBlock && /^\s*enabled\s*=/.test(line)) {
+      if (!enabledSeen) disabled.push("enabled = false");
+      enabledSeen = true;
+      continue;
+    }
+    disabled.push(line);
+  }
+  if (providerBlock && !enabledSeen) disabled.push("enabled = false");
+  return disabled.join("\n");
+}
+
+function assertAllProvidersDisabled(configText) {
+  const lines = configText.split("\n");
+  const providerBlocks = [];
+  let current;
+  for (const line of lines) {
+    const section = line.match(/^\[([^\]]+)\]\s*$/)?.[1];
+    if (section) {
+      if (current) providerBlocks.push(current);
+      current = section.startsWith("providers.") ? { name: section, enabled: [] } : undefined;
+    } else if (current && /^\s*enabled\s*=/.test(line)) {
+      current.enabled.push(line.trim());
+    }
+  }
+  if (current) providerBlocks.push(current);
+  assert.ok(providerBlocks.length > 0, "unconfigured QA config has no provider blocks");
+  for (const block of providerBlocks) {
+    assert.deepEqual(block.enabled, ["enabled = false"], `${block.name} is not deterministically disabled`);
+  }
 }
 
 async function closeServer() {
@@ -112,6 +159,8 @@ try {
     "[harness]\nstrict_gate = false\nreview_committee = false\n",
   );
   assert.notEqual(runtimeConfig, coderConfig, "QA strict review gate was not disabled");
+  const unconfiguredConfig = disableProviders(runtimeConfig);
+  assertAllProvidersDisabled(unconfiguredConfig);
 
   const build = spawnSync("cargo", ["build", "--all-features", "--manifest-path", "agent-harness/Cargo.toml"], {
     cwd: root,
@@ -189,7 +238,12 @@ await fs.writeFile(runtimeConfigPath, runtimeConfig);
 
 browser = await chromium.launch({ headless: true });
 
-async function terminalSurface(cols, rows, reducedMotion = false) {
+async function terminalSurface(
+  cols,
+  rows,
+  reducedMotion = false,
+  { config = runtimeConfigPath, args = ["--provider", "local", "--model", "qwen3:8b"] } = {},
+) {
   scenario += 1;
   const cellWidth = 9;
   const cellHeight = 20;
@@ -216,14 +270,15 @@ async function terminalSurface(cols, rows, reducedMotion = false) {
   }, { cols, rows });
   let raw = "";
   let closed = false;
-  childProcess = pty.spawn(binary, ["--config", runtimeConfigPath, "--provider", "local", "--model", "qwen3:8b"], {
+  const cliArgs = config ? ["--config", config, ...args] : args;
+  childProcess = pty.spawn(binary, cliArgs, {
     cols,
     rows,
     cwd: root,
     name: "xterm-256color",
     env: {
       ...processEnv(),
-      RAFIKX_HOME: path.join(tuiHome, "runs", runStamp, String(scenario)),
+      RAFIKX_HOME: path.join(runHome, String(scenario)),
       RAFIKX_REDUCE_MOTION: reducedMotion ? "1" : "0",
     },
   });
@@ -283,8 +338,12 @@ function processEnv() {
 const start = await terminalSurface(120, 40);
 await start.waitFor("RAFIKX");
 await start.page.waitForTimeout(260);
+await start.waitFor("Booting");
+assert.match(await start.screenText(), /Booting/);
 await start.screenshot("tui-start-mid-120x40.png");
 await start.waitFor("THE TERMINAL IS NOW A RUNTIME", 4000);
+await start.waitFor("Ready-configured");
+assert.match(await start.screenText(), /Ready-configured/);
 await start.screenshot("tui-start-settled-120x40.png");
 assert.match(await start.screenText(), /THE TERMINAL IS NOW A RUNTIME/);
 await start.close();
@@ -297,11 +356,14 @@ assert.match(await narrow.screenText(), /CONTEXT/);
 assert.match(await narrow.screenText(), /VERIFY/);
 await narrow.close();
 
-const reduced = await terminalSurface(80, 24, true);
+await fs.writeFile(unconfiguredConfigPath, unconfiguredConfig);
+const reduced = await terminalSurface(80, 24, true, { config: unconfiguredConfigPath, args: [] });
 await reduced.waitFor("RAFIKX");
 await reduced.page.waitForTimeout(150);
+await reduced.waitFor("Ready-unconfigured");
+assert.match(await reduced.screenText(), /Ready-unconfigured/);
 await reduced.screenshot("tui-start-reduced-80x24.png");
-assert.match(await reduced.screenText(), /THE TERMINAL IS NOW A RUNTIME/);
+assert.match(await reduced.screenText(), /CONNECT A MODEL TO OPEN THE RUNTIME/);
 await reduced.close();
 
 const running = await terminalSurface(100, 30);
@@ -361,6 +423,9 @@ process.stdout.write("TUI PTY/xterm QA passed\n");
   await promotionLock?.close().catch(() => {});
   if (promotionLock) await fs.rm(promotionLockPath, { force: true }).catch(() => {});
   await fs.rm(runtimeConfigPath, { force: true }).catch(() => {});
+  await fs.rm(unconfiguredConfigPath, { force: true }).catch(() => {});
   await fs.rm(qaWorkspace, { recursive: true, force: true }).catch(() => {});
   await fs.rm(stagingOutput, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(runHome, { recursive: true, force: true }).catch(() => {});
+  await assert.rejects(fs.access(runHome), { code: "ENOENT" });
 }

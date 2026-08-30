@@ -14,9 +14,9 @@
 - [x] 프로세스 탐색 허가 대기와 정리 제한 시간의 경쟁을 제거하고 retained-scope 자손 생존 회귀 고정
 - [x] 시스템·도구·출력 예약을 포함한 요청 총예산 강제와 ToolUse/ToolResult ID·개수 무결성 고정
 - [x] OpenAI 호환 공급자의 임의 오류 본문이 영구 디버그 로그에 기록되지 않도록 경계 정제
-- [ ] (진행) 후속 명령의 오래된 lifecycle 상태 제거와 booting·ready-unconfigured·ready-configured 표시 구분
-- [ ] (대기) PTY 실행별 `RAFIKX_HOME` 정리와 준비 상태 실제 터미널 증거 추가
-- [ ] (대기) 기본·최소 기능 전체 테스트, 브라우저 게임 복구 E2E, 릴리스 바이너리, 동시 PTY 검증
+- [x] 후속 명령의 오래된 lifecycle 상태 제거와 booting·ready-unconfigured·ready-configured 표시 구분
+- [x] PTY 실행별 `RAFIKX_HOME` 정리와 준비 상태 실제 터미널 증거 추가
+- [ ] (진행) 기본·최소 기능 전체 테스트, 브라우저 게임 복구 E2E, 릴리스 바이너리, 동시 PTY 검증
 - [ ] (대기) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 

@@ -4,7 +4,7 @@ mod tree;
 mod view;
 
 use std::io::{Write, stdout};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,6 +82,7 @@ pub struct App {
     pub active_run: Arc<Mutex<Option<crate::run::RunContext>>>,
     pub cancel_requested: Arc<AtomicBool>,
     pub lifecycle_state: Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
+    pub lifecycle_epoch: Arc<AtomicU64>,
     pub show_start: bool,
     pub recent_sessions: Vec<RecentSession>,
     /// 시작 화면 세션 목록 커서 — ↑↓ 로 움직이고 Enter 로 이어하기.
@@ -261,6 +262,7 @@ pub async fn run(
         active_run: Arc::new(Mutex::new(None)),
         cancel_requested: Arc::new(AtomicBool::new(false)),
         lifecycle_state: Arc::new(Mutex::new(None)),
+        lifecycle_epoch: Arc::new(AtomicU64::new(0)),
         show_start,
         recent_sessions: recent_sessions(),
         start_session_sel: 0,
@@ -1035,6 +1037,7 @@ fn make_turn_observer(
     cancel_requested: Arc<std::sync::atomic::AtomicBool>,
     active_run: Arc<std::sync::Mutex<Option<crate::run::RunContext>>>,
     lifecycle_state: Arc<std::sync::Mutex<Option<crate::lifecycle::LifecycleState>>>,
+    lifecycle_epoch: Arc<AtomicU64>,
 ) -> chat::RunObserver {
     Arc::new(move |run: crate::run::RunContext| {
         if cancel_requested.load(Ordering::Acquire) {
@@ -1045,22 +1048,41 @@ fn make_turn_observer(
         }
         let mut events = run.subscribe_lifecycle();
         let state = Arc::clone(&lifecycle_state);
-        if let Ok(mut current) = state.lock() {
+        let state_epoch = Arc::clone(&lifecycle_epoch);
+        let observed_epoch = state_epoch.load(Ordering::Acquire);
+        if let Ok(mut current) = state.lock()
+            && state_epoch.load(Ordering::Acquire) == observed_epoch
+        {
             *current = run.lifecycle_state();
         }
         // 위임 자식은 부모의 lifecycle 버스를 그대로 쓴다 — 필터가 없으면 자식의
         // 상태가 부모 스테이지 표시를 덮어쓰고, 자식 종료가 부모 구독까지 끊는다 (§16.1).
         let root_id = run.run_id().clone();
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                if !is_root_lifecycle(&event, &root_id) {
-                    continue;
-                }
-                if let Ok(mut current) = state.lock() {
-                    *current = Some(event.state);
-                }
-                if event.state.is_terminal() {
-                    break;
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        if !is_root_lifecycle(&event, &root_id) {
+                            continue;
+                        }
+                        update_lifecycle_state(
+                            &state,
+                            &state_epoch,
+                            observed_epoch,
+                            Some(event.state),
+                        );
+                        if event.state.is_terminal() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let latest = run.lifecycle_state();
+                        update_lifecycle_state(&state, &state_epoch, observed_epoch, latest);
+                        if latest.is_some_and(|state| state.is_terminal()) {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -1088,9 +1110,7 @@ fn start_turn(
     if let Ok(mut active) = app.active_run.lock() {
         *active = None;
     }
-    if let Ok(mut state) = app.lifecycle_state.lock() {
-        *state = None;
-    }
+    clear_lifecycle_state(&app.lifecycle_state, &app.lifecycle_epoch);
 
     let mut session = app.session.clone();
     let local_ask = local_ask.clone();
@@ -1098,7 +1118,12 @@ fn start_turn(
     let active_run = Arc::clone(&app.active_run);
     let cancel_requested = Arc::clone(&app.cancel_requested);
     let lifecycle_state = Arc::clone(&app.lifecycle_state);
-let observer = make_turn_observer(cancel_requested, active_run, lifecycle_state);
+    let observer = make_turn_observer(
+        cancel_requested,
+        active_run,
+        lifecycle_state,
+        Arc::clone(&app.lifecycle_epoch),
+    );
     let handle = tokio::spawn(async move {
         let result = chat::run_turn_observed(
             &mut session,
@@ -1144,9 +1169,7 @@ fn start_ulw(
     if let Ok(mut active) = app.active_run.lock() {
         *active = None;
     }
-    if let Ok(mut state) = app.lifecycle_state.lock() {
-        *state = None;
-    }
+    clear_lifecycle_state(&app.lifecycle_state, &app.lifecycle_epoch);
 
     let mut session = app.session.clone();
     let local_ask = local_ask.clone();
@@ -1155,6 +1178,7 @@ fn start_ulw(
         Arc::clone(&app.cancel_requested),
         Arc::clone(&app.active_run),
         Arc::clone(&app.lifecycle_state),
+        Arc::clone(&app.lifecycle_epoch),
     );
     let handle = tokio::spawn(async move {
         let result = match mode {
@@ -1301,8 +1325,7 @@ fn start_compact(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>) {
         return;
     }
     push(app, EntryKind::System, "대화를 요약해 압축하는 중…");
-    app.busy = true;
-    app.status = "압축 중…".into();
+    begin_background_activity(app, "압축 중…");
     let mut session = app.session.clone();
     let done_tx = done_tx.clone();
     tokio::spawn(async move {
@@ -1345,8 +1368,7 @@ fn start_assign(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>) {
         EntryKind::System,
         "Provider 모델을 조회해 역할별로 배정하는 중…",
     );
-    app.busy = true;
-    app.status = "역할 배정 중…".into();
+    begin_background_activity(app, "역할 배정 중…");
     let mut session = app.session.clone();
     let done_tx = done_tx.clone();
     tokio::spawn(async move {
@@ -1394,8 +1416,7 @@ fn start_model_fetch(app: &mut App, done_tx: &mpsc::UnboundedSender<TurnDone>, q
     // 시작 화면이 떠 있으면 트랜스크립트를 덮어 요약이 보이지 않는다 — 먼저 닫는다.
     app.show_start = false;
     push(app, EntryKind::System, "모델 목록 조회 중…");
-    app.busy = true;
-    app.status = "모델 목록 조회 중…".into();
+    begin_background_activity(app, "모델 목록 조회 중…");
     app.model_pick_after = Some(query);
     let session = app.session.clone();
     let done_tx = done_tx.clone();
@@ -1694,8 +1715,35 @@ fn reset_screen_for_new_session(app: &mut App) {
     app.workers.clear();
     app.mode_line.clear();
     app.status = "준비".into();
-    if let Ok(mut st) = app.lifecycle_state.lock() {
-        *st = None;
+    clear_lifecycle_state(&app.lifecycle_state, &app.lifecycle_epoch);
+}
+
+fn begin_background_activity(app: &mut App, status: impl Into<String>) {
+    app.busy = true;
+    app.status = status.into();
+    clear_lifecycle_state(&app.lifecycle_state, &app.lifecycle_epoch);
+}
+
+fn clear_lifecycle_state(
+    lifecycle_state: &Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
+    lifecycle_epoch: &Arc<AtomicU64>,
+) {
+    lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut state) = lifecycle_state.lock() {
+        *state = None;
+    }
+}
+
+fn update_lifecycle_state(
+    lifecycle_state: &Arc<Mutex<Option<crate::lifecycle::LifecycleState>>>,
+    lifecycle_epoch: &Arc<AtomicU64>,
+    observed_epoch: u64,
+    state: Option<crate::lifecycle::LifecycleState>,
+) {
+    if let Ok(mut current) = lifecycle_state.lock()
+        && lifecycle_epoch.load(Ordering::Acquire) == observed_epoch
+    {
+        *current = state;
     }
 }
 
@@ -2721,6 +2769,91 @@ mod upgrade_tests {
                 .all(|e| e.run_id == *root.run_id()),
             "루트 필터는 자식 이벤트를 남기지 않는다"
         );
+    }
+
+    #[test]
+    fn completed_run_then_background_work_clears_the_stale_lifecycle() {
+        use crate::lifecycle::LifecycleState;
+
+        let lifecycle_state = Arc::new(Mutex::new(Some(LifecycleState::Succeeded)));
+        let lifecycle_epoch = Arc::new(AtomicU64::new(0));
+        clear_lifecycle_state(&lifecycle_state, &lifecycle_epoch);
+        assert_eq!(*lifecycle_state.lock().expect("lifecycle lock"), None);
+
+        *lifecycle_state.lock().expect("lifecycle lock") = Some(LifecycleState::Failed);
+        clear_lifecycle_state(&lifecycle_state, &lifecycle_epoch);
+        assert_eq!(*lifecycle_state.lock().expect("lifecycle lock"), None);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_observer_recovers_after_broadcast_lag_and_keeps_receiving() {
+        use crate::lifecycle::{LifecycleEventData, LifecycleState};
+        use crate::run::{RunContext, RunId};
+
+        let lifecycle_state = Arc::new(Mutex::new(None));
+        let lifecycle_epoch = Arc::new(AtomicU64::new(0));
+        let observer = make_turn_observer(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&lifecycle_state),
+            Arc::clone(&lifecycle_epoch),
+        );
+        let run = RunContext::isolated(RunId::new("lag-recovery"), std::env::temp_dir());
+        observer(run.clone());
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start lifecycle");
+        for current in 1..=300 {
+            run.transition_lifecycle(LifecycleEventData::Iteration { current, max: 300 })
+                .expect("iteration lifecycle");
+        }
+        for _ in 0..64 {
+            if *lifecycle_state.lock().expect("lifecycle lock") == Some(LifecycleState::Running) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *lifecycle_state.lock().expect("lifecycle lock"),
+            Some(LifecycleState::Running)
+        );
+
+        run.transition_lifecycle(LifecycleEventData::AnswerStarted)
+            .expect("answer lifecycle");
+        for _ in 0..64 {
+            if *lifecycle_state.lock().expect("lifecycle lock") == Some(LifecycleState::Answering) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *lifecycle_state.lock().expect("lifecycle lock"),
+            Some(LifecycleState::Answering)
+        );
+    }
+
+    #[tokio::test]
+    async fn background_activity_rejects_a_late_terminal_event_from_the_previous_run() {
+        use crate::lifecycle::LifecycleEventData;
+        use crate::run::{RunContext, RunId, TerminalState};
+
+        let lifecycle_state = Arc::new(Mutex::new(None));
+        let lifecycle_epoch = Arc::new(AtomicU64::new(0));
+        let observer = make_turn_observer(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&lifecycle_state),
+            Arc::clone(&lifecycle_epoch),
+        );
+        let run = RunContext::isolated(RunId::new("stale-terminal"), std::env::temp_dir());
+        observer(run.clone());
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start lifecycle");
+        run.finish(TerminalState::Succeeded);
+        clear_lifecycle_state(&lifecycle_state, &lifecycle_epoch);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*lifecycle_state.lock().expect("lifecycle lock"), None);
     }
 
     #[test]
