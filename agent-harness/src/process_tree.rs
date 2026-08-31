@@ -951,7 +951,9 @@ async fn scoped_pids(scope: &ProcessScope) -> Result<Vec<u32>, String> {
         "/usr/bin/ps"
     };
     let mut command = Command::new(program);
-    command.args(["eww", "-axo", "pid=,command="]);
+    // BSD·procps 모두 수용하는 형태 — BSD 전용 `-axo` 는 Linux procps 가 personality
+    // 오류로 거부한다. 환경 변수(e)는 command 열 뒤에 붙어 scope 표식 매칭에 쓰인다.
+    command.args(["axeww", "-o", "pid=,command="]);
     let (status, output) = run_bounded_utility(
         &mut command,
         "프로세스 scope 환경 조회",
