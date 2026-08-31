@@ -35,6 +35,9 @@
 - [x] typed provider 실패, 응답·SSE 메모리 상한, 호출당 3회·실행 공유 시도 예산 고정
 - [x] Unix scoped process 실행 전 탐색 예약, 절대 deadline, 전용 marker 스캔 스레드·fallback 수렴 고정
 - [x] `b55280c` 후보의 default 740·minimal 670, 게임 E2E, Clippy, release, PTY·CJK·resize 검증
+- [x] 취소 선행 시 즉시 답변 미공개 cancelled 종료와 답변 확정 후 취소 거부의 lifecycle 선형화, 단위 테스트 프로세스 예약 격리
+- [x] 시도 예산 소진·NextCandidate 전환의 관측 공급자 오류 보존, 통합 계약 표면화 갱신, PTY 실패 시나리오 문구 추종
+- [x] 최종 후보의 default 746·minimal 676, 게임 E2E, Clippy, release, PTY 9상태·live resize 검증
 - [ ] (진행) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 
