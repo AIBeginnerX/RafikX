@@ -1898,19 +1898,22 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("rafikx-quality-argv-{}", crate::db::Db::new_id()));
         std::fs::create_dir_all(&root).expect("temp workspace");
-        let names = [
+        let mut names = vec![
             "$(touch PWNED).js",
             "`touch ALSO_PWNED`.js",
             "quote' and space.js",
-            "line\nbreak.js",
         ];
-        for name in names {
+        // 개행이 든 파일명은 Unix 전용 관심사다 — Windows 파일 시스템은 생성 자체를 거부한다.
+        if cfg!(unix) {
+            names.push("line\nbreak.js");
+        }
+        for name in &names {
             std::fs::write(root.join(name), "const value = 1;\n").expect("fixture");
         }
 
         let changed = names
             .iter()
-            .map(|name| name.to_string())
+            .map(|name| (*name).to_string())
             .collect::<Vec<_>>();
         let report = run_quality_gate(&root, &changed).await;
         assert!(
@@ -2433,7 +2436,15 @@ mod tests {
         )
         .expect("command")
         .expect("Rust file");
-        assert_eq!(args, ["--check", "src/lib.rs"]);
+        // 인자는 canonicalize 후 strip_prefix 로 만들어지므로 OS 구분자를 쓴다.
+        let rust_file = std::path::Path::new("src").join("lib.rs");
+        assert_eq!(
+            args,
+            [
+                "--check".to_string(),
+                rust_file.to_string_lossy().into_owned()
+            ]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

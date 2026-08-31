@@ -93,6 +93,29 @@ impl ProcessIdentity {
         let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
         Ok(Some(Self { pid, pidfd }))
     }
+
+    fn captured_generation_is_gone(&self) -> Result<bool, String> {
+        // SAFETY: The null signal (0) delivers nothing and only probes liveness of exactly the
+        // generation this pidfd names; null siginfo with zero flags is the ordinary probe form.
+        // ESRCH means that captured generation is already gone.
+        let result = unsafe {
+            syscall(
+                Self::PIDFD_SEND_SIGNAL,
+                self.pidfd.as_raw_fd(),
+                0i32,
+                std::ptr::null::<std::ffi::c_void>(),
+                0u32,
+            )
+        };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(3) {
+                return Ok(true);
+            }
+            return Err(format!("PID {} pidfd 세대 재검증 실패: {error}", self.pid));
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2775,9 +2798,17 @@ mod tests {
         })
         .await
         .expect("environment-cleared daemon ready");
-        let inherited = inherited_scope_pids(&scope)
-            .await
-            .expect("discover retained scope descriptor");
+        // Linux 의 marker-fd 조회는 discovery operation·예약을 함께 소비한다 — 블록을
+        // 벗어나며 둘 다 반환돼야 뒤따르는 terminate 의 조회가 다시 잠글 수 있다.
+        #[cfg(target_os = "linux")]
+        let inherited = {
+            let operation = try_discovery_operation(&scope.discovery_operation)
+                .expect("reserve inherited-scope discovery operation");
+            inherited_scope_pids(&scope, operation, Arc::clone(&scope.discovery_reservation)).await
+        };
+        #[cfg(not(target_os = "linux"))]
+        let inherited = inherited_scope_pids(&scope).await;
+        let inherited = inherited.expect("discover retained scope descriptor");
         assert!(
             inherited.contains(&daemon_pid),
             "daemon PID {daemon_pid} did not retain the scope descriptor: {inherited:?}"
