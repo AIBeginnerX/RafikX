@@ -660,7 +660,13 @@ async fn bash_nonzero_exit_is_an_error_result() {
     let bash = registry.get("bash").expect("bash tool");
 
     // When: a command exits unsuccessfully.
-    let result = bash.run(json!({"command": "printf failure >&2; exit 7"}), &context);
+    // bash 도구는 Windows 에서 cmd 로 실행된다 — sh 의 `;` 구분자가 통하지 않는다.
+    let command = if cfg!(windows) {
+        "echo failure 1>&2 & exit 7"
+    } else {
+        "printf failure >&2; exit 7"
+    };
+    let result = bash.run(json!({ "command": command }), &context);
 
     // Then: the agent loop must receive a tool error, including its evidence.
     let error = result.expect_err("nonzero exit must be a tool error");
@@ -746,11 +752,14 @@ async fn bash_created_files_are_recorded_as_execution_evidence() {
     let registry = ToolRegistry::all();
     let bash = registry.get("bash").expect("bash tool");
 
-    bash.run(
-        json!({"command": "printf '<canvas></canvas>' > game.html"}),
-        &context,
-    )
-    .expect("bash write");
+    // cmd 는 따옴표 없는 `<`·`>` 를 리디렉션으로 읽으므로 캐럿으로 이스케이프한다.
+    let command = if cfg!(windows) {
+        "echo ^<canvas^>^</canvas^> > game.html"
+    } else {
+        "printf '<canvas></canvas>' > game.html"
+    };
+    bash.run(json!({ "command": command }), &context)
+        .expect("bash write");
 
     assert_eq!(
         run.committed_paths(),
