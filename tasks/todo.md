@@ -40,6 +40,7 @@
 - [x] 최종 후보의 default 746·minimal 676, 게임 E2E, Clippy, release, PTY 9상태·live resize 검증
 - [x] 첫 3-OS CI가 드러낸 Ubuntu 컴파일(E0599·E0061)·Windows 테스트(개행 픽스처·경로 구분자) 결함 4건 수정
 - [x] Linux procps가 거부하던 scope 환경 조회 ps 인자 통일(45개 연쇄 실패 뿌리)과 Windows cmd bash 계약 테스트 2개 이식, 실제 Linux 컨테이너 표적 검증
+- [x] 브라우저 준비 프로브 상한 60초 상수화와 테스트 픽스처 준비·소멸 폴링 12곳 30초 상향(계약 대기 불변) — 느린 3-OS 러너 내성
 - [ ] (진행) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 
