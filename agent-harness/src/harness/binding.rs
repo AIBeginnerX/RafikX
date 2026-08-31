@@ -1071,8 +1071,12 @@ where
     let ids = account_ids_for(name);
     let mut last_err = None;
     for (i, id) in ids.iter().enumerate() {
-        if !gate.can_dispatch(u32::from(reserve_fallback_attempt))? {
-            break;
+        // 예산 소진은 새 dispatch 만 막는다 — 앞선 계정에서 이미 받은 오류가 있으면
+        // 그 오류를 그대로 돌려준다(이 함수의 반환 관례: last_err 원본).
+        match gate.can_dispatch(u32::from(reserve_fallback_attempt)) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(limit) => return Err(last_err.take().unwrap_or(limit)),
         }
         let wait = crate::usage::seconds_left(id);
         if wait > 0 && wait <= 20 {
@@ -1095,7 +1099,9 @@ where
         let Ok(client) = build_provider_account(cfg, name, id) else {
             continue;
         };
-        gate.claim()?;
+        if let Err(limit) = gate.claim() {
+            return Err(last_err.take().unwrap_or(limit));
+        }
         match call(client).await.and_then(|resp| {
             crate::provider::validate_chat_response(&resp, "fallback")?;
             Ok(resp)
@@ -1290,6 +1296,20 @@ fn sanitized_provider_error(error: anyhow::Error) -> anyhow::Error {
     anyhow!(crate::provider::safe_summary(&error))
 }
 
+/// 시도 예산 소진은 **새 HTTP dispatch 만** 막는다 — 이미 관측한 공급자 오류가 있으면
+/// 그 오류가 실패의 원인이므로 예산 소진 오류로 덮어쓰지 않는다. 덮으면 비치명 500이
+/// "예산 소진"으로 둔갑해 실행 전체가 limit 으로 조기 종료된다.
+fn attempt_limit_or_observed(
+    limit_error: anyhow::Error,
+    primary_err: &mut Option<anyhow::Error>,
+    last_err: &mut Option<anyhow::Error>,
+) -> anyhow::Error {
+    primary_err
+        .take()
+        .or_else(|| last_err.take())
+        .map_or(limit_error, sanitized_provider_error)
+}
+
 fn fallback_warn(error: &anyhow::Error, action: &'static str) {
     // 폴백 과정의 개별 실패(503·429·401 등)는 화면에 노출하지 않는다.
     // 폴백이 성공하면 사용자는 최종 답변만 보고, 전부 실패했을 때만 오류가 전달된다.
@@ -1414,7 +1434,11 @@ async fn chat_with_fallback_inner(
             }
             Err(e) => {
                 if is_provider_attempt_limit_exceeded(&e) {
-                    return Err(e);
+                    return Err(attempt_limit_or_observed(
+                        e,
+                        &mut primary_err,
+                        &mut last_err,
+                    ));
                 }
                 fallback_warn(&e, "trying next provider");
                 if Some(candidate.provider) == primary && primary_err.is_none() {
@@ -1515,6 +1539,23 @@ fn can_retry_same_account(
     has_fallback_candidate: bool,
 ) -> Result<bool> {
     gate.can_dispatch(u32::from(has_fallback_candidate))
+}
+
+/// 주 연결의 오류를 primary_err 로 이관한다 — 후보를 떠나는 경로가 두 갈래
+/// (계정 순회 종료·NextCandidate 즉시 전환)라 이관을 한 곳에 모은다.
+/// 이관하지 않으면 마지막 폴백의 오류가 주 연결의 원인을 덮어쓴다.
+fn promote_primary_error(
+    candidate: &str,
+    primary: Option<&str>,
+    primary_err: &mut Option<anyhow::Error>,
+    last_err: &mut Option<anyhow::Error>,
+) {
+    if last_err.is_some() && Some(candidate) == primary && primary_err.is_none() {
+        *primary_err = last_err.take();
+        if let Some(error) = primary_err.as_ref() {
+            fallback_warn(error, "trying next provider");
+        }
+    }
 }
 
 pub async fn stream_with_fallback<F>(
@@ -1657,11 +1698,19 @@ where
         req.model = model;
         let ids = account_ids_for(candidate.provider);
         for id in &ids {
-            if !gate.can_dispatch(u32::from(reserve_for_secondary(
+            match gate.can_dispatch(u32::from(reserve_for_secondary(
                 candidate_index,
                 candidate_count,
-            )))? {
-                break;
+            ))) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(limit) => {
+                    return Err(attempt_limit_or_observed(
+                        limit,
+                        &mut primary_err,
+                        &mut last_err,
+                    ));
+                }
             }
             let wait = crate::usage::seconds_left(id);
             if wait > 20 {
@@ -1691,7 +1740,13 @@ where
                     emitted.fetch_add(chars, Ordering::Relaxed);
                     on_event(ev);
                 };
-                gate.claim()?;
+                if let Err(limit) = gate.claim() {
+                    return Err(attempt_limit_or_observed(
+                        limit,
+                        &mut primary_err,
+                        &mut last_err,
+                    ));
+                }
                 match client
                     .chat_semantic_stream(&req, &mut track)
                     .await
@@ -1721,29 +1776,40 @@ where
                                     .unwrap_or_else(|| anyhow!("응답 도중 스트림이 끊겼습니다")));
                             }
                             StreamFailureAction::RetrySameAccount => {
-                                if !can_retry_same_account(
+                                match can_retry_same_account(
                                     gate,
                                     reserve_for_secondary(candidate_index, candidate_count),
-                                )? {
-                                    break;
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => break,
+                                    Err(limit) => {
+                                        return Err(attempt_limit_or_observed(
+                                            limit,
+                                            &mut primary_err,
+                                            &mut last_err,
+                                        ));
+                                    }
                                 }
                                 attempt += 1;
                                 tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt)))
                                     .await;
                             }
                             StreamFailureAction::NextAccount => break,
-                            StreamFailureAction::NextCandidate => continue 'candidates,
+                            StreamFailureAction::NextCandidate => {
+                                promote_primary_error(
+                                    candidate.provider,
+                                    primary,
+                                    &mut primary_err,
+                                    &mut last_err,
+                                );
+                                continue 'candidates;
+                            }
                         }
                     }
                 }
             }
         }
-        if last_err.is_some() && Some(candidate.provider) == primary && primary_err.is_none() {
-            primary_err = last_err.take();
-            if let Some(error) = primary_err.as_ref() {
-                fallback_warn(error, "trying next provider");
-            }
-        }
+        promote_primary_error(candidate.provider, primary, &mut primary_err, &mut last_err);
     }
     Err(primary_err
         .or(last_err)
@@ -2354,6 +2420,195 @@ mod combo_tests {
         let returned = sanitized_provider_error(error).to_string();
         assert_eq!(returned, "provider operation failed");
         assert!(!returned.contains(secret));
+    }
+
+    /// 요청마다 같은 HTTP 오류만 돌려주는 최소 공급자 — 받은 dispatch 수를 센다.
+    async fn spawn_always_failing(
+        status: u16,
+        reason: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock listener");
+        let port = listener.local_addr().expect("mock addr").port();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // 요청 본문까지 받아야 클라이언트가 응답을 정상 수신한다.
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = socket.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                    if let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..head_end]).to_lowercase();
+                        let body_len = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if raw.len() >= head_end + 4 + body_len {
+                            break;
+                        }
+                    }
+                }
+                let body = format!(r#"{{"error":{{"message":"forced {status}"}}}}"#);
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), requests, server)
+    }
+
+    async fn spawn_always_500() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_always_failing(500, "Internal Server Error").await
+    }
+
+    fn insert_mock_provider(cfg: &mut Config, name: &str, base_url: &str) {
+        cfg.file.providers.insert(
+            name.to_string(),
+            ProviderConfig {
+                kind: "openai_compat".into(),
+                auth: "none".into(),
+                api_key_env: String::new(),
+                model: "mock-model".into(),
+                small_model: None,
+                base_url: Some(base_url.to_string()),
+                supports_tools: false,
+                models_url: None,
+                model_auto: false,
+                context_window: Some(8_000),
+                enabled: true,
+            },
+        );
+    }
+
+    fn cfg_with_mock_providers(base_url: &str, names: &[String]) -> Config {
+        let workspace =
+            std::env::temp_dir().join(format!("rafikx-attempt-budget-{}", crate::db::Db::new_id()));
+        std::fs::create_dir_all(&workspace).expect("attempt budget workspace");
+        let mut cfg =
+            Config::load(Some(&workspace.join("config.toml"))).expect("attempt budget config");
+        for name in names {
+            insert_mock_provider(&mut cfg, name, base_url);
+        }
+        cfg
+    }
+
+    fn mock_request() -> ChatRequest {
+        ChatRequest {
+            model: "mock-model".into(),
+            system: String::new(),
+            messages: vec![crate::provider::Message::user_text("시도 예산 회귀 검증")],
+            tools: Vec::new(),
+            max_tokens: 64,
+            stream: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn attempt_exhaustion_preserves_the_observed_provider_error() {
+        let (base_url, requests, server) = spawn_always_500().await;
+        let suffix = crate::db::Db::new_id();
+        let names = vec![format!("only500a{suffix}"), format!("only500b{suffix}")];
+        let cfg = cfg_with_mock_providers(&base_url, &names);
+
+        let error = stream_with_fallback(&cfg, &names, "main", mock_request(), |_event| {})
+            .await
+            .expect_err("500 만 돌려주는 공급자는 성공할 수 없다");
+
+        assert!(
+            !is_provider_attempt_limit_exceeded(&error),
+            "관측된 500 이 예산 소진 오류로 둔갑했다: {error}"
+        );
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "공급자 오류가 보존되지 않았다: {error}"
+        );
+        let dispatched = requests.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            dispatched <= COMBO_MAX_HOPS,
+            "dispatch 상한({COMBO_MAX_HOPS})을 넘었다: {dispatched}"
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(cfg.path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn attempt_exhaustion_without_observed_error_still_reports_the_limit() {
+        let (base_url, requests, server) = spawn_always_500().await;
+        let names = vec![format!("only500c{}", crate::db::Db::new_id())];
+        let cfg = cfg_with_mock_providers(&base_url, &names);
+        let run = crate::run::RunContext::isolated(
+            crate::run::RunId::new("provider-attempt-budget-exhausted"),
+            std::env::temp_dir(),
+        );
+        assert_eq!(run.ensure_provider_attempt_limit(1), 1);
+        // 공유 예산을 앞선 호출이 이미 다 쓴 상태 — 이번 호출은 dispatch 전에 막힌다.
+        let mut spent = ProviderAttemptGate::in_run(&run);
+        assert!(spent.claim().is_ok());
+
+        let error = chat_with_fallback_in_run(&cfg, &run, &names, "main", mock_request())
+            .await
+            .expect_err("공유 예산이 소진되면 호출은 실패한다");
+
+        assert!(
+            is_provider_attempt_limit_exceeded(&error),
+            "관측 오류가 전혀 없으면 예산 소진이 그대로 보고돼야 한다: {error}"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+        server.abort();
+        let _ = std::fs::remove_dir_all(cfg.path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn next_candidate_switch_preserves_the_primary_error() {
+        let (primary_url, primary_hits, primary_server) = spawn_always_500().await;
+        let (secondary_url, secondary_hits, secondary_server) =
+            spawn_always_failing(401, "Unauthorized").await;
+        let suffix = crate::db::Db::new_id();
+        let names = vec![
+            format!("primary500{suffix}"),
+            format!("secondary401{suffix}"),
+        ];
+        let mut cfg = cfg_with_mock_providers(&primary_url, &names[..1]);
+        insert_mock_provider(&mut cfg, &names[1], &secondary_url);
+
+        let error = stream_with_fallback(&cfg, &names, "main", mock_request(), |_event| {})
+            .await
+            .expect_err("두 공급자 모두 실패하면 호출도 실패한다");
+
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "주 연결 오류가 폴백 오류에 덮였다: {error}"
+        );
+        assert!(
+            !error.to_string().contains("HTTP 401"),
+            "마지막 폴백 오류가 원인으로 보고됐다: {error}"
+        );
+        assert!(primary_hits.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(secondary_hits.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        primary_server.abort();
+        secondary_server.abort();
+        let _ = std::fs::remove_dir_all(cfg.path.parent().expect("config dir"));
     }
 }
 

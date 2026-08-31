@@ -1277,12 +1277,21 @@ async fn public_combo_wrapper_caps_wire_attempts_at_three() {
         .expect("public cap server timeout")
         .expect("public cap server task");
 
-    assert!(error.to_string().contains("HTTP 시도 예산 3회 소진"));
+    // 소진은 새 dispatch 만 막는다 — 이미 관측한 공급자 오류를 예산 소진 문구로 덮지 않는다.
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTP 500"),
+        "관측된 공급자 오류가 보고돼야 한다: {message}"
+    );
+    assert!(
+        !message.contains("시도 예산"),
+        "예산 소진 문구가 관측 오류를 덮었다: {message}"
+    );
     assert_eq!(requests.lock().expect("public cap requests").len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_attempt_exhaustion_stops_fallback_with_limit_status() {
+async fn shared_attempt_exhaustion_stops_fallback_and_reports_the_observed_error() {
     let workspace = TestWorkspace::new("shared-attempt-limit-status");
     let (base_url, requests, server) = start_scripted_response_sequence(vec![
         (500, "{}".into()),
@@ -1305,7 +1314,7 @@ async fn shared_attempt_exhaustion_stops_fallback_with_limit_status() {
         Arc::new(cfg.clone()),
     );
 
-    let outcome = run_pipeline_with_context(
+    let Err(error) = run_pipeline_with_context(
         &cfg,
         &binding,
         "exhaust the shared attempt budget",
@@ -1317,20 +1326,23 @@ async fn shared_attempt_exhaustion_stops_fallback_with_limit_status() {
         run,
     )
     .await
-    .expect("attempt-limited pipeline");
+    else {
+        panic!("exhausted budget must surface the observed provider failure");
+    };
     tokio::time::timeout(std::time::Duration::from_secs(2), server)
         .await
         .expect("attempt limit server timeout")
         .expect("attempt limit server task");
 
-    assert_eq!(outcome.status, "limit");
+    // 공유 예산이 소진돼도 실행은 관측된 공급자 오류로 끝난다 — 소진 문구로 둔갑하지 않는다.
+    let message = error.to_string();
     assert!(
-        outcome
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("HTTP 시도 예산 3회 소진")),
-        "attempt-limit outcome: {:?}",
-        outcome.error
+        message.contains("HTTP 500"),
+        "관측된 공급자 오류가 보고돼야 한다: {message}"
+    );
+    assert!(
+        !message.contains("시도 예산"),
+        "예산 소진 문구가 관측 오류를 덮었다: {message}"
     );
     assert_eq!(requests.lock().expect("attempt limit requests").len(), 3);
 }
@@ -1356,7 +1368,7 @@ async fn in_run_fallback_call_caps_wire_attempts_below_the_shared_budget() {
     let binding = scripted_binding(TaskClass::Simple, &[], 7, false, 8_000);
     let run = RunContext::for_config(RunId::new("in-run-call-attempt-cap"), Arc::new(cfg.clone()));
 
-    let outcome = run_pipeline_with_context(
+    let Err(error) = run_pipeline_with_context(
         &cfg,
         &binding,
         "cap one fallback invocation below the run-tree budget",
@@ -1368,20 +1380,23 @@ async fn in_run_fallback_call_caps_wire_attempts_below_the_shared_budget() {
         run,
     )
     .await
-    .expect("locally attempt-limited pipeline");
+    else {
+        panic!("one capped invocation must surface the observed provider failure");
+    };
     tokio::time::timeout(std::time::Duration::from_secs(2), server)
         .await
         .expect("local attempt cap server timeout")
         .expect("local attempt cap server task");
 
-    assert_eq!(outcome.status, "limit");
+    // 호출당 dispatch 상한에 걸려도 보고되는 것은 관측된 공급자 오류다.
+    let message = error.to_string();
     assert!(
-        outcome
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("HTTP 시도 예산 3회 소진")),
-        "local attempt-limit outcome: {:?}",
-        outcome.error
+        message.contains("HTTP 500"),
+        "관측된 공급자 오류가 보고돼야 한다: {message}"
+    );
+    assert!(
+        !message.contains("시도 예산"),
+        "예산 소진 문구가 관측 오류를 덮었다: {message}"
     );
     assert_eq!(requests.lock().expect("local cap requests").len(), 3);
 }
