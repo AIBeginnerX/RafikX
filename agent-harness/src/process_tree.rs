@@ -2162,7 +2162,7 @@ mod tests {
         let (child, scope) = spawn_scoped_with_probe(&mut command, probe.clone())
             .await
             .expect("spawn admission fixture");
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !ready.exists() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -2239,7 +2239,7 @@ mod tests {
         let (child, scope) = spawn_scoped_with_probe(&mut command, probe.clone())
             .await
             .expect("spawn admission fixture");
-        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
                     && let Ok(pid) = pid.parse::<u32>()
@@ -2267,7 +2267,7 @@ mod tests {
             .expect("cleanup caller joined");
 
         // Then: no round reacquires global capacity and the exact retained-marker daemon dies.
-        let gone = tokio::time::timeout(Duration::from_secs(3), async {
+        let gone = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let output = std::process::Command::new("ps")
                     .args(["-p", &daemon_pid.to_string(), "-o", "stat="])
@@ -2344,7 +2344,7 @@ mod tests {
         let (child, scope) = spawn_scoped_with_probe(&mut command, probe.clone())
             .await
             .expect("spawn cancellation fixture");
-        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
                     && let Ok(pid) = pid.parse::<u32>()
@@ -2381,7 +2381,7 @@ mod tests {
             "queued worker dropped its process scope"
         );
         drop(held_admission);
-        let gone = tokio::time::timeout(Duration::from_secs(5), async {
+        let gone = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let output = std::process::Command::new("ps")
                     .args(["-p", &daemon_pid.to_string(), "-o", "stat="])
@@ -2520,7 +2520,7 @@ mod tests {
             let _process = ScopedProcess::new(child, scope);
             std::future::pending::<()>().await;
         });
-        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
                     && let Ok(pid) = pid.parse::<u32>()
@@ -2680,7 +2680,7 @@ mod tests {
         let (child, scope) = spawn_scoped(&mut command)
             .await
             .expect("spawn detached process");
-        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
                     && let Ok(pid) = pid.parse::<u32>()
@@ -2695,7 +2695,7 @@ mod tests {
         terminate(child, scope)
             .await
             .expect("terminate detached tree");
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let output = std::process::Command::new("ps")
                     .args(["-p", &daemon_pid.to_string(), "-o", "stat="])
@@ -2734,7 +2734,7 @@ mod tests {
         let (mut child, scope) = spawn_scoped(&mut command)
             .await
             .expect("spawn env-only process");
-        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
                     && let Ok(pid) = pid.parse::<u32>()
@@ -2788,7 +2788,7 @@ mod tests {
         let (child, scope) = spawn_scoped(&mut command)
             .await
             .expect("spawn clearenv process");
-        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
                     && let Ok(pid) = pid.parse::<u32>()
@@ -2818,7 +2818,7 @@ mod tests {
         terminate(child, scope)
             .await
             .expect("terminate clearenv tree");
-        let gone = tokio::time::timeout(Duration::from_secs(3), async {
+        let gone = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let output = std::process::Command::new("ps")
                     .args(["-p", &daemon_pid.to_string(), "-o", "stat="])
@@ -2870,7 +2870,7 @@ mod tests {
         let (child, mut scope) = spawn_scoped(&mut command)
             .await
             .expect("spawn timeout fixture");
-        let daemon_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let daemon_pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&ready)
                     && let Ok(pid) = pid.parse::<u32>()

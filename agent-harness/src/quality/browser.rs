@@ -25,6 +25,9 @@ const MAX_STAGING_DURATION: Duration = Duration::from_secs(3);
 const MAX_BROWSER_STDERR_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ERRORS: usize = 64;
 const MAX_BROWSER_ERROR_DETAIL_CHARS: usize = 300;
+/// 예약 대기·spawn·readiness 프로브 전체를 덮는 절대 상한 — 느린 CI 러너의
+/// Chrome 콜드 스타트를 견딜 만큼 넉넉해야 한다(성공 경로는 소진하지 않는다).
+const BROWSER_READINESS_TIMEOUT_SECS: u64 = 60;
 const MAX_DISCOVERY_ENTRIES: usize = 25_000;
 const MAX_BROWSER_ENTRIES: usize = 8;
 const MAX_DISCOVERY_DURATION: Duration = Duration::from_secs(3);
@@ -2493,7 +2496,8 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let readiness_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let readiness_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(BROWSER_READINESS_TIMEOUT_SECS);
     let spawn = async {
         #[cfg(all(test, unix))]
         return crate::process_tree::spawn_scoped_with_probe(
@@ -2506,7 +2510,9 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     };
     let (child, process_scope) = match tokio::time::timeout_at(readiness_deadline, spawn).await {
         Ok(result) => result.map_err(|error| anyhow::anyhow!("브라우저 실행 실패: {error}"))?,
-        Err(_) => anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)"),
+        Err(_) => {
+            anyhow::bail!("브라우저 준비 프로브 시간 초과 ({BROWSER_READINESS_TIMEOUT_SECS}초)")
+        }
     };
     let mut process = crate::process_tree::ScopedProcess::new(child, process_scope);
     let Some(stderr) = process
@@ -2578,7 +2584,7 @@ pub(crate) async fn smoke_test_in_workspace_with_contract(
     } else {
         process.terminate().await.map_err(anyhow::Error::msg)?;
         let _ = await_stderr_reader(&mut resources).await;
-        anyhow::bail!("브라우저 준비 프로브 시간 초과 (15초)");
+        anyhow::bail!("브라우저 준비 프로브 시간 초과 ({BROWSER_READINESS_TIMEOUT_SECS}초)");
     };
     process.terminate().await.map_err(anyhow::Error::msg)?;
     await_stderr_reader(&mut resources).await?;
