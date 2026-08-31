@@ -1561,7 +1561,7 @@ mod tests {
             .expect("numeric daemon PID");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if pid_is_gone_or_in_state(daemon_pid, &[b'Z'])
+                if pid_is_gone_or_in_state(daemon_pid, b"Z")
                     .await
                     .expect("inspect daemon PID")
                 {
@@ -1652,7 +1652,7 @@ mod tests {
         assert!(error.to_string().contains("5초를 넘겨"), "{error}");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if pid_is_gone_or_in_state(daemon_pid, &[b'Z'])
+                if pid_is_gone_or_in_state(daemon_pid, b"Z")
                     .await
                     .expect("inspect timeout daemon PID")
                 {
@@ -1804,7 +1804,7 @@ mod tests {
         assert!(run.cancel("test cancellation"));
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if pid_is_gone_or_in_state(pid, &[b'Z', b'T'])
+                if pid_is_gone_or_in_state(pid, b"ZT")
                     .await
                     .expect("probe cancelled shell PID")
                 {

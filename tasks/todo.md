@@ -30,6 +30,11 @@
 - [x] admission 대기 전 프로세스 quiesce와 Bash·브라우저·품질 명령 취소·조기 오류 정리
 - [x] 중첩 child lifecycle·검증 후 마지막 root 답변·TUI Esc 선형화 경계 고정
 - [x] 기본·최소 전체 테스트, 브라우저 게임 복구 E2E, 실제 PTY·release build 재검증
+- [x] `read_file`·`grep`·변경 스냅샷의 스트리밍 메모리·출력·심볼릭 경계 고정
+- [x] updater의 인증 fetch·네트워크·offline build 환경 allowlist 분리
+- [x] typed provider 실패, 응답·SSE 메모리 상한, 호출당 3회·실행 공유 시도 예산 고정
+- [x] Unix scoped process 실행 전 탐색 예약, 절대 deadline, 전용 marker 스캔 스레드·fallback 수렴 고정
+- [x] `b55280c` 후보의 default 740·minimal 670, 게임 E2E, Clippy, release, PTY·CJK·resize 검증
 - [ ] (진행) 새 정확 SHA의 GPT-5.6 Sol 독립 검증 전 레인 통과
 - [ ] (대기) master push → 정확 SHA CLI CI → v1.1.9 태그·GitHub Release → 설치본 `rafikx update`
 
