@@ -42,7 +42,7 @@
 
 ## 검증
 
-- 기본 구성은 라이브러리 701개와 통합·바이너리 테스트를 포함해 746개가 통과했고, `--no-default-features`는 라이브러리 631개·전체 676개가 통과했습니다. 두 구성 모두 실패 0개였으며, 환경 의존 LSP 3개와 릴리스용 브라우저 게임 E2E 1개는 기본 실행에서 ignore된 4개입니다. 게임 E2E는 Node와 Chrome을 사용해 별도로 1/1이 약 29초에 통과했습니다. Provider 66개, binding 26개, recovery 28개, process-tree 24개, Bash 9개, quality 23개, browser 50개와 completion·timeout 병렬 압력 24회도 통과했습니다.
+- 기본 구성은 라이브러리 701개와 통합·바이너리 테스트를 포함해 746개가 통과했고, `--no-default-features`는 라이브러리 631개·전체 676개가 통과했습니다. 두 구성 모두 실패 0개였으며, 환경 의존 LSP 3개와 릴리스용 브라우저 게임 E2E 1개는 기본 실행에서 ignore된 4개입니다. 게임 E2E는 Node와 Chrome을 사용해 별도로 1/1이 약 29초에 통과했습니다. Provider 66개, binding 29개, recovery 28개, process-tree 24개, Bash 9개, quality 23개, browser 50개와 completion·timeout 병렬 압력 24회도 통과했습니다.
 - 실제 release 바이너리는 `RafikX 1.1.9`를 출력하고 최상위·`update`·`quality-gate` 도움말을 정상 종료했습니다. xterm.js PTY는 9개 lifecycle 상태와 120→60→120 리사이즈를 11개 PNG로 캡처해 CJK 셀 폭·테두리·오버플로를 직접 확인했고, 실행 홈·임시 config·staging·promotion lock·프로세스를 남기지 않았습니다. 전체 기능 Clippy는 기존 경고를 기록하며 종료 코드 0으로 통과했고, 변경한 Rust 파일은 별도 rustfmt 검사를 통과했습니다. 독립 GPT-5.6 Sol 코드·보안·아키텍처·계약·런타임·시각·CJK 검토는 이 문서를 포함한 정확한 최종 후보 SHA에 묶어 통과한 뒤에만 push합니다. 이번 릴리스는 CLI만 검증했고 Tauri 데스크탑은 후속 단계로 보류했습니다.
 - 개발 중 후보 `040e2aa`에서는 실제 `rafikx ask`로 패키지 없는 마리오 스타일 브라우저 게임 3개 파일을 생성했습니다. 생성 에이전트의 Chrome CDP 검증에서 좌우 이동·점프·적 밟기·피해·패배·승리와 양쪽 재시작을 통과했고, 별도 상호작용 점검에서도 이동·점프·적 밟기·피해·패배·재시작을 재현했습니다.
 - 같은 개발 중 후보에서 생성된 HTML은 S4 브라우저 스모크에서 콘솔 오류 0건으로 통과했습니다.
