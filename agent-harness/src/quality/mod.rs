@@ -119,7 +119,9 @@ pub(crate) async fn run_bounded_command(
         workspace,
         deadline,
         #[cfg(all(test, unix))]
-        None,
+        Some(crate::process_tree::CleanupProbe::with_discovery_capacity(
+            1,
+        )),
     )
     .await
 }

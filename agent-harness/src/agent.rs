@@ -585,23 +585,44 @@ async fn run_agent_with_delivery(
         }
 
         if resp.stop_reason != StopReason::ToolUse && tool_uses.is_empty() {
-            if !record_final_answer(&run_context, &mut messages, &resp, answer_delivery) {
-                return Ok(AgentOutcome {
-                    status: "incomplete".into(),
-                    iterations,
-                    input_tokens,
-                    output_tokens,
-                    context_tokens,
-                    cached_tokens,
-                    cache_reported,
-                    error: Some("모델이 전달 가능한 최종 답변을 반환하지 않았습니다.".into()),
-                    messages,
-                    changed_files: committed_files(&run_context),
-                    tool_errors,
-                    deny_reasons,
-                    verify_fail: None,
-                    verify_recovered: None,
-                });
+            match record_final_answer(&run_context, &mut messages, &resp, answer_delivery) {
+                FinalAnswerRecord::Recorded => {}
+                FinalAnswerRecord::Cancelled => {
+                    return Ok(AgentOutcome {
+                        status: "cancelled".into(),
+                        iterations,
+                        input_tokens,
+                        output_tokens,
+                        context_tokens,
+                        cached_tokens,
+                        cache_reported,
+                        error: Some("실행이 취소되었습니다.".into()),
+                        messages,
+                        changed_files: committed_files(&run_context),
+                        tool_errors,
+                        deny_reasons,
+                        verify_fail: None,
+                        verify_recovered: None,
+                    });
+                }
+                FinalAnswerRecord::Undeliverable => {
+                    return Ok(AgentOutcome {
+                        status: "incomplete".into(),
+                        iterations,
+                        input_tokens,
+                        output_tokens,
+                        context_tokens,
+                        cached_tokens,
+                        cache_reported,
+                        error: Some("모델이 전달 가능한 최종 답변을 반환하지 않았습니다.".into()),
+                        messages,
+                        changed_files: committed_files(&run_context),
+                        tool_errors,
+                        deny_reasons,
+                        verify_fail: None,
+                        verify_recovered: None,
+                    });
+                }
             }
             let hit_token_limit = resp.stop_reason == StopReason::MaxTokens;
             return Ok(AgentOutcome {
@@ -1136,25 +1157,43 @@ fn response_text(response: &ChatResponse) -> String {
         .join("\n")
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FinalAnswerRecord {
+    Recorded,
+    Undeliverable,
+    Cancelled,
+}
+
 fn record_final_answer(
     run: &RunContext,
     messages: &mut Vec<Message>,
     response: &ChatResponse,
     delivery: AnswerDelivery,
-) -> bool {
+) -> FinalAnswerRecord {
     let text = response_text(response);
     if text.trim().is_empty() || crate::harness::leaked_tool_call(&text) {
-        return false;
+        return FinalAnswerRecord::Undeliverable;
     }
     if matches!(delivery, AnswerDelivery::Immediate) {
-        let _ = run.transition_lifecycle(LifecycleEventData::AnswerStarted);
+        if run
+            .transition_lifecycle(LifecycleEventData::AnswerStarted)
+            .is_err()
+        {
+            return if run.is_cancelled()
+                || run.lifecycle_state() == Some(LifecycleState::CancelRequested)
+            {
+                FinalAnswerRecord::Cancelled
+            } else {
+                FinalAnswerRecord::Undeliverable
+            };
+        }
         print_text_blocks(run, response);
     }
     messages.push(Message {
         role: Role::Assistant,
         content: response.content.clone(),
     });
-    true
+    FinalAnswerRecord::Recorded
 }
 
 fn print_work_text_blocks(run: &RunContext, resp: &ChatResponse) {
@@ -1476,12 +1515,15 @@ mod tests {
             .expect("start run");
         let mut messages = vec![Message::user_text("게임을 만들어줘")];
 
-        assert!(!record_final_answer(
-            &run,
-            &mut messages,
-            &final_response(r#"<tool_call>{"name":"write_file","arguments":{}}</tool_call>"#),
-            AnswerDelivery::Immediate,
-        ));
+        assert_eq!(
+            record_final_answer(
+                &run,
+                &mut messages,
+                &final_response(r#"<tool_call>{"name":"write_file","arguments":{}}</tool_call>"#),
+                AnswerDelivery::Immediate,
+            ),
+            FinalAnswerRecord::Undeliverable
+        );
         assert!(emitted.lock().expect("event lock").is_empty());
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0].role, Role::User));
@@ -1501,16 +1543,132 @@ mod tests {
             .expect("start run");
         let mut messages = vec![Message::user_text("작업")];
 
-        assert!(record_final_answer(
-            &run,
-            &mut messages,
-            &final_response("검증 전 후보"),
-            AnswerDelivery::Deferred,
-        ));
+        assert_eq!(
+            record_final_answer(
+                &run,
+                &mut messages,
+                &final_response("검증 전 후보"),
+                AnswerDelivery::Deferred,
+            ),
+            FinalAnswerRecord::Recorded
+        );
 
         assert!(emitted.lock().expect("event lock").is_empty());
         assert_eq!(last_assistant_text(&messages), "검증 전 후보");
         assert_eq!(run.lifecycle_state(), Some(LifecycleState::Running));
+    }
+
+    #[test]
+    fn cancelled_before_immediate_answer_never_emits_or_records_an_assistant_message() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let run = RunContext::isolated(
+            RunId::new("cancelled-before-immediate-answer"),
+            std::env::temp_dir(),
+        )
+        .with_live_sink(Some(Arc::new(move |event| {
+            sink_events.lock().expect("event lock").push(event);
+        })));
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        assert!(run.cancel("answer publication cancelled"));
+        let mut messages = vec![Message::user_text("작업")];
+
+        assert_eq!(
+            record_final_answer(
+                &run,
+                &mut messages,
+                &final_response("전달되면 안 되는 최종 답변"),
+                AnswerDelivery::Immediate,
+            ),
+            FinalAnswerRecord::Cancelled
+        );
+
+        assert!(
+            emitted
+                .lock()
+                .expect("event lock")
+                .iter()
+                .all(|event| !matches!(event, crate::ui::Live::Assistant(_)))
+        );
+        assert!(assistant_text(&messages).is_empty());
+        assert_eq!(messages.len(), 1);
+        assert!(run.is_cancelled());
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::CancelRequested));
+    }
+
+    #[test]
+    fn immediate_answer_commit_publishes_and_rejects_late_cancellation() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        let run = RunContext::isolated(RunId::new("immediate-answer-commit"), std::env::temp_dir())
+            .with_live_sink(Some(Arc::new(move |event| {
+                sink_events.lock().expect("event lock").push(event);
+            })));
+        run.transition_lifecycle(LifecycleEventData::RunStarted { model: None })
+            .expect("start run");
+        let mut messages = vec![Message::user_text("작업")];
+
+        assert_eq!(
+            record_final_answer(
+                &run,
+                &mut messages,
+                &final_response("확정된 최종 답변"),
+                AnswerDelivery::Immediate,
+            ),
+            FinalAnswerRecord::Recorded
+        );
+
+        assert!(
+            emitted
+                .lock()
+                .expect("event lock")
+                .iter()
+                .any(|event| matches!(event, crate::ui::Live::Assistant(_)))
+        );
+        assert_eq!(last_assistant_text(&messages), "확정된 최종 답변");
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::Answering));
+
+        // 답변이 확정된 뒤에 들어온 취소는 거부된다 — 상태도 취소 토큰도 바뀌지 않는다.
+        assert!(!run.cancel("늦은 취소"));
+        assert!(!run.is_cancelled());
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::Answering));
+    }
+
+    #[test]
+    fn queued_run_immediate_answer_is_undeliverable_not_cancelled() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&emitted);
+        // RunContext 는 생성 시점에 Queued 를 발행한다 — 아직 실행이 시작되지 않은 런이다.
+        let run = RunContext::isolated(RunId::new("queued-immediate-answer"), std::env::temp_dir())
+            .with_live_sink(Some(Arc::new(move |event| {
+                sink_events.lock().expect("event lock").push(event);
+            })));
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::Queued));
+        let mut messages = vec![Message::user_text("작업")];
+
+        // Queued 에서 AnswerStarted 는 불법 전이지만 취소는 아니다.
+        assert_eq!(
+            record_final_answer(
+                &run,
+                &mut messages,
+                &final_response("시작도 하지 않은 런의 최종 답변"),
+                AnswerDelivery::Immediate,
+            ),
+            FinalAnswerRecord::Undeliverable
+        );
+
+        assert!(
+            emitted
+                .lock()
+                .expect("event lock")
+                .iter()
+                .all(|event| !matches!(event, crate::ui::Live::Assistant(_)))
+        );
+        assert!(assistant_text(&messages).is_empty());
+        assert_eq!(messages.len(), 1);
+        assert!(!run.is_cancelled());
+        assert_eq!(run.lifecycle_state(), Some(LifecycleState::Queued));
     }
 
     #[test]
